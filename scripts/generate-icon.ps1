@@ -37,59 +37,96 @@ function New-LawPdfPngBytes {
     $graphics.Clear([System.Drawing.Color]::Transparent)
 
     $scale = [float]$Size / 256.0
-    $paper = New-RoundedRectPath (28 * $scale) (18 * $scale) (184 * $scale) (220 * $scale) (22 * $scale)
-    $shadow = New-RoundedRectPath (34 * $scale) (24 * $scale) (184 * $scale) (220 * $scale) (22 * $scale)
 
-    $graphics.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(44, 35, 41, 48))), $shadow)
-    $graphics.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 251, 247, 237))), $paper)
-    $graphics.DrawPath((New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 37, 51, 64), [Math]::Max(2.0, 5.0 * $scale))), $paper)
+    $bell = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $bell.StartFigure()
+    $bell.AddBezier(
+        [System.Drawing.PointF]::new((82 * $scale), (187 * $scale)),
+        [System.Drawing.PointF]::new((88 * $scale), (162 * $scale)),
+        [System.Drawing.PointF]::new((76 * $scale), (130 * $scale)),
+        [System.Drawing.PointF]::new((78 * $scale), (94 * $scale))
+    )
+    $bell.AddBezier(
+        [System.Drawing.PointF]::new((78 * $scale), (94 * $scale)),
+        [System.Drawing.PointF]::new((80 * $scale), (58 * $scale)),
+        [System.Drawing.PointF]::new((100 * $scale), (38 * $scale)),
+        [System.Drawing.PointF]::new((128 * $scale), (38 * $scale))
+    )
+    $bell.AddBezier(
+        [System.Drawing.PointF]::new((128 * $scale), (38 * $scale)),
+        [System.Drawing.PointF]::new((156 * $scale), (38 * $scale)),
+        [System.Drawing.PointF]::new((176 * $scale), (58 * $scale)),
+        [System.Drawing.PointF]::new((178 * $scale), (94 * $scale))
+    )
+    $bell.AddBezier(
+        [System.Drawing.PointF]::new((178 * $scale), (94 * $scale)),
+        [System.Drawing.PointF]::new((180 * $scale), (130 * $scale)),
+        [System.Drawing.PointF]::new((168 * $scale), (162 * $scale)),
+        [System.Drawing.PointF]::new((174 * $scale), (187 * $scale))
+    )
+    $bell.AddBezier(
+        [System.Drawing.PointF]::new((174 * $scale), (187 * $scale)),
+        [System.Drawing.PointF]::new((156 * $scale), (202 * $scale)),
+        [System.Drawing.PointF]::new((100 * $scale), (202 * $scale)),
+        [System.Drawing.PointF]::new((82 * $scale), (187 * $scale))
+    )
+    $bell.CloseFigure()
 
-    $fold = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $fold.AddPolygon(@(
-        ([System.Drawing.PointF]::new((165 * $scale), (18 * $scale))),
-        ([System.Drawing.PointF]::new((212 * $scale), (65 * $scale))),
-        ([System.Drawing.PointF]::new((165 * $scale), (65 * $scale)))
-    ))
-    $graphics.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 232, 225, 211))), $fold)
-    $graphics.DrawLine((New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 37, 51, 64), [Math]::Max(1.0, 3.0 * $scale))), (165 * $scale), (18 * $scale), (212 * $scale), (65 * $scale))
+    $shadow = $bell.Clone()
+    $matrix = New-Object System.Drawing.Drawing2D.Matrix
+    $matrix.Translate((7 * $scale), (9 * $scale))
+    $shadow.Transform($matrix)
 
-    $accentPen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 193, 137, 63)), ([Math]::Max(3.0, 8.0 * $scale))
-    $accentPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
-    $accentPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
-    $graphics.DrawLine($accentPen, (58 * $scale), (197 * $scale), (182 * $scale), (197 * $scale))
+    $handlePen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 37, 51, 64)), ([Math]::Max(2.0, 8.0 * $scale))
+    $handlePen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $handlePen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $rimPen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 37, 51, 64)), ([Math]::Max(2.0, 7.0 * $scale))
+    $rimPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $rimPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $outlinePen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 37, 51, 64)), ([Math]::Max(2.0, 6.0 * $scale))
+
+    $shadowBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(44, 35, 41, 48))
+    $bellBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 251, 247, 237))
+    $clapperBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 193, 137, 63))
+    $letterBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 124, 30, 43))
+
+    $graphics.FillPath($shadowBrush, $shadow)
+    $graphics.FillPath($bellBrush, $bell)
+    $graphics.DrawPath($outlinePen, $bell)
+    $graphics.DrawArc(
+        $handlePen,
+        [System.Drawing.RectangleF]::new((101 * $scale), (24 * $scale), (54 * $scale), (40 * $scale)),
+        205,
+        130
+    )
+    $graphics.DrawLine($rimPen, (67 * $scale), (188 * $scale), (189 * $scale), (188 * $scale))
+    $graphics.FillEllipse($clapperBrush, (111 * $scale), (190 * $scale), (34 * $scale), (34 * $scale))
+    $graphics.DrawEllipse($outlinePen, (111 * $scale), (190 * $scale), (34 * $scale), (34 * $scale))
 
     $format = New-Object System.Drawing.StringFormat
     $format.Alignment = [System.Drawing.StringAlignment]::Center
     $format.LineAlignment = [System.Drawing.StringAlignment]::Center
 
-    $yFont = New-Object System.Drawing.Font "Georgia", ([Math]::Max(10.0, 124.0 * $scale)), ([System.Drawing.FontStyle]::Bold), ([System.Drawing.GraphicsUnit]::Pixel)
-    $yRect = [System.Drawing.RectangleF]::new((50 * $scale), (62 * $scale), (140 * $scale), (108 * $scale))
-    $graphics.DrawString("Y", $yFont, (New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 124, 30, 43))), $yRect, $format)
-
-    if ($Size -ge 96) {
-        $nameFont = New-Object System.Drawing.Font "Segoe UI Semibold", (22 * $scale), ([System.Drawing.FontStyle]::Regular), ([System.Drawing.GraphicsUnit]::Pixel)
-        $nameRect = [System.Drawing.RectangleF]::new((48 * $scale), (167 * $scale), (144 * $scale), (28 * $scale))
-        $graphics.DrawString("LawPDF", $nameFont, (New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 37, 51, 64))), $nameRect, $format)
-        $nameFont.Dispose()
-    }
-
-    if ($Size -ge 192) {
-        $creditFont = New-Object System.Drawing.Font "Segoe UI", (12 * $scale), ([System.Drawing.FontStyle]::Regular), ([System.Drawing.GraphicsUnit]::Pixel)
-        $creditRect = [System.Drawing.RectangleF]::new((48 * $scale), (203 * $scale), (144 * $scale), (18 * $scale))
-        $graphics.DrawString("Y. Arbel 2026", $creditFont, (New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 83, 94, 104))), $creditRect, $format)
-        $creditFont.Dispose()
-    }
+    $aFont = New-Object System.Drawing.Font "Georgia", ([Math]::Max(9.0, 102.0 * $scale)), ([System.Drawing.FontStyle]::Bold), ([System.Drawing.GraphicsUnit]::Pixel)
+    $aRect = [System.Drawing.RectangleF]::new((76 * $scale), (74 * $scale), (104 * $scale), (88 * $scale))
+    $graphics.DrawString("A", $aFont, $letterBrush, $aRect, $format)
 
     $stream = New-Object System.IO.MemoryStream
     $bmp.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
     $bytes = $stream.ToArray()
 
-    $accentPen.Dispose()
+    $aFont.Dispose()
     $format.Dispose()
-    $yFont.Dispose()
-    $paper.Dispose()
+    $letterBrush.Dispose()
+    $clapperBrush.Dispose()
+    $bellBrush.Dispose()
+    $shadowBrush.Dispose()
+    $outlinePen.Dispose()
+    $rimPen.Dispose()
+    $handlePen.Dispose()
+    $matrix.Dispose()
     $shadow.Dispose()
-    $fold.Dispose()
+    $bell.Dispose()
     $graphics.Dispose()
     $bmp.Dispose()
     $stream.Dispose()
