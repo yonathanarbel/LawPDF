@@ -12,6 +12,9 @@ use eframe::egui::{
 use rfd::FileDialog;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+use crate::liquid::{
+    LiquidBlock, LiquidBlockRole, LiquidDocument, LiquidEvent, LiquidRequest, spawn_liquid_job,
+};
 use crate::model::{
     AnnotationKind, EditorAnnotation, LoadedDocument, MarkerStyle, OcrPageState, PageTextChar,
     PdfRect, RenderedPage, SearchHit, SearchSource, Tool,
@@ -21,6 +24,7 @@ use crate::pdf_backend::{export_text, save_with_annotations, sidecar_path_for_ex
 use crate::render_worker::{
     PageRenderKey, RenderEvent, RenderRequest, ThumbnailRenderKey, spawn_render_worker,
 };
+use crate::settings::{AppSettings, load_settings, save_settings};
 
 const CANVAS_FILL: Color32 = Color32::from_rgb(232, 230, 224);
 const PANEL_FILL: Color32 = Color32::from_rgb(246, 244, 239);
@@ -156,6 +160,10 @@ pub struct PdfEditorApp {
     document: Option<LoadedDocument>,
     page_index: usize,
     document_epoch: u64,
+    view_mode: DocumentViewMode,
+    liquid_state: LiquidState,
+    liquid_tx: Sender<LiquidEvent>,
+    liquid_rx: Receiver<LiquidEvent>,
     zoom: f32,
     target_zoom: f32,
     page_textures: HashMap<usize, PageTexture>,
@@ -198,6 +206,9 @@ pub struct PdfEditorApp {
     scroll_target_page: Option<usize>,
     thumbnail_scroll_target: Option<usize>,
     visible_page_ranges: Vec<VisiblePageRange>,
+    settings: AppSettings,
+    settings_api_key_edit: String,
+    show_settings: bool,
     status: String,
 }
 
@@ -219,6 +230,31 @@ impl TextSelection {
 
     fn contains(self, page_index: usize) -> bool {
         self.page_index == page_index && self.start <= self.end
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentViewMode {
+    Pdf,
+    Liquid,
+}
+
+#[derive(Debug, Clone)]
+enum LiquidState {
+    Idle,
+    Preparing,
+    Ready(LiquidDocument),
+    Failed(String),
+}
+
+impl LiquidState {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Idle => "Liquid idle",
+            Self::Preparing => "Liquid preparing",
+            Self::Ready(_) => "Liquid ready",
+            Self::Failed(_) => "Liquid failed",
+        }
     }
 }
 
@@ -301,6 +337,8 @@ struct DocumentTab {
     document: LoadedDocument,
     page_index: usize,
     document_epoch: u64,
+    view_mode: DocumentViewMode,
+    liquid_state: LiquidState,
     zoom: f32,
     target_zoom: f32,
     page_textures: HashMap<usize, PageTexture>,
@@ -348,6 +386,9 @@ impl PdfEditorApp {
 
         let (ocr_tx, ocr_rx) = unbounded();
         let (render_tx, render_rx) = spawn_render_worker();
+        let (liquid_tx, liquid_rx) = unbounded();
+        let settings = load_settings();
+        let settings_api_key_edit = settings.openrouter_api_key.clone();
         let mut app = Self {
             startup_error: None,
             tabs: Vec::new(),
@@ -356,6 +397,10 @@ impl PdfEditorApp {
             document: None,
             page_index: 0,
             document_epoch: 0,
+            view_mode: DocumentViewMode::Pdf,
+            liquid_state: LiquidState::Idle,
+            liquid_tx,
+            liquid_rx,
             zoom: 1.25,
             target_zoom: 1.25,
             page_textures: HashMap::new(),
@@ -398,6 +443,9 @@ impl PdfEditorApp {
             scroll_target_page: Some(0),
             thumbnail_scroll_target: Some(0),
             visible_page_ranges: Vec::new(),
+            settings,
+            settings_api_key_edit,
+            show_settings: false,
             status: "Ready".to_owned(),
         };
 
@@ -428,6 +476,8 @@ impl PdfEditorApp {
             document,
             page_index: self.page_index,
             document_epoch: self.document_epoch,
+            view_mode: self.view_mode,
+            liquid_state: self.liquid_state.clone(),
             zoom: self.zoom,
             target_zoom: self.target_zoom,
             page_textures: self.page_textures.clone(),
@@ -476,6 +526,8 @@ impl PdfEditorApp {
         self.document = Some(tab.document);
         self.page_index = tab.page_index;
         self.document_epoch = tab.document_epoch;
+        self.view_mode = tab.view_mode;
+        self.liquid_state = tab.liquid_state;
         self.zoom = tab.zoom;
         self.target_zoom = tab.target_zoom;
         self.page_textures = tab.page_textures;
@@ -558,6 +610,8 @@ impl PdfEditorApp {
         self.document = None;
         self.page_index = 0;
         self.document_epoch = 0;
+        self.view_mode = DocumentViewMode::Pdf;
+        self.liquid_state = LiquidState::Idle;
         self.zoom = 1.25;
         self.target_zoom = 1.25;
         self.page_textures.clear();
@@ -738,6 +792,8 @@ impl PdfEditorApp {
             document,
             page_index: 0,
             document_epoch: self.allocate_document_epoch(),
+            view_mode: DocumentViewMode::Pdf,
+            liquid_state: LiquidState::Idle,
             zoom: 1.25,
             target_zoom: 1.25,
             page_textures: HashMap::new(),
@@ -1176,6 +1232,114 @@ impl PdfEditorApp {
             .iter()
             .map(|state| state.text().unwrap_or_default().to_owned())
             .collect()
+    }
+
+    fn collect_liquid_source_pages(&self, document: &LoadedDocument) -> Vec<String> {
+        (0..document.page_count)
+            .map(|page_index| {
+                let native = document
+                    .native_text
+                    .get(page_index)
+                    .map(|text| text.trim())
+                    .unwrap_or_default();
+                if !native.is_empty() {
+                    native.to_owned()
+                } else {
+                    self.ocr_states
+                        .get(page_index)
+                        .and_then(OcrPageState::text)
+                        .unwrap_or_default()
+                        .to_owned()
+                }
+            })
+            .collect()
+    }
+
+    fn set_view_mode(&mut self, mode: DocumentViewMode, ctx: &Context) {
+        if self.view_mode == mode {
+            return;
+        }
+        self.view_mode = mode;
+        match mode {
+            DocumentViewMode::Pdf => {
+                self.status = "PDF view".to_owned();
+            }
+            DocumentViewMode::Liquid => {
+                self.ensure_liquid_started(ctx);
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn ensure_liquid_started(&mut self, ctx: &Context) {
+        if !matches!(self.liquid_state, LiquidState::Idle) {
+            return;
+        }
+
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let pages = self.collect_liquid_source_pages(document);
+        let has_text = pages.iter().any(|page| !page.trim().is_empty());
+        if !has_text {
+            self.liquid_state = LiquidState::Failed(
+                "Liquid Mode needs native PDF text or completed OCR text.".to_owned(),
+            );
+            self.status = "Liquid Mode has no text to format.".to_owned();
+            return;
+        }
+
+        let api_key = self.settings.openrouter_api_key.trim();
+        let api_key = if api_key.is_empty() {
+            None
+        } else {
+            Some(api_key.to_owned())
+        };
+
+        let request = LiquidRequest {
+            document_epoch: self.document_epoch,
+            path: document.path.clone(),
+            title: document.title.clone(),
+            pages,
+            openrouter_api_key: api_key,
+        };
+        self.liquid_state = LiquidState::Preparing;
+        self.status = "Preparing Liquid Mode...".to_owned();
+        spawn_liquid_job(request, self.liquid_tx.clone());
+        ctx.request_repaint_after(RENDER_POLL_INTERVAL);
+    }
+
+    fn poll_liquid_results(&mut self, ctx: &Context) {
+        while let Ok(event) = self.liquid_rx.try_recv() {
+            let next_state = match event.result {
+                Ok(document) => {
+                    let status = if document.llm_used {
+                        format!(
+                            "Liquid Mode ready; {} footnote line(s) removed.",
+                            document.footnotes_removed
+                        )
+                    } else {
+                        format!(
+                            "Liquid Mode ready locally; {} footnote line(s) removed.",
+                            document.footnotes_removed
+                        )
+                    };
+                    (LiquidState::Ready(document), status)
+                }
+                Err(error) => (LiquidState::Failed(error.clone()), error),
+            };
+
+            if self.is_current_document(event.document_epoch, &event.path) {
+                self.liquid_state = next_state.0;
+                self.status = next_state.1;
+                ctx.request_repaint();
+            } else if let Some(tab) = self.tabs.iter_mut().find(|tab| {
+                tab.document_epoch == event.document_epoch && tab.document.path == event.path
+            }) {
+                tab.liquid_state = next_state.0;
+                tab.status = next_state.1;
+            }
+        }
     }
 
     fn rebuild_search(&mut self) {
@@ -1722,6 +1886,41 @@ impl PdfEditorApp {
                     ui.add_space(6.0);
 
                     toolbar_group(ui, |ui| {
+                        let pdf_active = self.view_mode == DocumentViewMode::Pdf;
+                        if ui
+                            .add_enabled(
+                                has_document,
+                                egui::Button::new("PDF").selected(pdf_active),
+                            )
+                            .on_hover_text("Original PDF view")
+                            .clicked()
+                        {
+                            self.set_view_mode(DocumentViewMode::Pdf, ctx);
+                        }
+                        let liquid_active = self.view_mode == DocumentViewMode::Liquid;
+                        if ui
+                            .add_enabled(
+                                has_document,
+                                egui::Button::new("Liquid").selected(liquid_active),
+                            )
+                            .on_hover_text("Reflowed reading view")
+                            .clicked()
+                        {
+                            self.set_view_mode(DocumentViewMode::Liquid, ctx);
+                        }
+                        if ui
+                            .button("LLM")
+                            .on_hover_text("OpenRouter settings")
+                            .clicked()
+                        {
+                            self.settings_api_key_edit = self.settings.openrouter_api_key.clone();
+                            self.show_settings = true;
+                        }
+                    });
+
+                    ui.add_space(6.0);
+
+                    toolbar_group(ui, |ui| {
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
                                 for (tool, label) in [
@@ -2170,8 +2369,10 @@ impl PdfEditorApp {
                     .as_ref()
                     .map(|document| document.page_count)
                     .unwrap_or_default();
-                let page_text = if page_count > 0 {
+                let page_text = if page_count > 0 && self.view_mode == DocumentViewMode::Pdf {
                     format!("Page {} of {}", self.page_index + 1, page_count)
+                } else if page_count > 0 {
+                    self.liquid_state.label().to_owned()
                 } else {
                     "No document".to_owned()
                 };
@@ -2179,7 +2380,11 @@ impl PdfEditorApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(page_text).color(INK));
                     ui.separator();
-                    ui.label(RichText::new(format!("{:.0}% zoom", self.zoom * 100.0)).color(INK));
+                    let mode_text = match self.view_mode {
+                        DocumentViewMode::Pdf => format!("{:.0}% zoom", self.zoom * 100.0),
+                        DocumentViewMode::Liquid => "Liquid view".to_owned(),
+                    };
+                    ui.label(RichText::new(mode_text).color(INK));
                     ui.separator();
                     ui.label(RichText::new(self.active_tool.label()).color(INK));
                     ui.separator();
@@ -2189,6 +2394,50 @@ impl PdfEditorApp {
                     });
                 });
             });
+    }
+
+    fn draw_settings_window(&mut self, ctx: &Context) {
+        if !self.show_settings {
+            return;
+        }
+
+        let mut open = self.show_settings;
+        let mut save_clicked = false;
+        egui::Window::new("LawPDF settings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("OpenRouter").strong().color(INK));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings_api_key_edit)
+                        .password(true)
+                        .hint_text("API key")
+                        .desired_width(360.0),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        save_clicked = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.settings_api_key_edit = self.settings.openrouter_api_key.clone();
+                        self.show_settings = false;
+                    }
+                });
+            });
+
+        self.show_settings = open && self.show_settings;
+        if save_clicked {
+            self.settings.openrouter_api_key = self.settings_api_key_edit.trim().to_owned();
+            match save_settings(&self.settings) {
+                Ok(()) => {
+                    self.show_settings = false;
+                    self.liquid_state = LiquidState::Idle;
+                    self.status = "Settings saved.".to_owned();
+                }
+                Err(error) => self.status = error,
+            }
+        }
     }
 
     fn draw_empty_state(&mut self, ui: &mut egui::Ui, ctx: &Context) {
@@ -2291,6 +2540,185 @@ impl PdfEditorApp {
         }
     }
 
+    fn draw_liquid_document(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+        let state = self.liquid_state.clone();
+        egui::ScrollArea::vertical()
+            .id_salt("liquid_document")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let width = ui.available_width().min(920.0);
+                let side = ((ui.available_width() - width) * 0.5).max(0.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(side);
+                    ui.vertical(|ui| {
+                        ui.set_width(width);
+                        ui.add_space(28.0);
+                        match state {
+                            LiquidState::Idle => {
+                                ui.label(RichText::new("Liquid Mode").size(26.0).strong());
+                                if ui.button("Prepare").clicked() {
+                                    self.ensure_liquid_started(ctx);
+                                }
+                            }
+                            LiquidState::Preparing => {
+                                ui.add_space(80.0);
+                                ui.spinner();
+                                ui.label(RichText::new("Preparing Liquid Mode").size(20.0));
+                                ui.label(RichText::new("Formatting text...").color(MUTED_INK));
+                            }
+                            LiquidState::Failed(error) => {
+                                ui.add_space(48.0);
+                                ui.label(
+                                    RichText::new("Liquid Mode unavailable")
+                                        .size(22.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(132, 49, 42)),
+                                );
+                                ui.label(RichText::new(error).color(MUTED_INK));
+                                if ui.button("Retry").clicked() {
+                                    self.liquid_state = LiquidState::Idle;
+                                    self.ensure_liquid_started(ctx);
+                                }
+                            }
+                            LiquidState::Ready(document) => {
+                                self.draw_liquid_header(ui, &document);
+                                for block in &document.blocks {
+                                    self.draw_liquid_block(ui, block);
+                                }
+                                ui.add_space(40.0);
+                            }
+                        }
+                    });
+                });
+            });
+    }
+
+    fn draw_liquid_header(&self, ui: &mut egui::Ui, document: &LiquidDocument) {
+        ui.horizontal_wrapped(|ui| {
+            let engine = if document.llm_used {
+                "OpenRouter"
+            } else {
+                "Local"
+            };
+            ui.label(
+                RichText::new(format!("Liquid Mode · {engine}"))
+                    .strong()
+                    .color(INK),
+            );
+            ui.separator();
+            ui.label(
+                RichText::new(format!(
+                    "{} footnote line(s) removed",
+                    document.footnotes_removed
+                ))
+                .color(MUTED_INK),
+            );
+        });
+        for warning in &document.warnings {
+            ui.label(RichText::new(warning).color(Color32::from_rgb(134, 92, 34)));
+        }
+        ui.add_space(12.0);
+    }
+
+    fn draw_liquid_block(&self, ui: &mut egui::Ui, block: &LiquidBlock) {
+        match block.role {
+            LiquidBlockRole::Title => {
+                ui.add_space(8.0);
+                ui.add(
+                    egui::Label::new(RichText::new(&block.text).size(30.0).strong().color(INK))
+                        .wrap(),
+                );
+                ui.add_space(12.0);
+            }
+            LiquidBlockRole::Heading => {
+                ui.add_space(18.0);
+                ui.add(
+                    egui::Label::new(RichText::new(&block.text).size(24.0).strong().color(INK))
+                        .wrap(),
+                );
+                ui.add_space(4.0);
+            }
+            LiquidBlockRole::Subheading => {
+                ui.add_space(12.0);
+                ui.add(
+                    egui::Label::new(RichText::new(&block.text).size(19.0).strong().color(INK))
+                        .wrap(),
+                );
+                ui.add_space(2.0);
+            }
+            LiquidBlockRole::Definition => {
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(248, 244, 235))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(211, 195, 166)))
+                    .corner_radius(6)
+                    .inner_margin(Margin::symmetric(12, 9))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(block.label.as_deref().unwrap_or("Definition"))
+                                .strong()
+                                .color(Color32::from_rgb(116, 77, 30)),
+                        );
+                        ui.add(egui::Label::new(RichText::new(&block.text).size(17.0)).wrap());
+                    });
+                ui.add_space(8.0);
+            }
+            LiquidBlockRole::KeyClause => {
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(244, 247, 243))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(177, 197, 171)))
+                    .corner_radius(6)
+                    .inner_margin(Margin::symmetric(12, 9))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(block.label.as_deref().unwrap_or("Key clause"))
+                                .strong()
+                                .color(Color32::from_rgb(53, 95, 58)),
+                        );
+                        ui.add(egui::Label::new(RichText::new(&block.text).size(17.0)).wrap());
+                    });
+                ui.add_space(8.0);
+            }
+            LiquidBlockRole::Clause => {
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.add(egui::Label::new(RichText::new(&block.text).size(17.0)).wrap());
+                });
+                ui.add_space(7.0);
+            }
+            LiquidBlockRole::ListItem => {
+                ui.horizontal_top(|ui| {
+                    ui.label(RichText::new("•").size(18.0).strong().color(MUTED_INK));
+                    ui.add(egui::Label::new(RichText::new(&block.text).size(17.0)).wrap());
+                });
+                ui.add_space(4.0);
+            }
+            LiquidBlockRole::Quote => {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&block.text)
+                                .size(17.0)
+                                .italics()
+                                .color(Color32::from_rgb(69, 63, 55)),
+                        )
+                        .wrap(),
+                    );
+                });
+                ui.add_space(6.0);
+            }
+            LiquidBlockRole::Paragraph => {
+                ui.add(egui::Label::new(RichText::new(&block.text).size(17.0).color(INK)).wrap());
+                ui.add_space(8.0);
+            }
+        }
+    }
+
     fn draw_document(&mut self, ctx: &Context) {
         self.text_box_action_rect = None;
         egui::CentralPanel::default()
@@ -2298,6 +2726,12 @@ impl PdfEditorApp {
             .show(ctx, |ui| {
                 if self.document.is_none() {
                     self.draw_empty_state(ui, ctx);
+                    return;
+                }
+
+                if self.view_mode == DocumentViewMode::Liquid {
+                    self.ensure_liquid_started(ctx);
+                    self.draw_liquid_document(ui, ctx);
                     return;
                 }
 
@@ -3434,6 +3868,7 @@ impl eframe::App for PdfEditorApp {
         self.poll_queued_open_paths(ctx);
         self.poll_render_results(ctx);
         self.poll_ocr();
+        self.poll_liquid_results(ctx);
         self.handle_dropped_files(ctx);
 
         let zoom_delta = ctx.input(|input| input.zoom_delta());
@@ -3512,12 +3947,14 @@ impl eframe::App for PdfEditorApp {
         self.draw_side_panel(ctx);
         self.draw_status_bar(ctx);
         self.draw_document(ctx);
+        self.draw_settings_window(ctx);
 
         if self.zoom_is_animating()
             || !self.pending_page_renders.is_empty()
             || !self.pending_thumbnail_renders.is_empty()
             || !self.pending_text_chars.is_empty()
             || !self.queued_open_paths.is_empty()
+            || matches!(self.liquid_state, LiquidState::Preparing)
         {
             ctx.request_repaint_after(RENDER_POLL_INTERVAL);
         }

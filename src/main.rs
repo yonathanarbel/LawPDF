@@ -1,10 +1,12 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod liquid;
 mod model;
 mod ocr;
 mod pdf_backend;
 mod render_worker;
+mod settings;
 mod single_instance;
 
 use std::path::PathBuf;
