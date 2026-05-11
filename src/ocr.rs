@@ -10,11 +10,14 @@ use crate::render_worker::RenderRequest;
 
 #[derive(Debug, Clone)]
 pub struct OcrEvent {
+    pub document_epoch: u64,
+    pub path: PathBuf,
     pub page_index: usize,
     pub state: OcrPageState,
 }
 
 pub fn spawn_ocr_job(
+    document_epoch: u64,
     pdf_path: PathBuf,
     page_count: usize,
     tx: Sender<OcrEvent>,
@@ -23,6 +26,8 @@ pub fn spawn_ocr_job(
     thread::spawn(move || {
         for page_index in 0..page_count {
             let _ = tx.send(OcrEvent {
+                document_epoch,
+                path: pdf_path.clone(),
                 page_index,
                 state: OcrPageState::Running,
             });
@@ -32,7 +37,12 @@ pub fn spawn_ocr_job(
                 Err(error) => OcrPageState::Failed(error),
             };
 
-            let _ = tx.send(OcrEvent { page_index, state });
+            let _ = tx.send(OcrEvent {
+                document_epoch,
+                path: pdf_path.clone(),
+                page_index,
+                state,
+            });
         }
     });
 }

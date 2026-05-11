@@ -150,6 +150,9 @@ fn install_paper_theme(ctx: &Context) {
 
 pub struct PdfEditorApp {
     startup_error: Option<String>,
+    tabs: Vec<DocumentTab>,
+    active_tab: Option<usize>,
+    next_document_epoch: u64,
     document: Option<LoadedDocument>,
     page_index: usize,
     document_epoch: u64,
@@ -238,6 +241,7 @@ impl SidebarTab {
     }
 }
 
+#[derive(Clone)]
 struct PageTexture {
     zoom: f32,
     render_scale: f32,
@@ -245,6 +249,7 @@ struct PageTexture {
     texture: TextureHandle,
 }
 
+#[derive(Clone)]
 struct ThumbnailTexture {
     texture: TextureHandle,
 }
@@ -289,8 +294,49 @@ struct VisiblePageRange {
     coverage: f32,
 }
 
+#[derive(Clone)]
+struct DocumentTab {
+    document: LoadedDocument,
+    page_index: usize,
+    document_epoch: u64,
+    zoom: f32,
+    target_zoom: f32,
+    page_textures: HashMap<usize, PageTexture>,
+    thumbnail_textures: HashMap<usize, ThumbnailTexture>,
+    texture_access_counter: u64,
+    last_zoom_change: Option<Instant>,
+    annotations: Vec<EditorAnnotation>,
+    text_selection: Option<TextSelection>,
+    selection_anchor: Option<(usize, usize)>,
+    selection_toolbar_rect: Option<Rect>,
+    selected_text_box: Option<usize>,
+    editing_text_box: Option<usize>,
+    text_box_focus_request: Option<usize>,
+    text_box_action_rect: Option<Rect>,
+    text_box_drag: Option<TextBoxDrag>,
+    active_drag_page: Option<usize>,
+    drag_start_pdf: Option<(f32, f32)>,
+    drag_preview: Option<PdfRect>,
+    active_signature_stroke: Vec<(f32, f32)>,
+    search_query: String,
+    search_hits: Vec<SearchHit>,
+    selected_hit: Option<usize>,
+    show_search_highlights: bool,
+    ocr_states: Vec<OcrPageState>,
+    scroll_target_page: Option<usize>,
+    thumbnail_scroll_target: Option<usize>,
+    visible_page_ranges: Vec<VisiblePageRange>,
+    status: String,
+}
+
+impl DocumentTab {
+    fn title(&self) -> String {
+        tab_title(&self.document)
+    }
+}
+
 impl PdfEditorApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, startup_paths: Vec<PathBuf>) -> Self {
         install_eb_garamond(&cc.egui_ctx);
         install_paper_theme(&cc.egui_ctx);
 
@@ -298,6 +344,9 @@ impl PdfEditorApp {
         let (render_tx, render_rx) = spawn_render_worker();
         let mut app = Self {
             startup_error: None,
+            tabs: Vec::new(),
+            active_tab: None,
+            next_document_epoch: 1,
             document: None,
             page_index: 0,
             document_epoch: 0,
@@ -344,14 +393,196 @@ impl PdfEditorApp {
             status: "Ready".to_owned(),
         };
 
-        if let Ok(path) = std::env::var("LAWPDF_DEFAULT_PDF") {
-            if !path.trim().is_empty() {
-                app.status = format!("Opening {}", path);
-                app.load_document(PathBuf::from(path), &cc.egui_ctx);
+        for path in startup_paths {
+            app.status = format!("Opening {}", path.display());
+            app.load_document(path, &cc.egui_ctx);
+        }
+
+        if app.tabs.is_empty() {
+            if let Ok(path) = std::env::var("LAWPDF_DEFAULT_PDF") {
+                if !path.trim().is_empty() {
+                    app.status = format!("Opening {}", path);
+                    app.load_document(PathBuf::from(path), &cc.egui_ctx);
+                }
             }
         }
 
         app
+    }
+
+    fn allocate_document_epoch(&mut self) -> u64 {
+        let epoch = self.next_document_epoch;
+        self.next_document_epoch = self.next_document_epoch.wrapping_add(1).max(1);
+        epoch
+    }
+
+    fn active_tab_snapshot(&self, document: LoadedDocument) -> DocumentTab {
+        DocumentTab {
+            document,
+            page_index: self.page_index,
+            document_epoch: self.document_epoch,
+            zoom: self.zoom,
+            target_zoom: self.target_zoom,
+            page_textures: self.page_textures.clone(),
+            thumbnail_textures: self.thumbnail_textures.clone(),
+            texture_access_counter: self.texture_access_counter,
+            last_zoom_change: self.last_zoom_change,
+            annotations: self.annotations.clone(),
+            text_selection: self.text_selection,
+            selection_anchor: self.selection_anchor,
+            selection_toolbar_rect: self.selection_toolbar_rect,
+            selected_text_box: self.selected_text_box,
+            editing_text_box: self.editing_text_box,
+            text_box_focus_request: self.text_box_focus_request,
+            text_box_action_rect: self.text_box_action_rect,
+            text_box_drag: self.text_box_drag,
+            active_drag_page: self.active_drag_page,
+            drag_start_pdf: self.drag_start_pdf,
+            drag_preview: self.drag_preview,
+            active_signature_stroke: self.active_signature_stroke.clone(),
+            search_query: self.search_query.clone(),
+            search_hits: self.search_hits.clone(),
+            selected_hit: self.selected_hit,
+            show_search_highlights: self.show_search_highlights,
+            ocr_states: self.ocr_states.clone(),
+            scroll_target_page: self.scroll_target_page,
+            thumbnail_scroll_target: self.thumbnail_scroll_target,
+            visible_page_ranges: self.visible_page_ranges.clone(),
+            status: self.status.clone(),
+        }
+    }
+
+    fn save_active_tab_state(&mut self) {
+        let Some(tab_index) = self.active_tab else {
+            return;
+        };
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let snapshot = self.active_tab_snapshot(document);
+        if let Some(tab) = self.tabs.get_mut(tab_index) {
+            *tab = snapshot;
+        }
+    }
+
+    fn apply_tab_state(&mut self, tab: DocumentTab, ctx: &Context) {
+        self.document = Some(tab.document);
+        self.page_index = tab.page_index;
+        self.document_epoch = tab.document_epoch;
+        self.zoom = tab.zoom;
+        self.target_zoom = tab.target_zoom;
+        self.page_textures = tab.page_textures;
+        self.thumbnail_textures = tab.thumbnail_textures;
+        self.pending_page_renders.clear();
+        self.pending_thumbnail_renders.clear();
+        self.pending_text_chars.clear();
+        self.texture_access_counter = tab.texture_access_counter;
+        self.last_zoom_change = tab.last_zoom_change;
+        self.annotations = tab.annotations;
+        self.text_selection = tab.text_selection;
+        self.selection_anchor = tab.selection_anchor;
+        self.selection_toolbar_rect = tab.selection_toolbar_rect;
+        self.selected_text_box = tab.selected_text_box;
+        self.editing_text_box = tab.editing_text_box;
+        self.text_box_focus_request = tab.text_box_focus_request;
+        self.text_box_action_rect = tab.text_box_action_rect;
+        self.text_box_drag = tab.text_box_drag;
+        self.active_drag_page = tab.active_drag_page;
+        self.drag_start_pdf = tab.drag_start_pdf;
+        self.drag_preview = tab.drag_preview;
+        self.active_signature_stroke = tab.active_signature_stroke;
+        self.search_query = tab.search_query;
+        self.search_hits = tab.search_hits;
+        self.selected_hit = tab.selected_hit;
+        self.show_search_highlights = tab.show_search_highlights;
+        self.ocr_states = tab.ocr_states;
+        self.scroll_target_page = tab.scroll_target_page.or(Some(self.page_index));
+        self.thumbnail_scroll_target = tab.thumbnail_scroll_target.or(Some(self.page_index));
+        self.visible_page_ranges = tab.visible_page_ranges;
+        self.status = tab.status;
+        ctx.request_repaint();
+    }
+
+    fn switch_to_tab(&mut self, tab_index: usize, ctx: &Context) {
+        if self.active_tab == Some(tab_index) || tab_index >= self.tabs.len() {
+            return;
+        }
+
+        self.save_active_tab_state();
+        let tab = self.tabs[tab_index].clone();
+        self.active_tab = Some(tab_index);
+        self.startup_error = None;
+        self.apply_tab_state(tab, ctx);
+    }
+
+    fn close_tab(&mut self, tab_index: usize, ctx: &Context) {
+        if tab_index >= self.tabs.len() {
+            return;
+        }
+
+        let closing_active = self.active_tab == Some(tab_index);
+        if !closing_active {
+            self.save_active_tab_state();
+        }
+
+        self.tabs.remove(tab_index);
+        if self.tabs.is_empty() {
+            self.active_tab = None;
+            self.clear_document_state();
+            ctx.request_repaint();
+            return;
+        }
+
+        if closing_active {
+            let next_index = tab_index.min(self.tabs.len() - 1);
+            let tab = self.tabs[next_index].clone();
+            self.active_tab = Some(next_index);
+            self.apply_tab_state(tab, ctx);
+        } else if let Some(active_tab) = self.active_tab {
+            self.active_tab = Some(if active_tab > tab_index {
+                active_tab - 1
+            } else {
+                active_tab
+            });
+        }
+    }
+
+    fn clear_document_state(&mut self) {
+        self.document = None;
+        self.page_index = 0;
+        self.document_epoch = 0;
+        self.zoom = 1.25;
+        self.target_zoom = 1.25;
+        self.page_textures.clear();
+        self.thumbnail_textures.clear();
+        self.pending_page_renders.clear();
+        self.pending_thumbnail_renders.clear();
+        self.pending_text_chars.clear();
+        self.texture_access_counter = 0;
+        self.last_zoom_change = None;
+        self.annotations.clear();
+        self.text_selection = None;
+        self.selection_anchor = None;
+        self.selection_toolbar_rect = None;
+        self.clear_text_box_selection();
+        self.text_box_drag = None;
+        self.active_drag_page = None;
+        self.drag_start_pdf = None;
+        self.drag_preview = None;
+        self.active_signature_stroke.clear();
+        self.search_query.clear();
+        self.search_hits.clear();
+        self.selected_hit = None;
+        self.show_search_highlights = true;
+        self.ocr_states.clear();
+        self.scroll_target_page = Some(0);
+        self.thumbnail_scroll_target = Some(0);
+        self.visible_page_ranges.clear();
+        self.status = "Ready".to_owned();
+    }
+
+    fn tab_index_for_path(&self, path: &Path) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.document.path == path)
     }
 
     fn open_dialog(&mut self, ctx: &Context) {
@@ -361,13 +592,20 @@ impl PdfEditorApp {
     }
 
     fn load_document(&mut self, path: PathBuf, ctx: &Context) {
+        if let Some(tab_index) = self.tab_index_for_path(&path) {
+            self.switch_to_tab(tab_index, ctx);
+            self.status = format!("Switched to {}", path.display());
+            return;
+        }
+
         let result = self.load_document_on_worker(path.clone());
 
         match result {
             Ok(document) => {
+                self.save_active_tab_state();
                 self.startup_error = None;
                 self.page_index = 0;
-                self.document_epoch = self.document_epoch.wrapping_add(1);
+                self.document_epoch = self.allocate_document_epoch();
                 self.zoom = 1.25;
                 self.target_zoom = 1.25;
                 self.page_textures.clear();
@@ -389,7 +627,10 @@ impl PdfEditorApp {
                 self.selected_hit = None;
                 self.ocr_states = vec![OcrPageState::Idle; document.page_count];
                 self.status = format!("Opened {}", document.title);
-                self.document = Some(document);
+                self.document = Some(document.clone());
+                let tab = self.active_tab_snapshot(document);
+                self.tabs.push(tab);
+                self.active_tab = Some(self.tabs.len() - 1);
                 self.render_first_page_before_repaint(ctx);
                 self.prefetch_small_document_pages(ctx);
                 ctx.request_repaint();
@@ -472,6 +713,7 @@ impl PdfEditorApp {
 
         self.ocr_states = vec![OcrPageState::Pending; document.page_count];
         spawn_ocr_job(
+            self.document_epoch,
             document.path.clone(),
             document.page_count,
             self.ocr_tx.clone(),
@@ -484,10 +726,18 @@ impl PdfEditorApp {
         let mut should_rebuild_search = false;
 
         while let Ok(event) = self.ocr_rx.try_recv() {
-            if let Some(state) = self.ocr_states.get_mut(event.page_index) {
-                let was_done = matches!(event.state, OcrPageState::Done(_));
-                *state = event.state;
-                should_rebuild_search |= was_done && !self.search_query.trim().is_empty();
+            if self.is_current_document(event.document_epoch, &event.path) {
+                if let Some(state) = self.ocr_states.get_mut(event.page_index) {
+                    let was_done = matches!(event.state, OcrPageState::Done(_));
+                    *state = event.state;
+                    should_rebuild_search |= was_done && !self.search_query.trim().is_empty();
+                }
+            } else if let Some(tab) = self.tabs.iter_mut().find(|tab| {
+                tab.document_epoch == event.document_epoch && tab.document.path == event.path
+            }) {
+                if let Some(state) = tab.ocr_states.get_mut(event.page_index) {
+                    *state = event.state;
+                }
             }
         }
 
@@ -1217,6 +1467,67 @@ impl PdfEditorApp {
         self.status = "Text box deleted.".to_owned();
     }
 
+    fn draw_tab_strip(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+        let mut switch_to = None;
+        let mut close_tab = None;
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("LawPDF").strong().color(INK));
+            ui.add_space(4.0);
+
+            for (index, tab) in self.tabs.iter().enumerate() {
+                egui::Frame::NONE
+                    .fill(if self.active_tab == Some(index) {
+                        Color32::from_rgb(250, 247, 239)
+                    } else {
+                        Color32::from_rgb(238, 234, 225)
+                    })
+                    .stroke(Stroke::new(
+                        1.0,
+                        if self.active_tab == Some(index) {
+                            Color32::from_rgb(171, 128, 73)
+                        } else {
+                            Color32::from_rgb(218, 212, 202)
+                        },
+                    ))
+                    .corner_radius(6)
+                    .inner_margin(Margin::symmetric(7, 3))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let mut title = tab.title();
+                            const MAX_TAB_CHARS: usize = 28;
+                            if title.chars().count() > MAX_TAB_CHARS {
+                                title = format!(
+                                    "{}...",
+                                    title.chars().take(MAX_TAB_CHARS - 3).collect::<String>()
+                                );
+                            }
+                            if ui
+                                .selectable_label(self.active_tab == Some(index), title)
+                                .on_hover_text(tab.document.path.display().to_string())
+                                .clicked()
+                            {
+                                switch_to = Some(index);
+                            }
+                            if ui.small_button("x").on_hover_text("Close tab").clicked() {
+                                close_tab = Some(index);
+                            }
+                        });
+                    });
+            }
+
+            if ui.small_button("+").on_hover_text("Open PDF").clicked() {
+                self.open_dialog(ctx);
+            }
+        });
+
+        if let Some(index) = close_tab {
+            self.close_tab(index, ctx);
+        } else if let Some(index) = switch_to {
+            self.switch_to_tab(index, ctx);
+        }
+    }
+
     fn draw_toolbar(&mut self, ctx: &Context) {
         egui::TopBottomPanel::top("toolbar")
             .frame(
@@ -1226,6 +1537,9 @@ impl PdfEditorApp {
                     .stroke(Stroke::new(1.0, Color32::from_rgb(222, 218, 208))),
             )
             .show(ctx, |ui| {
+                self.draw_tab_strip(ui, ctx);
+                ui.add_space(6.0);
+
                 let has_document = self.document.is_some();
                 let page_count = self
                     .document
@@ -1804,7 +2118,6 @@ impl PdfEditorApp {
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"));
             if is_pdf {
                 self.load_document(path, ctx);
-                break;
             }
         }
     }
@@ -2993,6 +3306,22 @@ impl eframe::App for PdfEditorApp {
         if ctx.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::F)) {
             self.rebuild_search();
         }
+        if ctx.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::Tab))
+            && self.tabs.len() > 1
+        {
+            let active = self.active_tab.unwrap_or(0);
+            let next = if ctx.input(|input| input.modifiers.shift) {
+                active.checked_sub(1).unwrap_or(self.tabs.len() - 1)
+            } else {
+                (active + 1) % self.tabs.len()
+            };
+            self.switch_to_tab(next, ctx);
+        }
+        if ctx.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::W)) {
+            if let Some(active_tab) = self.active_tab {
+                self.close_tab(active_tab, ctx);
+            }
+        }
         if ctx.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::Plus)) {
             self.set_zoom(self.target_zoom * 1.15);
         }
@@ -3313,4 +3642,17 @@ fn default_output_name(source: &Path, suffix: &str, extension: &str) -> String {
         .and_then(|value| value.to_str())
         .unwrap_or("document");
     format!("{stem}-{suffix}.{extension}")
+}
+
+fn tab_title(document: &LoadedDocument) -> String {
+    if !document.title.trim().is_empty() {
+        return document.title.clone();
+    }
+
+    document
+        .path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("Untitled PDF")
+        .to_owned()
 }

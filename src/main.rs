@@ -6,6 +6,8 @@ mod ocr;
 mod pdf_backend;
 mod render_worker;
 
+use std::path::PathBuf;
+
 use app::PdfEditorApp;
 
 const APP_TITLE: &str = "LawPDF - Y. Arbel design (2026)";
@@ -19,6 +21,11 @@ fn main() -> eframe::Result<()> {
         smoke_render_worker();
         return Ok(());
     }
+    let startup_paths = std::env::args_os()
+        .skip(1)
+        .filter(|arg| !arg.to_string_lossy().starts_with("--"))
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -32,7 +39,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         APP_TITLE,
         options,
-        Box::new(|cc| Ok(Box::new(PdfEditorApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(PdfEditorApp::new(cc, startup_paths.clone())))),
     )
 }
 

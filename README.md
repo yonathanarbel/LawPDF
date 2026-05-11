@@ -5,6 +5,7 @@ LawPDF is a native Windows PDF reader and annotation editor built in Rust with `
 ## Features
 
 - Open and render PDF documents with continuous multi-page scrolling.
+- Open multiple PDFs in tabs.
 - Zoom with toolbar controls or `Ctrl` + mouse wheel.
 - Select native PDF text and copy with `Ctrl+C`.
 - Highlight selected text with pastel markers or crimson underline.
