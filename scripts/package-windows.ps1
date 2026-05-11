@@ -6,7 +6,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-$targetDir = Join-Path $repoRoot "target\$Configuration"
+$targetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $repoRoot "target" }
+$targetDir = Join-Path $targetRoot $Configuration
 $exeName = "lawpdf.exe"
 $exePath = Join-Path $targetDir $exeName
 

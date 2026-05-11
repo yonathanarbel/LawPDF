@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -162,6 +162,8 @@ pub struct PdfEditorApp {
     thumbnail_textures: HashMap<usize, ThumbnailTexture>,
     render_tx: Sender<RenderRequest>,
     render_rx: Receiver<RenderEvent>,
+    incoming_paths_rx: Receiver<Vec<PathBuf>>,
+    queued_open_paths: VecDeque<PathBuf>,
     pending_page_renders: HashMap<usize, PageRenderKey>,
     pending_thumbnail_renders: HashMap<usize, ThumbnailRenderKey>,
     pending_text_chars: HashSet<usize>,
@@ -336,7 +338,11 @@ impl DocumentTab {
 }
 
 impl PdfEditorApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, startup_paths: Vec<PathBuf>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        startup_paths: Vec<PathBuf>,
+        incoming_paths_rx: Receiver<Vec<PathBuf>>,
+    ) -> Self {
         install_eb_garamond(&cc.egui_ctx);
         install_paper_theme(&cc.egui_ctx);
 
@@ -356,6 +362,8 @@ impl PdfEditorApp {
             thumbnail_textures: HashMap::new(),
             render_tx,
             render_rx,
+            incoming_paths_rx,
+            queued_open_paths: VecDeque::new(),
             pending_page_renders: HashMap::new(),
             pending_thumbnail_renders: HashMap::new(),
             pending_text_chars: HashSet::new(),
@@ -393,9 +401,8 @@ impl PdfEditorApp {
             status: "Ready".to_owned(),
         };
 
-        for path in startup_paths {
-            app.status = format!("Opening {}", path.display());
-            app.load_document(path, &cc.egui_ctx);
+        if !startup_paths.is_empty() {
+            app.open_paths_in_tabs(startup_paths, &cc.egui_ctx, true);
         }
 
         if app.tabs.is_empty() {
@@ -586,60 +593,179 @@ impl PdfEditorApp {
     }
 
     fn open_dialog(&mut self, ctx: &Context) {
-        if let Some(path) = FileDialog::new().add_filter("PDF", &["pdf"]).pick_file() {
-            self.load_document(path, ctx);
+        if let Some(paths) = FileDialog::new().add_filter("PDF", &["pdf"]).pick_files() {
+            self.open_paths_in_tabs(paths, ctx, true);
         }
     }
 
     fn load_document(&mut self, path: PathBuf, ctx: &Context) {
-        if let Some(tab_index) = self.tab_index_for_path(&path) {
-            self.switch_to_tab(tab_index, ctx);
-            self.status = format!("Switched to {}", path.display());
+        self.load_document_with_options(path, ctx, true, true, true);
+    }
+
+    fn open_paths_in_tabs(&mut self, paths: Vec<PathBuf>, ctx: &Context, defer_background: bool) {
+        let mut paths = clean_pdf_paths(paths);
+        if paths.is_empty() {
             return;
+        }
+
+        let total = paths.len();
+        let first = paths.remove(0);
+        self.load_document_with_options(first, ctx, true, true, total == 1);
+
+        if defer_background {
+            self.queued_open_paths.extend(paths);
+            if total > 1 {
+                self.status = format!("Opening {total} PDFs in tabs...");
+                ctx.request_repaint_after(RENDER_POLL_INTERVAL);
+            }
+            return;
+        }
+
+        let mut opened = 1;
+        for path in paths {
+            if self.load_document_with_options(path, ctx, false, false, false) {
+                opened += 1;
+            }
+        }
+        if opened > 1 {
+            self.status = format!("Opened {opened} PDFs in tabs.");
+        }
+    }
+
+    fn poll_queued_open_paths(&mut self, ctx: &Context) {
+        let Some(path) = self.queued_open_paths.pop_front() else {
+            return;
+        };
+
+        self.load_document_with_options(path, ctx, false, false, false);
+        let remaining = self.queued_open_paths.len();
+        if remaining == 0 {
+            self.prefetch_small_document_pages(ctx);
+            self.status = format!("Opened {} PDFs in tabs.", self.tabs.len());
+        } else {
+            self.status = format!("Opening PDFs in tabs... {remaining} remaining");
+            ctx.request_repaint_after(RENDER_POLL_INTERVAL);
+        }
+    }
+
+    fn poll_incoming_paths(&mut self, ctx: &Context) {
+        let mut saw_message = false;
+        let mut paths = Vec::new();
+        while let Ok(mut batch) = self.incoming_paths_rx.try_recv() {
+            saw_message = true;
+            paths.append(&mut batch);
+        }
+
+        if !saw_message {
+            return;
+        }
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+            egui::UserAttentionType::Informational,
+        ));
+
+        if paths.is_empty() {
+            self.status = "LawPDF is already open.".to_owned();
+            ctx.request_repaint();
+        } else {
+            self.open_paths_in_tabs(paths, ctx, true);
+        }
+    }
+
+    fn load_document_with_options(
+        &mut self,
+        path: PathBuf,
+        ctx: &Context,
+        activate: bool,
+        render_first_page: bool,
+        prefetch_pages: bool,
+    ) -> bool {
+        if let Some(tab_index) = self.tab_index_for_path(&path) {
+            if activate {
+                self.switch_to_tab(tab_index, ctx);
+                self.status = format!("Switched to {}", path.display());
+            } else {
+                self.status = format!("Already open {}", path.display());
+            }
+            return true;
         }
 
         let result = self.load_document_on_worker(path.clone());
 
         match result {
             Ok(document) => {
-                self.save_active_tab_state();
+                let title = document.title.clone();
+                let tab = self.tab_for_new_document(document);
+                let should_activate = activate || self.active_tab.is_none();
+                if should_activate {
+                    self.save_active_tab_state();
+                }
                 self.startup_error = None;
-                self.page_index = 0;
-                self.document_epoch = self.allocate_document_epoch();
-                self.zoom = 1.25;
-                self.target_zoom = 1.25;
-                self.page_textures.clear();
-                self.thumbnail_textures.clear();
-                self.pending_page_renders.clear();
-                self.pending_thumbnail_renders.clear();
-                self.pending_text_chars.clear();
-                self.texture_access_counter = 0;
-                self.last_zoom_change = None;
-                self.scroll_target_page = Some(0);
-                self.thumbnail_scroll_target = Some(0);
-                self.visible_page_ranges.clear();
-                self.annotations.clear();
-                self.text_selection = None;
-                self.selection_anchor = None;
-                self.selection_toolbar_rect = None;
-                self.clear_text_box_selection();
-                self.search_hits.clear();
-                self.selected_hit = None;
-                self.ocr_states = vec![OcrPageState::Idle; document.page_count];
-                self.status = format!("Opened {}", document.title);
-                self.document = Some(document.clone());
-                let tab = self.active_tab_snapshot(document);
                 self.tabs.push(tab);
-                self.active_tab = Some(self.tabs.len() - 1);
-                self.render_first_page_before_repaint(ctx);
-                self.prefetch_small_document_pages(ctx);
+                let tab_index = self.tabs.len() - 1;
+                if should_activate {
+                    let tab = self.tabs[tab_index].clone();
+                    self.active_tab = Some(tab_index);
+                    self.apply_tab_state(tab, ctx);
+                    if render_first_page {
+                        self.render_first_page_before_repaint(ctx);
+                    }
+                    if prefetch_pages {
+                        self.prefetch_small_document_pages(ctx);
+                    }
+                } else {
+                    self.status = format!("Added {title} to tabs");
+                }
                 ctx.request_repaint();
+                true
             }
             Err(error) => {
                 self.startup_error = Some(error.clone());
                 self.visible_page_ranges.clear();
                 self.status = error;
+                false
             }
+        }
+    }
+
+    fn tab_for_new_document(&mut self, document: LoadedDocument) -> DocumentTab {
+        let page_count = document.page_count;
+        let title = document.title.clone();
+        DocumentTab {
+            document,
+            page_index: 0,
+            document_epoch: self.allocate_document_epoch(),
+            zoom: 1.25,
+            target_zoom: 1.25,
+            page_textures: HashMap::new(),
+            thumbnail_textures: HashMap::new(),
+            texture_access_counter: 0,
+            last_zoom_change: None,
+            annotations: Vec::new(),
+            text_selection: None,
+            selection_anchor: None,
+            selection_toolbar_rect: None,
+            selected_text_box: None,
+            editing_text_box: None,
+            text_box_focus_request: None,
+            text_box_action_rect: None,
+            text_box_drag: None,
+            active_drag_page: None,
+            drag_start_pdf: None,
+            drag_preview: None,
+            active_signature_stroke: Vec::new(),
+            search_query: String::new(),
+            search_hits: Vec::new(),
+            selected_hit: None,
+            show_search_highlights: true,
+            ocr_states: vec![OcrPageState::Idle; page_count],
+            scroll_target_page: Some(0),
+            thumbnail_scroll_target: Some(0),
+            visible_page_ranges: Vec::new(),
+            status: format!("Opened {title}"),
         }
     }
 
@@ -2108,17 +2234,12 @@ impl PdfEditorApp {
 
     fn handle_dropped_files(&mut self, ctx: &Context) {
         let dropped_files = ctx.input(|input| input.raw.dropped_files.clone());
-        for file in dropped_files {
-            let Some(path) = file.path else {
-                continue;
-            };
-            let is_pdf = path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"));
-            if is_pdf {
-                self.load_document(path, ctx);
-            }
+        let paths = dropped_files
+            .into_iter()
+            .filter_map(|file| file.path)
+            .collect::<Vec<_>>();
+        if !paths.is_empty() {
+            self.open_paths_in_tabs(paths, ctx, true);
         }
     }
 
@@ -3289,6 +3410,8 @@ impl PdfEditorApp {
 
 impl eframe::App for PdfEditorApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.poll_incoming_paths(ctx);
+        self.poll_queued_open_paths(ctx);
         self.poll_render_results(ctx);
         self.poll_ocr();
         self.handle_dropped_files(ctx);
@@ -3374,6 +3497,7 @@ impl eframe::App for PdfEditorApp {
             || !self.pending_page_renders.is_empty()
             || !self.pending_thumbnail_renders.is_empty()
             || !self.pending_text_chars.is_empty()
+            || !self.queued_open_paths.is_empty()
         {
             ctx.request_repaint_after(RENDER_POLL_INTERVAL);
         }
@@ -3558,6 +3682,26 @@ fn draw_pdf_stroke(
             stroke,
         );
     }
+}
+
+fn clean_pdf_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut clean = Vec::new();
+    for path in paths {
+        let is_pdf = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"));
+        if !is_pdf {
+            continue;
+        }
+
+        let normalized = std::fs::canonicalize(&path).unwrap_or(path);
+        if seen.insert(normalized.clone()) {
+            clean.push(normalized);
+        }
+    }
+    clean
 }
 
 fn find_hits(text: &str, query: &str, page_index: usize, source: SearchSource) -> Vec<SearchHit> {

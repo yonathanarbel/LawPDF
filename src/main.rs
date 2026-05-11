@@ -5,6 +5,7 @@ mod model;
 mod ocr;
 mod pdf_backend;
 mod render_worker;
+mod single_instance;
 
 use std::path::PathBuf;
 
@@ -26,6 +27,11 @@ fn main() -> eframe::Result<()> {
         .filter(|arg| !arg.to_string_lossy().starts_with("--"))
         .map(PathBuf::from)
         .collect::<Vec<_>>();
+    let single_instance = single_instance::initialize(&startup_paths);
+    let incoming_paths_rx = match single_instance {
+        single_instance::InstanceMode::Primary { incoming_paths_rx } => incoming_paths_rx,
+        single_instance::InstanceMode::SecondarySent => return Ok(()),
+    };
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -39,7 +45,13 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         APP_TITLE,
         options,
-        Box::new(move |cc| Ok(Box::new(PdfEditorApp::new(cc, startup_paths.clone())))),
+        Box::new(move |cc| {
+            Ok(Box::new(PdfEditorApp::new(
+                cc,
+                startup_paths.clone(),
+                incoming_paths_rx.clone(),
+            )))
+        }),
     )
 }
 
