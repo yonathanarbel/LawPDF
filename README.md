@@ -26,6 +26,8 @@ Tagged releases are built by GitHub Actions and publish two Windows assets:
 
 The portable build does not require installation. Extract the zip and run `lawpdf.exe`.
 
+The installer registers LawPDF as a PDF-capable app in Windows. To make it the default PDF app, open Windows Settings, go to Apps > Default apps, search for `.pdf`, and choose LawPDF.
+
 ## Runtime Requirements
 
 PDF rendering uses PDFium through `pdfium-render`. Release builds bundle `pdfium.dll`.
