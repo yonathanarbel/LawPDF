@@ -25,6 +25,7 @@ New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $portableDir "fonts") | Out-Null
 
 Copy-Item -LiteralPath $exePath -Destination (Join-Path $portableDir $exeName) -Force
+Copy-Item -LiteralPath (Join-Path $repoRoot "assets\lawpdf.ico") -Destination (Join-Path $portableDir "lawpdf.ico") -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot "vendor\pdfium.dll") -Destination (Join-Path $portableDir "pdfium.dll") -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot "vendor\fonts\EBGaramond.ttf") -Destination (Join-Path $portableDir "fonts\EBGaramond.ttf") -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot "LICENSE") -Destination (Join-Path $portableDir "LICENSE") -Force

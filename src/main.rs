@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod model;
 mod ocr;
@@ -5,6 +7,8 @@ mod pdf_backend;
 mod render_worker;
 
 use app::PdfEditorApp;
+
+const APP_TITLE: &str = "LawPDF - Y. Arbel design (2026)";
 
 fn main() -> eframe::Result<()> {
     if std::env::args().any(|arg| arg == "--smoke-open-default") {
@@ -18,17 +22,23 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("LawPDF")
+            .with_title(APP_TITLE)
+            .with_icon(std::sync::Arc::new(load_app_icon()))
             .with_inner_size([1280.0, 860.0])
             .with_min_inner_size([980.0, 640.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "LawPDF",
+        APP_TITLE,
         options,
         Box::new(|cc| Ok(Box::new(PdfEditorApp::new(cc)))),
     )
+}
+
+fn load_app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/lawpdf.png"))
+        .expect("bundled LawPDF icon should be a valid PNG")
 }
 
 fn smoke_open_default() {

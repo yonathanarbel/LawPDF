@@ -1,6 +1,7 @@
 #define MyAppName "LawPDF"
-#define MyAppPublisher "LawPDF"
+#define MyAppPublisher "Y. Arbel design (2026)"
 #define MyAppExeName "lawpdf.exe"
+#define MyAppIconName "lawpdf.ico"
 #ifndef AppVersion
 #define AppVersion "0.1.0"
 #endif
@@ -14,6 +15,7 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 LicenseFile=..\..\LICENSE
+SetupIconFile=..\..\assets\lawpdf.ico
 OutputDir=..\..\dist
 OutputBaseFilename=LawPDFSetup-x64
 Compression=lzma2
@@ -21,7 +23,7 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-UninstallDisplayIcon={app}\{#MyAppExeName}
+UninstallDisplayIcon={app}\{#MyAppIconName}
 ChangesAssociations=yes
 
 [Languages]
@@ -36,7 +38,7 @@ Source: "..\..\dist\LawPDF-portable\*"; DestDir: "{app}"; Flags: ignoreversion r
 [Registry]
 Root: HKLM; Subkey: "Software\Classes\.pdf\OpenWithProgids"; ValueType: string; ValueName: "LawPDF.PDF"; ValueData: "{#MyAppName}"; Flags: uninsdeletevalue
 Root: HKCR; Subkey: "LawPDF.PDF"; ValueType: string; ValueData: "PDF Document"; Flags: uninsdeletekey
-Root: HKCR; Subkey: "LawPDF.PDF\DefaultIcon"; ValueType: string; ValueData: "{app}\{#MyAppExeName},0"
+Root: HKCR; Subkey: "LawPDF.PDF\DefaultIcon"; ValueType: string; ValueData: "{app}\{#MyAppIconName}"
 Root: HKCR; Subkey: "LawPDF.PDF\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
 Root: HKLM; Subkey: "Software\{#MyAppName}\Capabilities"; ValueType: string; ValueName: "ApplicationName"; ValueData: "{#MyAppName}"; Flags: uninsdeletekey
 Root: HKLM; Subkey: "Software\{#MyAppName}\Capabilities"; ValueType: string; ValueName: "ApplicationDescription"; ValueData: "Read, search, sign, and annotate PDF documents with LawPDF."
@@ -46,8 +48,8 @@ Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\{#MyApp
 Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\{#MyAppExeName}"; ValueType: string; ValueName: "Path"; ValueData: "{app}"
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppIconName}"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppIconName}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
