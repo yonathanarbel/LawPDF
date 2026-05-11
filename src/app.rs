@@ -1602,22 +1602,28 @@ impl PdfEditorApp {
             ui.add_space(4.0);
 
             for (index, tab) in self.tabs.iter().enumerate() {
+                let is_active = self.active_tab == Some(index);
+                let tab_fill = if is_active {
+                    Color32::from_rgb(255, 254, 250)
+                } else {
+                    Color32::from_rgb(229, 224, 214)
+                };
+                let tab_stroke = if is_active {
+                    Stroke::new(1.4, Color32::from_rgb(151, 105, 48))
+                } else {
+                    Stroke::new(1.0, Color32::from_rgb(204, 198, 187))
+                };
+                let title_color = if is_active { INK } else { MUTED_INK };
+
                 egui::Frame::NONE
-                    .fill(if self.active_tab == Some(index) {
-                        Color32::from_rgb(250, 247, 239)
-                    } else {
-                        Color32::from_rgb(238, 234, 225)
-                    })
-                    .stroke(Stroke::new(
-                        1.0,
-                        if self.active_tab == Some(index) {
-                            Color32::from_rgb(171, 128, 73)
-                        } else {
-                            Color32::from_rgb(218, 212, 202)
-                        },
-                    ))
+                    .fill(tab_fill)
+                    .stroke(tab_stroke)
                     .corner_radius(6)
-                    .inner_margin(Margin::symmetric(7, 3))
+                    .inner_margin(if is_active {
+                        Margin::symmetric(10, 5)
+                    } else {
+                        Margin::symmetric(9, 4)
+                    })
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let mut title = tab.title();
@@ -1628,14 +1634,28 @@ impl PdfEditorApp {
                                     title.chars().take(MAX_TAB_CHARS - 3).collect::<String>()
                                 );
                             }
+                            let title = if is_active {
+                                RichText::new(title).strong().color(title_color)
+                            } else {
+                                RichText::new(title).color(title_color)
+                            };
                             if ui
-                                .selectable_label(self.active_tab == Some(index), title)
+                                .add(egui::Label::new(title).sense(Sense::click()))
                                 .on_hover_text(tab.document.path.display().to_string())
                                 .clicked()
                             {
                                 switch_to = Some(index);
                             }
-                            if ui.small_button("x").on_hover_text("Close tab").clicked() {
+                            let close_text = RichText::new("x").color(if is_active {
+                                Color32::from_rgb(104, 75, 43)
+                            } else {
+                                Color32::from_rgb(128, 122, 112)
+                            });
+                            if ui
+                                .add(egui::Button::new(close_text).small().frame(false))
+                                .on_hover_text("Close tab")
+                                .clicked()
+                            {
                                 close_tab = Some(index);
                             }
                         });
