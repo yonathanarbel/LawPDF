@@ -1,0 +1,5 @@
+/target
+/dist
+/.claude
+/vendor/*.tgz
+/vendor/pdfium-win-x64/

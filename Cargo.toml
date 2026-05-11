@@ -1,0 +1,18 @@
+[package]
+name = "lawpdf"
+version = "0.1.0"
+edition = "2024"
+description = "Native Windows PDF reader and annotation editor for legal workflows"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+crossbeam-channel = "0.5"
+eframe = { version = "0.33", default-features = true }
+egui = "0.33"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+lopdf = "0.38"
+pdfium-render = { version = "0.8", features = ["image"] }
+rfd = "0.15"
+serde = { version = "1.0", features = ["derive"] }
+time = { version = "0.3", features = ["formatting", "local-offset"] }
