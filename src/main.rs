@@ -1,6 +1,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod benchmark;
+mod chat;
 mod liquid;
 mod model;
 mod ocr;
@@ -8,6 +10,7 @@ mod pdf_backend;
 mod render_worker;
 mod settings;
 mod single_instance;
+mod updater;
 
 use std::path::PathBuf;
 
@@ -24,6 +27,13 @@ fn main() -> eframe::Result<()> {
         smoke_render_worker();
         return Ok(());
     }
+    if std::env::args().any(|arg| arg == "--bench-scroll") {
+        if let Err(error) = benchmark::run_scroll_benchmark(std::env::args_os().skip(1)) {
+            eprintln!("Benchmark failed: {error:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let startup_paths = std::env::args_os()
         .skip(1)
         .filter(|arg| !arg.to_string_lossy().starts_with("--"))
@@ -34,6 +44,13 @@ fn main() -> eframe::Result<()> {
         single_instance::InstanceMode::Primary { incoming_paths_rx } => incoming_paths_rx,
         single_instance::InstanceMode::SecondarySent => return Ok(()),
     };
+    if let Some(pending_update) = updater::load_pending_update() {
+        let relaunch_args = std::env::args_os().skip(1).collect::<Vec<_>>();
+        match updater::start_update_helper(&pending_update, &relaunch_args) {
+            Ok(()) => return Ok(()),
+            Err(error) => eprintln!("Failed to start pending LawPDF update: {error}"),
+        }
+    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

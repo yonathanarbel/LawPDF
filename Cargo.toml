@@ -1,12 +1,13 @@
 [package]
 name = "lawpdf"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Native Windows PDF reader and annotation editor for legal workflows"
 license = "MIT"
 
 [dependencies]
 anyhow = "1.0"
+arboard = "3.6"
 crossbeam-channel = "0.5"
 eframe = { version = "0.33", default-features = true }
 egui = "0.33"

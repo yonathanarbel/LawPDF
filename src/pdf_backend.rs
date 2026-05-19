@@ -1,10 +1,15 @@
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use image::RgbaImage;
-use lopdf::{Document, Object, ObjectId, StringFormat, dictionary};
+use lopdf::{
+    Dictionary, Document, Object, ObjectId, Stream, StringFormat,
+    content::{Content, Operation},
+    dictionary,
+};
 use pdfium_render::prelude::*;
 
 use crate::model::{
@@ -14,7 +19,7 @@ use crate::model::{
 
 pub struct PdfEngine {
     pdfium: &'static Pdfium,
-    open_document: RefCell<Option<OpenPdfDocument>>,
+    open_documents: RefCell<VecDeque<OpenPdfDocument>>,
 }
 
 struct OpenPdfDocument {
@@ -28,6 +33,8 @@ pub enum RenderQuality {
     Fast,
 }
 
+const OPEN_DOCUMENT_CACHE_CAP: usize = 3;
+
 impl PdfEngine {
     pub fn new() -> Result<Self> {
         let bindings = bind_pdfium()?;
@@ -35,7 +42,7 @@ impl PdfEngine {
 
         Ok(Self {
             pdfium,
-            open_document: RefCell::new(None),
+            open_documents: RefCell::new(VecDeque::new()),
         })
     }
 
@@ -44,6 +51,7 @@ impl PdfEngine {
             let page_count = document.pages().len() as usize;
             let mut pages = Vec::with_capacity(page_count);
             let mut native_text = Vec::with_capacity(page_count);
+            let mut native_text_loaded = Vec::with_capacity(page_count);
             let mut text_chars = Vec::with_capacity(page_count);
 
             for page_index in 0..page_count {
@@ -53,17 +61,9 @@ impl PdfEngine {
                     .with_context(|| format!("failed to read page {}", page_index + 1))?;
 
                 pages.push(PageInfo::new(page.width().value, page.height().value));
-
-                match page.text() {
-                    Ok(text_page) => {
-                        native_text.push(text_page.all());
-                        text_chars.push(None);
-                    }
-                    Err(_) => {
-                        native_text.push(String::new());
-                        text_chars.push(None);
-                    }
-                }
+                native_text.push(String::new());
+                native_text_loaded.push(false);
+                text_chars.push(None);
             }
 
             let title = path
@@ -78,8 +78,24 @@ impl PdfEngine {
                 page_count,
                 pages,
                 native_text,
+                native_text_loaded,
                 text_chars,
             })
+        })
+    }
+
+    pub fn load_page_text(&self, path: &Path, page_index: usize) -> Result<String> {
+        self.with_open_document(path, |document| {
+            let page = document
+                .pages()
+                .get(page_index as u16)
+                .with_context(|| format!("failed to read page {}", page_index + 1))?;
+
+            let text_page = page
+                .text()
+                .with_context(|| format!("failed to read text on page {}", page_index + 1))?;
+
+            Ok(text_page.all())
         })
     }
 
@@ -174,26 +190,29 @@ impl PdfEngine {
         path: &Path,
         operation: impl FnOnce(&PdfDocument<'static>) -> Result<T>,
     ) -> Result<T> {
-        let should_open = self
-            .open_document
-            .borrow()
-            .as_ref()
-            .is_none_or(|open| open.path != path);
-
-        if should_open {
+        let mut open_documents = self.open_documents.borrow_mut();
+        if let Some(position) = open_documents.iter().position(|open| open.path == path) {
+            if position != 0 {
+                if let Some(open_document) = open_documents.remove(position) {
+                    open_documents.push_front(open_document);
+                }
+            }
+        } else {
             let document = self
                 .pdfium
                 .load_pdf_from_file(path, None)
                 .with_context(|| format!("failed to open {}", path.display()))?;
-            *self.open_document.borrow_mut() = Some(OpenPdfDocument {
+            open_documents.push_front(OpenPdfDocument {
                 path: path.to_path_buf(),
                 document,
             });
+            while open_documents.len() > OPEN_DOCUMENT_CACHE_CAP {
+                open_documents.pop_back();
+            }
         }
 
-        let open_document = self.open_document.borrow();
-        let open_document = open_document
-            .as_ref()
+        let open_document = open_documents
+            .front()
             .ok_or_else(|| anyhow!("internal PDF cache is empty"))?;
         operation(&open_document.document)
     }
@@ -336,6 +355,240 @@ pub fn save_with_annotations(
         .save(destination)
         .with_context(|| format!("failed to save {}", destination.display()))?;
 
+    Ok(())
+}
+
+pub fn save_with_ocr_text(
+    source: &Path,
+    destination: &Path,
+    page_sizes: &[(f32, f32)],
+    ocr_text: &[String],
+) -> Result<()> {
+    let mut document = Document::load(source)
+        .with_context(|| format!("failed to load source PDF {}", source.display()))?;
+    append_ocr_text_layers(&mut document, page_sizes, ocr_text)?;
+    document.prune_objects();
+    document.compress();
+    document
+        .save(destination)
+        .with_context(|| format!("failed to save {}", destination.display()))?;
+
+    Ok(())
+}
+
+fn append_ocr_text_layers(
+    document: &mut Document,
+    page_sizes: &[(f32, f32)],
+    ocr_text: &[String],
+) -> Result<()> {
+    let pages = document.get_pages();
+    let font_id = document.new_object_id();
+    document.objects.insert(
+        font_id,
+        Object::Dictionary(dictionary! {
+            "Type" => Object::Name(b"Font".to_vec()),
+            "Subtype" => Object::Name(b"Type1".to_vec()),
+            "BaseFont" => Object::Name(b"Helvetica".to_vec()),
+            "Encoding" => Object::Name(b"WinAnsiEncoding".to_vec()),
+        }),
+    );
+
+    for (page_index, text) in ocr_text.iter().enumerate() {
+        if text.trim().is_empty() {
+            continue;
+        }
+        let page_number = page_index as u32 + 1;
+        let Some(page_id) = pages.get(&page_number).copied() else {
+            continue;
+        };
+        let page_size = page_sizes
+            .get(page_index)
+            .copied()
+            .unwrap_or((612.0, 792.0));
+        ensure_ocr_font_resource(document, page_id, font_id)?;
+        let content = ocr_text_content(text, page_size)?;
+        let stream_id = document.add_object(Stream::new(dictionary! {}, content));
+        append_page_content_stream(document, page_id, stream_id)?;
+    }
+
+    Ok(())
+}
+
+fn ensure_ocr_font_resource(
+    document: &mut Document,
+    page_id: ObjectId,
+    font_id: ObjectId,
+) -> Result<()> {
+    let resources = {
+        let page = document.get_object_mut(page_id)?.as_dict_mut()?;
+        page.get(b"Resources").ok().cloned()
+    };
+
+    match resources {
+        Some(Object::Reference(resources_id)) => {
+            let font_object = document
+                .get_object(resources_id)?
+                .as_dict()?
+                .get(b"Font")
+                .ok()
+                .cloned();
+            match font_object {
+                Some(Object::Reference(fonts_id)) => {
+                    document
+                        .get_object_mut(fonts_id)?
+                        .as_dict_mut()?
+                        .set("LawPDFOCR", Object::Reference(font_id));
+                }
+                Some(Object::Dictionary(mut fonts)) => {
+                    fonts.set("LawPDFOCR", Object::Reference(font_id));
+                    document
+                        .get_object_mut(resources_id)?
+                        .as_dict_mut()?
+                        .set("Font", Object::Dictionary(fonts));
+                }
+                _ => {
+                    document
+                        .get_object_mut(resources_id)?
+                        .as_dict_mut()?
+                        .set("Font", ocr_font_dictionary(font_id));
+                }
+            }
+        }
+        Some(Object::Dictionary(mut resources)) => {
+            ensure_ocr_font_in_resources(document, &mut resources, font_id)?;
+            document
+                .get_object_mut(page_id)?
+                .as_dict_mut()?
+                .set("Resources", Object::Dictionary(resources));
+        }
+        _ => {
+            document.get_object_mut(page_id)?.as_dict_mut()?.set(
+                "Resources",
+                Object::Dictionary(dictionary! {
+                    "Font" => ocr_font_dictionary(font_id)
+                }),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_ocr_font_in_resources(
+    document: &mut Document,
+    resources: &mut Dictionary,
+    font_id: ObjectId,
+) -> Result<()> {
+    match resources.get(b"Font").ok().cloned() {
+        Some(Object::Reference(fonts_id)) => {
+            document
+                .get_object_mut(fonts_id)?
+                .as_dict_mut()?
+                .set("LawPDFOCR", Object::Reference(font_id));
+        }
+        Some(Object::Dictionary(mut fonts)) => {
+            fonts.set("LawPDFOCR", Object::Reference(font_id));
+            resources.set("Font", Object::Dictionary(fonts));
+        }
+        _ => {
+            resources.set("Font", ocr_font_dictionary(font_id));
+        }
+    }
+    Ok(())
+}
+
+fn ocr_font_dictionary(font_id: ObjectId) -> Object {
+    Object::Dictionary(dictionary! {
+        "LawPDFOCR" => Object::Reference(font_id)
+    })
+}
+
+fn ocr_text_content(text: &str, page_size: (f32, f32)) -> Result<Vec<u8>> {
+    let (_, page_height) = page_size;
+    let mut operations = vec![
+        Operation::new("BT", vec![]),
+        Operation::new(
+            "Tf",
+            vec![Object::Name(b"LawPDFOCR".to_vec()), Object::Real(8.0)],
+        ),
+        Operation::new("TL", vec![Object::Real(9.6)]),
+        Operation::new("Tr", vec![Object::Integer(3)]),
+        Operation::new(
+            "Tm",
+            vec![
+                Object::Real(1.0),
+                Object::Real(0.0),
+                Object::Real(0.0),
+                Object::Real(1.0),
+                Object::Real(36.0),
+                Object::Real((page_height - 36.0).max(36.0)),
+            ],
+        ),
+    ];
+
+    for line in ocr_pdf_lines(text) {
+        operations.push(Operation::new(
+            "Tj",
+            vec![literal(sanitize_pdf_text(&line))],
+        ));
+        operations.push(Operation::new("T*", vec![]));
+    }
+    operations.push(Operation::new("ET", vec![]));
+
+    Content { operations }
+        .encode()
+        .context("failed to encode OCR text layer")
+}
+
+fn ocr_pdf_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .flat_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return vec![String::new()];
+            }
+            line.chars()
+                .collect::<Vec<_>>()
+                .chunks(96)
+                .map(|chunk| chunk.iter().collect::<String>())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn sanitize_pdf_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>()
+}
+
+fn append_page_content_stream(
+    document: &mut Document,
+    page_id: ObjectId,
+    stream_id: ObjectId,
+) -> Result<()> {
+    let existing = {
+        let page = document.get_object(page_id)?.as_dict()?;
+        page.get(b"Contents").ok().cloned()
+    };
+
+    let contents = match existing {
+        Some(Object::Array(mut array)) => {
+            array.push(Object::Reference(stream_id));
+            Object::Array(array)
+        }
+        Some(Object::Reference(existing_id)) => Object::Array(vec![
+            Object::Reference(existing_id),
+            Object::Reference(stream_id),
+        ]),
+        Some(other) => Object::Array(vec![other, Object::Reference(stream_id)]),
+        None => Object::Reference(stream_id),
+    };
+
+    document
+        .get_object_mut(page_id)?
+        .as_dict_mut()?
+        .set("Contents", contents);
     Ok(())
 }
 

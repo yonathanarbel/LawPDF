@@ -112,6 +112,7 @@ pub struct LoadedDocument {
     pub page_count: usize,
     pub pages: Vec<PageInfo>,
     pub native_text: Vec<String>,
+    pub native_text_loaded: Vec<bool>,
     pub text_chars: Vec<Option<Vec<PageTextChar>>>,
 }
 

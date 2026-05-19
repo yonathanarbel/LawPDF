@@ -2,10 +2,48 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
-    #[serde(default)]
+    #[serde(default = "default_openrouter_api_key")]
     pub openrouter_api_key: String,
+    #[serde(default)]
+    pub groq_api_key: String,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            openrouter_api_key: default_openrouter_api_key(),
+            groq_api_key: String::new(),
+        }
+    }
+}
+
+pub fn effective_openrouter_api_key(settings: &AppSettings) -> Option<String> {
+    let configured = settings.openrouter_api_key.trim();
+    if configured.is_empty() {
+        std::env::var("LAWPDF_OPENROUTER_API_KEY")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    } else {
+        Some(configured.to_owned())
+    }
+}
+
+pub fn effective_groq_api_key(settings: &AppSettings) -> Option<String> {
+    let configured = settings.groq_api_key.trim();
+    if !configured.is_empty() {
+        return Some(configured.to_owned());
+    }
+    std::env::var("LAWPDF_GROQ_API_KEY")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn default_openrouter_api_key() -> String {
+    String::new()
 }
 
 pub fn load_settings() -> AppSettings {

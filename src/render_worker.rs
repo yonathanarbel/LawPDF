@@ -17,10 +17,11 @@ pub struct PageRenderKey {
 
 impl PageRenderKey {
     pub fn new(document_epoch: u64, page_index: usize, zoom: f32, render_scale: f32) -> Self {
+        let _ = zoom;
         Self {
             document_epoch,
             page_index,
-            zoom_key: float_key(zoom),
+            zoom_key: 0,
             render_scale_key: float_key(render_scale),
         }
     }
@@ -39,6 +40,11 @@ pub enum RenderRequest {
         reply: Sender<Result<LoadedDocument, String>>,
     },
     TextCharsAsync {
+        document_epoch: u64,
+        path: PathBuf,
+        page_index: usize,
+    },
+    TextPageAsync {
         document_epoch: u64,
         path: PathBuf,
         page_index: usize,
@@ -74,7 +80,7 @@ pub enum RenderEvent {
     Page {
         key: PageRenderKey,
         path: PathBuf,
-        zoom: f32,
+        _zoom: f32,
         render_scale: f32,
         result: Result<RenderedPage, String>,
     },
@@ -88,6 +94,12 @@ pub enum RenderEvent {
         path: PathBuf,
         page_index: usize,
         result: Result<Vec<PageTextChar>, String>,
+    },
+    TextPage {
+        document_epoch: u64,
+        path: PathBuf,
+        page_index: usize,
+        result: Result<String, String>,
     },
 }
 
@@ -134,6 +146,18 @@ pub fn spawn_render_worker() -> (Sender<RenderRequest>, Receiver<RenderEvent>) {
                         .load_page_text_chars(&path, page_index)
                         .map_err(|error| error.to_string()),
                 },
+                RenderRequest::TextPageAsync {
+                    document_epoch,
+                    path,
+                    page_index,
+                } => RenderEvent::TextPage {
+                    document_epoch,
+                    path: path.clone(),
+                    page_index,
+                    result: engine
+                        .load_page_text(&path, page_index)
+                        .map_err(|error| error.to_string()),
+                },
                 RenderRequest::Page {
                     key,
                     path,
@@ -142,7 +166,7 @@ pub fn spawn_render_worker() -> (Sender<RenderRequest>, Receiver<RenderEvent>) {
                 } => RenderEvent::Page {
                     key,
                     path: path.clone(),
-                    zoom,
+                    _zoom: zoom,
                     render_scale,
                     result: engine
                         .render_page(&path, key.page_index, render_scale)
@@ -264,6 +288,16 @@ fn error_event(request: RenderRequest, message: String) -> RenderEvent {
             page_index,
             result: Err(message),
         },
+        RenderRequest::TextPageAsync {
+            document_epoch,
+            path,
+            page_index,
+        } => RenderEvent::TextPage {
+            document_epoch,
+            path,
+            page_index,
+            result: Err(message),
+        },
         RenderRequest::Page {
             key,
             path,
@@ -272,7 +306,7 @@ fn error_event(request: RenderRequest, message: String) -> RenderEvent {
         } => RenderEvent::Page {
             key,
             path,
-            zoom,
+            _zoom: zoom,
             render_scale,
             result: Err(message),
         },
