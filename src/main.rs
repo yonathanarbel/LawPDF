@@ -16,6 +16,7 @@ mod render_worker;
 mod settings;
 mod single_instance;
 mod text_conversion;
+mod tts;
 mod updater;
 
 use std::ffi::{OsStr, OsString};

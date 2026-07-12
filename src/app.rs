@@ -40,10 +40,11 @@ use crate::render_worker::{
     PageRenderKey, RenderEvent, RenderRequest, ThumbnailRenderKey, spawn_render_worker,
 };
 use crate::settings::{
-    AppSettings, app_data_dir, effective_groq_api_key, effective_openrouter_api_key, load_settings,
-    normalized_pdf_zoom, save_settings,
+    AppSettings, app_data_dir, effective_groq_api_key, effective_openai_api_key,
+    effective_openrouter_api_key, load_settings, normalized_pdf_zoom, save_settings,
 };
 use crate::text_conversion;
+use crate::tts::{PaidTtsEvent, PaidTtsProvider, PaidTtsRequest, spawn_paid_tts_job};
 use crate::updater::{self, UpdateEvent};
 
 const CANVAS_FILL: Color32 = Color32::from_rgb(232, 230, 224);
@@ -279,6 +280,10 @@ pub struct PdfEditorApp {
     tts_child: Option<std::process::Child>,
     /// #33 TTS: whether to read footnotes as a separate pass after the body.
     liquid_tts_include_notes: bool,
+    paid_tts_provider: PaidTtsProvider,
+    paid_tts_tx: Sender<PaidTtsEvent>,
+    paid_tts_rx: Receiver<PaidTtsEvent>,
+    paid_tts_progress: Option<(usize, usize)>,
     marker_animations: Vec<MarkerAnim>,
     active_tool: Tool,
     sidebar_tab: SidebarTab,
@@ -326,6 +331,7 @@ pub struct PdfEditorApp {
     visible_page_ranges: Vec<VisiblePageRange>,
     settings: AppSettings,
     settings_api_key_edit: String,
+    settings_openai_api_key_edit: String,
     settings_groq_api_key_edit: String,
     show_settings: bool,
     status: String,
@@ -735,6 +741,7 @@ impl PdfEditorApp {
         let (liquid_mode2_tx, liquid_mode2_rx) = unbounded();
         let (chat_tx, chat_rx) = unbounded();
         let (update_tx, update_rx) = unbounded();
+        let (paid_tts_tx, paid_tts_rx) = unbounded();
         let updates_enabled = updater::updates_enabled();
         if updates_enabled {
             updater::spawn_update_check(update_tx.clone());
@@ -750,6 +757,7 @@ impl PdfEditorApp {
         let settings = load_settings();
         let initial_zoom = normalized_pdf_zoom(settings.last_pdf_zoom);
         let settings_api_key_edit = settings.openrouter_api_key.clone();
+        let settings_openai_api_key_edit = settings.openai_api_key.clone();
         let settings_groq_api_key_edit = settings.groq_api_key.clone();
         let mut app = Self {
             startup_error: None,
@@ -800,7 +808,11 @@ impl PdfEditorApp {
             liquid_provenance_highlight: Vec::new(),
             liquid_show_hidden_furniture: false,
             tts_child: None,
-            liquid_tts_include_notes: true,
+            liquid_tts_include_notes: false,
+            paid_tts_provider: PaidTtsProvider::OpenRouter,
+            paid_tts_tx,
+            paid_tts_rx,
+            paid_tts_progress: None,
             marker_animations: Vec::new(),
             active_tool: Tool::Select,
             sidebar_tab: SidebarTab::Pages,
@@ -848,6 +860,7 @@ impl PdfEditorApp {
             visible_page_ranges: Vec::new(),
             settings,
             settings_api_key_edit,
+            settings_openai_api_key_edit,
             settings_groq_api_key_edit,
             show_settings: false,
             status: initial_status.to_owned(),
@@ -1454,6 +1467,29 @@ impl PdfEditorApp {
             match export_text(&destination, document, &ocr_text) {
                 Ok(()) => self.status = format!("Exported {}", destination.display()),
                 Err(error) => self.status = error.to_string(),
+            }
+        }
+    }
+
+    fn export_review_text_dialog(&mut self, document: &LiquidDocument) {
+        let Some(text) = liquid_document_copy_text(document) else {
+            self.status = "Review Mode has no readable text to export.".to_owned();
+            return;
+        };
+        let file_name = self
+            .document
+            .as_ref()
+            .map(|source| default_output_name(&source.path, "review-mode", "txt"))
+            .unwrap_or_else(|| "review-mode.txt".to_owned());
+        if let Some(destination) = FileDialog::new()
+            .add_filter("Text", &["txt"])
+            .set_file_name(file_name)
+            .save_file()
+        {
+            let contents = format!("{}\n", text.trim_end());
+            match std::fs::write(&destination, contents) {
+                Ok(()) => self.status = format!("Downloaded {}", destination.display()),
+                Err(error) => self.status = format!("Could not save Review Mode text: {error}"),
             }
         }
     }
@@ -4231,12 +4267,26 @@ impl PdfEditorApp {
                         .hint_text("API key")
                         .desired_width(360.0),
                 );
+                ui.add_space(8.0);
+                ui.label(RichText::new("OpenAI (optional TTS)").strong().color(INK));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings_openai_api_key_edit)
+                        .password(true)
+                        .hint_text("API key")
+                        .desired_width(360.0),
+                );
+                ui.label(
+                    RichText::new("Keys stay in this app's local settings.")
+                        .size(10.0)
+                        .color(MUTED_INK),
+                );
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {
                         save_clicked = true;
                     }
                     if ui.button("Cancel").clicked() {
                         self.settings_api_key_edit = self.settings.openrouter_api_key.clone();
+                        self.settings_openai_api_key_edit = self.settings.openai_api_key.clone();
                         self.settings_groq_api_key_edit = self.settings.groq_api_key.clone();
                         self.show_settings = false;
                     }
@@ -4246,6 +4296,7 @@ impl PdfEditorApp {
         self.show_settings = open && self.show_settings;
         if save_clicked {
             self.settings.openrouter_api_key = self.settings_api_key_edit.trim().to_owned();
+            self.settings.openai_api_key = self.settings_openai_api_key_edit.trim().to_owned();
             self.settings.groq_api_key = self.settings_groq_api_key_edit.trim().to_owned();
             match save_settings(&self.settings) {
                 Ok(()) => {
@@ -4633,9 +4684,6 @@ impl PdfEditorApp {
                                 let hidden_contents =
                                     hidden_contents_mask_for_display(&document.blocks);
                                 let mut block_index = 0usize;
-                                // #28: track the source page so we can drop a pin-cite anchor
-                                // wherever the reflow crosses a source-page boundary.
-                                let mut last_source_page: Option<usize> = None;
                                 while block_index < document.blocks.len() {
                                     let block = &document.blocks[block_index];
                                     if hidden_contents.get(block_index).copied().unwrap_or(false)
@@ -4720,17 +4768,6 @@ impl PdfEditorApp {
                                         }
                                         margin_notes.push((next_index, note));
                                         next_index += 1;
-                                    }
-                                    // #28: pin-cite anchor at each source-page boundary.
-                                    if let Some(page) =
-                                        liquid_block_source_page(&document, block_index)
-                                    {
-                                        if last_source_page != Some(page) {
-                                            if last_source_page.is_some() {
-                                                self.draw_liquid_page_anchor(ui, page, ctx);
-                                            }
-                                            last_source_page = Some(page);
-                                        }
                                     }
                                     self.draw_liquid_reader_row(
                                         ui,
@@ -4829,9 +4866,6 @@ impl PdfEditorApp {
                                 let hidden_contents =
                                     hidden_contents_mask_for_display(&document.blocks);
                                 let mut block_index = 0usize;
-                                // #28: track the source page so we can drop a pin-cite anchor
-                                // wherever the reflow crosses a source-page boundary.
-                                let mut last_source_page: Option<usize> = None;
                                 while block_index < document.blocks.len() {
                                     let block = &document.blocks[block_index];
                                     if hidden_contents.get(block_index).copied().unwrap_or(false)
@@ -4916,17 +4950,6 @@ impl PdfEditorApp {
                                         }
                                         margin_notes.push((next_index, note));
                                         next_index += 1;
-                                    }
-                                    // #28: pin-cite anchor at each source-page boundary.
-                                    if let Some(page) =
-                                        liquid_block_source_page(&document, block_index)
-                                    {
-                                        if last_source_page != Some(page) {
-                                            if last_source_page.is_some() {
-                                                self.draw_liquid_page_anchor(ui, page, ctx);
-                                            }
-                                            last_source_page = Some(page);
-                                        }
                                     }
                                     self.draw_liquid_reader_row(
                                         ui,
@@ -5193,39 +5216,6 @@ impl PdfEditorApp {
         }
     }
 
-    /// #28: a subtle, centered "source p. N" divider marking a source-page boundary in the
-    /// reflow (N is the 1-based PDF page). Click it to jump to that page in the fixed layout,
-    /// preserving the page anchor a pin-cite (Bluebook) needs.
-    fn draw_liquid_page_anchor(&mut self, ui: &mut egui::Ui, page_index: usize, ctx: &Context) {
-        let accent = self.liquid_footnote_marker_color();
-        let scale = self.liquid_text_scale;
-        ui.add_space(12.0);
-        let mut jump = false;
-        ui.horizontal(|ui| {
-            let full = ui.available_width();
-            ui.add_space((full - 120.0).max(0.0) / 2.0);
-            let response = ui
-                .add(
-                    egui::Label::new(
-                        RichText::new(format!("— source p. {} —", page_index + 1))
-                            .size(10.5 * scale)
-                            .color(accent),
-                    )
-                    .sense(Sense::click()),
-                )
-                .on_hover_cursor(CursorIcon::PointingHand)
-                .on_hover_text("Jump to this source page in the fixed layout");
-            if response.clicked() {
-                jump = true;
-            }
-        });
-        ui.add_space(6.0);
-        if jump {
-            self.scroll_target_page = Some(page_index);
-            self.set_view_mode(DocumentViewMode::Pdf, ctx);
-        }
-    }
-
     fn draw_liquid_reader_row(
         &mut self,
         ui: &mut egui::Ui,
@@ -5482,7 +5472,74 @@ impl PdfEditorApp {
         }
     }
 
-    /// #33: Read-aloud / Stop control + a "footnotes" toggle for the Liquid reader.
+    fn start_paid_liquid_tts(&mut self, document: &LiquidDocument) {
+        if self.paid_tts_progress.is_some() {
+            return;
+        }
+        let api_key = match self.paid_tts_provider {
+            PaidTtsProvider::OpenRouter => effective_openrouter_api_key(&self.settings),
+            PaidTtsProvider::OpenAi => effective_openai_api_key(&self.settings),
+        };
+        let Some(api_key) = api_key else {
+            self.show_settings = true;
+            self.status = format!(
+                "Add your {} API key to create an MP3.",
+                self.paid_tts_provider.label()
+            );
+            return;
+        };
+        let text = liquid_tts_text(document, self.liquid_tts_include_notes);
+        if text.is_empty() {
+            self.status = "Nothing to narrate.".to_owned();
+            return;
+        }
+        let file_name = self
+            .document
+            .as_ref()
+            .map(|source| default_output_name(&source.path, "review-mode", "mp3"))
+            .unwrap_or_else(|| "review-mode.mp3".to_owned());
+        let Some(destination) = FileDialog::new()
+            .add_filter("MP3 audio", &["mp3"])
+            .set_file_name(file_name)
+            .save_file()
+        else {
+            return;
+        };
+        spawn_paid_tts_job(
+            PaidTtsRequest {
+                provider: self.paid_tts_provider,
+                api_key,
+                voice: "nova".to_owned(),
+                text,
+                destination,
+            },
+            self.paid_tts_tx.clone(),
+        );
+        self.paid_tts_progress = Some((0, 0));
+        self.status = format!("Creating MP3 with {}…", self.paid_tts_provider.label());
+    }
+
+    fn poll_paid_tts(&mut self, ctx: &Context) {
+        while let Ok(event) = self.paid_tts_rx.try_recv() {
+            match event {
+                PaidTtsEvent::Progress { completed, total } => {
+                    self.paid_tts_progress = Some((completed, total));
+                    self.status = format!("Creating MP3… {completed}/{total}");
+                }
+                PaidTtsEvent::Complete(path) => {
+                    self.paid_tts_progress = None;
+                    self.status = format!("Created {}", path.display());
+                }
+                PaidTtsEvent::Failed(error) => {
+                    self.paid_tts_progress = None;
+                    self.status = error;
+                }
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    /// Reader actions: clean text download is the default; narration is optional.
     fn draw_liquid_tts_controls(&mut self, ui: &mut egui::Ui, document: &LiquidDocument) {
         // Clear the handle if playback finished on its own.
         let finished = self
@@ -5494,6 +5551,13 @@ impl PdfEditorApp {
             self.tts_child = None;
         }
         ui.horizontal_wrapped(|ui| {
+            if ui
+                .button(RichText::new("Download text").size(11.0).strong())
+                .on_hover_text("Save the clean, page-free Review Mode text as a .txt file")
+                .clicked()
+            {
+                self.export_review_text_dialog(document);
+            }
             if self.tts_child.is_some() {
                 if ui
                     .button(RichText::new("⏹ Stop reading").size(11.0))
@@ -5507,6 +5571,50 @@ impl PdfEditorApp {
                 .clicked()
             {
                 self.start_liquid_tts(document);
+            }
+            ui.separator();
+            egui::ComboBox::from_id_salt("paid_tts_provider")
+                .selected_text(self.paid_tts_provider.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.paid_tts_provider,
+                        PaidTtsProvider::OpenRouter,
+                        "OpenRouter",
+                    );
+                    ui.selectable_value(
+                        &mut self.paid_tts_provider,
+                        PaidTtsProvider::OpenAi,
+                        "OpenAI",
+                    );
+                });
+            let paid_label = self
+                .paid_tts_progress
+                .map(|(completed, total)| {
+                    if total == 0 {
+                        "Creating MP3…".to_owned()
+                    } else {
+                        format!("Creating MP3… {completed}/{total}")
+                    }
+                })
+                .unwrap_or_else(|| "Create AI MP3".to_owned());
+            if ui
+                .add_enabled(
+                    self.paid_tts_progress.is_none(),
+                    egui::Button::new(RichText::new(paid_label).size(11.0)),
+                )
+                .on_hover_text(
+                    "Creates AI-generated narration. Sends the article text to the selected provider using your key; provider charges may apply.",
+                )
+                .clicked()
+            {
+                self.start_paid_liquid_tts(document);
+            }
+            if ui
+                .small_button("TTS keys")
+                .on_hover_text("Add or change OpenAI and OpenRouter API keys")
+                .clicked()
+            {
+                self.show_settings = true;
             }
             let mut include = self.liquid_tts_include_notes;
             if ui
@@ -8578,6 +8686,7 @@ impl eframe::App for PdfEditorApp {
         self.poll_chat_results(ctx);
         self.poll_liquid_results(ctx);
         self.poll_liquid_mode2_results(ctx);
+        self.poll_paid_tts(ctx);
         self.poll_update_events(ctx);
         self.handle_dropped_files(ctx);
 
@@ -9040,17 +9149,6 @@ fn liquid_block_source_lines(
         .find(|sources| sources.block_index == block_index)
         .map(|sources| sources.lines.clone())
         .unwrap_or_default()
-}
-
-/// #28: the source PDF page a reflowed block starts on (its first source line's page),
-/// used to anchor pin-cites. None if the block carries no source-line provenance.
-fn liquid_block_source_page(document: &LiquidDocument, block_index: usize) -> Option<usize> {
-    document
-        .block_source_lines
-        .iter()
-        .find(|sources| sources.block_index == block_index)
-        .and_then(|sources| sources.lines.first())
-        .map(|line| line.page_index)
 }
 
 #[derive(Debug, Clone, Serialize)]

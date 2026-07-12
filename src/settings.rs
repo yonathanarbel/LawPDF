@@ -11,6 +11,8 @@ pub struct AppSettings {
     #[serde(default = "default_openrouter_api_key")]
     pub openrouter_api_key: String,
     #[serde(default)]
+    pub openai_api_key: String,
+    #[serde(default)]
     pub groq_api_key: String,
     #[serde(default = "default_pdf_zoom")]
     pub last_pdf_zoom: f32,
@@ -28,6 +30,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             openrouter_api_key: default_openrouter_api_key(),
+            openai_api_key: String::new(),
             groq_api_key: String::new(),
             last_pdf_zoom: DEFAULT_PDF_ZOOM,
             reduce_motion: false,
@@ -35,6 +38,18 @@ impl Default for AppSettings {
             liquid_mode2_use_pp_footnote_regions: false,
         }
     }
+}
+
+pub fn effective_openai_api_key(settings: &AppSettings) -> Option<String> {
+    let configured = settings.openai_api_key.trim();
+    if !configured.is_empty() {
+        return Some(configured.to_owned());
+    }
+    std::env::var("OPENAI_API_KEY")
+        .or_else(|_| std::env::var("LAWPDF_OPENAI_API_KEY"))
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 pub fn effective_openrouter_api_key(settings: &AppSettings) -> Option<String> {

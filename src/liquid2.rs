@@ -8161,14 +8161,14 @@ fn build_lm2_blocks_with_grouping(
             continue;
         }
         if *action == Lm2Action::HideNoise {
-            flush_block(
-                &mut blocks,
-                &mut sources,
-                &mut current_text,
-                &mut current_refs,
-                current_role,
-            );
             if line.role_hint == Some(LiquidBlockRole::Table) {
+                flush_block(
+                    &mut blocks,
+                    &mut sources,
+                    &mut current_text,
+                    &mut current_refs,
+                    current_role,
+                );
                 let text = clean_lm2_line_text(&line.text);
                 if !text.is_empty() {
                     let block_index = blocks.len();
@@ -8182,9 +8182,9 @@ fn build_lm2_blocks_with_grouping(
                         lines: vec![line_ref(line, LiquidBlockRole::Table)],
                     });
                 }
+                current_last_line = None;
+                current_group_index = None;
             }
-            current_last_line = None;
-            current_group_index = None;
             continue;
         }
         let role = role_for_decoded_line(line, *action, blocks.is_empty());
@@ -8210,7 +8210,11 @@ fn build_lm2_blocks_with_grouping(
             && role == LiquidBlockRole::Paragraph
             && current_last_line.as_ref().is_some_and(|previous| {
                 if let Some(group_index) = line_group_index.get(&line.id).copied() {
-                    current_group_index != Some(group_index)
+                    if previous.page_index == line.page_index {
+                        current_group_index != Some(group_index)
+                    } else {
+                        paragraph_boundary(previous, line)
+                    }
                 } else {
                     paragraph_boundary(previous, line)
                 }
@@ -8344,12 +8348,13 @@ fn flush_action_neutral_blocksplit(
         return;
     }
     let block_index = blocks.len();
-    let text = refs
-        .iter()
-        .map(|line| clean_lm2_line_text(&line.text))
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut text = String::new();
+    for line in refs.iter() {
+        let cleaned = clean_lm2_line_text(&line.text);
+        if !cleaned.is_empty() {
+            append_line(&mut text, &cleaned);
+        }
+    }
     if text.trim().is_empty() {
         refs.clear();
         return;
@@ -8520,9 +8525,6 @@ fn lm2_blocksplit_should_split(
         LiquidBlockRole::Paragraph | LiquidBlockRole::Marginalia
     ) {
         return false;
-    }
-    if line_ref.page_index != previous_ref.page_index {
-        return true;
     }
     if lm2_blocksplit_divider_like(&line_ref.text)
         || lm2_blocksplit_divider_like(&previous_ref.text)
@@ -8740,7 +8742,9 @@ fn should_join_preserved_hyphen(existing: &str, next: &str) -> bool {
 
 fn paragraph_boundary(previous: &DeepLiquidSourceLine, line: &DeepLiquidSourceLine) -> bool {
     if previous.page_index != line.page_index {
-        return true;
+        let previous_sentence_end = lm2_blocksplit_ends_like_paragraph(&previous.text);
+        let indent = (line.left - previous.left) / line.page_width.max(1.0);
+        return previous_sentence_end && indent > 0.025;
     }
     if same_visual_row_fragment(previous, line) {
         return false;
@@ -14412,6 +14416,51 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["p0:l2".to_owned()]
         );
+    }
+
+    #[test]
+    fn paragraph_continues_across_source_page_without_indent() {
+        let previous = lm2_test_source_line(
+            "p0:l9",
+            9,
+            "The rule continues across the source page.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let mut next = lm2_test_source_line(
+            "p1:l0",
+            0,
+            "Its application remains contested.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        next.page_index = 1;
+        assert!(!paragraph_boundary(&previous, &next));
+    }
+
+    #[test]
+    fn clear_indent_can_start_approximate_paragraph_across_page() {
+        let previous = lm2_test_source_line(
+            "p0:l9",
+            9,
+            "The first paragraph ends here.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let mut next = lm2_test_source_line(
+            "p1:l0",
+            0,
+            "A new paragraph begins here.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        next.page_index = 1;
+        next.left = previous.left + 0.04;
+        assert!(paragraph_boundary(&previous, &next));
     }
 
     #[test]
