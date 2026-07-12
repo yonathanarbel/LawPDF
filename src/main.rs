@@ -19,8 +19,7 @@ mod text_conversion;
 mod updater;
 
 use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
 
 use app::PdfEditorApp;
 
@@ -122,7 +121,7 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
-    let mut startup_paths = if let Some(source_paths) = convert_sources_from_args(&args) {
+    let startup_paths = if let Some(source_paths) = convert_sources_from_args(&args) {
         match text_conversion::convert_sources_to_pdf(&source_paths) {
             Ok(outputs) => {
                 let converted_paths = outputs
@@ -150,19 +149,6 @@ fn main() -> eframe::Result<()> {
             .map(PathBuf::from)
             .collect::<Vec<_>>()
     };
-    if startup_paths.is_empty()
-        && !args.iter().any(|arg| arg == "--no-random-library-open")
-        && !env_flag_enabled("LAWPDF_DISABLE_RANDOM_LIBRARY_OPEN")
-    {
-        if let Some(path) = random_library_pdf() {
-            eprintln!(
-                "Opening random library PDF for Liquid audit: {}",
-                path.display()
-            );
-            startup_paths.push(path);
-        }
-    }
-
     let single_instance = single_instance::initialize(&startup_paths);
     let incoming_paths_rx = match single_instance {
         single_instance::InstanceMode::Primary { incoming_paths_rx } => incoming_paths_rx,
@@ -221,77 +207,6 @@ fn show_conversion_error(message: &str) {
         .set_description(message)
         .set_level(rfd::MessageLevel::Error)
         .show();
-}
-
-fn env_flag_enabled(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn random_library_pdf() -> Option<PathBuf> {
-    let mut pdfs = Vec::new();
-    for library_dir in random_library_dirs() {
-        collect_pdf_paths(&library_dir, &mut pdfs);
-        if !pdfs.is_empty() {
-            break;
-        }
-    }
-    if pdfs.is_empty() {
-        return None;
-    }
-    pdfs.sort();
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as usize)
-        .unwrap_or(0);
-    let pid = std::process::id() as usize;
-    Some(pdfs[(seed ^ pid) % pdfs.len()].clone())
-}
-
-fn random_library_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(dir) = std::env::var_os("LAWPDF_RANDOM_LIBRARY_DIR").map(PathBuf::from) {
-        dirs.push(dir);
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        dirs.push(cwd.join("top_law_review_pdfs"));
-    }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(exe_dir) = exe.parent()
-    {
-        dirs.push(exe_dir.join("top_law_review_pdfs"));
-        dirs.push(exe_dir.join("../Resources/top_law_review_pdfs"));
-        dirs.push(exe_dir.join("../../top_law_review_pdfs"));
-    }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        dirs.push(home.join("lawpdf/top_law_review_pdfs"));
-    }
-    dirs
-}
-
-fn collect_pdf_paths(dir: &Path, output: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_pdf_paths(&path, output);
-        } else if path
-            .extension()
-            .and_then(OsStr::to_str)
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
-        {
-            output.push(path);
-        }
-    }
 }
 
 fn load_app_icon() -> egui::IconData {

@@ -857,15 +857,6 @@ impl PdfEditorApp {
             app.open_paths_in_tabs(startup_paths, &cc.egui_ctx, true);
         }
 
-        if app.tabs.is_empty() {
-            if let Ok(path) = std::env::var("LAWPDF_DEFAULT_PDF") {
-                if !path.trim().is_empty() {
-                    app.status = format!("Opening {}", path);
-                    app.load_document(PathBuf::from(path), &cc.egui_ctx);
-                }
-            }
-        }
-
         app.apply_startup_view_mode(&cc.egui_ctx);
 
         app
@@ -1117,10 +1108,6 @@ impl PdfEditorApp {
         {
             self.open_paths_in_tabs(paths, ctx, true);
         }
-    }
-
-    fn load_document(&mut self, path: PathBuf, ctx: &Context) {
-        self.load_document_with_options(path, ctx, true, true, true);
     }
 
     fn open_paths_in_tabs(&mut self, paths: Vec<PathBuf>, ctx: &Context, defer_background: bool) {
@@ -3361,6 +3348,27 @@ impl PdfEditorApp {
                                 }
                             });
                         });
+                        #[cfg(target_os = "windows")]
+                        if ui
+                            .button("Set as default")
+                            .on_hover_text(
+                                "Open Windows Settings to choose LawPDF as the default PDF reader",
+                            )
+                            .clicked()
+                        {
+                            match open_windows_default_pdf_settings() {
+                                Ok(()) => {
+                                    self.status =
+                                        "Windows Settings opened. Choose LawPDF for .pdf files."
+                                            .to_owned();
+                                }
+                                Err(error) => {
+                                    self.status = format!(
+                                        "Could not open Windows default-app settings: {error}"
+                                    );
+                                }
+                            }
+                        }
                     });
 
                     ui.add_space(6.0);
@@ -8720,6 +8728,17 @@ impl eframe::App for PdfEditorApp {
             ctx.request_repaint_after(RENDER_POLL_INTERVAL);
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn open_windows_default_pdf_settings() -> Result<(), String> {
+    const DEFAULT_APPS_URI: &str = "ms-settings:defaultapps?registeredAppMachine=LawPDF";
+
+    std::process::Command::new("explorer.exe")
+        .arg(DEFAULT_APPS_URI)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn toolbar_group(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {

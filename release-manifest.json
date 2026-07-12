@@ -2,7 +2,7 @@
   "schema_version": "lawpdf-public-release-manifest-v1",
   "product": {
     "name": "LawPDF",
-    "version": "0.2.2"
+    "version": "0.2.3"
   },
   "runtime_assets": {
     "native_model": {
