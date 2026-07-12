@@ -46,6 +46,30 @@ Root: HKLM; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; Value
 Root: HKLM; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: "Software\{#MyAppName}\Capabilities"; Flags: uninsdeletevalue
 Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\{#MyAppExeName}"; ValueType: string; ValueData: "{app}\{#MyAppExeName}"; Flags: uninsdeletekey
 Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\{#MyAppExeName}"; ValueType: string; ValueName: "Path"; ValueData: "{app}"
+Root: HKCR; Subkey: "SystemFileAssociations\.docx\shell\LawPDF.ConvertToPdf"; ValueType: string; ValueData: "Convert to PDF with {#MyAppName}"; Flags: uninsdeletekey
+Root: HKCR; Subkey: "SystemFileAssociations\.docx\shell\LawPDF.ConvertToPdf"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#MyAppIconName}"
+Root: HKCR; Subkey: "SystemFileAssociations\.docx\shell\LawPDF.ConvertToPdf\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" --convert-to-pdf ""%1"""
+Root: HKCR; Subkey: "SystemFileAssociations\.md\shell\LawPDF.ConvertToPdf"; ValueType: string; ValueData: "Convert to PDF with {#MyAppName}"; Flags: uninsdeletekey
+Root: HKCR; Subkey: "SystemFileAssociations\.md\shell\LawPDF.ConvertToPdf"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#MyAppIconName}"
+Root: HKCR; Subkey: "SystemFileAssociations\.md\shell\LawPDF.ConvertToPdf\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" --convert-to-pdf ""%1"""
+Root: HKCR; Subkey: "SystemFileAssociations\.markdown\shell\LawPDF.ConvertToPdf"; ValueType: string; ValueData: "Convert to PDF with {#MyAppName}"; Flags: uninsdeletekey
+Root: HKCR; Subkey: "SystemFileAssociations\.markdown\shell\LawPDF.ConvertToPdf"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#MyAppIconName}"
+Root: HKCR; Subkey: "SystemFileAssociations\.markdown\shell\LawPDF.ConvertToPdf\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" --convert-to-pdf ""%1"""
+Root: HKCR; Subkey: "SystemFileAssociations\.txt\shell\LawPDF.ConvertToPdf"; ValueType: string; ValueData: "Convert to PDF with {#MyAppName}"; Flags: uninsdeletekey
+Root: HKCR; Subkey: "SystemFileAssociations\.txt\shell\LawPDF.ConvertToPdf"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#MyAppIconName}"
+Root: HKCR; Subkey: "SystemFileAssociations\.txt\shell\LawPDF.ConvertToPdf\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" --convert-to-pdf ""%1"""
+Root: HKCR; Subkey: "SystemFileAssociations\.text\shell\LawPDF.ConvertToPdf"; ValueType: string; ValueData: "Convert to PDF with {#MyAppName}"; Flags: uninsdeletekey
+Root: HKCR; Subkey: "SystemFileAssociations\.text\shell\LawPDF.ConvertToPdf"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#MyAppIconName}"
+Root: HKCR; Subkey: "SystemFileAssociations\.text\shell\LawPDF.ConvertToPdf\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" --convert-to-pdf ""%1"""
+Root: HKCR; Subkey: "SystemFileAssociations\.log\shell\LawPDF.ConvertToPdf"; ValueType: string; ValueData: "Convert to PDF with {#MyAppName}"; Flags: uninsdeletekey
+Root: HKCR; Subkey: "SystemFileAssociations\.log\shell\LawPDF.ConvertToPdf"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#MyAppIconName}"
+Root: HKCR; Subkey: "SystemFileAssociations\.log\shell\LawPDF.ConvertToPdf\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" --convert-to-pdf ""%1"""
+Root: HKCR; Subkey: "SystemFileAssociations\.csv\shell\LawPDF.ConvertToPdf"; ValueType: string; ValueData: "Convert to PDF with {#MyAppName}"; Flags: uninsdeletekey
+Root: HKCR; Subkey: "SystemFileAssociations\.csv\shell\LawPDF.ConvertToPdf"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#MyAppIconName}"
+Root: HKCR; Subkey: "SystemFileAssociations\.csv\shell\LawPDF.ConvertToPdf\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" --convert-to-pdf ""%1"""
+Root: HKCR; Subkey: "SystemFileAssociations\.json\shell\LawPDF.ConvertToPdf"; ValueType: string; ValueData: "Convert to PDF with {#MyAppName}"; Flags: uninsdeletekey
+Root: HKCR; Subkey: "SystemFileAssociations\.json\shell\LawPDF.ConvertToPdf"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#MyAppIconName}"
+Root: HKCR; Subkey: "SystemFileAssociations\.json\shell\LawPDF.ConvertToPdf\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" --convert-to-pdf ""%1"""
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppIconName}"

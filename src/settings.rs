@@ -2,12 +2,26 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_PDF_ZOOM: f32 = 1.25;
+pub const MIN_PDF_ZOOM: f32 = 0.35;
+pub const MAX_PDF_ZOOM: f32 = 5.0;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default = "default_openrouter_api_key")]
     pub openrouter_api_key: String,
     #[serde(default)]
     pub groq_api_key: String,
+    #[serde(default = "default_pdf_zoom")]
+    pub last_pdf_zoom: f32,
+    /// When true, highlights appear instantly instead of animating the
+    /// "laying-down" ink stroke. Honors users who prefer reduced motion.
+    #[serde(default)]
+    pub reduce_motion: bool,
+    #[serde(default)]
+    pub liquid_mode2_use_pymupdf_blocks: bool,
+    #[serde(default)]
+    pub liquid_mode2_use_pp_footnote_regions: bool,
 }
 
 impl Default for AppSettings {
@@ -15,6 +29,10 @@ impl Default for AppSettings {
         Self {
             openrouter_api_key: default_openrouter_api_key(),
             groq_api_key: String::new(),
+            last_pdf_zoom: DEFAULT_PDF_ZOOM,
+            reduce_motion: false,
+            liquid_mode2_use_pymupdf_blocks: false,
+            liquid_mode2_use_pp_footnote_regions: false,
         }
     }
 }
@@ -46,6 +64,18 @@ fn default_openrouter_api_key() -> String {
     String::new()
 }
 
+fn default_pdf_zoom() -> f32 {
+    DEFAULT_PDF_ZOOM
+}
+
+pub fn normalized_pdf_zoom(zoom: f32) -> f32 {
+    if zoom.is_finite() {
+        zoom.clamp(MIN_PDF_ZOOM, MAX_PDF_ZOOM)
+    } else {
+        DEFAULT_PDF_ZOOM
+    }
+}
+
 pub fn load_settings() -> AppSettings {
     let Some(path) = settings_path() else {
         return AppSettings::default();
@@ -53,7 +83,9 @@ pub fn load_settings() -> AppSettings {
     let Ok(bytes) = std::fs::read(path) else {
         return AppSettings::default();
     };
-    serde_json::from_slice(&bytes).unwrap_or_default()
+    let mut settings: AppSettings = serde_json::from_slice(&bytes).unwrap_or_default();
+    settings.last_pdf_zoom = normalized_pdf_zoom(settings.last_pdf_zoom);
+    settings
 }
 
 pub fn save_settings(settings: &AppSettings) -> Result<(), String> {

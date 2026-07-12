@@ -1,5 +1,184 @@
-/target
-/dist
-/.claude
-/vendor/*.tgz
-/vendor/pdfium-win-x64/
+.env
+.env.*
+!.env.example
+
+# Build and package outputs
+/target/
+/dist/
+/output/
+/liquid2-cache/
+/.lawpdf/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local/generated archives and platform metadata
+/lawpdf-code-root.tar.gz
+._*
+**/._*
+
+# Local corpora and generated model artifacts
+/top_law_review_pdfs/*.pdf
+*.pt
+*.joblib
+*.onnx
+*.safetensors
+*.ckpt
+*.bin
+*.pkl
+
+# Large generated training/model run folders are kept as local artifacts, except
+# the small JSON models embedded by src/layout_roles.rs via include_str!.
+/profile-models/*
+!/profile-models/liquidvision/
+/profile-models/liquidvision/*
+!/profile-models/liquidvision/nano-epoch51.onnx
+!/profile-models/lm2-native-catboost-runtime/
+/profile-models/lm2-native-catboost-runtime/*
+!/profile-models/lm2-native-catboost-runtime/lm2-catboost-augmented-epoch51lv-relabels-tc.cbm
+!/profile-models/lm2-native-catboost-runtime/libcatboostmodel-darwin-universal2-1.2.10.dylib
+!/profile-models/lm2-context-twopass-runtime/
+/profile-models/lm2-context-twopass-runtime/*
+!/profile-models/lm2-context-twopass-runtime/lm2-context-twopass-hgb-v1.json
+!/profile-models/layout-role-v45-pp-grok-scaleup-0507-candidate/
+/profile-models/layout-role-v45-pp-grok-scaleup-0507-candidate/*
+!/profile-models/layout-role-v45-pp-grok-scaleup-0507-candidate/layout-role-model.json
+!/profile-models/layout-footnote-v68-chandra-filtered3-w035-20260603-candidate/
+/profile-models/layout-footnote-v68-chandra-filtered3-w035-20260603-candidate/*
+!/profile-models/layout-footnote-v68-chandra-filtered3-w035-20260603-candidate/layout-role-model.json
+!/profile-models/layout-body-chandra-structure-disputes-20260604-interim-104950-cycle064-candidate/
+/profile-models/layout-body-chandra-structure-disputes-20260604-interim-104950-cycle064-candidate/*
+!/profile-models/layout-body-chandra-structure-disputes-20260604-interim-104950-cycle064-candidate/layout-role-model.json
+!/profile-models/layout-body-v5-unseen-highconf-calibrated-20260602-candidate/
+/profile-models/layout-body-v5-unseen-highconf-calibrated-20260602-candidate/*
+!/profile-models/layout-body-v5-unseen-highconf-calibrated-20260602-candidate/layout-role-model.json
+!/profile-models/layout-heading-cycle058-faststack-expanded-goldnoise-20260605-candidate/
+/profile-models/layout-heading-cycle058-faststack-expanded-goldnoise-20260605-candidate/*
+!/profile-models/layout-heading-cycle058-faststack-expanded-goldnoise-20260605-candidate/layout-role-model.json
+!/profile-models/layout-heading-chandra-feature-hardneg-backfill-allaccum-20260605-night-0001-000039-cycle263-seed-candidate/
+/profile-models/layout-heading-chandra-feature-hardneg-backfill-allaccum-20260605-night-0001-000039-cycle263-seed-candidate/*
+!/profile-models/layout-heading-chandra-feature-hardneg-backfill-allaccum-20260605-night-0001-000039-cycle263-seed-candidate/layout-role-model.json
+!/profile-models/layout-header-footer-v1-grok-lawreview-bias-neg20/
+/profile-models/layout-header-footer-v1-grok-lawreview-bias-neg20/*
+!/profile-models/layout-header-footer-v1-grok-lawreview-bias-neg20/layout-role-model.json
+!/profile-models/layout-role-v64-doclaynet-stream-balanced-20260603-candidate/
+/profile-models/layout-role-v64-doclaynet-stream-balanced-20260603-candidate/*
+!/profile-models/layout-role-v64-doclaynet-stream-balanced-20260603-candidate/layout-role-model.json
+!/profile-models/layout-role-liquid-core-v34-block-geometry-20260601-candidate/
+/profile-models/layout-role-liquid-core-v34-block-geometry-20260601-candidate/*
+!/profile-models/layout-role-liquid-core-v34-block-geometry-20260601-candidate/layout-role-model.json
+!/profile-models/layout-role-liquid-core-v35-doclaynet-stream-balanced-20260603-candidate/
+/profile-models/layout-role-liquid-core-v35-doclaynet-stream-balanced-20260603-candidate/*
+!/profile-models/layout-role-liquid-core-v35-doclaynet-stream-balanced-20260603-candidate/layout-role-model.json
+/training-data/
+
+# EXP-A4 CatBoost local/generated artifacts. Keep proposal, scripts, compact
+# reports, and small model files tracked; regenerate these bulky intermediates.
+/research/catboost-venv/
+/experiments/expA4-catboost-emission-model/train-tabular.jsonl
+/experiments/expA4-catboost-emission-model/train-tabular.tsv
+/experiments/expA4-catboost-emission-model/dev-v2-lm2-examples.json
+/experiments/expA4-catboost-emission-model/dev-v2-catboost-*-decoder-lattice*.json
+/experiments/expA4-catboost-emission-model/catboost-model*/catboost-info/
+/experiments/expA5-lm1-lm2-stacker/stacker-model*/catboost-info/
+
+# Large benchmark-v2 generated line/draft artifacts. Keep generator tools and
+# small summaries tracked; regenerate these local blobs when needed.
+/eval/benchmark-v2/extracted-lines-lm2-source.json
+/eval/benchmark-v2/extract-tmp/
+/eval/benchmark-v2/drafts/*.jsonl
+/eval/benchmark-v2/drafts/lm2-combined.json
+/eval/benchmark-v2/pp-doclayout/*.jsonl
+
+# Runtime/local state
+/data/worker-status.json
+/data/processed-archives.json
+
+# Local agent/editor state
+/.claude/settings.local.json
+
+# Research Python virtualenvs and nested build artifacts (libraries, not source).
+# These were leaking ~38k untracked files into `git status`. None are tracked.
+/research/*-venv/
+/research/**/target/
+**/site-packages/
+
+# Agent 2 tables quest: large runtime smokes (not committed)
+experiments/agent2-tables/router-bench-full.json
+experiments/agent2-tables/router-smoke-tmp/
+experiments/agent2-tables/router-smoke.log
+
+experiments/agent2-tables/distill-ds/
+experiments/agent2-tables/nano-train/
+yolov10n.pt
+*.log
+
+experiments/agent2-tables/distill-pp-ds/
+experiments/agent2-tables/nano-pp-train/
+
+experiments/agent2-tables/dashboard/*.log
+
+viewer/review-data/bbox-pages/
+
+experiments/agent2-tables/nano-pp-full/
+
+# SynthLabels: user IP + generated data stay local, never committed
+experiments/synthlabels/papers/
+experiments/synthlabels/pdfs/
+experiments/synthlabels/variants/
+experiments/synthlabels/synthlabels-train-corpus.json
+experiments/synthlabels/render-manifest.json
+experiments/synthlabels/*.log
+experiments/synthlabels/pdfs_word/
+experiments/synthlabels/synthlabels-word-corpus.json
+experiments/synthlabels/word-render-results.json
+experiments/synthlabels/word-projection-summary.json
+
+experiments/expA4-catboost-emission-model/centering-run/
+
+# large regenerable training feature dumps (0.8-1.1 GB each) — never commit
+experiments/expA4-catboost-emission-model/train-tabular-*.jsonl
+experiments/**/train-tabular*.jsonl
+experiments/**/*-fossil*.jsonl
+experiments/**/*-fragment*.jsonl
+
+# shared scratch + regenerable caches (see Uncommitted/README.md) — adopt option-c
+/Uncommitted/
+**/catboost_info/
+viewer/**/line-pages/
+viewer/**/bbox-pages/
+viewer/**/line-pages*/
+experiments/**/catboost-model*/
+debug_*.py
+
+# Ephemeral review/editor debris must never become repository state.
+**/*.bak-*
+**/*.backup-*
+**/.DS_Store
+/.coverage
+/--*
+/=
+/viewer/review-data/pages/
+/viewer/review-data/sus-pages/
+/viewer/review-data/label-pages/
+
+# Generated review corpora and run archives; retain their compact reports only.
+/experiments/agent2-tables/archive/
+/experiments/agent2-tables/router-smoke-tmp-*/
+/experiments/agent2-tables/router-product-v2-tmp-*/
+/experiments/synthlabels/table-pdfs/
+/experiments/synthlabels/gt/
+/experiments/synthlabels/*-run/
+/experiments/synthlabels/*-audit/
+/experiments/synthlabels/*-featuredump/
+/experiments/synthlabels/lv51-*/
+/experiments/expA4-catboost-emission-model/agent1-runs/
+/experiments/expA4-catboost-emission-model/lane-b-runs/
+/experiments/fluency-reader/*sample*/
+/tmp-task30/
+/experiments/promotion-lm2.5/*/
+/experiments/promotion-lm2.5/*.cbm
+/experiments/promotion-lm2.5/*.jsonl
+/experiments/promotion-lm2.5/*.tsv
+/flywheel/blocks/pymupdf-block-cache/
+/eval/benchmark-v2/block-quality/

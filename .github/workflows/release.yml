@@ -24,6 +24,14 @@ jobs:
           rustup default stable
           rustup target add x86_64-pc-windows-msvc
 
+      - name: Fetch pinned CatBoost runtime
+        shell: pwsh
+        run: .\scripts\fetch-catboost-windows.ps1
+
+      - name: Verify release manifest and assets
+        shell: pwsh
+        run: python tools\verify_release_manifest.py --platform windows --require-platform-library
+
       - name: Build release
         shell: pwsh
         run: cargo build --release --locked --target x86_64-pc-windows-msvc
@@ -45,7 +53,11 @@ jobs:
       - name: Build installer
         shell: pwsh
         run: |
-          $version = if ($env:GITHUB_REF_NAME -like "v*") { $env:GITHUB_REF_NAME.TrimStart("v") } else { "0.1.0" }
+          $version = if ($env:GITHUB_REF_NAME -like "v*") {
+            $env:GITHUB_REF_NAME.TrimStart("v")
+          } else {
+            (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          }
           $isccCandidates = @(
             (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"),
             (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe"),
@@ -67,20 +79,67 @@ jobs:
           name: LawPDFSetup-x64
           path: dist/LawPDFSetup-x64.exe
 
+  macos:
+    name: macOS arm64
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Rust
+        run: rustup default stable
+
+      - name: Verify release manifest and assets
+        run: python3 tools/verify_release_manifest.py --platform macos --require-platform-library
+
+      - name: Build and verify app bundle
+        run: bash scripts/package-macos.sh
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LawPDF-macos
+          path: dist/LawPDF-macos.zip
+
+  publish:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download Windows portable
+        uses: actions/download-artifact@v4
+        with:
+          name: LawPDF-windows-portable-x64
+          path: dist
+
+      - name: Download Windows installer
+        uses: actions/download-artifact@v4
+        with:
+          name: LawPDFSetup-x64
+          path: dist
+
+      - name: Download macOS package
+        uses: actions/download-artifact@v4
+        with:
+          name: LawPDF-macos
+          path: dist
+
       - name: Publish GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = $env:GITHUB_REF_NAME
-          $assets = @(
-            "dist\LawPDF-windows-portable-x64.zip",
-            "dist\LawPDFSetup-x64.exe"
+          assets=(
+            dist/LawPDF-windows-portable-x64.zip
+            dist/LawPDFSetup-x64.exe
+            dist/LawPDF-macos.zip
           )
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag @assets --clobber
-          } else {
-            gh release create $tag @assets --title "LawPDF $tag" --notes "Windows x64 portable and installer builds."
-          }
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --title "LawPDF $GITHUB_REF_NAME" \
+              --notes "Verified Windows x64 and macOS packages."
+          fi
