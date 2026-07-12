@@ -130,6 +130,7 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           assets=(
             dist/LawPDF-windows-portable-x64.zip
