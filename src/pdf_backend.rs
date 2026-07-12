@@ -1152,7 +1152,7 @@ pub fn save_with_annotations(
 ) -> Result<()> {
     let mut document = Document::load(source)
         .with_context(|| format!("failed to load source PDF {}", source.display()))?;
-    remove_lawpdf_comment_annotations(&mut document)?;
+    remove_lawpdf_owned_annotations(&mut document)?;
     let pages = document.get_pages();
 
     for annotation in annotations {
@@ -1168,9 +1168,13 @@ pub fn save_with_annotations(
 
     document.prune_objects();
     document.compress();
-    document
-        .save(destination)
-        .with_context(|| format!("failed to save {}", destination.display()))?;
+    if source == destination {
+        save_document_in_place(&mut document, destination)?;
+    } else {
+        document
+            .save(destination)
+            .with_context(|| format!("failed to save {}", destination.display()))?;
+    }
 
     Ok(())
 }
@@ -1200,11 +1204,11 @@ pub fn load_pdf_web_links(source: &Path, page_count: usize) -> Result<Vec<Vec<Pa
     Ok(links)
 }
 
-pub fn load_lawpdf_comments(source: &Path) -> Result<Vec<EditorAnnotation>> {
+pub fn load_lawpdf_annotations(source: &Path) -> Result<Vec<EditorAnnotation>> {
     let document = Document::load(source)
         .with_context(|| format!("failed to load source PDF {}", source.display()))?;
     let pages = document.get_pages();
-    let mut comments = Vec::new();
+    let mut annotations = Vec::new();
 
     for (page_number, page_id) in pages {
         let page_index = page_number.saturating_sub(1) as usize;
@@ -1219,34 +1223,43 @@ pub fn load_lawpdf_comments(source: &Path) -> Result<Vec<EditorAnnotation>> {
         match annots {
             Object::Array(annots) => {
                 for annot in &annots {
-                    if let Some(comment) =
-                        lawpdf_comment_from_annotation(&document, annot, page_index)
+                    if let Some(annotation) =
+                        lawpdf_owned_annotation_from_pdf(&document, annot, page_index)
                     {
-                        comments.push(comment);
+                        annotations.push(annotation);
                     }
                 }
             }
             Object::Reference(annots_id) => {
                 if let Ok(annots) = document.get_object(annots_id).and_then(Object::as_array) {
                     for annot in annots {
-                        if let Some(comment) =
-                            lawpdf_comment_from_annotation(&document, annot, page_index)
+                        if let Some(annotation) =
+                            lawpdf_owned_annotation_from_pdf(&document, annot, page_index)
                         {
-                            comments.push(comment);
+                            annotations.push(annotation);
                         }
                     }
                 }
             }
             annot => {
-                if let Some(comment) = lawpdf_comment_from_annotation(&document, &annot, page_index)
+                if let Some(annotation) =
+                    lawpdf_owned_annotation_from_pdf(&document, &annot, page_index)
                 {
-                    comments.push(comment);
+                    annotations.push(annotation);
                 }
             }
         }
     }
 
-    Ok(comments)
+    Ok(annotations)
+}
+
+#[cfg(test)]
+fn load_lawpdf_comments(source: &Path) -> Result<Vec<EditorAnnotation>> {
+    Ok(load_lawpdf_annotations(source)?
+        .into_iter()
+        .filter(|annotation| matches!(annotation.kind, AnnotationKind::Comment { .. }))
+        .collect())
 }
 
 pub fn sync_lawpdf_comments(source: &Path, comments: &[EditorAnnotation]) -> Result<usize> {
@@ -1538,6 +1551,7 @@ fn annotation_to_pdf_object(annotation: &EditorAnnotation) -> Object {
                 "C" => color_array(*color_rgb),
                 "CA" => Object::Real(*opacity),
                 "Contents" => literal(contents),
+                "LawPDF" => Object::Boolean(true),
                 "F" => Object::Integer(4),
             })
         }
@@ -1574,6 +1588,7 @@ fn annotation_to_pdf_object(annotation: &EditorAnnotation) -> Object {
             "C" => color_array(*color_rgb),
             // Private key: the on-text anchor point for the dotted leader.
             "LawA" => Object::Array(vec![Object::Real(anchor.0), Object::Real(anchor.1)]),
+            "LawPDF" => Object::Boolean(true),
             "F" => Object::Integer(4),
         }),
         AnnotationKind::Signature {
@@ -1649,6 +1664,49 @@ fn lawpdf_comment_from_annotation(
             created_at,
             updated_at,
             anchor,
+        },
+    })
+}
+
+fn lawpdf_owned_annotation_from_pdf(
+    document: &Document,
+    annotation: &Object,
+    page_index: usize,
+) -> Option<EditorAnnotation> {
+    let dict = annotation_dict(document, annotation)?;
+    if is_lawpdf_comment_dict(dict) {
+        return lawpdf_comment_from_annotation(document, annotation, page_index);
+    }
+    if !is_lawpdf_owned_dict(dict) {
+        return None;
+    }
+    let subtype = dict.get(b"Subtype").ok().and_then(pdf_object_text)?;
+    let style = if subtype.eq_ignore_ascii_case("Highlight") {
+        MarkerStyle::Highlight
+    } else if subtype.eq_ignore_ascii_case("Underline") {
+        MarkerStyle::Underline
+    } else {
+        return None;
+    };
+    let rect = dict.get(b"Rect").ok().and_then(pdf_rect_from_object)?;
+    let color_rgb = dict
+        .get(b"C")
+        .ok()
+        .and_then(pdf_color_from_object)
+        .unwrap_or([1.0, 0.93, 0.45]);
+    let opacity = dict
+        .get(b"CA")
+        .ok()
+        .and_then(pdf_number)
+        .unwrap_or(0.42)
+        .clamp(0.0, 1.0);
+    Some(EditorAnnotation {
+        page_index,
+        rect,
+        kind: AnnotationKind::Marker {
+            color_rgb,
+            opacity,
+            style,
         },
     })
 }
@@ -1735,6 +1793,17 @@ fn normalize_web_url(uri: &str) -> Option<String> {
 }
 
 fn remove_lawpdf_comment_annotations(document: &mut Document) -> Result<usize> {
+    remove_lawpdf_annotations_matching(document, false)
+}
+
+fn remove_lawpdf_owned_annotations(document: &mut Document) -> Result<usize> {
+    remove_lawpdf_annotations_matching(document, true)
+}
+
+fn remove_lawpdf_annotations_matching(
+    document: &mut Document,
+    include_owned: bool,
+) -> Result<usize> {
     let pages = document.get_pages();
     let mut removed = 0usize;
     let mut removed_object_ids = Vec::new();
@@ -1755,6 +1824,7 @@ fn remove_lawpdf_comment_annotations(document: &mut Document) -> Result<usize> {
                     annots,
                     &mut removed_object_ids,
                     &mut removed,
+                    include_owned,
                 );
                 document
                     .get_object_mut(page_id)?
@@ -1772,13 +1842,14 @@ fn remove_lawpdf_comment_annotations(document: &mut Document) -> Result<usize> {
                     annots,
                     &mut removed_object_ids,
                     &mut removed,
+                    include_owned,
                 );
                 let annots_array = document.get_object_mut(annots_id)?.as_array_mut()?;
                 annots_array.clear();
                 annots_array.extend(filtered);
             }
             annot => {
-                if is_lawpdf_comment_annotation(document, &annot) {
+                if is_matching_lawpdf_annotation(document, &annot, include_owned) {
                     document
                         .get_object_mut(page_id)?
                         .as_dict_mut()?
@@ -1801,10 +1872,11 @@ fn filter_lawpdf_comment_annots(
     annots: Vec<Object>,
     removed_object_ids: &mut Vec<ObjectId>,
     removed: &mut usize,
+    include_owned: bool,
 ) -> Vec<Object> {
     let mut kept = Vec::with_capacity(annots.len());
     for annot in annots {
-        if is_lawpdf_comment_annotation(document, &annot) {
+        if is_matching_lawpdf_annotation(document, &annot, include_owned) {
             if let Object::Reference(id) = annot {
                 removed_object_ids.push(id);
             }
@@ -1816,8 +1888,14 @@ fn filter_lawpdf_comment_annots(
     kept
 }
 
-fn is_lawpdf_comment_annotation(document: &Document, annotation: &Object) -> bool {
-    annotation_dict(document, annotation).is_some_and(is_lawpdf_comment_dict)
+fn is_matching_lawpdf_annotation(
+    document: &Document,
+    annotation: &Object,
+    include_owned: bool,
+) -> bool {
+    annotation_dict(document, annotation).is_some_and(|dict| {
+        is_lawpdf_comment_dict(dict) || (include_owned && is_lawpdf_owned_dict(dict))
+    })
 }
 
 fn is_lawpdf_comment_dict(dict: &Dictionary) -> bool {
@@ -1825,6 +1903,10 @@ fn is_lawpdf_comment_dict(dict: &Dictionary) -> bool {
         .ok()
         .and_then(pdf_object_text)
         .is_some_and(|id| id.starts_with(LAWPDF_COMMENT_ID_PREFIX))
+}
+
+fn is_lawpdf_owned_dict(dict: &Dictionary) -> bool {
+    matches!(dict.get(b"LawPDF"), Ok(Object::Boolean(true))) || is_lawpdf_comment_dict(dict)
 }
 
 fn annotation_dict<'a>(document: &'a Document, annotation: &'a Object) -> Option<&'a Dictionary> {
@@ -2058,6 +2140,57 @@ mod tests {
         assert_eq!(rule.right, 60.0);
         assert!((rule.bottom - 19.5).abs() < 0.001);
         assert!((rule.top - 20.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn in_place_save_round_trips_highlights_and_comments_without_duplicates() {
+        let path = std::env::temp_dir().join(format!(
+            "lawpdf-annotations-roundtrip-{}-unit.pdf",
+            std::process::id()
+        ));
+        write_blank_pdf(&path);
+        let annotations = vec![
+            EditorAnnotation {
+                page_index: 0,
+                rect: PdfRect::new(72.0, 650.0, 220.0, 668.0),
+                kind: AnnotationKind::Marker {
+                    color_rgb: [1.0, 0.93, 0.45],
+                    opacity: 0.42,
+                    style: MarkerStyle::Highlight,
+                },
+            },
+            EditorAnnotation {
+                page_index: 0,
+                rect: PdfRect::new(500.0, 650.0, 530.0, 680.0),
+                kind: AnnotationKind::Comment {
+                    id: format!("{LAWPDF_COMMENT_ID_PREFIX}roundtrip"),
+                    text: "Remember this point".to_owned(),
+                    color_rgb: [1.0, 0.78, 0.28],
+                    created_at: "2026-07-12T00:00:00Z".to_owned(),
+                    updated_at: "2026-07-12T00:00:00Z".to_owned(),
+                    anchor: (210.0, 659.0),
+                },
+            },
+        ];
+
+        save_with_annotations(&path, &path, &annotations).unwrap();
+        assert_eq!(load_lawpdf_annotations(&path).unwrap().len(), 2);
+        save_with_annotations(&path, &path, &annotations).unwrap();
+        let loaded = load_lawpdf_annotations(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().any(|annotation| matches!(
+            annotation.kind,
+            AnnotationKind::Marker {
+                style: MarkerStyle::Highlight,
+                ..
+            }
+        )));
+        assert!(
+            loaded
+                .iter()
+                .any(|annotation| matches!(annotation.kind, AnnotationKind::Comment { .. }))
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]

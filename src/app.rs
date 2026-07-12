@@ -33,7 +33,7 @@ use crate::ocr::{
     OcrEvent, load_ocr_cache, save_ocr_cache, spawn_ocr_job, spawn_openrouter_ocr_save_job,
 };
 use crate::pdf_backend::{
-    LAWPDF_COMMENT_ID_PREFIX, export_text, load_lawpdf_comments, save_with_annotations,
+    LAWPDF_COMMENT_ID_PREFIX, export_text, load_lawpdf_annotations, save_with_annotations,
     sidecar_path_for_export,
 };
 use crate::render_worker::{
@@ -264,6 +264,7 @@ pub struct PdfEditorApp {
     texture_access_counter: u64,
     last_zoom_change: Option<Instant>,
     annotations: Vec<EditorAnnotation>,
+    annotations_dirty: bool,
     liquid_feedback: Vec<LiquidFeedback>,
     editing_liquid_feedback: Option<String>,
     /// #27 footnote popovers: body superscript marker number -> footnote text,
@@ -312,7 +313,6 @@ pub struct PdfEditorApp {
     marker_opacity: f32,
     marker_preset_index: usize,
     comment_color_index: usize,
-    comment_save_generation: u64,
     pending_comment_saves: HashMap<PathBuf, PendingCommentSave>,
     active_comment_saves: HashMap<PathBuf, u64>,
     text_box_text: String,
@@ -338,6 +338,8 @@ pub struct PdfEditorApp {
     settings_groq_api_key_edit: String,
     show_settings: bool,
     status: String,
+    show_unsaved_close_prompt: bool,
+    allow_window_close: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -688,6 +690,7 @@ struct DocumentTab {
     texture_access_counter: u64,
     last_zoom_change: Option<Instant>,
     annotations: Vec<EditorAnnotation>,
+    annotations_dirty: bool,
     liquid_feedback: Vec<LiquidFeedback>,
     editing_liquid_feedback: Option<String>,
     text_selection: Option<TextSelection>,
@@ -804,6 +807,7 @@ impl PdfEditorApp {
             texture_access_counter: 0,
             last_zoom_change: None,
             annotations: Vec::new(),
+            annotations_dirty: false,
             liquid_feedback: Vec::new(),
             editing_liquid_feedback: None,
             liquid_footnote_index: HashMap::new(),
@@ -841,7 +845,6 @@ impl PdfEditorApp {
             marker_opacity: 0.45,
             marker_preset_index: 0,
             comment_color_index: 0,
-            comment_save_generation: 0,
             pending_comment_saves: HashMap::new(),
             active_comment_saves: HashMap::new(),
             text_box_text: String::new(),
@@ -867,6 +870,8 @@ impl PdfEditorApp {
             settings_groq_api_key_edit,
             show_settings: false,
             status: initial_status.to_owned(),
+            show_unsaved_close_prompt: false,
+            allow_window_close: false,
         };
 
         if !startup_paths.is_empty() {
@@ -900,6 +905,7 @@ impl PdfEditorApp {
             texture_access_counter: self.texture_access_counter,
             last_zoom_change: self.last_zoom_change,
             annotations: self.annotations.clone(),
+            annotations_dirty: self.annotations_dirty,
             liquid_feedback: self.liquid_feedback.clone(),
             editing_liquid_feedback: self.editing_liquid_feedback.clone(),
             text_selection: self.text_selection,
@@ -971,6 +977,7 @@ impl PdfEditorApp {
         self.texture_access_counter = tab.texture_access_counter;
         self.last_zoom_change = tab.last_zoom_change;
         self.annotations = tab.annotations;
+        self.annotations_dirty = tab.annotations_dirty;
         self.liquid_feedback = tab.liquid_feedback;
         self.editing_liquid_feedback = tab.editing_liquid_feedback;
         self.text_selection = tab.text_selection;
@@ -1072,6 +1079,7 @@ impl PdfEditorApp {
         self.texture_access_counter = 0;
         self.last_zoom_change = None;
         self.annotations.clear();
+        self.annotations_dirty = false;
         self.liquid_feedback.clear();
         self.editing_liquid_feedback = None;
         self.text_selection = None;
@@ -1361,9 +1369,12 @@ impl PdfEditorApp {
         let zoom = self.default_zoom_for_new_document();
         let ocr_states = load_ocr_cache(&document.path, page_count)
             .unwrap_or_else(|| vec![OcrPageState::Idle; page_count]);
-        let annotations = load_lawpdf_comments(&document.path).unwrap_or_default();
+        let annotations = load_lawpdf_annotations(&document.path).unwrap_or_default();
         let liquid_feedback = load_liquid_feedback(&document.path).unwrap_or_default();
-        let comment_count = annotations.len();
+        let comment_count = annotations
+            .iter()
+            .filter(|annotation| matches!(annotation.kind, AnnotationKind::Comment { .. }))
+            .count();
         let feedback_count = liquid_feedback
             .iter()
             .filter(|entry| entry.submitted_at.is_none())
@@ -1387,6 +1398,7 @@ impl PdfEditorApp {
             texture_access_counter: 0,
             last_zoom_change: None,
             annotations,
+            annotations_dirty: false,
             liquid_feedback,
             editing_liquid_feedback: None,
             text_selection: None,
@@ -1439,6 +1451,53 @@ impl PdfEditorApp {
                 Err(error) => self.status = error.to_string(),
             }
         }
+    }
+
+    fn save_current_annotations(&mut self) -> Result<(), String> {
+        let Some(document) = self.document.as_ref() else {
+            return Ok(());
+        };
+        let path = document.path.clone();
+        save_with_annotations(&path, &path, &self.annotations)
+            .map_err(|error| error.to_string())?;
+        self.annotations_dirty = false;
+        self.pending_comment_saves.remove(&path);
+        self.active_comment_saves.remove(&path);
+        if let Some(tab_index) = self.active_tab
+            && let Some(tab) = self.tabs.get_mut(tab_index)
+        {
+            tab.annotations = self.annotations.clone();
+            tab.annotations_dirty = false;
+        }
+        self.status = format!("Saved annotations to {}", path.display());
+        Ok(())
+    }
+
+    fn save_all_dirty_annotations(&mut self) -> Result<(), String> {
+        self.save_active_tab_state();
+        for tab in &mut self.tabs {
+            if !tab.annotations_dirty {
+                continue;
+            }
+            let path = tab.document.path.clone();
+            save_with_annotations(&path, &path, &tab.annotations)
+                .map_err(|error| format!("Could not save {}: {error}", path.display()))?;
+            tab.annotations_dirty = false;
+            self.pending_comment_saves.remove(&path);
+            self.active_comment_saves.remove(&path);
+        }
+        if let Some(tab_index) = self.active_tab {
+            self.annotations_dirty = self
+                .tabs
+                .get(tab_index)
+                .is_some_and(|tab| tab.annotations_dirty);
+        }
+        self.status = "Saved annotations to PDF.".to_owned();
+        Ok(())
+    }
+
+    fn has_unsaved_annotations(&self) -> bool {
+        self.annotations_dirty || self.tabs.iter().any(|tab| tab.annotations_dirty)
     }
 
     fn export_text_dialog(&mut self, ctx: &Context) {
@@ -2606,6 +2665,9 @@ impl PdfEditorApp {
             }
         }
 
+        if added > 0 {
+            self.annotations_dirty = true;
+        }
         self.status = format!("Added {added} highlight annotation(s)");
     }
 
@@ -3141,33 +3203,9 @@ impl PdfEditorApp {
     }
 
     fn schedule_comment_autosave_with_delay(&mut self, ctx: &Context, delay: Duration) {
-        let Some(document) = self.document.as_ref() else {
-            return;
-        };
-
-        self.comment_save_generation = self.comment_save_generation.wrapping_add(1).max(1);
-        let generation = self.comment_save_generation;
-        let path = document.path.clone();
-        let comments = self.comment_annotations_for_save();
-        self.pending_comment_saves.insert(
-            path.clone(),
-            PendingCommentSave {
-                document_epoch: self.document_epoch,
-                path,
-                generation,
-                comments,
-                due_at: Instant::now() + delay,
-            },
-        );
-        if delay.is_zero() {
-            ctx.request_repaint();
-        } else {
-            ctx.request_repaint_after(delay);
-        }
-    }
-
-    fn comment_annotations_for_save(&self) -> Vec<EditorAnnotation> {
-        comment_annotations_for_save_from(&self.annotations)
+        let _ = delay;
+        self.annotations_dirty = true;
+        ctx.request_repaint();
     }
 
     fn start_due_comment_saves(&mut self, ctx: &Context) {
@@ -3297,6 +3335,14 @@ impl PdfEditorApp {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let mut title = tab.title();
+                            let dirty = if is_active {
+                                self.annotations_dirty
+                            } else {
+                                tab.annotations_dirty
+                            };
+                            if dirty {
+                                title.push_str(" •");
+                            }
                             const MAX_TAB_CHARS: usize = 28;
                             if title.chars().count() > MAX_TAB_CHARS {
                                 title = format!(
@@ -3370,13 +3416,19 @@ impl PdfEditorApp {
                         }
                         if ui
                             .add_enabled(has_document, egui::Button::new("Save"))
-                            .on_hover_text("Save edited copy")
+                            .on_hover_text("Save highlights and comments into this PDF")
                             .clicked()
                         {
-                            self.save_as_dialog();
+                            if let Err(error) = self.save_current_annotations() {
+                                self.status = error;
+                            }
                         }
                         ui.add_enabled_ui(has_document, |ui| {
                             ui.menu_button("Export", |ui| {
+                                if ui.button("Save PDF copy").clicked() {
+                                    self.save_as_dialog();
+                                    ui.close();
+                                }
                                 if ui.button("Text").clicked() {
                                     self.export_text_dialog(ctx);
                                     ui.close();
@@ -4310,6 +4362,40 @@ impl PdfEditorApp {
                 Err(error) => self.status = error,
             }
         }
+    }
+
+    fn draw_unsaved_close_prompt(&mut self, ctx: &Context) {
+        if !self.show_unsaved_close_prompt {
+            return;
+        }
+        egui::Window::new("Save changes before closing?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("Highlights or comments have not been saved into their PDF files.");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save and close").clicked() {
+                        match self.save_all_dirty_annotations() {
+                            Ok(()) => {
+                                self.show_unsaved_close_prompt = false;
+                                self.allow_window_close = true;
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                            Err(error) => self.status = error,
+                        }
+                    }
+                    if ui.button("Don't save").clicked() {
+                        self.show_unsaved_close_prompt = false;
+                        self.allow_window_close = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.show_unsaved_close_prompt = false;
+                    }
+                });
+            });
     }
 
     fn draw_update_notice(&mut self, ctx: &Context) {
@@ -8542,6 +8628,9 @@ impl PdfEditorApp {
             }
             MarkerStyle::Underline => format!("Underlined selected text ({count} line segment(s))"),
         };
+        if count > 0 {
+            self.annotations_dirty = true;
+        }
         self.clear_text_selection();
     }
 
@@ -8691,6 +8780,13 @@ impl eframe::App for PdfEditorApp {
     }
 
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|input| input.viewport().close_requested()) && !self.allow_window_close {
+            self.save_active_tab_state();
+            if self.has_unsaved_annotations() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.show_unsaved_close_prompt = true;
+            }
+        }
         if consume_command_shortcut(ctx, egui::Key::W) {
             if let Some(active_tab) = self.active_tab {
                 self.close_tab(active_tab, ctx);
@@ -8722,6 +8818,11 @@ impl eframe::App for PdfEditorApp {
 
         if consume_command_shortcut(ctx, egui::Key::O) {
             self.open_dialog(ctx);
+        }
+        if consume_command_shortcut(ctx, egui::Key::S)
+            && let Err(error) = self.save_current_annotations()
+        {
+            self.status = error;
         }
         if consume_command_shortcut(ctx, egui::Key::F) {
             self.focus_search(ctx);
@@ -8831,6 +8932,7 @@ impl eframe::App for PdfEditorApp {
         self.draw_status_bar(ctx);
         self.draw_document(ctx);
         self.draw_settings_window(ctx);
+        self.draw_unsaved_close_prompt(ctx);
         self.draw_update_notice(ctx);
 
         if self.zoom_is_animating()
@@ -9350,6 +9452,7 @@ fn save_liquid_retrain_queue(
     Ok(path)
 }
 
+#[cfg(test)]
 fn comment_annotations_for_save_from(annotations: &[EditorAnnotation]) -> Vec<EditorAnnotation> {
     annotations
         .iter()
