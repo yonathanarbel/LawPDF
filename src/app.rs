@@ -80,12 +80,15 @@ const MARKER_WIPE_DURATION: Duration = Duration::from_millis(260);
 const MARKER_SETTLE_DURATION: Duration = Duration::from_millis(160);
 const MARKER_STAGGER: Duration = Duration::from_millis(65);
 const MARKER_CORNER_RADIUS: u8 = 2;
-// Settled highlights "breathe": a slow, low-amplitude opacity sway so the ink
-// reads as alive rather than printed. Phase varies per mark so they don't pulse
-// in lockstep. Disabled under reduced motion.
-const MARKER_BREATH_RATE: f32 = 1.4;
-const MARKER_BREATH_AMPLITUDE: f32 = 0.08;
-const MARKER_BREATH_REPAINT: Duration = Duration::from_millis(40);
+// Settled highlights stay gently alive: a long, low-amplitude opacity drift and
+// an occasional faint sheen. Each mark gets its own deterministic phase/cycle,
+// so a page never pulses in unison. Disabled under reduced motion.
+const MARKER_BREATH_RATE: f32 = 0.66;
+const MARKER_BREATH_AMPLITUDE: f32 = 0.045;
+const MARKER_SHEEN_CYCLE_BASE: f32 = 12.0;
+const MARKER_SHEEN_CYCLE_VARIANCE: f32 = 5.0;
+const MARKER_SHEEN_ALPHA: f32 = 0.11;
+const MARKER_BREATH_REPAINT: Duration = Duration::from_millis(80);
 const MARKER_PRESETS: [MarkerPreset; 6] = [
     MarkerPreset {
         label: "Yellow",
@@ -7084,17 +7087,34 @@ impl PdfEditorApp {
             .iter()
             .find(|anim| anim.page_index == page_index && anim.rect == pdf_rect)
         else {
-            let alpha = if self.settings.reduce_motion {
-                target_alpha
-            } else {
-                let time = painter.ctx().input(|input| input.time) as f32;
-                let phase = (pdf_rect.left + pdf_rect.top) * 0.05;
-                let breath = (time * MARKER_BREATH_RATE + phase).sin();
-                painter.ctx().request_repaint_after(MARKER_BREATH_REPAINT);
-                ((target_alpha as f32) * (1.0 + MARKER_BREATH_AMPLITUDE * breath)).clamp(0.0, 255.0)
-                    as u8
-            };
-            paint_marker_stroke(painter, rect, seed, color_rgb, alpha);
+            if self.settings.reduce_motion {
+                paint_marker_stroke(painter, rect, seed, color_rgb, target_alpha);
+                return;
+            }
+            let time = painter.ctx().input(|input| input.time) as f32;
+            let motion = settled_marker_motion(time, seed, target_alpha);
+            painter.ctx().request_repaint_after(MARKER_BREATH_REPAINT);
+            paint_marker_stroke(painter, rect, seed, color_rgb, motion.alpha);
+
+            // A narrow glint passes over the existing textured stroke. It fades
+            // in and out at the ends of its long cycle, so it never flashes.
+            if motion.sheen_alpha > 0 && rect.width() > 8.0 {
+                let band_width = (rect.width() * 0.14).clamp(10.0, 38.0);
+                let travel = rect.width() + band_width * 2.0;
+                let center = rect.left() - band_width + travel * motion.sheen_progress;
+                let band = Rect::from_min_max(
+                    Pos2::new(center - band_width * 0.5, rect.top()),
+                    Pos2::new(center + band_width * 0.5, rect.bottom()),
+                );
+                let sheen = painter.with_clip_rect(band.intersect(painter.clip_rect()));
+                paint_marker_stroke(
+                    &sheen,
+                    rect,
+                    seed,
+                    marker_sheen_rgb(color_rgb),
+                    motion.sheen_alpha,
+                );
+            }
             return;
         };
 
@@ -9370,6 +9390,40 @@ fn ease_in_cubic(t: f32) -> f32 {
     t * t * t
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SettledMarkerMotion {
+    alpha: u8,
+    sheen_progress: f32,
+    sheen_alpha: u8,
+}
+
+fn settled_marker_motion(time: f32, seed: u32, target_alpha: u8) -> SettledMarkerMotion {
+    let phase = hash01(seed ^ 0xA511_E9B3, 17) * std::f32::consts::TAU;
+    let breath = (time * MARKER_BREATH_RATE + phase).sin();
+    let alpha = ((target_alpha as f32) * (1.0 + MARKER_BREATH_AMPLITUDE * breath))
+        .round()
+        .clamp(0.0, 255.0) as u8;
+
+    let cycle =
+        MARKER_SHEEN_CYCLE_BASE + MARKER_SHEEN_CYCLE_VARIANCE * hash01(seed ^ 0x63D8_3595, 29);
+    let offset = cycle * hash01(seed ^ 0xB529_7A4D, 43);
+    let sheen_progress = (time + offset).rem_euclid(cycle) / cycle;
+    let fade = (std::f32::consts::PI * sheen_progress).sin().powi(4);
+    let sheen_alpha = ((target_alpha as f32) * MARKER_SHEEN_ALPHA * fade)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+
+    SettledMarkerMotion {
+        alpha,
+        sheen_progress,
+        sheen_alpha,
+    }
+}
+
+fn marker_sheen_rgb(color_rgb: [f32; 3]) -> [f32; 3] {
+    color_rgb.map(|channel| channel + (1.0 - channel) * 0.34)
+}
+
 /// Paint a highlight as a felt-tip marker stroke rather than a flat box: wavy
 /// (non-straight) top and bottom edges plus uneven ink density — darker pools
 /// where the tip lingered, lighter streaks where it skipped. Everything is
@@ -11280,5 +11334,30 @@ mod app_tests {
         let body_only = liquid_tts_text(&doc, false);
         assert!(!body_only.contains("Footnotes."));
         assert!(!body_only.contains("See Example v. State."));
+    }
+
+    #[test]
+    fn settled_marker_motion_stays_subtle_and_seeded() {
+        let target = 110;
+        let first = settled_marker_motion(3.0, 17, target);
+        let later = settled_marker_motion(7.0, 17, target);
+        let other = settled_marker_motion(3.0, 99, target);
+
+        let allowed_delta = (target as f32 * MARKER_BREATH_AMPLITUDE).ceil() as i16 + 1;
+        for motion in [first, later, other] {
+            assert!((motion.alpha as i16 - target as i16).abs() <= allowed_delta);
+            assert!((0.0..1.0).contains(&motion.sheen_progress));
+            assert!(motion.sheen_alpha <= 13);
+        }
+        assert_ne!(first.sheen_progress, later.sheen_progress);
+        assert_ne!(first.sheen_progress, other.sheen_progress);
+    }
+
+    #[test]
+    fn marker_sheen_only_gently_lifts_color() {
+        let lifted = marker_sheen_rgb([0.68, 0.42, 1.0]);
+        assert!(lifted[0] > 0.68 && lifted[0] < 0.8);
+        assert!(lifted[1] > 0.42 && lifted[1] < 0.7);
+        assert_eq!(lifted[2], 1.0);
     }
 }
