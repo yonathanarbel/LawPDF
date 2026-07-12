@@ -17,6 +17,11 @@ Download the newest version from the
 - `LawPDF-windows-portable-x64.zip` — portable version; extract it and run
   `lawpdf.exe`.
 
+The installer registers LawPDF as a PDF-capable app and offers to open the
+Windows default-app chooser. You can reopen that chooser at any time with
+**Set as default** in the LawPDF toolbar. Windows requires you to confirm the
+`.pdf` association yourself.
+
 ### macOS
 
 - `LawPDF-macos.zip` — application bundle for Apple-silicon Macs running
@@ -29,6 +34,7 @@ Control-clicking the app, choosing **Open**, and confirming once.
 ## Features
 
 - Review Mode for comfortable law review reading.
+- Optional Windows default-PDF-reader integration.
 - Continuous multi-page PDF viewing and zoom.
 - Native text selection, search, and copy.
 - Highlights, underlining, comments, free-text boxes, and signatures.

@@ -76,4 +76,5 @@ Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppIconName}"; Tasks: desktopicon
 
 [Run]
+Filename: "ms-settings:defaultapps?registeredAppMachine=LawPDF"; Description: "Choose LawPDF as the default PDF reader"; Flags: shellexec postinstall skipifsilent unchecked nowait
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
