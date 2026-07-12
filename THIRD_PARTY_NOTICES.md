@@ -51,3 +51,17 @@ third_party/inno-setup/LICENSE.txt
 
 LawPDF invokes `tesseract.exe` only when OCR is requested. Tesseract is not
 bundled in the LawPDF release packages; users install it separately.
+
+## CatBoost Model Evaluation Library
+
+Review Mode bundles the CatBoost model evaluation library and a trained CBM
+model. CatBoost is Copyright 2017–2026 YANDEX LLC and is distributed under the
+Apache License 2.0. Release libraries are pinned to CatBoost 1.2.10 artifacts
+published by the official `catboost/catboost` GitHub project. The Windows DLL
+is checksum-verified by `scripts/fetch-catboost-windows.ps1` before packaging.
+
+The Apache License 2.0 text is committed at:
+
+```text
+third_party/catboost/LICENSE
+```

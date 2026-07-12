@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::model::OcrPageState;
-use crate::pdf_backend::save_with_ocr_text;
+use crate::pdf_backend::{PdfEngine, save_with_ocr_text};
 use crate::render_worker::RenderRequest;
 use crate::settings::app_data_dir;
 
@@ -16,9 +16,11 @@ const OCR_CACHE_SCHEMA_VERSION: u32 = 1;
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_OCR_MODEL: &str = "baidu/qianfan-ocr-fast:free";
 const OCR_RENDER_SCALE: f32 = 2.2;
+const LOCAL_TESSERACT_PSM: &str = "4";
 const OPENROUTER_OCR_BATCH_PAGES: usize = 3;
 const OPENROUTER_REQUEST_SPACING: Duration = Duration::from_millis(3200);
 const OPENROUTER_MAX_RETRIES: usize = 3;
+const LOCAL_TESSERACT_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone)]
 pub struct OcrEvent {
@@ -112,6 +114,34 @@ pub fn save_ocr_cache(path: &Path, states: &[OcrPageState]) -> Result<(), String
     let bytes = serde_json::to_vec_pretty(&cache)
         .map_err(|error| format!("Could not encode OCR cache: {error}"))?;
     std::fs::write(cache_path, bytes).map_err(|error| format!("Could not save OCR cache: {error}"))
+}
+
+pub fn ocr_page_with_engine(
+    engine: &PdfEngine,
+    pdf_path: &Path,
+    page_index: usize,
+) -> Result<String, String> {
+    ocr_page_with_engine_scale(engine, pdf_path, page_index, OCR_RENDER_SCALE)
+}
+
+pub fn ocr_page_with_engine_scale(
+    engine: &PdfEngine,
+    pdf_path: &Path,
+    page_index: usize,
+    scale: f32,
+) -> Result<String, String> {
+    let image_path = temp_image_path(page_index);
+    let export_result = engine
+        .export_page_png(pdf_path, page_index, &image_path, scale)
+        .map_err(|error| format!("Could not render OCR page image: {error:#}"));
+    if let Err(error) = export_result {
+        let _ = std::fs::remove_file(&image_path);
+        return Err(error);
+    }
+
+    let result = run_tesseract_image(&image_path);
+    let _ = std::fs::remove_file(&image_path);
+    result
 }
 
 pub fn spawn_openrouter_ocr_save_job(
@@ -279,22 +309,54 @@ fn ocr_page(
     let image_path = temp_image_path(page_index);
     export_ocr_image(render_tx, pdf_path.clone(), page_index, image_path.clone())?;
 
-    let output = Command::new("tesseract")
+    let result = run_tesseract_image(&image_path);
+    let _ = std::fs::remove_file(&image_path);
+    result
+}
+
+fn run_tesseract_image(image_path: &Path) -> Result<String, String> {
+    let mut child = Command::new("tesseract")
         .arg(&image_path)
         .arg("stdout")
         .arg("-l")
         .arg("eng")
         .arg("--psm")
-        .arg("6")
-        .output();
-
-    let _ = std::fs::remove_file(&image_path);
-
-    let output = output.map_err(|error| {
+        .arg(LOCAL_TESSERACT_PSM)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
         format!(
             "failed to run tesseract; install Tesseract OCR and make sure it is on PATH: {error}"
         )
     })?;
+
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                if started.elapsed() >= LOCAL_TESSERACT_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "tesseract timed out after {} seconds",
+                        LOCAL_TESSERACT_TIMEOUT.as_secs()
+                    ));
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("failed while waiting for tesseract: {error}"));
+            }
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed to read tesseract output: {error}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();

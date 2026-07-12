@@ -4,8 +4,8 @@ use std::thread;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
-use crate::model::{LoadedDocument, PageTextChar, RenderedPage};
-use crate::pdf_backend::{PdfEngine, RenderQuality};
+use crate::model::{EditorAnnotation, LoadedDocument, PageTextChar, RenderedPage};
+use crate::pdf_backend::{PdfEngine, RenderQuality, sync_lawpdf_comments};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PageRenderKey {
@@ -73,6 +73,12 @@ pub enum RenderRequest {
         scale: f32,
         reply: Sender<Result<(), String>>,
     },
+    SyncComments {
+        document_epoch: u64,
+        path: PathBuf,
+        generation: u64,
+        comments: Vec<EditorAnnotation>,
+    },
 }
 
 #[derive(Debug)]
@@ -100,6 +106,12 @@ pub enum RenderEvent {
         path: PathBuf,
         page_index: usize,
         result: Result<String, String>,
+    },
+    CommentsSaved {
+        document_epoch: u64,
+        path: PathBuf,
+        generation: u64,
+        result: Result<usize, String>,
     },
 }
 
@@ -214,6 +226,21 @@ pub fn spawn_render_worker() -> (Sender<RenderRequest>, Receiver<RenderEvent>) {
                             .map_err(|error| error.to_string()),
                     );
                     continue;
+                }
+                RenderRequest::SyncComments {
+                    document_epoch,
+                    path,
+                    generation,
+                    comments,
+                } => {
+                    engine.close_document(&path);
+                    RenderEvent::CommentsSaved {
+                        document_epoch,
+                        path: path.clone(),
+                        generation,
+                        result: sync_lawpdf_comments(&path, &comments)
+                            .map_err(|error| error.to_string()),
+                    }
                 }
             };
 
@@ -337,6 +364,17 @@ fn error_event(request: RenderRequest, message: String) -> RenderEvent {
                 result: Err("PDF worker failed before exporting PNG".to_owned()),
             }
         }
+        RenderRequest::SyncComments {
+            document_epoch,
+            path,
+            generation,
+            ..
+        } => RenderEvent::CommentsSaved {
+            document_epoch,
+            path,
+            generation,
+            result: Err(message),
+        },
     }
 }
 

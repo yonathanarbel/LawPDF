@@ -1,0 +1,39 @@
+{
+  "schema_version": "lawpdf-public-release-manifest-v1",
+  "product": {
+    "name": "LawPDF",
+    "version": "0.2.2"
+  },
+  "runtime_assets": {
+    "native_model": {
+      "path": "profile-models/lm2-native-catboost-runtime/lm2-catboost-augmented-epoch51lv-relabels-tc.cbm",
+      "sha256": "e9537a1f934c015674e3274af4ceaa5b095a54266a7abb456da025ebba32aa05"
+    },
+    "context_model": {
+      "path": "profile-models/lm2-context-twopass-runtime/lm2-context-twopass-hgb-v1.json",
+      "sha256": "c7c9986cd98f733e523696a7f94ffd658d9c578f79bd8f189382d86da54d2840"
+    },
+    "catboost_version": "1.2.10",
+    "platform_libraries": {
+      "macos": {
+        "path": "profile-models/lm2-native-catboost-runtime/libcatboostmodel-darwin-universal2-1.2.10.dylib",
+        "sha256": "c31067d8df69e0be3dd353a06853d64f2e74bab1097512fc2d0db76add75514e"
+      },
+      "windows": {
+        "path": "profile-models/lm2-native-catboost-runtime/catboostmodel.dll",
+        "sha256": "668d8867940a0832accaad6004e249f11ecc48eb63eb1d65551cfdd37c1939ad",
+        "fetched_during_release": true
+      }
+    }
+  },
+  "package_contracts": {
+    "windows-x86_64": {
+      "builder": "scripts/package-windows.ps1",
+      "runtime_verification": "lawpdf.exe --lm2-runtime-status --require-native --require-context"
+    },
+    "macos-arm64": {
+      "builder": "scripts/package-macos.sh",
+      "runtime_verification": "LawPDF --lm2-runtime-status --require-native --require-context"
+    }
+  }
+}
