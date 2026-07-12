@@ -62,8 +62,13 @@ $verifyWorkingDir = Join-Path ([System.IO.Path]::GetTempPath()) "lawpdf-package-
 New-Item -ItemType Directory -Force -Path $verifyWorkingDir | Out-Null
 Push-Location $verifyWorkingDir
 try {
-    & (Join-Path $portableDir $exeName) --lm2-runtime-status --require-native --require-context
-    if ($LASTEXITCODE -ne 0) {
+    $runtimeStatus = Start-Process `
+        -FilePath (Join-Path $portableDir $exeName) `
+        -ArgumentList @("--lm2-runtime-status", "--require-native", "--require-context") `
+        -NoNewWindow `
+        -PassThru `
+        -Wait
+    if ($runtimeStatus.ExitCode -ne 0) {
         throw "Packaged LawPDF did not load the promoted native CatBoost + context runtime."
     }
 }
