@@ -67,6 +67,8 @@ const SMALL_DOCUMENT_PREFETCH_LIMIT: usize = 6;
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const UPDATE_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const UPDATE_NOTICE_DURATION: Duration = Duration::from_secs(4);
+const NOTICE_CAPACITY: usize = 5;
+const INFO_NOTICE_DURATION: Duration = Duration::from_secs(6);
 const CHAT_CONTEXT_TOKEN_LIMIT: usize = 64_000;
 const COMMENT_AUTOSAVE_DELAY: Duration = Duration::from_millis(650);
 const COMMENT_CARD_WIDTH: f32 = 324.0;
@@ -248,6 +250,7 @@ pub struct PdfEditorApp {
     update_state: UpdateUiState,
     update_check_in_flight: bool,
     update_notice: Option<UpdateNotice>,
+    notices: VecDeque<Notice>,
     next_update_check: Option<Instant>,
     zoom: f32,
     target_zoom: f32,
@@ -479,7 +482,7 @@ enum UpdateUiState {
     Checking,
     Downloading,
     Ready,
-    Failed { message: String, shown_at: Instant },
+    Failed { shown_at: Instant },
 }
 
 impl UpdateUiState {
@@ -519,6 +522,45 @@ impl UpdateNotice {
 enum UpdateNoticeKind {
     Working,
     Success,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoticeSeverity {
+    Info,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct Notice {
+    message: String,
+    severity: NoticeSeverity,
+    created_at: Instant,
+}
+
+impl Notice {
+    fn new(message: impl Into<String>, severity: NoticeSeverity) -> Self {
+        Self {
+            message: message.into(),
+            severity,
+            created_at: Instant::now(),
+        }
+    }
+
+    fn is_expired_at(&self, now: Instant) -> bool {
+        self.severity == NoticeSeverity::Info
+            && now.saturating_duration_since(self.created_at) >= INFO_NOTICE_DURATION
+    }
+}
+
+fn enqueue_notice(notices: &mut VecDeque<Notice>, notice: Notice) {
+    while notices.len() >= NOTICE_CAPACITY {
+        notices.pop_front();
+    }
+    notices.push_back(notice);
+}
+
+fn prune_notices_at(notices: &mut VecDeque<Notice>, now: Instant) {
+    notices.retain(|notice| !notice.is_expired_at(now));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -788,6 +830,7 @@ impl PdfEditorApp {
             update_state: UpdateUiState::Idle,
             update_check_in_flight: true,
             update_notice,
+            notices: VecDeque::new(),
             next_update_check: None,
             zoom: initial_zoom,
             target_zoom: initial_zoom,
@@ -1110,6 +1153,20 @@ impl PdfEditorApp {
         self.tabs.iter().position(|tab| tab.document.path == path)
     }
 
+    fn pick_save_path(
+        &self,
+        title: &str,
+        file_name: &str,
+        filter_name: &str,
+        extensions: &[&str],
+    ) -> Option<PathBuf> {
+        FileDialog::new()
+            .set_title(title)
+            .add_filter(filter_name, extensions)
+            .set_file_name(file_name)
+            .save_file()
+    }
+
     fn open_dialog(&mut self, ctx: &Context) {
         if let Some(paths) = FileDialog::new()
             .add_filter(
@@ -1252,13 +1309,12 @@ impl PdfEditorApp {
                 UpdateEvent::Failed(message) => {
                     self.update_check_in_flight = false;
                     self.next_update_check = Some(Instant::now() + UPDATE_RETRY_INTERVAL);
-                    self.status = message.clone();
+                    self.push_error_notice(message.clone());
                     if matches!(
                         self.update_state,
                         UpdateUiState::Checking | UpdateUiState::Downloading
                     ) {
                         self.update_state = UpdateUiState::Failed {
-                            message,
                             shown_at: Instant::now(),
                         };
                     }
@@ -1266,9 +1322,8 @@ impl PdfEditorApp {
             }
         }
 
-        if let UpdateUiState::Failed { message, shown_at } = &self.update_state {
+        if let UpdateUiState::Failed { shown_at, .. } = &self.update_state {
             if shown_at.elapsed() < Duration::from_secs(12) {
-                self.status = message.clone();
                 ctx.request_repaint_after(Duration::from_secs(1));
             } else {
                 self.update_state = UpdateUiState::Idle;
@@ -1437,10 +1492,8 @@ impl PdfEditorApp {
         };
 
         let file_name = default_output_name(&document.path, "edited", "pdf");
-        if let Some(destination) = FileDialog::new()
-            .add_filter("PDF", &["pdf"])
-            .set_file_name(file_name)
-            .save_file()
+        if let Some(destination) =
+            self.pick_save_path("Save edited PDF", &file_name, "PDF", &["pdf"])
         {
             match save_with_annotations(&document.path, &destination, &self.annotations) {
                 Ok(()) => self.status = format!("Saved {}", destination.display()),
@@ -1516,10 +1569,8 @@ impl PdfEditorApp {
             .and_then(|value| value.to_str())
             .unwrap_or("document-text.txt");
 
-        if let Some(destination) = FileDialog::new()
-            .add_filter("Text", &["txt"])
-            .set_file_name(file_name)
-            .save_file()
+        if let Some(destination) =
+            self.pick_save_path("Export document text", file_name, "Text", &["txt"])
         {
             let ocr_text = self.collect_ocr_text();
             match export_text(&destination, document, &ocr_text) {
@@ -1539,10 +1590,8 @@ impl PdfEditorApp {
             .as_ref()
             .map(|source| default_output_name(&source.path, "review-mode", "txt"))
             .unwrap_or_else(|| "review-mode.txt".to_owned());
-        if let Some(destination) = FileDialog::new()
-            .add_filter("Text", &["txt"])
-            .set_file_name(file_name)
-            .save_file()
+        if let Some(destination) =
+            self.pick_save_path("Download Review Mode text", &file_name, "Text", &["txt"])
         {
             let contents = format!("{}\n", text.trim_end());
             match std::fs::write(&destination, contents) {
@@ -1561,10 +1610,8 @@ impl PdfEditorApp {
         let page_index = self.page_index;
         let file_name = default_output_name(&path, &format!("page-{}", page_index + 1), "png");
 
-        if let Some(destination) = FileDialog::new()
-            .add_filter("PNG", &["png"])
-            .set_file_name(file_name)
-            .save_file()
+        if let Some(destination) =
+            self.pick_save_path("Export page image", &file_name, "PNG", &["png"])
         {
             match self.export_page_png_on_worker(path, page_index, destination.clone(), 2.0) {
                 Ok(()) => self.status = format!("Exported {}", destination.display()),
@@ -1620,10 +1667,7 @@ impl PdfEditorApp {
             .and_then(|value| value.to_str())
             .unwrap_or("document-ocr.pdf");
 
-        let Some(destination) = FileDialog::new()
-            .add_filter("PDF", &["pdf"])
-            .set_file_name(file_name)
-            .save_file()
+        let Some(destination) = self.pick_save_path("Save OCR PDF", file_name, "PDF", &["pdf"])
         else {
             return;
         };
@@ -1675,6 +1719,13 @@ impl PdfEditorApp {
         let mut current_ocr_text_changed = false;
 
         while let Ok(event) = self.ocr_rx.try_recv() {
+            let mut error_notice = match &event.state {
+                OcrPageState::Failed(error) => Some(format!(
+                    "OCR failed on page {}: {error}",
+                    event.page_index + 1
+                )),
+                _ => None,
+            };
             if let Some(status) = event.status.as_ref() {
                 self.status = status.clone();
             }
@@ -1686,7 +1737,9 @@ impl PdfEditorApp {
                     current_ocr_text_changed |= was_done;
                     if was_done {
                         if let Some(document) = self.document.as_ref() {
-                            let _ = save_ocr_cache(&document.path, &self.ocr_states);
+                            if let Err(error) = save_ocr_cache(&document.path, &self.ocr_states) {
+                                error_notice = Some(format!("Could not save OCR cache: {error}"));
+                            }
                         }
                         if self.chat_state.messages.is_empty() {
                             self.chat_state.document_context = None;
@@ -1702,7 +1755,9 @@ impl PdfEditorApp {
                     let was_done = matches!(event.state, OcrPageState::Done(_));
                     *state = event.state;
                     if was_done {
-                        let _ = save_ocr_cache(&tab.document.path, &tab.ocr_states);
+                        if let Err(error) = save_ocr_cache(&tab.document.path, &tab.ocr_states) {
+                            error_notice = Some(format!("Could not save OCR cache: {error}"));
+                        }
                         if tab.chat_state.messages.is_empty() {
                             tab.chat_state.document_context = None;
                             tab.chat_state.context_estimated_tokens = None;
@@ -1710,6 +1765,9 @@ impl PdfEditorApp {
                         }
                     }
                 }
+            }
+            if let Some(error) = error_notice {
+                self.push_error_notice(error);
             }
         }
 
@@ -1814,6 +1872,7 @@ impl PdfEditorApp {
 
     fn poll_chat_results(&mut self, ctx: &Context) {
         while let Ok(event) = self.chat_rx.try_recv() {
+            let mut error_notice = None;
             if self.is_current_document(event.document_epoch, &event.path) {
                 self.chat_state.in_flight = false;
                 match event.result {
@@ -1825,11 +1884,12 @@ impl PdfEditorApp {
                         self.status = "Chat response ready.".to_owned();
                     }
                     Err(error) => {
+                        let message = format!("Chat failed: {error}");
                         self.chat_state.messages.push(ChatMessage {
                             role: ChatRole::Assistant,
-                            content: format!("Chat failed: {error}"),
+                            content: message.clone(),
                         });
-                        self.status = error;
+                        error_notice = Some(message);
                     }
                 }
                 ctx.request_repaint();
@@ -1846,13 +1906,18 @@ impl PdfEditorApp {
                         tab.status = "Chat response ready.".to_owned();
                     }
                     Err(error) => {
+                        let message = format!("Chat failed: {error}");
                         tab.chat_state.messages.push(ChatMessage {
                             role: ChatRole::Assistant,
-                            content: format!("Chat failed: {error}"),
+                            content: message.clone(),
                         });
                         tab.status = error;
+                        error_notice = Some(message);
                     }
                 }
+            }
+            if let Some(error) = error_notice {
+                self.push_error_notice(error);
             }
         }
     }
@@ -1943,7 +2008,7 @@ impl PdfEditorApp {
                             ctx.request_repaint();
                         }
                         Err(error) => {
-                            self.status = error;
+                            self.push_error_notice(error);
                             self.page_textures.remove(&key.page_index);
                         }
                     }
@@ -1980,7 +2045,7 @@ impl PdfEditorApp {
                             ctx.request_repaint();
                         }
                         Err(error) => {
-                            self.status = error;
+                            self.push_error_notice(error);
                         }
                     }
                 }
@@ -2005,7 +2070,7 @@ impl PdfEditorApp {
                             }
                         }
                         Err(error) => {
-                            self.status = error;
+                            self.push_error_notice(error);
                             if let Some(document) = self.document.as_mut() {
                                 if let Some(slot) = document.text_chars.get_mut(page_index) {
                                     *slot = Some(Vec::new());
@@ -2049,7 +2114,7 @@ impl PdfEditorApp {
                             ctx.request_repaint();
                         }
                         Err(error) => {
-                            self.status = error;
+                            self.push_error_notice(error);
                             if let Some(document) = self.document.as_mut() {
                                 if let Some(slot) = document.native_text_loaded.get_mut(page_index)
                                 {
@@ -2096,7 +2161,7 @@ impl PdfEditorApp {
                         }
                         Err(error) => {
                             if !newer_pending {
-                                self.status = format!("Could not save comments: {error}");
+                                self.push_error_notice(format!("Could not save comments: {error}"));
                             }
                         }
                     }
@@ -2162,7 +2227,7 @@ impl PdfEditorApp {
                 self.pending_page_renders.remove(&0);
             }
             Err(error) => {
-                self.status = error;
+                self.push_error_notice(error);
             }
         }
     }
@@ -2448,6 +2513,7 @@ impl PdfEditorApp {
 
     fn poll_liquid_results(&mut self, ctx: &Context) {
         while let Ok(event) = self.liquid_rx.try_recv() {
+            let mut error_notice = None;
             let next_state = match event.result {
                 Ok(document) => {
                     let status = if let Some(warning) = document
@@ -2469,7 +2535,10 @@ impl PdfEditorApp {
                     };
                     (LiquidState::Ready(document), status)
                 }
-                Err(error) => (LiquidState::Failed(error.clone()), error),
+                Err(error) => {
+                    error_notice = Some(format!("Review Mode failed: {error}"));
+                    (LiquidState::Failed(error.clone()), error)
+                }
             };
 
             if self.is_current_document(event.document_epoch, &event.path) {
@@ -2483,6 +2552,9 @@ impl PdfEditorApp {
                 tab.liquid_state = next_state.0;
                 tab.liquid_notice_dismissed = false;
                 tab.status = next_state.1;
+            }
+            if let Some(error) = error_notice {
+                self.push_error_notice(error);
             }
         }
     }
@@ -2550,6 +2622,7 @@ impl PdfEditorApp {
         while let Ok(event) = self.liquid_mode2_rx.try_recv() {
             let complete = event.complete;
             let preview_page_count = event.preview_page_count;
+            let mut error_notice = None;
             let next_state = match event.result {
                 Ok(document) => {
                     let status = if complete {
@@ -2576,7 +2649,10 @@ impl PdfEditorApp {
                     };
                     (LiquidState::Ready(document), status)
                 }
-                Err(error) => (LiquidState::Failed(error.clone()), error),
+                Err(error) => {
+                    error_notice = Some(format!("Review Mode failed: {error}"));
+                    (LiquidState::Failed(error.clone()), error)
+                }
             };
 
             if self.is_current_document(event.document_epoch, &event.path) {
@@ -2588,6 +2664,9 @@ impl PdfEditorApp {
             }) {
                 tab.liquid_mode2_state = next_state.0;
                 tab.status = next_state.1;
+            }
+            if let Some(error) = error_notice {
+                self.push_error_notice(error);
             }
         }
     }
@@ -4405,6 +4484,106 @@ impl PdfEditorApp {
             });
     }
 
+    fn push_notice(&mut self, message: impl Into<String>, severity: NoticeSeverity) {
+        enqueue_notice(&mut self.notices, Notice::new(message, severity));
+    }
+
+    fn push_error_notice(&mut self, message: impl Into<String>) {
+        self.push_notice(message, NoticeSeverity::Error);
+    }
+
+    fn push_info_notice(&mut self, message: impl Into<String>) {
+        self.push_notice(message, NoticeSeverity::Info);
+    }
+
+    fn draw_notices(&mut self, ctx: &Context) {
+        let now = Instant::now();
+        prune_notices_at(&mut self.notices, now);
+        if self.notices.is_empty() {
+            return;
+        }
+
+        let reduce_motion = self.settings.reduce_motion;
+        let notices = self.notices.iter().cloned().collect::<Vec<_>>();
+        let mut dismiss = None;
+        let mut animating = false;
+        egui::Area::new(egui::Id::new("general_notices"))
+            .order(egui::Order::Foreground)
+            .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-24.0, -56.0))
+            .show(ctx, |ui| {
+                ui.vertical(|ui| {
+                    for (index, notice) in notices.iter().enumerate().rev() {
+                        let age = now.saturating_duration_since(notice.created_at);
+                        let visibility = if reduce_motion {
+                            1.0
+                        } else {
+                            let visibility = (age.as_secs_f32() / 0.18).clamp(0.0, 1.0);
+                            animating |= visibility < 1.0;
+                            visibility
+                        };
+                        let alpha = (246.0 * visibility) as u8;
+                        let accent = match notice.severity {
+                            NoticeSeverity::Info => Color32::from_rgb(55, 104, 137),
+                            NoticeSeverity::Error => Color32::from_rgb(164, 54, 54),
+                        };
+                        egui::Frame::NONE
+                            .fill(Color32::from_rgba_unmultiplied(255, 254, 250, alpha))
+                            .stroke(Stroke::new(
+                                1.0,
+                                Color32::from_rgba_unmultiplied(
+                                    accent.r(),
+                                    accent.g(),
+                                    accent.b(),
+                                    alpha,
+                                ),
+                            ))
+                            .corner_radius(8)
+                            .inner_margin(Margin::symmetric(14, 10))
+                            .show(ui, |ui| {
+                                ui.set_width(360.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(match notice.severity {
+                                            NoticeSeverity::Info => "i",
+                                            NoticeSeverity::Error => "!",
+                                        })
+                                        .strong()
+                                        .color(accent),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&notice.message).color(INK).size(13.5),
+                                        )
+                                        .wrap(),
+                                    );
+                                    if ui
+                                        .small_button(RichText::new("x").color(MUTED_INK))
+                                        .on_hover_text("Dismiss")
+                                        .clicked()
+                                    {
+                                        dismiss = Some(index);
+                                    }
+                                });
+                            });
+                        ui.add_space(6.0);
+                    }
+                });
+            });
+
+        if let Some(index) = dismiss {
+            self.notices.remove(index);
+        }
+        if animating {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        } else if self
+            .notices
+            .iter()
+            .any(|notice| notice.severity == NoticeSeverity::Info)
+        {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+    }
+
     fn draw_update_notice(&mut self, ctx: &Context) {
         let Some(notice) = self.update_notice.as_ref() else {
             return;
@@ -5536,7 +5715,7 @@ impl PdfEditorApp {
         {
             let tmp = std::env::temp_dir().join("lawpdf-tts.txt");
             if let Err(error) = std::fs::write(&tmp, &text) {
-                self.status = format!("Could not prepare speech: {error}");
+                self.push_error_notice(format!("Could not prepare speech: {error}"));
                 return;
             }
             match std::process::Command::new("say")
@@ -5549,7 +5728,7 @@ impl PdfEditorApp {
                     self.status = "Reading aloud…".to_owned();
                 }
                 Err(error) => {
-                    self.status = format!("Text-to-speech unavailable: {error}");
+                    self.push_error_notice(format!("Text-to-speech unavailable: {error}"));
                 }
             }
         }
@@ -5594,10 +5773,8 @@ impl PdfEditorApp {
             .as_ref()
             .map(|source| default_output_name(&source.path, "review-mode", "mp3"))
             .unwrap_or_else(|| "review-mode.mp3".to_owned());
-        let Some(destination) = FileDialog::new()
-            .add_filter("MP3 audio", &["mp3"])
-            .set_file_name(file_name)
-            .save_file()
+        let Some(destination) =
+            self.pick_save_path("Save narration", &file_name, "MP3 audio", &["mp3"])
         else {
             return;
         };
@@ -5625,10 +5802,11 @@ impl PdfEditorApp {
                 PaidTtsEvent::Complete(path) => {
                     self.paid_tts_progress = None;
                     self.status = format!("Created {}", path.display());
+                    self.push_info_notice(format!("Created {}", path.display()));
                 }
                 PaidTtsEvent::Failed(error) => {
                     self.paid_tts_progress = None;
-                    self.status = error;
+                    self.push_error_notice(error);
                 }
             }
             ctx.request_repaint();
@@ -8941,6 +9119,7 @@ impl eframe::App for PdfEditorApp {
         self.draw_settings_window(ctx);
         self.draw_unsaved_close_prompt(ctx);
         self.draw_update_notice(ctx);
+        self.draw_notices(ctx);
 
         if self.zoom_is_animating()
             || !self.pending_page_renders.is_empty()
@@ -10508,6 +10687,57 @@ fn tab_title(document: &LoadedDocument) -> String {
 #[cfg(test)]
 mod app_tests {
     use super::*;
+
+    #[test]
+    fn notice_queue_keeps_only_the_newest_five_items() {
+        let mut notices = VecDeque::new();
+        for index in 0..7 {
+            enqueue_notice(
+                &mut notices,
+                Notice::new(format!("notice-{index}"), NoticeSeverity::Info),
+            );
+        }
+        assert_eq!(notices.len(), NOTICE_CAPACITY);
+        assert_eq!(
+            notices.front().map(|notice| notice.message.as_str()),
+            Some("notice-2")
+        );
+        assert_eq!(
+            notices.back().map(|notice| notice.message.as_str()),
+            Some("notice-6")
+        );
+    }
+
+    #[test]
+    fn notice_expiry_removes_old_info_but_keeps_errors() {
+        let now = Instant::now();
+        let old = now - INFO_NOTICE_DURATION - Duration::from_millis(1);
+        let mut notices = VecDeque::from([
+            Notice {
+                message: "old info".to_owned(),
+                severity: NoticeSeverity::Info,
+                created_at: old,
+            },
+            Notice {
+                message: "old error".to_owned(),
+                severity: NoticeSeverity::Error,
+                created_at: old,
+            },
+            Notice {
+                message: "new info".to_owned(),
+                severity: NoticeSeverity::Info,
+                created_at: now,
+            },
+        ]);
+        prune_notices_at(&mut notices, now);
+        assert_eq!(
+            notices
+                .iter()
+                .map(|notice| notice.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old error", "new info"]
+        );
+    }
 
     fn key_press_input(key: egui::Key, modifiers: egui::Modifiers) -> egui::InputState {
         let mut input = egui::InputState::default();
