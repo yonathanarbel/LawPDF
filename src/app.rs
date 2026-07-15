@@ -748,10 +748,7 @@ impl PdfEditorApp {
         let (chat_tx, chat_rx) = unbounded();
         let (update_tx, update_rx) = unbounded();
         let (paid_tts_tx, paid_tts_rx) = unbounded();
-        let updates_enabled = updater::updates_enabled();
-        if updates_enabled {
-            updater::spawn_update_check(update_tx.clone());
-        }
+        updater::spawn_update_check(update_tx.clone());
         let update_installed = updater::take_installed_update().is_some();
         let update_notice = update_installed
             .then(|| UpdateNotice::new("Update installed", UpdateNoticeKind::Success));
@@ -789,7 +786,7 @@ impl PdfEditorApp {
             update_tx,
             update_rx,
             update_state: UpdateUiState::Idle,
-            update_check_in_flight: updates_enabled,
+            update_check_in_flight: true,
             update_notice,
             next_update_check: None,
             zoom: initial_zoom,
@@ -1289,8 +1286,7 @@ impl PdfEditorApp {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
 
-        if updater::updates_enabled()
-            && !self.update_check_in_flight
+        if !self.update_check_in_flight
             && !self.update_state.is_busy()
             && !self.update_state.has_ready_update()
             && self
