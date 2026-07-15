@@ -2557,10 +2557,21 @@ impl PdfEditorApp {
             let next_state = match event.result {
                 Ok(document) => {
                     let status = if complete {
-                        format!(
-                            "Review Mode ready; {} noise line(s) removed.",
-                            document.noise_lines_removed
-                        )
+                        document
+                            .warnings
+                            .iter()
+                            .find(|warning| {
+                                warning.contains("Promoted native CatBoost runtime failed")
+                                    || warning
+                                        .contains("Promoted context two-pass model failed")
+                            })
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "Review Mode ready; {} noise line(s) removed.",
+                                    document.noise_lines_removed
+                                )
+                            })
                     } else {
                         format!(
                             "First {} page(s) ready; finishing the full Liquid document in the background...",

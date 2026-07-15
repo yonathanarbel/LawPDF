@@ -10,6 +10,7 @@ use crossbeam_channel::Sender;
 use libloading::Library;
 use serde::{Deserialize, Serialize};
 
+use crate::hashing::sha256_hex_of_file;
 use crate::layout_roles::{CALLOUT_END, CALLOUT_START};
 use crate::liquid::{
     DeepLiquidSourceLine, DocumentProfileKind, DocumentProfileScore, LiquidBlock, LiquidBlockRole,
@@ -3229,40 +3230,44 @@ fn model_is_usable(model: &Lm2Model) -> bool {
 }
 
 fn load_lm2_model() -> Result<Lm2Model, String> {
-    let path = lm2_model_candidates()
-        .into_iter()
+    let candidates = lm2_model_candidates();
+    let path = candidates
+        .iter()
         .find(|path| path.is_file())
-        .ok_or_else(|| "No LM2 model found.".to_owned())?;
+        .cloned()
+        .ok_or_else(|| missing_model_error("legacy LM2 model", &candidates))?;
     let bytes =
         std::fs::read(&path).map_err(|error| format!("Could not read LM2 model: {error}"))?;
     serde_json::from_slice(&bytes).map_err(|error| format!("Could not decode LM2 model: {error}"))
 }
 
 fn load_lm2_native_catboost_model() -> Result<Option<Lm2NativeCatboostModel>, String> {
-    let model_path = std::env::var_os("LAWPDF_LM2_NATIVE_CATBOOST_MODEL")
-        .map(PathBuf::from)
-        .or_else(|| {
-            lm2_native_catboost_runtime_asset_candidates(LM2_NATIVE_CATBOOST_MODEL_FILE)
-                .into_iter()
-                .find(|path| path.is_file())
-        });
-    let Some(model_path) = model_path else {
-        return Ok(None);
-    };
-    let lib_path = std::env::var_os("LAWPDF_LM2_NATIVE_CATBOOST_LIB")
-        .map(PathBuf::from)
-        .or_else(|| {
-            lm2_native_catboost_runtime_asset_candidates(lm2_native_catboost_library_file())
-                .into_iter()
-                .find(|path| path.is_file())
-        })
-        .ok_or_else(|| {
-            format!(
-                "Native CatBoost model {} requires {} or LAWPDF_LM2_NATIVE_CATBOOST_LIB",
-                model_path.display(),
-                lm2_native_catboost_library_file()
-            )
-        })?;
+    let mut model_candidates = Vec::new();
+    if let Some(path) = std::env::var_os("LAWPDF_LM2_NATIVE_CATBOOST_MODEL").map(PathBuf::from) {
+        model_candidates.push(path);
+    }
+    model_candidates.extend(lm2_native_catboost_runtime_asset_candidates(
+        LM2_NATIVE_CATBOOST_MODEL_FILE,
+    ));
+    let model_path = model_candidates
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .ok_or_else(|| missing_model_error("LM2 native CatBoost model", &model_candidates))?;
+    verify_model_asset_hash(&model_path, "native_model")?;
+
+    let mut library_candidates = Vec::new();
+    if let Some(path) = std::env::var_os("LAWPDF_LM2_NATIVE_CATBOOST_LIB").map(PathBuf::from) {
+        library_candidates.push(path);
+    }
+    library_candidates.extend(lm2_native_catboost_runtime_asset_candidates(
+        lm2_native_catboost_library_file(),
+    ));
+    let lib_path = library_candidates
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .ok_or_else(|| missing_model_error("LM2 native CatBoost library", &library_candidates))?;
     let library = unsafe { Library::new(&lib_path) }
         .map_err(|error| format!("Could not load native CatBoost library: {error}"))?;
     let (
@@ -3619,48 +3624,11 @@ fn guarded_pp_prior_action(
 }
 
 fn lm2_model_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(dir) = std::env::var_os("LAWPDF_LM2_MODEL_DIR").map(PathBuf::from) {
-        candidates.push(dir.join("lm2-model.json"));
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("profile-models/lm2-current/lm2-model.json"));
-    }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(exe_dir) = exe.parent()
-    {
-        candidates.push(exe_dir.join("profile-models/lm2-current/lm2-model.json"));
-        candidates.push(exe_dir.join("../Resources/profile-models/lm2-current/lm2-model.json"));
-        candidates.push(exe_dir.join("../../profile-models/lm2-current/lm2-model.json"));
-    }
-    candidates
+    lm2_runtime_asset_candidates("profile-models/lm2-current", "lm2-model.json")
 }
 
 fn lm2_v20_runtime_asset_candidates(file_name: &str) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("profile-models/lm2-v20-runtime").join(file_name));
-    }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(exe_dir) = exe.parent()
-    {
-        candidates.push(
-            exe_dir
-                .join("profile-models/lm2-v20-runtime")
-                .join(file_name),
-        );
-        candidates.push(
-            exe_dir
-                .join("../Resources/profile-models/lm2-v20-runtime")
-                .join(file_name),
-        );
-        candidates.push(
-            exe_dir
-                .join("../../profile-models/lm2-v20-runtime")
-                .join(file_name),
-        );
-    }
-    candidates
+    lm2_runtime_asset_candidates("profile-models/lm2-v20-runtime", file_name)
 }
 
 fn lm2_native_catboost_library_file() -> &'static str {
@@ -3701,9 +3669,12 @@ fn lm2_context_twopass_enabled() -> bool {
 
 fn load_lm2_context_twopass_model() -> Result<Option<Lm2ContextTwopassModel>, String> {
     let candidates = lm2_context_twopass_runtime_asset_candidates(LM2_CONTEXT_TWOPASS_MODEL_FILE);
-    let Some(path) = candidates.into_iter().find(|path| path.is_file()) else {
-        return Ok(None);
-    };
+    let path = candidates
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .ok_or_else(|| missing_model_error("LM2 context two-pass model", &candidates))?;
+    verify_model_asset_hash(&path, "context_model")?;
     let input: Lm2ContextTwopassModelFile = read_json_file(&path)?;
     if input.feature_count != 66 {
         return Err(format!(
@@ -3736,66 +3707,118 @@ fn lm2_context_twopass_runtime_asset_candidates(file_name: &str) -> Vec<PathBuf>
     if let Some(path) = std::env::var_os("LAWPDF_LM2_CONTEXT_TWOPASS_MODEL").map(PathBuf::from) {
         candidates.push(path);
     }
-    if let Some(dir) = std::env::var_os("LAWPDF_LM2_CONTEXT_TWOPASS_DIR").map(PathBuf::from) {
-        candidates.push(dir.join(file_name));
+    candidates.extend(lm2_runtime_asset_candidates(
+        LM2_CONTEXT_TWOPASS_RUNTIME_DIR,
+        file_name,
+    ));
+    candidates
+}
+
+fn lm2_native_catboost_runtime_asset_candidates(file_name: &str) -> Vec<PathBuf> {
+    lm2_runtime_asset_candidates(
+        LM2_NATIVE_CATBOOST_RUNTIME_DIR,
+        file_name,
+    )
+}
+
+fn lm2_runtime_asset_candidates(runtime_dir: &str, file_name: &str) -> Vec<PathBuf> {
+    let model_dir = std::env::var_os("LAWPDF_MODEL_DIR").map(PathBuf::from);
+    let exe_path = std::env::current_exe().ok();
+    lm2_runtime_asset_candidates_for(
+        model_dir.as_deref(),
+        exe_path.as_deref(),
+        runtime_dir,
+        file_name,
+    )
+}
+
+fn lm2_runtime_asset_candidates_for(
+    model_dir: Option<&Path>,
+    exe_path: Option<&Path>,
+    runtime_dir: &str,
+    file_name: &str,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(model_dir) = model_dir {
+        let relative_runtime_dir = runtime_dir
+            .strip_prefix("profile-models/")
+            .unwrap_or(runtime_dir);
+        candidates.push(model_dir.join(relative_runtime_dir).join(file_name));
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join(LM2_CONTEXT_TWOPASS_RUNTIME_DIR).join(file_name));
-    }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(exe_dir) = exe.parent()
-    {
+    if let Some(exe_dir) = exe_path.and_then(Path::parent) {
+        candidates.push(exe_dir.join(runtime_dir).join(file_name));
         candidates.push(
             exe_dir
-                .join(LM2_CONTEXT_TWOPASS_RUNTIME_DIR)
-                .join(file_name),
-        );
-        candidates.push(
-            exe_dir
-                .join("../Resources")
-                .join(LM2_CONTEXT_TWOPASS_RUNTIME_DIR)
-                .join(file_name),
-        );
-        candidates.push(
-            exe_dir
-                .join("../../")
-                .join(LM2_CONTEXT_TWOPASS_RUNTIME_DIR)
+                .join("..")
+                .join("Resources")
+                .join(runtime_dir)
                 .join(file_name),
         );
     }
     candidates
 }
 
-fn lm2_native_catboost_runtime_asset_candidates(file_name: &str) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(dir) = std::env::var_os("LAWPDF_LM2_NATIVE_CATBOOST_DIR").map(PathBuf::from) {
-        candidates.push(dir.join(file_name));
+fn missing_model_error(label: &str, candidates: &[PathBuf]) -> String {
+    let probed = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("Missing {label}; probed: {probed}")
+}
+
+#[derive(Debug, Deserialize)]
+struct Lm2ReleaseManifest {
+    runtime_assets: Lm2ReleaseRuntimeAssets,
+}
+
+#[derive(Debug, Deserialize)]
+struct Lm2ReleaseRuntimeAssets {
+    native_model: Lm2ReleaseAsset,
+    context_model: Lm2ReleaseAsset,
+}
+
+#[derive(Debug, Deserialize)]
+struct Lm2ReleaseAsset {
+    sha256: String,
+}
+
+fn verify_model_asset_hash(path: &Path, asset_name: &str) -> Result<(), String> {
+    let Some(manifest_path) = path
+        .parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .take(3)
+        .map(|directory| directory.join("release-manifest.json"))
+        .find(|candidate| candidate.is_file())
+    else {
+        return Ok(());
+    };
+    let bytes = std::fs::read(&manifest_path).map_err(|error| {
+        format!(
+            "Could not read LM2 release manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: Lm2ReleaseManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "Could not decode LM2 release manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let expected = match asset_name {
+        "native_model" => &manifest.runtime_assets.native_model.sha256,
+        "context_model" => &manifest.runtime_assets.context_model.sha256,
+        _ => return Err(format!("Unknown LM2 release-manifest asset: {asset_name}")),
+    };
+    let actual = sha256_hex_of_file(path)?;
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(format!(
+            "LM2 {asset_name} checksum mismatch for {}; expected {expected}, found {actual}",
+            path.display()
+        ));
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join(LM2_NATIVE_CATBOOST_RUNTIME_DIR).join(file_name));
-    }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(exe_dir) = exe.parent()
-    {
-        candidates.push(
-            exe_dir
-                .join(LM2_NATIVE_CATBOOST_RUNTIME_DIR)
-                .join(file_name),
-        );
-        candidates.push(
-            exe_dir
-                .join("../Resources")
-                .join(LM2_NATIVE_CATBOOST_RUNTIME_DIR)
-                .join(file_name),
-        );
-        candidates.push(
-            exe_dir
-                .join("../../")
-                .join(LM2_NATIVE_CATBOOST_RUNTIME_DIR)
-                .join(file_name),
-        );
-    }
-    candidates
+    Ok(())
 }
 
 fn decode_pages(
@@ -11109,6 +11132,34 @@ fn count_hyphen_artifacts(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lm2_runtime_asset_candidates_follow_stable_order() {
+        let model_dir = Path::new("C:/lawpdf-models");
+        let exe_path = Path::new("C:/Program Files/LawPDF/lawpdf.exe");
+        let candidates = lm2_runtime_asset_candidates_for(
+            Some(model_dir),
+            Some(exe_path),
+            LM2_NATIVE_CATBOOST_RUNTIME_DIR,
+            LM2_NATIVE_CATBOOST_MODEL_FILE,
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                model_dir
+                    .join("lm2-native-catboost-runtime")
+                    .join(LM2_NATIVE_CATBOOST_MODEL_FILE),
+                Path::new("C:/Program Files/LawPDF")
+                    .join(LM2_NATIVE_CATBOOST_RUNTIME_DIR)
+                    .join(LM2_NATIVE_CATBOOST_MODEL_FILE),
+                Path::new("C:/Program Files/LawPDF")
+                    .join("..")
+                    .join("Resources")
+                    .join(LM2_NATIVE_CATBOOST_RUNTIME_DIR)
+                    .join(LM2_NATIVE_CATBOOST_MODEL_FILE),
+            ]
+        );
+    }
 
     fn lm2_test_source_line(
         id: &str,

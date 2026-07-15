@@ -48,6 +48,7 @@ Copy-Item -LiteralPath (Join-Path $repoRoot "vendor\fonts\EBGaramond.ttf") -Dest
 Copy-Item -LiteralPath (Join-Path $repoRoot "LICENSE") -Destination (Join-Path $portableDir "LICENSE") -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot "THIRD_PARTY_NOTICES.md") -Destination (Join-Path $portableDir "THIRD_PARTY_NOTICES.md") -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot "THIRD_PARTY_RUST_LICENSES.csv") -Destination (Join-Path $portableDir "THIRD_PARTY_RUST_LICENSES.csv") -Force
+Copy-Item -LiteralPath (Join-Path $repoRoot "release-manifest.json") -Destination (Join-Path $portableDir "release-manifest.json") -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot "third_party") -Destination (Join-Path $portableDir "third_party") -Recurse -Force
 
 $nativeRuntimeDest = Join-Path $portableDir "profile-models\lm2-native-catboost-runtime"

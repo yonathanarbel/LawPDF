@@ -3,6 +3,7 @@
 mod app;
 mod benchmark;
 mod chat;
+mod hashing;
 mod layout_roles;
 mod liquid;
 mod liquid2;

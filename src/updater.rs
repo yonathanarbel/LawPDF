@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
+use crate::hashing::sha256_hex_of_file;
 use crate::settings::app_data_dir;
 
 const GITHUB_LATEST_RELEASE_URL: &str =
@@ -304,27 +304,6 @@ fn parse_sha256sums(text: &str) -> Vec<(String, String)> {
             (!hash.is_empty() && !name.is_empty()).then(|| (hash.to_owned(), name.to_owned()))
         })
         .collect()
-}
-
-pub(crate) fn sha256_hex_of_file(path: &Path) -> Result<String, String> {
-    let mut file = std::fs::File::open(path).map_err(|error| {
-        format!(
-            "Could not open {} for verification: {error}",
-            path.display()
-        )
-    })?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| format!("Could not verify {}: {error}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn verify_pending_update(pending: &PendingUpdate) -> Result<(), String> {
