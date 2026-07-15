@@ -1,17 +1,20 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+#[cfg(feature = "devtools")]
 mod benchmark;
 mod chat;
 mod hashing;
 mod layout_roles;
 mod liquid;
 mod liquid2;
+#[cfg(feature = "devtools")]
 mod liquid_smoke;
 mod liquidvision;
 mod model;
 mod ocr;
 mod pdf_backend;
+#[cfg(feature = "devtools")]
 mod profile_dataset;
 mod render_worker;
 mod settings;
@@ -30,14 +33,6 @@ const APP_TITLE: &str = "LawPDF - Y. Arbel design (2026)";
 fn main() -> eframe::Result<()> {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
 
-    if args.iter().any(|arg| arg == "--smoke-open-default") {
-        smoke_open_default();
-        return Ok(());
-    }
-    if args.iter().any(|arg| arg == "--smoke-render-worker") {
-        smoke_render_worker();
-        return Ok(());
-    }
     if args.iter().any(|arg| arg == "--lm2-runtime-status") {
         if let Err(error) = liquid2::run_lm2_runtime_status(args.clone().into_iter()) {
             eprintln!("LiquidMode2 runtime verification failed: {error}");
@@ -45,79 +40,10 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
-    if args.iter().any(|arg| arg == "--bench-scroll") {
-        if let Err(error) = benchmark::run_scroll_benchmark(args.clone().into_iter()) {
-            eprintln!("Benchmark failed: {error:#}");
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-    if args.iter().any(|arg| arg == "--smoke-liquid") {
-        if let Err(error) = liquid_smoke::run_liquid_smoke(args.clone().into_iter()) {
-            eprintln!("Liquid smoke failed: {error:#}");
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-    if args.iter().any(|arg| arg == "--smoke-liquid2") {
-        if let Err(error) = liquid_smoke::run_liquid_smoke(args.clone().into_iter()) {
-            eprintln!("LiquidMode2 smoke failed: {error:#}");
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-    if args.iter().any(|arg| arg == "--lm2-assemble-markdown") {
-        if let Err(error) = liquid_smoke::run_lm2_assemble_markdown(args.clone().into_iter()) {
-            eprintln!("LiquidMode2 Markdown export failed: {error:#}");
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-    if args.iter().any(|arg| arg == "--lm2-timing-baseline") {
-        if let Err(error) = liquid_smoke::run_lm2_timing_baseline(args.clone().into_iter()) {
-            eprintln!("LiquidMode2 timing baseline failed: {error:#}");
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-    if args.iter().any(|arg| arg == "--lm2-eval") {
-        if let Err(error) = liquid2::run_lm2_eval(args.clone().into_iter()) {
-            eprintln!("LiquidMode2 eval failed: {error}");
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-    if args.iter().any(|arg| arg == "--dump-lm2-features") {
-        if let Err(error) = liquid2::run_lm2_feature_dump(args.clone().into_iter()) {
-            eprintln!("LiquidMode2 feature dump failed: {error}");
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-    if args.iter().any(|arg| arg == "--dump-lm2-decoder-lattice") {
-        if let Err(error) = liquid2::run_lm2_decoder_lattice_dump(args.clone().into_iter()) {
-            eprintln!("LiquidMode2 decoder lattice dump failed: {error}");
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-    if args.iter().any(|arg| arg == "--lm2-draft") {
-        if let Err(error) = liquid2::run_lm2_draft(args.clone().into_iter()) {
-            eprintln!("LiquidMode2 draft failed: {error}");
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-    if args.iter().any(|arg| arg == "--lm2-source-smoke") {
-        if let Err(error) = liquid2::run_lm2_source_smoke(args.clone().into_iter()) {
-            eprintln!("LiquidMode2 source smoke failed: {error}");
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-    if args.iter().any(|arg| arg == "--profile-dataset") {
-        if let Err(error) = profile_dataset::run_profile_dataset(args.clone().into_iter()) {
-            eprintln!("Profile dataset failed: {error:#}");
+    #[cfg(feature = "devtools")]
+    if let Some(result) = dispatch_dev_command(&args) {
+        if let Err(error) = result {
+            eprintln!("{error}");
             std::process::exit(1);
         }
         return Ok(());
@@ -186,6 +112,96 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+#[cfg(feature = "devtools")]
+type DevCommandHandler = fn(Vec<OsString>) -> Result<(), String>;
+
+#[cfg(feature = "devtools")]
+const DEV_COMMANDS: &[(&str, DevCommandHandler)] = &[
+    ("--smoke-open-default", dev_smoke_open_default),
+    ("--smoke-render-worker", dev_smoke_render_worker),
+    ("--bench-scroll", dev_bench_scroll),
+    ("--smoke-liquid", dev_smoke_liquid),
+    ("--smoke-liquid2", dev_smoke_liquid),
+    ("--lm2-assemble-markdown", dev_lm2_assemble_markdown),
+    ("--lm2-timing-baseline", dev_lm2_timing_baseline),
+    ("--lm2-eval", dev_lm2_eval),
+    ("--dump-lm2-features", dev_lm2_feature_dump),
+    ("--dump-lm2-decoder-lattice", dev_lm2_decoder_lattice_dump),
+    ("--lm2-draft", dev_lm2_draft),
+    ("--lm2-source-smoke", dev_lm2_source_smoke),
+    ("--profile-dataset", dev_profile_dataset),
+];
+
+#[cfg(feature = "devtools")]
+fn dispatch_dev_command(args: &[OsString]) -> Option<Result<(), String>> {
+    let (flag, handler) = DEV_COMMANDS
+        .iter()
+        .find(|(flag, _)| args.iter().any(|arg| arg == flag))?;
+    Some(handler(args.to_vec()).map_err(|error| format!("{flag} failed: {error}")))
+}
+
+#[cfg(feature = "devtools")]
+fn dev_smoke_open_default(_args: Vec<OsString>) -> Result<(), String> {
+    smoke_open_default();
+    Ok(())
+}
+
+#[cfg(feature = "devtools")]
+fn dev_smoke_render_worker(_args: Vec<OsString>) -> Result<(), String> {
+    smoke_render_worker();
+    Ok(())
+}
+
+#[cfg(feature = "devtools")]
+fn dev_bench_scroll(args: Vec<OsString>) -> Result<(), String> {
+    benchmark::run_scroll_benchmark(args.into_iter()).map_err(|error| format!("{error:#}"))
+}
+
+#[cfg(feature = "devtools")]
+fn dev_smoke_liquid(args: Vec<OsString>) -> Result<(), String> {
+    liquid_smoke::run_liquid_smoke(args.into_iter()).map_err(|error| format!("{error:#}"))
+}
+
+#[cfg(feature = "devtools")]
+fn dev_lm2_assemble_markdown(args: Vec<OsString>) -> Result<(), String> {
+    liquid_smoke::run_lm2_assemble_markdown(args.into_iter()).map_err(|error| format!("{error:#}"))
+}
+
+#[cfg(feature = "devtools")]
+fn dev_lm2_timing_baseline(args: Vec<OsString>) -> Result<(), String> {
+    liquid_smoke::run_lm2_timing_baseline(args.into_iter()).map_err(|error| format!("{error:#}"))
+}
+
+#[cfg(feature = "devtools")]
+fn dev_lm2_eval(args: Vec<OsString>) -> Result<(), String> {
+    liquid2::run_lm2_eval(args.into_iter())
+}
+
+#[cfg(feature = "devtools")]
+fn dev_lm2_feature_dump(args: Vec<OsString>) -> Result<(), String> {
+    liquid2::run_lm2_feature_dump(args.into_iter())
+}
+
+#[cfg(feature = "devtools")]
+fn dev_lm2_decoder_lattice_dump(args: Vec<OsString>) -> Result<(), String> {
+    liquid2::run_lm2_decoder_lattice_dump(args.into_iter())
+}
+
+#[cfg(feature = "devtools")]
+fn dev_lm2_draft(args: Vec<OsString>) -> Result<(), String> {
+    liquid2::run_lm2_draft(args.into_iter())
+}
+
+#[cfg(feature = "devtools")]
+fn dev_lm2_source_smoke(args: Vec<OsString>) -> Result<(), String> {
+    liquid2::run_lm2_source_smoke(args.into_iter())
+}
+
+#[cfg(feature = "devtools")]
+fn dev_profile_dataset(args: Vec<OsString>) -> Result<(), String> {
+    profile_dataset::run_profile_dataset(args.into_iter()).map_err(|error| format!("{error:#}"))
+}
+
 fn convert_sources_from_args(args: &[OsString]) -> Option<Vec<PathBuf>> {
     let mut saw_flag = false;
     let mut paths = Vec::new();
@@ -216,6 +232,7 @@ fn load_app_icon() -> egui::IconData {
         .expect("bundled LawPDF icon should be a valid PNG")
 }
 
+#[cfg(feature = "devtools")]
 fn smoke_open_default() {
     match pdf_backend::PdfEngine::new().and_then(|engine| {
         let path = smoke_pdf_path()?;
@@ -239,6 +256,7 @@ fn smoke_open_default() {
     }
 }
 
+#[cfg(feature = "devtools")]
 fn smoke_render_worker() {
     use std::time::Duration;
 
@@ -305,6 +323,7 @@ fn smoke_render_worker() {
     }
 }
 
+#[cfg(feature = "devtools")]
 fn smoke_pdf_path() -> anyhow::Result<std::path::PathBuf> {
     std::env::var("LAWPDF_SMOKE_PDF")
         .or_else(|_| std::env::var("LAWPDF_DEFAULT_PDF"))

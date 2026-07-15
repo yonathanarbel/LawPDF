@@ -1,10 +1,14 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ffi::{CStr, CString, OsStr, OsString};
+use std::ffi::{CStr, CString};
+#[cfg(any(feature = "devtools", test))]
+use std::ffi::{OsStr, OsString};
 use std::os::raw::{c_char, c_double, c_float, c_void};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+#[cfg(any(feature = "devtools", test))]
+use std::time::SystemTime;
+use std::time::{Instant, UNIX_EPOCH};
 
 use crossbeam_channel::Sender;
 use libloading::Library;
@@ -751,16 +755,19 @@ pub(crate) fn lm2_progressive_preview_request(
     (!preview.deep_source_lines.is_empty()).then_some((preview, LM2_PROGRESSIVE_PREVIEW_PAGES))
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Deserialize)]
 struct Lm2EvalExamplesFile {
     lines: Vec<Lm2EvalRow>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Deserialize)]
 struct Lm2EvalLabelsFile {
     labels: Vec<Lm2EvalLabel>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Clone, Deserialize)]
 struct Lm2EvalRow {
     path: String,
@@ -835,6 +842,7 @@ struct Lm2EvalRow {
     dist_to_nearest_rule: Option<f32>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Deserialize)]
 struct Lm2EvalLabel {
     path: String,
@@ -844,6 +852,7 @@ struct Lm2EvalLabel {
     role: String,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2EvalReport {
     model_label: String,
@@ -863,6 +872,7 @@ struct Lm2EvalReport {
     block_quality: Lm2BlockQualityMetrics,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2EvalActionMetric {
     action: &'static str,
@@ -872,12 +882,14 @@ struct Lm2EvalActionMetric {
     f1: f64,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug)]
 struct Lm2EvalItem {
     source: DeepLiquidSourceLine,
     actual: Lm2Action,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2EvalDisagreement {
     path: String,
@@ -902,6 +914,7 @@ struct Lm2EvalDisagreement {
     page_has_footnote_divider: bool,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2BlockQualityMetrics {
     block_count: usize,
@@ -915,6 +928,7 @@ struct Lm2BlockQualityMetrics {
     hyphen_artifacts_per_1000_blocks: f64,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Default)]
 struct Lm2BlockQualityAccumulator {
     block_count: usize,
@@ -925,6 +939,7 @@ struct Lm2BlockQualityAccumulator {
     hyphen_artifacts: usize,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2FeatureDumpReport {
     examples_input: String,
@@ -935,6 +950,7 @@ struct Lm2FeatureDumpReport {
     rows: Vec<Lm2FeatureDumpRow>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2FeatureDumpRow {
     path: String,
@@ -944,6 +960,7 @@ struct Lm2FeatureDumpRow {
     features: Vec<(usize, f64)>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2DecoderLatticeReport {
     schema_version: &'static str,
@@ -958,6 +975,7 @@ struct Lm2DecoderLatticeReport {
     pages: Vec<Lm2DecoderLatticePage>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2DecoderLatticePage {
     path: String,
@@ -965,6 +983,7 @@ struct Lm2DecoderLatticePage {
     lines: Vec<Lm2DecoderLatticeLine>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2DecoderLatticeLine {
     line_index: usize,
@@ -1167,11 +1186,13 @@ fn external_basename_key(path: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Deserialize)]
 struct Lm2DraftInput {
     documents: Vec<Lm2DraftInputDocument>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Deserialize)]
 struct Lm2DraftInputDocument {
     path: String,
@@ -1185,6 +1206,7 @@ struct Lm2DraftInputDocument {
     source_lines: Vec<DeepLiquidSourceLine>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2SourceSmokeReport {
     app_version: &'static str,
@@ -1194,6 +1216,7 @@ struct Lm2SourceSmokeReport {
     documents: Vec<Lm2SourceSmokeDocument>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2SourceSmokeDocument {
     path: String,
@@ -1202,6 +1225,7 @@ struct Lm2SourceSmokeDocument {
     error: Option<String>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2DraftReport {
     schema_version: &'static str,
@@ -1214,6 +1238,7 @@ struct Lm2DraftReport {
     rows: Vec<Lm2DraftRow>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2DraftRow {
     path: String,
@@ -1241,6 +1266,7 @@ struct Lm2DraftRow {
     page_has_footnote_divider: bool,
 }
 
+#[cfg(feature = "devtools")]
 pub fn run_lm2_eval(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     let mut examples_input = PathBuf::from(
         "training-data/layout-role-core/lawpdf-layout-role-examples-chandra-expanded-fast-20260604.json",
@@ -1444,6 +1470,7 @@ pub fn run_lm2_eval(args: impl IntoIterator<Item = OsString>) -> Result<(), Stri
     Ok(())
 }
 
+#[cfg(feature = "devtools")]
 pub fn run_lm2_feature_dump(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     let mut examples_input = PathBuf::from(
         "training-data/layout-role-core/lawpdf-layout-role-examples-chandra-expanded-fast-20260604.json",
@@ -1553,6 +1580,7 @@ pub fn run_lm2_feature_dump(args: impl IntoIterator<Item = OsString>) -> Result<
     Ok(())
 }
 
+#[cfg(feature = "devtools")]
 pub fn run_lm2_decoder_lattice_dump(
     args: impl IntoIterator<Item = OsString>,
 ) -> Result<(), String> {
@@ -1704,6 +1732,7 @@ pub fn run_lm2_decoder_lattice_dump(
     Ok(())
 }
 
+#[cfg(feature = "devtools")]
 pub fn run_lm2_draft(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     let mut input_path = PathBuf::from("eval/benchmark-v2/extracted-lines-lm2-source.json");
     let mut output_path: Option<PathBuf> = None;
@@ -1803,6 +1832,7 @@ pub fn run_lm2_draft(args: impl IntoIterator<Item = OsString>) -> Result<(), Str
     Ok(())
 }
 
+#[cfg(feature = "devtools")]
 pub fn run_lm2_source_smoke(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     let mut input_path = PathBuf::from("eval/benchmark-v2/extracted-lines-lm2-source.json");
     let mut output_path: Option<PathBuf> = None;
@@ -3715,10 +3745,7 @@ fn lm2_context_twopass_runtime_asset_candidates(file_name: &str) -> Vec<PathBuf>
 }
 
 fn lm2_native_catboost_runtime_asset_candidates(file_name: &str) -> Vec<PathBuf> {
-    lm2_runtime_asset_candidates(
-        LM2_NATIVE_CATBOOST_RUNTIME_DIR,
-        file_name,
-    )
+    lm2_runtime_asset_candidates(LM2_NATIVE_CATBOOST_RUNTIME_DIR, file_name)
 }
 
 fn lm2_runtime_asset_candidates(runtime_dir: &str, file_name: &str) -> Vec<PathBuf> {
@@ -6600,6 +6627,7 @@ fn apply_pp_priors(runtime: &Lm2Runtime, line: &DeepLiquidSourceLine, scores: &m
     }
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn action_scores_map(scores: [f64; 3]) -> BTreeMap<String, f64> {
     ACTIONS
         .iter()
@@ -6607,6 +6635,7 @@ fn action_scores_map(scores: [f64; 3]) -> BTreeMap<String, f64> {
         .collect()
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn start_scores_map(role_hint: Option<LiquidBlockRole>, scale: f64) -> BTreeMap<String, f64> {
     ACTIONS
         .iter()
@@ -6667,6 +6696,7 @@ fn start_feature_map(line: &DeepLiquidSourceLine) -> BTreeMap<String, f64> {
     features
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn transition_scores_map(
     previous_line: &DeepLiquidSourceLine,
     line: &DeepLiquidSourceLine,
@@ -8113,6 +8143,7 @@ fn normalize_features(mut features: Vec<(usize, f64)>) -> Vec<(usize, f64)> {
     merged
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn build_lm2_blocks(
     fallback_title: &str,
     decoded: &[(DeepLiquidSourceLine, Lm2Action)],
@@ -10002,6 +10033,7 @@ fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String
         .map_err(|error| format!("Could not parse {}: {error}", path.display()))
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn reject_label_like_path(path: &Path) -> Result<(), String> {
     let lower = path
         .to_string_lossy()
@@ -10060,6 +10092,7 @@ fn annotate_pp_prior(runtime: &Lm2Runtime, path: &str, line: &mut DeepLiquidSour
     line.pp_prior_score = Some(prior.score);
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn eval_sources_for_rows(
     rows: Vec<Lm2EvalRow>,
     use_example_role_hints: bool,
@@ -10842,6 +10875,7 @@ fn leading_note_marker(text: &str) -> Option<u16> {
     (digits > 0 && (1..=500).contains(&value)).then_some(value as u16)
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn eval_source_line(row: &Lm2EvalRow, use_example_role_hints: bool) -> DeepLiquidSourceLine {
     let page_width = row.page_width.unwrap_or(1.0).max(1.0);
     let page_height = row.page_height.unwrap_or(1.0).max(1.0);
@@ -10997,6 +11031,7 @@ fn normalize_role_name(name: &str) -> String {
     name.trim().to_ascii_lowercase().replace('-', "_")
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn action_for_role_name(role: &str) -> Lm2Action {
     match normalize_role_name(role).as_str() {
         "footnote" | "marginalia" => Lm2Action::Marginalia,
@@ -11006,6 +11041,7 @@ fn action_for_role_name(role: &str) -> Lm2Action {
     }
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn lm2_eval_report(
     model_label: String,
     pp_prior_source: Option<String>,
@@ -11064,6 +11100,7 @@ fn lm2_eval_report(
     }
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn ratio(numerator: usize, denominator: usize) -> f64 {
     if denominator == 0 {
         0.0
@@ -11072,6 +11109,7 @@ fn ratio(numerator: usize, denominator: usize) -> f64 {
     }
 }
 
+#[cfg(any(feature = "devtools", test))]
 impl Lm2BlockQualityAccumulator {
     fn add_page(&mut self, decoded: &[(DeepLiquidSourceLine, Lm2Action)]) {
         if decoded.is_empty() {
@@ -11121,6 +11159,7 @@ impl Lm2BlockQualityAccumulator {
     }
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn count_hyphen_artifacts(text: &str) -> usize {
     let chars = text.chars().collect::<Vec<_>>();
     chars
