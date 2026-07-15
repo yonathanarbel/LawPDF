@@ -67,6 +67,19 @@ jobs:
           if (-not $iscc) { throw "ISCC.exe was not found after installing Inno Setup." }
           & $iscc .\packaging\windows\LawPDF.iss /DAppVersion=$version
 
+      - name: Create Windows SHA-256 manifest fragment
+        shell: pwsh
+        run: |
+          $assets = @(
+            "LawPDFSetup-x64.exe",
+            "LawPDF-windows-portable-x64.zip"
+          )
+          $lines = foreach ($asset in $assets) {
+            $hash = (Get-FileHash -LiteralPath (Join-Path "dist" $asset) -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $asset"
+          }
+          Set-Content -LiteralPath dist\SHA256SUMS-windows.txt -Value $lines -Encoding ascii
+
       - name: Upload portable artifact
         uses: actions/upload-artifact@v4
         with:
@@ -78,6 +91,12 @@ jobs:
         with:
           name: LawPDFSetup-x64
           path: dist/LawPDFSetup-x64.exe
+
+      - name: Upload Windows checksum fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: LawPDF-SHA256SUMS-windows
+          path: dist/SHA256SUMS-windows.txt
 
   macos:
     name: macOS arm64
@@ -96,11 +115,20 @@ jobs:
       - name: Build and verify app bundle
         run: bash scripts/package-macos.sh
 
+      - name: Create macOS SHA-256 manifest fragment
+        run: shasum -a 256 dist/LawPDF-macos.zip > dist/SHA256SUMS-macos.txt
+
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
           name: LawPDF-macos
           path: dist/LawPDF-macos.zip
+
+      - name: Upload macOS checksum fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: LawPDF-SHA256SUMS-macos
+          path: dist/SHA256SUMS-macos.txt
 
   publish:
     name: Publish tagged release
@@ -127,6 +155,23 @@ jobs:
           name: LawPDF-macos
           path: dist
 
+      - name: Download Windows checksum fragment
+        uses: actions/download-artifact@v4
+        with:
+          name: LawPDF-SHA256SUMS-windows
+          path: checksums
+
+      - name: Download macOS checksum fragment
+        uses: actions/download-artifact@v4
+        with:
+          name: LawPDF-SHA256SUMS-macos
+          path: checksums
+
+      - name: Assemble and verify SHA-256 manifest
+        run: |
+          cat checksums/SHA256SUMS-windows.txt checksums/SHA256SUMS-macos.txt > dist/SHA256SUMS.txt
+          (cd dist && sha256sum --check SHA256SUMS.txt)
+
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -136,6 +181,7 @@ jobs:
             dist/LawPDF-windows-portable-x64.zip
             dist/LawPDFSetup-x64.exe
             dist/LawPDF-macos.zip
+            dist/SHA256SUMS.txt
           )
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
