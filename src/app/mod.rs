@@ -1,3 +1,7 @@
+mod settings_ui;
+
+use settings_ui::SettingsUi;
+
 use std::collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -336,10 +340,7 @@ pub struct PdfEditorApp {
     pending_document_scroll_offset: Option<Vec2>,
     visible_page_ranges: Vec<VisiblePageRange>,
     settings: AppSettings,
-    settings_api_key_edit: String,
-    settings_openai_api_key_edit: String,
-    settings_groq_api_key_edit: String,
-    show_settings: bool,
+    settings_ui: SettingsUi,
     status: String,
     show_unsaved_close_prompt: bool,
     allow_window_close: bool,
@@ -801,9 +802,7 @@ impl PdfEditorApp {
         };
         let settings = load_settings();
         let initial_zoom = normalized_pdf_zoom(settings.last_pdf_zoom);
-        let settings_api_key_edit = settings.openrouter_api_key.clone();
-        let settings_openai_api_key_edit = settings.openai_api_key.clone();
-        let settings_groq_api_key_edit = settings.groq_api_key.clone();
+        let settings_ui = SettingsUi::new(&settings);
         let mut app = Self {
             startup_error: None,
             tabs: Vec::new(),
@@ -905,10 +904,7 @@ impl PdfEditorApp {
             pending_document_scroll_offset: None,
             visible_page_ranges: Vec::new(),
             settings,
-            settings_api_key_edit,
-            settings_openai_api_key_edit,
-            settings_groq_api_key_edit,
-            show_settings: false,
+            settings_ui,
             status: initial_status.to_owned(),
             show_unsaved_close_prompt: false,
             allow_window_close: false,
@@ -1649,7 +1645,7 @@ impl PdfEditorApp {
 
         let Some(api_key) = effective_openrouter_api_key(&self.settings) else {
             self.status = "OpenRouter OCR needs an API key.".to_owned();
-            self.show_settings = true;
+            self.settings_ui.open = true;
             return;
         };
 
@@ -1811,7 +1807,7 @@ impl PdfEditorApp {
 
         let Some(api_key) = effective_openrouter_api_key(&self.settings) else {
             self.status = "Chat needs an OpenRouter API key.".to_owned();
-            self.show_settings = true;
+            self.settings_ui.open = true;
             return;
         };
 
@@ -4381,75 +4377,6 @@ impl PdfEditorApp {
             });
     }
 
-    fn draw_settings_window(&mut self, ctx: &Context) {
-        if !self.show_settings {
-            return;
-        }
-
-        let mut open = self.show_settings;
-        let mut save_clicked = false;
-        egui::Window::new("LawPDF settings")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.label(RichText::new("Groq").strong().color(INK));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.settings_groq_api_key_edit)
-                        .password(true)
-                        .hint_text("API key")
-                        .desired_width(360.0),
-                );
-                ui.add_space(8.0);
-                ui.label(RichText::new("OpenRouter").strong().color(INK));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.settings_api_key_edit)
-                        .password(true)
-                        .hint_text("API key")
-                        .desired_width(360.0),
-                );
-                ui.add_space(8.0);
-                ui.label(RichText::new("OpenAI (optional TTS)").strong().color(INK));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.settings_openai_api_key_edit)
-                        .password(true)
-                        .hint_text("API key")
-                        .desired_width(360.0),
-                );
-                ui.label(
-                    RichText::new("Keys stay in this app's local settings.")
-                        .size(10.0)
-                        .color(MUTED_INK),
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
-                        save_clicked = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.settings_api_key_edit = self.settings.openrouter_api_key.clone();
-                        self.settings_openai_api_key_edit = self.settings.openai_api_key.clone();
-                        self.settings_groq_api_key_edit = self.settings.groq_api_key.clone();
-                        self.show_settings = false;
-                    }
-                });
-            });
-
-        self.show_settings = open && self.show_settings;
-        if save_clicked {
-            self.settings.openrouter_api_key = self.settings_api_key_edit.trim().to_owned();
-            self.settings.openai_api_key = self.settings_openai_api_key_edit.trim().to_owned();
-            self.settings.groq_api_key = self.settings_groq_api_key_edit.trim().to_owned();
-            match save_settings(&self.settings) {
-                Ok(()) => {
-                    self.show_settings = false;
-                    self.liquid_state = LiquidState::Idle;
-                    self.status = "Settings saved.".to_owned();
-                }
-                Err(error) => self.status = error,
-            }
-        }
-    }
-
     fn draw_unsaved_close_prompt(&mut self, ctx: &Context) {
         if !self.show_unsaved_close_prompt {
             return;
@@ -5756,7 +5683,7 @@ impl PdfEditorApp {
             PaidTtsProvider::OpenAi => effective_openai_api_key(&self.settings),
         };
         let Some(api_key) = api_key else {
-            self.show_settings = true;
+            self.settings_ui.open = true;
             self.status = format!(
                 "Add your {} API key to create an MP3.",
                 self.paid_tts_provider.label()
@@ -5888,7 +5815,7 @@ impl PdfEditorApp {
                 .on_hover_text("Add or change OpenAI and OpenRouter API keys")
                 .clicked()
             {
-                self.show_settings = true;
+                self.settings_ui.open = true;
             }
             let mut include = self.liquid_tts_include_notes;
             if ui
