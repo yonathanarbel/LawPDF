@@ -1,10 +1,12 @@
 mod chat_ui;
 mod settings_ui;
+mod search_state;
 mod tts_controller;
 mod update_ui;
 
 use chat_ui::{ChatState, ChatUi};
 use settings_ui::SettingsUi;
+use search_state::SearchState;
 use tts_controller::TtsController;
 use update_ui::UpdateUi;
 
@@ -317,11 +319,7 @@ pub struct PdfEditorApp {
     text_box_text: String,
     signer_name: String,
     pending_select_all_text: bool,
-    search_query: String,
-    search_focus_request: bool,
-    search_hits: Vec<SearchHit>,
-    selected_hit: Option<usize>,
-    show_search_highlights: bool,
+    search_state: SearchState,
     ocr_states: Vec<OcrPageState>,
     ocr_progress: Option<OcrProgress>,
     ocr_tx: Sender<OcrEvent>,
@@ -845,11 +843,7 @@ impl PdfEditorApp {
             text_box_text: String::new(),
             signer_name: String::new(),
             pending_select_all_text: false,
-            search_query: String::new(),
-            search_focus_request: false,
-            search_hits: Vec::new(),
-            selected_hit: None,
-            show_search_highlights: true,
+            search_state: SearchState::default(),
             ocr_states: Vec::new(),
             ocr_progress: None,
             ocr_tx,
@@ -918,10 +912,10 @@ impl PdfEditorApp {
             drag_preview: self.drag_preview,
             active_signature_stroke: self.active_signature_stroke.clone(),
             pending_select_all_text: self.pending_select_all_text,
-            search_query: self.search_query.clone(),
-            search_hits: self.search_hits.clone(),
-            selected_hit: self.selected_hit,
-            show_search_highlights: self.show_search_highlights,
+            search_query: self.search_state.query.clone(),
+            search_hits: self.search_state.hits.clone(),
+            selected_hit: self.search_state.selected_hit,
+            show_search_highlights: self.search_state.show_highlights,
             ocr_states: self.ocr_states.clone(),
             ocr_progress: self.ocr_progress,
             chat_state: self.chat_ui.state.clone(),
@@ -990,10 +984,10 @@ impl PdfEditorApp {
         self.drag_preview = tab.drag_preview;
         self.active_signature_stroke = tab.active_signature_stroke;
         self.pending_select_all_text = tab.pending_select_all_text;
-        self.search_query = tab.search_query;
-        self.search_hits = tab.search_hits;
-        self.selected_hit = tab.selected_hit;
-        self.show_search_highlights = tab.show_search_highlights;
+        self.search_state.query = tab.search_query;
+        self.search_state.hits = tab.search_hits;
+        self.search_state.selected_hit = tab.selected_hit;
+        self.search_state.show_highlights = tab.show_search_highlights;
         self.ocr_states = tab.ocr_states;
         self.ocr_progress = tab.ocr_progress;
         self.chat_ui.state = tab.chat_state;
@@ -1086,11 +1080,7 @@ impl PdfEditorApp {
         self.drag_preview = None;
         self.active_signature_stroke.clear();
         self.pending_select_all_text = false;
-        self.search_query.clear();
-        self.search_focus_request = false;
-        self.search_hits.clear();
-        self.selected_hit = None;
-        self.show_search_highlights = true;
+        self.search_state = SearchState::default();
         self.ocr_states.clear();
         self.ocr_progress = None;
         self.chat_ui.state = ChatState::default();
@@ -1688,7 +1678,8 @@ impl PdfEditorApp {
                 if let Some(state) = self.ocr_states.get_mut(event.page_index) {
                     let was_done = matches!(event.state, OcrPageState::Done(_));
                     *state = event.state;
-                    should_rebuild_search |= was_done && !self.search_query.trim().is_empty();
+                    should_rebuild_search |=
+                        was_done && !self.search_state.query.trim().is_empty();
                     current_ocr_text_changed |= was_done;
                     if was_done {
                         if let Some(document) = self.document.as_ref() {
@@ -1905,7 +1896,7 @@ impl PdfEditorApp {
                                     *slot = true;
                                 }
                             }
-                            if !self.search_query.trim().is_empty() {
+                            if !self.search_state.query.trim().is_empty() {
                                 self.rebuild_search();
                             }
                             ctx.request_repaint();
@@ -2469,7 +2460,7 @@ impl PdfEditorApp {
     }
 
     fn start_search(&mut self, ctx: &Context) {
-        if !self.search_query.trim().is_empty()
+        if !self.search_state.query.trim().is_empty()
             && !self.ensure_native_text_loaded_for_all(ctx, "Preparing searchable PDF text")
         {
             self.rebuild_search();
@@ -2480,7 +2471,7 @@ impl PdfEditorApp {
 
     fn focus_search(&mut self, ctx: &Context) {
         self.sidebar_tab = SidebarTab::Search;
-        self.search_focus_request = true;
+        self.search_state.focus_request = true;
         if self.document.is_none() {
             self.status = "Open a PDF to search.".to_owned();
         }
@@ -2488,21 +2479,21 @@ impl PdfEditorApp {
     }
 
     fn rebuild_search(&mut self) {
-        self.search_hits.clear();
-        self.selected_hit = None;
+        self.search_state.hits.clear();
+        self.search_state.selected_hit = None;
 
         let Some(document) = self.document.as_ref() else {
             return;
         };
 
-        let query = self.search_query.trim();
+        let query = self.search_state.query.trim();
         if query.is_empty() {
             return;
         }
 
         for page_index in 0..document.page_count {
             if let Some(text) = document.native_text.get(page_index) {
-                self.search_hits.extend(find_hits(
+                self.search_state.hits.extend(find_hits(
                     text,
                     query,
                     page_index,
@@ -2511,19 +2502,20 @@ impl PdfEditorApp {
             }
 
             if let Some(text) = self.ocr_states.get(page_index).and_then(OcrPageState::text) {
-                self.search_hits
+                self.search_state
+                    .hits
                     .extend(find_hits(text, query, page_index, SearchSource::OcrText));
             }
         }
 
-        if let Some(first) = self.search_hits.first() {
-            self.selected_hit = Some(0);
+        if let Some(first) = self.search_state.hits.first() {
+            self.search_state.selected_hit = Some(0);
             self.page_index = first.page_index;
             self.scroll_target_page = Some(first.page_index);
             self.thumbnail_scroll_target = Some(first.page_index);
         }
 
-        self.status = format!("{} match(es)", self.search_hits.len());
+        self.status = format!("{} match(es)", self.search_state.hits.len());
     }
 
     fn add_search_highlights(&mut self) {
@@ -2533,7 +2525,7 @@ impl PdfEditorApp {
 
         let preset = self.marker_preset();
         let mut added = 0usize;
-        for hit in &self.search_hits {
+        for hit in &self.search_state.hits {
             if let Some(rect) = self.estimated_hit_rect(document, hit) {
                 self.annotations.push(EditorAnnotation {
                     page_index: hit.page_index,
@@ -3478,7 +3470,7 @@ impl PdfEditorApp {
                     toolbar_group(ui, |ui| {
                         let search_response = ui.add_enabled(
                             has_document,
-                            egui::TextEdit::singleline(&mut self.search_query)
+                            egui::TextEdit::singleline(&mut self.search_state.query)
                                 .hint_text("Find")
                                 .desired_width(190.0),
                         );
@@ -3705,15 +3697,15 @@ impl PdfEditorApp {
         ui.horizontal(|ui| {
             let search_response = ui.add_enabled(
                 has_document,
-                egui::TextEdit::singleline(&mut self.search_query)
+                egui::TextEdit::singleline(&mut self.search_state.query)
                     .hint_text("Find")
                     .desired_width(168.0),
             );
-            if self.search_focus_request {
+            if self.search_state.focus_request {
                 if has_document {
                     search_response.request_focus();
                 }
-                self.search_focus_request = false;
+                self.search_state.focus_request = false;
             }
             let pressed_enter = search_response.lost_focus()
                 && ui.input(|input| input.key_pressed(egui::Key::Enter));
@@ -3727,10 +3719,10 @@ impl PdfEditorApp {
         });
 
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.show_search_highlights, "show hits");
+            ui.checkbox(&mut self.search_state.show_highlights, "show hits");
             if ui
                 .add_enabled(
-                    has_document && !self.search_hits.is_empty(),
+                    has_document && !self.search_state.hits.is_empty(),
                     egui::Button::new("Annotate"),
                 )
                 .clicked()
@@ -3740,11 +3732,14 @@ impl PdfEditorApp {
         });
 
         ui.add_space(6.0);
-        ui.label(RichText::new(format!("{} result(s)", self.search_hits.len())).color(MUTED_INK));
+        ui.label(
+            RichText::new(format!("{} result(s)", self.search_state.hits.len()))
+                .color(MUTED_INK),
+        );
         egui::ScrollArea::vertical()
             .max_height(280.0)
             .show(ui, |ui| {
-                let hits = self.search_hits.clone();
+                let hits = self.search_state.hits.clone();
                 for (index, hit) in hits.iter().enumerate() {
                     let label = format!(
                         "p{} [{}] {}",
@@ -3753,10 +3748,10 @@ impl PdfEditorApp {
                         hit.snippet
                     );
                     if ui
-                        .selectable_label(self.selected_hit == Some(index), label)
+                        .selectable_label(self.search_state.selected_hit == Some(index), label)
                         .clicked()
                     {
-                        self.selected_hit = Some(index);
+                        self.search_state.selected_hit = Some(index);
                         self.go_to_page(hit.page_index);
                     }
                 }
@@ -6923,7 +6918,7 @@ impl PdfEditorApp {
         placement: &PagePlacement,
         page_index: usize,
     ) {
-        if !self.show_search_highlights {
+        if !self.search_state.show_highlights {
             return;
         }
 
@@ -6932,7 +6927,8 @@ impl PdfEditorApp {
         };
 
         for hit in self
-            .search_hits
+            .search_state
+            .hits
             .iter()
             .filter(|hit| hit.page_index == page_index)
         {
