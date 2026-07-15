@@ -1,10 +1,12 @@
 mod chat_ui;
 mod settings_ui;
 mod tts_controller;
+mod update_ui;
 
 use chat_ui::{ChatState, ChatUi};
 use settings_ui::SettingsUi;
 use tts_controller::TtsController;
+use update_ui::UpdateUi;
 
 use std::collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
@@ -251,13 +253,8 @@ pub struct PdfEditorApp {
     liquid_mode2_tx: Sender<LiquidMode2Event>,
     liquid_mode2_rx: Receiver<LiquidMode2Event>,
     chat_ui: ChatUi,
-    update_tx: Sender<UpdateEvent>,
-    update_rx: Receiver<UpdateEvent>,
-    update_state: UpdateUiState,
-    update_check_in_flight: bool,
-    update_notice: Option<UpdateNotice>,
+    update_ui: UpdateUi,
     notices: VecDeque<Notice>,
-    next_update_check: Option<Instant>,
     zoom: f32,
     target_zoom: f32,
     page_textures: HashMap<usize, PageTexture>,
@@ -764,6 +761,7 @@ impl PdfEditorApp {
         let update_installed = updater::take_installed_update().is_some();
         let update_notice = update_installed
             .then(|| UpdateNotice::new("Update installed", UpdateNoticeKind::Success));
+        let update_ui = UpdateUi::new(update_tx, update_rx, update_notice);
         let initial_status = if update_installed {
             "Update installed."
         } else {
@@ -792,13 +790,8 @@ impl PdfEditorApp {
             liquid_mode2_tx,
             liquid_mode2_rx,
             chat_ui,
-            update_tx,
-            update_rx,
-            update_state: UpdateUiState::Idle,
-            update_check_in_flight: true,
-            update_notice,
+            update_ui,
             notices: VecDeque::new(),
-            next_update_check: None,
             zoom: initial_zoom,
             target_zoom: initial_zoom,
             page_textures: HashMap::new(),
@@ -1225,18 +1218,18 @@ impl PdfEditorApp {
     }
 
     fn poll_update_events(&mut self, ctx: &Context) {
-        while let Ok(event) = self.update_rx.try_recv() {
+        while let Ok(event) = self.update_ui.rx.try_recv() {
             match event {
                 UpdateEvent::Checking => {
-                    self.update_check_in_flight = true;
-                    if !self.update_state.has_ready_update() {
-                        self.update_state = UpdateUiState::Checking;
+                    self.update_ui.check_in_flight = true;
+                    if !self.update_ui.state.has_ready_update() {
+                        self.update_ui.state = UpdateUiState::Checking;
                     }
                 }
                 UpdateEvent::Detected { version } => {
-                    self.update_check_in_flight = true;
-                    self.update_state = UpdateUiState::Downloading;
-                    self.update_notice = Some(UpdateNotice::new(
+                    self.update_ui.check_in_flight = true;
+                    self.update_ui.state = UpdateUiState::Downloading;
+                    self.update_ui.notice = Some(UpdateNotice::new(
                         "New update detected, updating in background",
                         UpdateNoticeKind::Working,
                     ));
@@ -1244,35 +1237,35 @@ impl PdfEditorApp {
                     ctx.request_repaint();
                 }
                 UpdateEvent::NotAvailable => {
-                    self.update_check_in_flight = false;
-                    self.next_update_check = Some(Instant::now() + UPDATE_CHECK_INTERVAL);
-                    if matches!(self.update_state, UpdateUiState::Checking) {
-                        self.update_state = UpdateUiState::Idle;
+                    self.update_ui.check_in_flight = false;
+                    self.update_ui.next_check = Some(Instant::now() + UPDATE_CHECK_INTERVAL);
+                    if matches!(self.update_ui.state, UpdateUiState::Checking) {
+                        self.update_ui.state = UpdateUiState::Idle;
                     }
                 }
                 UpdateEvent::Downloading => {
-                    self.update_check_in_flight = true;
-                    self.update_state = UpdateUiState::Downloading;
+                    self.update_ui.check_in_flight = true;
+                    self.update_ui.state = UpdateUiState::Downloading;
                 }
                 UpdateEvent::Ready(pending) => {
-                    self.update_check_in_flight = false;
-                    self.next_update_check = Some(Instant::now() + UPDATE_CHECK_INTERVAL);
+                    self.update_ui.check_in_flight = false;
+                    self.update_ui.next_check = Some(Instant::now() + UPDATE_CHECK_INTERVAL);
                     self.status = format!(
                         "LawPDF {} is ready and will install on next launch.",
                         pending.version
                     );
-                    self.update_state = UpdateUiState::Ready;
+                    self.update_ui.state = UpdateUiState::Ready;
                     ctx.request_repaint();
                 }
                 UpdateEvent::Failed(message) => {
-                    self.update_check_in_flight = false;
-                    self.next_update_check = Some(Instant::now() + UPDATE_RETRY_INTERVAL);
+                    self.update_ui.check_in_flight = false;
+                    self.update_ui.next_check = Some(Instant::now() + UPDATE_RETRY_INTERVAL);
                     self.push_error_notice(message.clone());
                     if matches!(
-                        self.update_state,
+                        self.update_ui.state,
                         UpdateUiState::Checking | UpdateUiState::Downloading
                     ) {
-                        self.update_state = UpdateUiState::Failed {
+                        self.update_ui.state = UpdateUiState::Failed {
                             shown_at: Instant::now(),
                         };
                     }
@@ -1280,38 +1273,40 @@ impl PdfEditorApp {
             }
         }
 
-        if let UpdateUiState::Failed { shown_at, .. } = &self.update_state {
+        if let UpdateUiState::Failed { shown_at, .. } = &self.update_ui.state {
             if shown_at.elapsed() < Duration::from_secs(12) {
                 ctx.request_repaint_after(Duration::from_secs(1));
             } else {
-                self.update_state = UpdateUiState::Idle;
+                self.update_ui.state = UpdateUiState::Idle;
             }
         }
 
         if self
-            .update_notice
+            .update_ui
+            .notice
             .as_ref()
             .is_some_and(UpdateNotice::is_expired)
         {
-            self.update_notice = None;
+            self.update_ui.notice = None;
             ctx.request_repaint();
-        } else if self.update_notice.is_some() {
+        } else if self.update_ui.notice.is_some() {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
 
-        if !self.update_check_in_flight
-            && !self.update_state.is_busy()
-            && !self.update_state.has_ready_update()
+        if !self.update_ui.check_in_flight
+            && !self.update_ui.state.is_busy()
+            && !self.update_ui.state.has_ready_update()
             && self
-                .next_update_check
+                .update_ui
+                .next_check
                 .is_some_and(|next_check| Instant::now() >= next_check)
         {
-            self.update_check_in_flight = true;
-            self.next_update_check = None;
-            updater::spawn_update_check(self.update_tx.clone());
+            self.update_ui.check_in_flight = true;
+            self.update_ui.next_check = None;
+            updater::spawn_update_check(self.update_ui.tx.clone());
         }
 
-        if matches!(self.update_state, UpdateUiState::Downloading) {
+        if matches!(self.update_ui.state, UpdateUiState::Downloading) {
             ctx.request_repaint_after(RENDER_POLL_INTERVAL);
         }
     }
@@ -4215,7 +4210,7 @@ impl PdfEditorApp {
     }
 
     fn draw_update_notice(&mut self, ctx: &Context) {
-        let Some(notice) = self.update_notice.as_ref() else {
+        let Some(notice) = self.update_ui.notice.as_ref() else {
             return;
         };
         if notice.is_expired() {
@@ -8768,7 +8763,7 @@ impl eframe::App for PdfEditorApp {
             || !self.pending_comment_saves.is_empty()
             || !self.active_comment_saves.is_empty()
             || !self.queued_open_paths.is_empty()
-            || self.update_state.is_busy()
+            || self.update_ui.state.is_busy()
             || self.chat_ui.state.in_flight
             || self.ocr_is_active()
             || matches!(
