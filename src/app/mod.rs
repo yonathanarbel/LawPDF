@@ -1,8 +1,10 @@
 mod chat_ui;
 mod settings_ui;
+mod tts_controller;
 
 use chat_ui::{ChatState, ChatUi};
 use settings_ui::SettingsUi;
+use tts_controller::TtsController;
 
 use std::collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
@@ -287,14 +289,7 @@ pub struct PdfEditorApp {
     /// normally hidden for display (headers/footers/TOC/noise/tables) as dimmed,
     /// role-tagged lines instead of dropping them.
     liquid_show_hidden_furniture: bool,
-    /// #33 TTS: handle to the running native speech process (macOS `say`), if any.
-    tts_child: Option<std::process::Child>,
-    /// #33 TTS: whether to read footnotes as a separate pass after the body.
-    liquid_tts_include_notes: bool,
-    paid_tts_provider: PaidTtsProvider,
-    paid_tts_tx: Sender<PaidTtsEvent>,
-    paid_tts_rx: Receiver<PaidTtsEvent>,
-    paid_tts_progress: Option<(usize, usize)>,
+    tts_controller: TtsController,
     marker_animations: Vec<MarkerAnim>,
     active_tool: Tool,
     sidebar_tab: SidebarTab,
@@ -764,7 +759,7 @@ impl PdfEditorApp {
         let (liquid_mode2_tx, liquid_mode2_rx) = unbounded();
         let chat_ui = ChatUi::new();
         let (update_tx, update_rx) = unbounded();
-        let (paid_tts_tx, paid_tts_rx) = unbounded();
+        let tts_controller = TtsController::new();
         updater::spawn_update_check(update_tx.clone());
         let update_installed = updater::take_installed_update().is_some();
         let update_notice = update_installed
@@ -826,12 +821,7 @@ impl PdfEditorApp {
             liquid_scroll_to_heading: None,
             liquid_provenance_highlight: Vec::new(),
             liquid_show_hidden_furniture: false,
-            tts_child: None,
-            liquid_tts_include_notes: false,
-            paid_tts_provider: PaidTtsProvider::OpenRouter,
-            paid_tts_tx,
-            paid_tts_rx,
-            paid_tts_progress: None,
+            tts_controller,
             marker_animations: Vec::new(),
             active_tool: Tool::Select,
             sidebar_tab: SidebarTab::Pages,
@@ -5346,7 +5336,7 @@ impl PdfEditorApp {
     /// playback. No-op with a note on non-macOS.
     fn start_liquid_tts(&mut self, document: &LiquidDocument) {
         self.stop_liquid_tts();
-        let text = liquid_tts_text(document, self.liquid_tts_include_notes);
+        let text = liquid_tts_text(document, self.tts_controller.include_notes);
         if text.is_empty() {
             self.status = "Nothing to read aloud.".to_owned();
             return;
@@ -5364,7 +5354,7 @@ impl PdfEditorApp {
                 .spawn()
             {
                 Ok(child) => {
-                    self.tts_child = Some(child);
+                    self.tts_controller.child = Some(child);
                     self.status = "Reading aloud…".to_owned();
                 }
                 Err(error) => {
@@ -5381,7 +5371,7 @@ impl PdfEditorApp {
 
     /// #33: stop any in-progress speech playback.
     fn stop_liquid_tts(&mut self) {
-        if let Some(mut child) = self.tts_child.take() {
+        if let Some(mut child) = self.tts_controller.child.take() {
             // Best-effort process cleanup: playback is already detached from app state.
             let _ = child.kill();
             let _ = child.wait();
@@ -5389,10 +5379,10 @@ impl PdfEditorApp {
     }
 
     fn start_paid_liquid_tts(&mut self, document: &LiquidDocument) {
-        if self.paid_tts_progress.is_some() {
+        if self.tts_controller.progress.is_some() {
             return;
         }
-        let api_key = match self.paid_tts_provider {
+        let api_key = match self.tts_controller.provider {
             PaidTtsProvider::OpenRouter => effective_openrouter_api_key(&self.settings),
             PaidTtsProvider::OpenAi => effective_openai_api_key(&self.settings),
         };
@@ -5400,11 +5390,11 @@ impl PdfEditorApp {
             self.settings_ui.open = true;
             self.status = format!(
                 "Add your {} API key to create an MP3.",
-                self.paid_tts_provider.label()
+                self.tts_controller.provider.label()
             );
             return;
         };
-        let text = liquid_tts_text(document, self.liquid_tts_include_notes);
+        let text = liquid_tts_text(document, self.tts_controller.include_notes);
         if text.is_empty() {
             self.status = "Nothing to narrate.".to_owned();
             return;
@@ -5421,32 +5411,35 @@ impl PdfEditorApp {
         };
         spawn_paid_tts_job(
             PaidTtsRequest {
-                provider: self.paid_tts_provider,
+                provider: self.tts_controller.provider,
                 api_key,
                 voice: "nova".to_owned(),
                 text,
                 destination,
             },
-            self.paid_tts_tx.clone(),
+            self.tts_controller.tx.clone(),
         );
-        self.paid_tts_progress = Some((0, 0));
-        self.status = format!("Creating MP3 with {}…", self.paid_tts_provider.label());
+        self.tts_controller.progress = Some((0, 0));
+        self.status = format!(
+            "Creating MP3 with {}…",
+            self.tts_controller.provider.label()
+        );
     }
 
     fn poll_paid_tts(&mut self, ctx: &Context) {
-        while let Ok(event) = self.paid_tts_rx.try_recv() {
+        while let Ok(event) = self.tts_controller.rx.try_recv() {
             match event {
                 PaidTtsEvent::Progress { completed, total } => {
-                    self.paid_tts_progress = Some((completed, total));
+                    self.tts_controller.progress = Some((completed, total));
                     self.status = format!("Creating MP3… {completed}/{total}");
                 }
                 PaidTtsEvent::Complete(path) => {
-                    self.paid_tts_progress = None;
+                    self.tts_controller.progress = None;
                     self.status = format!("Created {}", path.display());
                     self.push_info_notice(format!("Created {}", path.display()));
                 }
                 PaidTtsEvent::Failed(error) => {
-                    self.paid_tts_progress = None;
+                    self.tts_controller.progress = None;
                     self.push_error_notice(error);
                 }
             }
@@ -5458,12 +5451,13 @@ impl PdfEditorApp {
     fn draw_liquid_tts_controls(&mut self, ui: &mut egui::Ui, document: &LiquidDocument) {
         // Clear the handle if playback finished on its own.
         let finished = self
-            .tts_child
+            .tts_controller
+            .child
             .as_mut()
             .map(|child| matches!(child.try_wait(), Ok(Some(_))))
             .unwrap_or(false);
         if finished {
-            self.tts_child = None;
+            self.tts_controller.child = None;
         }
         ui.horizontal_wrapped(|ui| {
             if ui
@@ -5473,7 +5467,7 @@ impl PdfEditorApp {
             {
                 self.export_review_text_dialog(document);
             }
-            if self.tts_child.is_some() {
+            if self.tts_controller.child.is_some() {
                 if ui
                     .button(RichText::new("⏹ Stop reading").size(11.0))
                     .clicked()
@@ -5489,21 +5483,22 @@ impl PdfEditorApp {
             }
             ui.separator();
             egui::ComboBox::from_id_salt("paid_tts_provider")
-                .selected_text(self.paid_tts_provider.label())
+                .selected_text(self.tts_controller.provider.label())
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
-                        &mut self.paid_tts_provider,
+                        &mut self.tts_controller.provider,
                         PaidTtsProvider::OpenRouter,
                         "OpenRouter",
                     );
                     ui.selectable_value(
-                        &mut self.paid_tts_provider,
+                        &mut self.tts_controller.provider,
                         PaidTtsProvider::OpenAi,
                         "OpenAI",
                     );
                 });
             let paid_label = self
-                .paid_tts_progress
+                .tts_controller
+                .progress
                 .map(|(completed, total)| {
                     if total == 0 {
                         "Creating MP3…".to_owned()
@@ -5514,7 +5509,7 @@ impl PdfEditorApp {
                 .unwrap_or_else(|| "Create AI MP3".to_owned());
             if ui
                 .add_enabled(
-                    self.paid_tts_progress.is_none(),
+                    self.tts_controller.progress.is_none(),
                     egui::Button::new(RichText::new(paid_label).size(11.0)),
                 )
                 .on_hover_text(
@@ -5531,13 +5526,13 @@ impl PdfEditorApp {
             {
                 self.settings_ui.open = true;
             }
-            let mut include = self.liquid_tts_include_notes;
+            let mut include = self.tts_controller.include_notes;
             if ui
                 .checkbox(&mut include, RichText::new("footnotes").size(11.0))
                 .on_hover_text("Read footnotes as a separate pass after the body")
                 .changed()
             {
-                self.liquid_tts_include_notes = include;
+                self.tts_controller.include_notes = include;
             }
         });
         ui.add_space(6.0);
