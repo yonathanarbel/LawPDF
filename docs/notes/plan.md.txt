@@ -1,0 +1,189 @@
+Phase 1.
+Grok tried to create modularity in the project. Your goal is to review the quality of its work and then make sure we are truly modular as we proceed to refine and add functionalities. Add best practices as needed.
+You are done when you are satisfied that we have the right degree of modularity, and that there is a clear map of the project, so future coding agents will not lack context.
+
+Phase 2.
+Claude offered these revisions, which sound highly sensible.
+
+
+  What Liquid Mode is for
+
+  It's a fidelity-preserving "reader mode" for PDFs — the PDF analog of Safari Reader or Acrobat's own
+  Liquid Mode, tuned for the document types you read: law-review articles, briefs, academic papers, and
+  news PDFs. The pipeline (prepare_liquid_document, liquid.rs:210) is:
+
+  1. Clean — strip running headers/footers, page numbers, and web/publisher chrome (cookie banners,
+  "subscribe", SSRN/HeinOnline/DigitalCommons boilerplate), and join text across page breaks with
+  hyphenation handling (clean_source_text:428).
+  2. Segment + classify — split into paragraphs and assign each a semantic role (Title, Heading,
+  Abstract, AuthorInfo, Lead, Footnote, Caption, Definition, plus legal-specific Holding/Issue/KeyClause)
+  using text heuristics (build_local_blocks:797, classify_block:2770).
+  3. Refine (optional) — send compact block descriptors to a free LLM (Groq gpt-oss-20b primary,
+  OpenRouter gpt-oss-120b:free fallback) that returns JSON styling metadata only — it reclassifies, drops
+  junk, and marks section breaks but never rewrites text (apply_llm_layout:4094).
+  4. Render — a calm single-column view at 920px max width with callout boxes, a collapsing outline, and
+  footnotes pushed to a "Notes" section (draw_liquid_document:3771).
+
+  The defining constraint is fidelity: the LLM is a layout planner, not a summarizer. That's the right
+  call for legal documents and is enforced repeatedly in the prompt.
+
+  Strengths
+
+  - The fidelity-first design (LLM returns metadata keyed by source_index, original text preserved) is
+  genuinely well thought out and rare.
+  - Graceful degradation: no key → local heuristics; LLM fails → local fallback; result cached by file
+  signature (source_signature:4704).
+  - The domain-specific role taxonomy (Holding/Issue/KeyClause/Definition) is a nice fit for legal
+  reading.
+
+  Opportunities for improvement
+
+  1. The biggest one: you're throwing away PDF geometry
+
+  Every classification decision is reconstructed from plain text — uppercase ratio, title-case ratio,
+  known-heading wordlists, digit prefixes. But PDFium already knows each character's font size, weight,
+  and bounding box. Heading detection, footnote detection (small font at page bottom), pull-quote
+  detection, caption-vs-body, and especially multi-column reading order are all things you're guessing at
+  from text when the layout data is sitting right there. pdfium-render exposes per-character metrics;
+  even better, the mupdf crate (MuPDF bindings) gives structured text as blocks→lines→spans with bbox +
+  font name + size + bold/italic flags in one call. This single change would let you delete a large
+  fraction of the heuristics in liquid.rs and make them more accurate. Real Liquid Mode / Acrobat is
+  built on structure recognition, not text guessing.
+
+  This also fixes a latent correctness issue: page.text() extraction order can interleave columns or
+  splice page-bottom footnotes into the body on two-column law-review layouts, and nothing here detects
+  columns.
+
+  2. The LLM layer has cheap, high-value reliability wins
+
+  - No structured-output enforcement. You rely on the model emitting valid JSON, then strip code fences
+  and grab the first {…last } (extract_json_object:4569). Both Groq and OpenRouter support
+  response_format: {type:"json_object"} (and json_schema). gpt-oss models honor it. Deriving the schema
+  from LlmLayout with schemars and passing it would largely eliminate parse failures.
+  - No retries. Free tiers (:free, Groq free) rate-limit constantly. A single 429 = silent fallback to
+  local. Add a retry with backoff (the backoff crate) honoring Retry-After.
+  - Reasoning budget mis-set. Groq runs with reasoning_effort: "medium" and only max_completion_tokens:
+  2048 (liquid.rs:254). For a pure classification task, hidden reasoning is mostly wasted and can
+  truncate the JSON on long docs. Drop to low/none and/or raise the cap.
+  - Compression disabled + fresh client per request (http1_only().no_gzip().no_brotli()...,
+  Accept-Encoding: identity, liquid.rs:4210). Makes responses bigger and rebuilds TLS each time. Reuse
+  one shared Client; re-enable compression unless there's a known decode bug.
+
+  3. The prompt advertises features the pipeline can't honor
+
+  The system prompt (liquid.rs:4134) instructs the model to preserve <bold>/<italics>/<underline> tags
+  and emit box, bkground_color, text_color. But:
+  - PDFium text extraction produces no inline tags, and the renderer doesn't parse them — they'd render
+  literally.
+  - _box_emphasis, _background_color, _text_color are parsed but effectively ignored (box only nudges
+  Paragraph→Explainer; colors unused — liquid.rs:4483).
+
+  So the model spends latency/tokens on fields that don't change output. Either trim the prompt to only
+  what you act on, or wire the fields through to the renderer (callout colors are already there). Also:
+  the two _legacy_* prompts (liquid.rs:4110, 4127) are dead code — delete them.
+
+  4. Concrete UX gaps
+
+  - Body paragraphs aren't selectable. Paragraph (app.rs:4032) lacks .selectable(true), while Lead,
+  ListItem, and callouts have it. For a legal reading view, not being able to select/copy the main body
+  text is a real gap. One-line fix.
+  - Engine label is wrong. The header prints "OpenRouter" whenever llm_used is true (app.rs:3856), even
+  when Groq actually produced the layout (Groq is tried first). Track which provider won and label
+  accurately.
+  - Mis-classified text vanishes. Header/Footer/Contents blocks hit an empty match arm (app.rs:4075) and
+  are dropped entirely. If a heuristic wrongly tags a real paragraph as a footer, it's gone with no
+  recovery. Consider routing everything droppable into the collapsible Notes instead of {}, or add a
+  "show hidden" toggle.
+  - No reading controls. A reader mode benefits from adjustable text size, column width, and a sepia/dark
+  theme. Everything is fixed sizes and one light palette.
+
+  5. Code health
+
+  - liquid.rs is 7,400 lines in one module. Worth splitting into cleaning / classify / llm / model
+  submodules.
+  - is_noise_line (liquid.rs:499) is a hand-maintained matches! plus ~80 starts_with arms — brittle,
+  English-only, and reinvents Readability's stoplists. Make it table-driven (a static slice compiled
+  once) so it's testable and extendable.
+  - apply_llm_layout repeats the same ~20-line write_liquid_llm_log(&LiquidLlmLog{...}) 8 times. A
+  closure capturing the common fields removes ~150 lines and prevents drift.
+  - Log hygiene/privacy: every request writes full prompt + request body + full response (containing
+  document text) to liquid-logs/ with no rotation (write_liquid_llm_log:4534). That's an unbounded disk
+  leak and plaintext document content on disk. Cap/rotate it, or gate behind a debug flag.
+
+  6. Naive sentence splitting will misfire on legal text
+
+  3. The prompt advertises features the pipeline can't honor
+
+  The system prompt (liquid.rs:4134) instructs the model to preserve <bold>/<italics>/<underline> tags
+  and emit box, bkground_color, text_color. But:
+  - PDFium text extraction produces no inline tags, and the renderer doesn't parse them — they'd render
+  literally.
+  - _box_emphasis, _background_color, _text_color are parsed but effectively ignored (box only nudges
+  Paragraph→Explainer; colors unused — liquid.rs:4483).
+
+  So the model spends latency/tokens on fields that don't change output. Either trim the prompt to only
+  what you act on, or wire the fields through to the renderer (callout colors are already there). Also:
+  the two _legacy_* prompts (liquid.rs:4110, 4127) are dead code — delete them.
+
+  4. Concrete UX gaps
+
+  - Body paragraphs aren't selectable. Paragraph (app.rs:4032) lacks .selectable(true), while Lead,
+  ListItem, and callouts have it. For a legal reading view, not being able to select/copy the main body
+  text is a real gap. One-line fix.
+  - Engine label is wrong. The header prints "OpenRouter" whenever llm_used is true (app.rs:3856), even
+  when Groq actually produced the layout (Groq is tried first). Track which provider won and label
+  accurately.
+  - Mis-classified text vanishes. Header/Footer/Contents blocks hit an empty match arm (app.rs:4075) and
+  are dropped entirely. If a heuristic wrongly tags a real paragraph as a footer, it's gone with no
+  recovery. Consider routing everything droppable into the collapsible Notes instead of {}, or add a
+  "show hidden" toggle.
+  - No reading controls. A reader mode benefits from adjustable text size, column width, and a sepia/dark
+  theme. Everything is fixed sizes and one light palette.
+
+  5. Code health
+
+  - liquid.rs is 7,400 lines in one module. Worth splitting into cleaning / classify / llm / model
+  submodules.
+  - is_noise_line (liquid.rs:499) is a hand-maintained matches! plus ~80 starts_with arms — brittle,
+  English-only, and reinvents Readability's stoplists. Make it table-driven (a static slice compiled
+  once) so it's testable and extendable.
+  - apply_llm_layout repeats the same ~20-line write_liquid_llm_log(&LiquidLlmLog{...}) 8 times. A
+  closure capturing the common fields removes ~150 lines and prevents drift.
+  - Log hygiene/privacy: every request writes full prompt + request body + full response (containing
+  document text) to liquid-logs/ with no rotation (write_liquid_llm_log:4534). That's an unbounded disk
+  leak and plaintext document content on disk. Cap/rotate it, or gate behind a debug flag.
+
+  6. Naive sentence splitting will misfire on legal text
+
+  split_sentences (liquid.rs:2742) breaks on any . + whitespace. That mis-splits "U.S. v. Lopez", "No.
+  5", "Fed. R. Civ. P. 12", "Inc." etc. — extremely common in your corpus — which then corrupts
+  split_long_paragraph and pull-quote detection. An abbreviation-aware splitter would help.
+
+  Libraries worth cribbing
+
+  ┌────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+  │        Need        │                                 Suggestion                                  │
+  ├────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+  │ Layout/structure   │ mupdf crate (structured text: blocks/lines/spans with bbox + font +         │
+  │ (biggest win)      │ bold/italic), or pdfium-render's char-level metrics you already have access │
+  │                    │  to. Borrow detection ideas from Python pdfplumber / unstructured.          │
+  ├────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+  │ Structured LLM     │ OpenRouter/Groq response_format json_schema + schemars to derive it from    │
+  │ JSON               │ LlmLayout.                                                                  │
+  ├────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+  │ Retries/backoff    │ backoff crate; reuse one reqwest::Client.                                   │
+  ├────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+  │ Boilerplate        │ Curated lists from Mozilla Readability / trafilatura to replace the         │
+  │ stoplists          │ hand-rolled is_noise_line table.                                            │
+  ├────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+  │ Sentence/word      │ unicode-segmentation, plus a small legal-abbreviation guard for the         │
+  │ segmentation       │ splitter.                                                                   │
+  ├────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+  │ De-hyphenation     │ hyphenation crate or a wordlist dictionary check, instead of the hardcoded  │
+  │                    │ well-/case-/... preserve list (should_preserve_terminal_hyphen:2453).       │
+  └────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+
+Implement all of claude's suggestions.
+
+Phase 3:
+compilation and testing, find pdfs in my computer, see what liquid mode produces, and rank errors and fix them. Test at least 10 pdfs.

@@ -182,3 +182,16 @@ debug_*.py
 /experiments/promotion-lm2.5/*.tsv
 /flywheel/blocks/pymupdf-block-cache/
 /eval/benchmark-v2/block-quality/
+
+# Local dev artifacts that must never land in the repo root
+/cargo_*.log
+/cargo_*.log.out
+/*_labels.json
+/labels*.json
+/conflict-*.json
+/task_*.json
+/tasks*.json
+/hard-*.json
+/tmp_labels.json
+/*.png
+!/assets/**
