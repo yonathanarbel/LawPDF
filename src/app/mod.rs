@@ -1,5 +1,7 @@
+mod chat_ui;
 mod settings_ui;
 
+use chat_ui::{ChatState, ChatUi};
 use settings_ui::SettingsUi;
 
 use std::collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
@@ -73,7 +75,6 @@ const UPDATE_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const UPDATE_NOTICE_DURATION: Duration = Duration::from_secs(4);
 const NOTICE_CAPACITY: usize = 5;
 const INFO_NOTICE_DURATION: Duration = Duration::from_secs(6);
-const CHAT_CONTEXT_TOKEN_LIMIT: usize = 64_000;
 const COMMENT_AUTOSAVE_DELAY: Duration = Duration::from_millis(650);
 const COMMENT_CARD_WIDTH: f32 = 324.0;
 const COMMENT_CARD_GAP: f32 = 14.0;
@@ -247,8 +248,7 @@ pub struct PdfEditorApp {
     liquid_rx: Receiver<LiquidEvent>,
     liquid_mode2_tx: Sender<LiquidMode2Event>,
     liquid_mode2_rx: Receiver<LiquidMode2Event>,
-    chat_tx: Sender<ChatEvent>,
-    chat_rx: Receiver<ChatEvent>,
+    chat_ui: ChatUi,
     update_tx: Sender<UpdateEvent>,
     update_rx: Receiver<UpdateEvent>,
     update_state: UpdateUiState,
@@ -332,7 +332,6 @@ pub struct PdfEditorApp {
     show_search_highlights: bool,
     ocr_states: Vec<OcrPageState>,
     ocr_progress: Option<OcrProgress>,
-    chat_state: ChatState,
     ocr_tx: Sender<OcrEvent>,
     ocr_rx: Receiver<OcrEvent>,
     scroll_target_page: Option<usize>,
@@ -438,31 +437,6 @@ enum LiquidState {
 struct LiquidOutlineItem {
     level: usize,
     text: String,
-}
-
-#[derive(Debug, Clone)]
-struct ChatState {
-    messages: Vec<ChatMessage>,
-    input: String,
-    model_index: usize,
-    in_flight: bool,
-    document_context: Option<String>,
-    context_estimated_tokens: Option<usize>,
-    context_warning: Option<String>,
-}
-
-impl Default for ChatState {
-    fn default() -> Self {
-        Self {
-            messages: Vec::new(),
-            input: String::new(),
-            model_index: 0,
-            in_flight: false,
-            document_context: None,
-            context_estimated_tokens: None,
-            context_warning: None,
-        }
-    }
 }
 
 impl LiquidState {
@@ -788,7 +762,7 @@ impl PdfEditorApp {
         let (render_tx, render_rx) = spawn_render_worker();
         let (liquid_tx, liquid_rx) = unbounded();
         let (liquid_mode2_tx, liquid_mode2_rx) = unbounded();
-        let (chat_tx, chat_rx) = unbounded();
+        let chat_ui = ChatUi::new();
         let (update_tx, update_rx) = unbounded();
         let (paid_tts_tx, paid_tts_rx) = unbounded();
         updater::spawn_update_check(update_tx.clone());
@@ -822,8 +796,7 @@ impl PdfEditorApp {
             liquid_rx,
             liquid_mode2_tx,
             liquid_mode2_rx,
-            chat_tx,
-            chat_rx,
+            chat_ui,
             update_tx,
             update_rx,
             update_state: UpdateUiState::Idle,
@@ -896,7 +869,6 @@ impl PdfEditorApp {
             show_search_highlights: true,
             ocr_states: Vec::new(),
             ocr_progress: None,
-            chat_state: ChatState::default(),
             ocr_tx,
             ocr_rx,
             scroll_target_page: Some(0),
@@ -969,7 +941,7 @@ impl PdfEditorApp {
             show_search_highlights: self.show_search_highlights,
             ocr_states: self.ocr_states.clone(),
             ocr_progress: self.ocr_progress,
-            chat_state: self.chat_state.clone(),
+            chat_state: self.chat_ui.state.clone(),
             scroll_target_page: self.scroll_target_page,
             thumbnail_scroll_target: self.thumbnail_scroll_target,
             pending_document_scroll_offset: self.pending_document_scroll_offset,
@@ -1041,7 +1013,7 @@ impl PdfEditorApp {
         self.show_search_highlights = tab.show_search_highlights;
         self.ocr_states = tab.ocr_states;
         self.ocr_progress = tab.ocr_progress;
-        self.chat_state = tab.chat_state;
+        self.chat_ui.state = tab.chat_state;
         self.scroll_target_page = tab.scroll_target_page.or(Some(self.page_index));
         self.thumbnail_scroll_target = tab.thumbnail_scroll_target.or(Some(self.page_index));
         self.pending_document_scroll_offset = tab.pending_document_scroll_offset;
@@ -1138,7 +1110,7 @@ impl PdfEditorApp {
         self.show_search_highlights = true;
         self.ocr_states.clear();
         self.ocr_progress = None;
-        self.chat_state = ChatState::default();
+        self.chat_ui.state = ChatState::default();
         self.scroll_target_page = Some(0);
         self.thumbnail_scroll_target = Some(0);
         self.visible_page_ranges.clear();
@@ -1739,10 +1711,10 @@ impl PdfEditorApp {
                                 error_notice = Some(format!("Could not save OCR cache: {error}"));
                             }
                         }
-                        if self.chat_state.messages.is_empty() {
-                            self.chat_state.document_context = None;
-                            self.chat_state.context_estimated_tokens = None;
-                            self.chat_state.context_warning = None;
+                        if self.chat_ui.state.messages.is_empty() {
+                            self.chat_ui.state.document_context = None;
+                            self.chat_ui.state.context_estimated_tokens = None;
+                            self.chat_ui.state.context_warning = None;
                         }
                     }
                 }
@@ -1792,164 +1764,6 @@ impl PdfEditorApp {
             self.status = "OCR ready; rebuilding Review Mode...".to_owned();
             self.ensure_liquid_mode2_started(ctx);
         }
-    }
-
-    fn send_chat_message(&mut self, ctx: &Context) {
-        if self.document.is_none() {
-            return;
-        }
-        if self.chat_state.in_flight {
-            return;
-        }
-
-        let user_message = self.chat_state.input.trim().to_owned();
-        if user_message.is_empty() {
-            return;
-        }
-
-        let Some(api_key) = effective_openrouter_api_key(&self.settings) else {
-            self.status = "Chat needs an OpenRouter API key.".to_owned();
-            self.settings_ui.open = true;
-            return;
-        };
-
-        if self.chat_state.messages.is_empty() && self.chat_state.document_context.is_none() {
-            if !self.ensure_native_text_loaded_for_all(ctx, "Preparing PDF text for chat") {
-                self.status = "Preparing PDF text for chat; send again when ready.".to_owned();
-                return;
-            }
-
-            let Some(document) = self.document.as_ref() else {
-                return;
-            };
-            let (context, estimated_tokens) = self.chat_context_for_document(document);
-            self.chat_state.context_estimated_tokens = Some(estimated_tokens);
-            if context.trim().is_empty() {
-                self.status = "Chat needs PDF text or OCR text first.".to_owned();
-                return;
-            }
-            if estimated_tokens <= CHAT_CONTEXT_TOKEN_LIMIT {
-                self.chat_state.document_context = Some(context);
-                self.chat_state.context_warning = None;
-            } else {
-                self.chat_state.context_warning = Some(format!(
-                    "PDF text is about {estimated_tokens} tokens, so it was not attached to the first chat message."
-                ));
-            }
-        }
-
-        self.chat_state.messages.push(ChatMessage {
-            role: ChatRole::User,
-            content: user_message,
-        });
-        self.chat_state.input.clear();
-        self.chat_state.in_flight = true;
-
-        let Some(document) = self.document.as_ref() else {
-            return;
-        };
-        let document_path = document.path.clone();
-        let model = CHAT_MODELS
-            .get(self.chat_state.model_index)
-            .unwrap_or(&CHAT_MODELS[0])
-            .id
-            .to_owned();
-        spawn_chat_job(
-            ChatRequest {
-                document_epoch: self.document_epoch,
-                path: document_path,
-                api_key,
-                model,
-                visible_messages: self.chat_state.messages.clone(),
-                document_context: self.chat_state.document_context.clone(),
-            },
-            self.chat_tx.clone(),
-        );
-        self.status = "Chat request sent.".to_owned();
-    }
-
-    fn poll_chat_results(&mut self, ctx: &Context) {
-        while let Ok(event) = self.chat_rx.try_recv() {
-            let mut error_notice = None;
-            if self.is_current_document(event.document_epoch, &event.path) {
-                self.chat_state.in_flight = false;
-                match event.result {
-                    Ok(content) => {
-                        self.chat_state.messages.push(ChatMessage {
-                            role: ChatRole::Assistant,
-                            content,
-                        });
-                        self.status = "Chat response ready.".to_owned();
-                    }
-                    Err(error) => {
-                        let message = format!("Chat failed: {error}");
-                        self.chat_state.messages.push(ChatMessage {
-                            role: ChatRole::Assistant,
-                            content: message.clone(),
-                        });
-                        error_notice = Some(message);
-                    }
-                }
-                ctx.request_repaint();
-            } else if let Some(tab) = self.tabs.iter_mut().find(|tab| {
-                tab.document_epoch == event.document_epoch && tab.document.path == event.path
-            }) {
-                tab.chat_state.in_flight = false;
-                match event.result {
-                    Ok(content) => {
-                        tab.chat_state.messages.push(ChatMessage {
-                            role: ChatRole::Assistant,
-                            content,
-                        });
-                        tab.status = "Chat response ready.".to_owned();
-                    }
-                    Err(error) => {
-                        let message = format!("Chat failed: {error}");
-                        tab.chat_state.messages.push(ChatMessage {
-                            role: ChatRole::Assistant,
-                            content: message.clone(),
-                        });
-                        tab.status = error;
-                        error_notice = Some(message);
-                    }
-                }
-            }
-            if let Some(error) = error_notice {
-                self.push_error_notice(error);
-            }
-        }
-    }
-
-    fn chat_context_for_document(&self, document: &LoadedDocument) -> (String, usize) {
-        let pages = self.collect_liquid_source_pages(document);
-        let mut context = String::new();
-        for (page_index, page) in pages.iter().enumerate() {
-            let text = page.trim();
-            if text.is_empty() {
-                continue;
-            }
-            context.push_str(&format!("\n\n--- Page {} ---\n", page_index + 1));
-            context.push_str(text);
-        }
-        let estimated_tokens = estimate_tokens(&context);
-        (context, estimated_tokens)
-    }
-
-    fn chat_context_summary(&self) -> (usize, usize) {
-        let Some(document) = self.document.as_ref() else {
-            return (0, 0);
-        };
-        let pages = self.collect_liquid_source_pages(document);
-        let mut page_count = 0usize;
-        let mut chars = 0usize;
-        for page in pages {
-            let text = page.trim();
-            if !text.is_empty() {
-                page_count += 1;
-                chars += text.chars().count();
-            }
-        }
-        (page_count, (chars / 4).max(1))
     }
 
     fn poll_render_results(&mut self, ctx: &Context) {
@@ -3980,113 +3794,6 @@ impl PdfEditorApp {
             self.start_openrouter_ocr_save();
         }
         self.draw_ocr_status(ui);
-    }
-
-    fn draw_chat_tab(&mut self, ui: &mut egui::Ui) {
-        let has_document = self.document.is_some();
-        if !has_document {
-            ui.label(RichText::new("No PDF loaded").color(MUTED_INK));
-            return;
-        }
-
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Model").color(INK));
-            let selected = CHAT_MODELS
-                .get(self.chat_state.model_index)
-                .unwrap_or(&CHAT_MODELS[0]);
-            egui::ComboBox::from_id_salt("chat_model_selector")
-                .selected_text(selected.label)
-                .width(180.0)
-                .show_ui(ui, |ui| {
-                    for (index, model) in CHAT_MODELS.iter().enumerate() {
-                        ui.selectable_value(&mut self.chat_state.model_index, index, model.label)
-                            .on_hover_text(model.id);
-                    }
-                });
-        });
-
-        let (context_pages, context_estimate) = self.chat_context_summary();
-        let context_status = if let Some(tokens) = self.chat_state.context_estimated_tokens {
-            if self.chat_state.document_context.is_some() {
-                format!("PDF context attached: ~{tokens} tokens")
-            } else {
-                format!("PDF context not attached: ~{tokens} tokens")
-            }
-        } else {
-            format!("PDF text available: {context_pages} page(s), ~{context_estimate} tokens")
-        };
-        ui.label(RichText::new(context_status).color(MUTED_INK));
-        if let Some(warning) = self.chat_state.context_warning.as_ref() {
-            ui.label(RichText::new(warning).color(Color32::from_rgb(134, 92, 34)));
-        }
-
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    !self.chat_state.messages.is_empty() || self.chat_state.in_flight,
-                    egui::Button::new("Clear"),
-                )
-                .clicked()
-            {
-                self.chat_state = ChatState {
-                    model_index: self.chat_state.model_index,
-                    ..ChatState::default()
-                };
-            }
-            if self.chat_state.in_flight {
-                ui.spinner();
-            }
-        });
-
-        ui.add_space(8.0);
-        egui::ScrollArea::vertical()
-            .id_salt("chat_messages")
-            .max_height(340.0)
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                if self.chat_state.messages.is_empty() {
-                    ui.label(RichText::new("Ask a question about this PDF.").color(MUTED_INK));
-                }
-                for message in &self.chat_state.messages {
-                    let (label, color) = match message.role {
-                        ChatRole::User => ("You", Color32::from_rgb(93, 68, 37)),
-                        ChatRole::Assistant => ("LawPDF", INK),
-                    };
-                    ui.label(RichText::new(label).strong().color(color));
-                    egui::Frame::NONE
-                        .fill(if message.role == ChatRole::User {
-                            Color32::from_rgb(247, 243, 235)
-                        } else {
-                            Color32::from_rgb(255, 254, 250)
-                        })
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(222, 216, 205)))
-                        .corner_radius(6)
-                        .inner_margin(Margin::symmetric(8, 6))
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(&message.content).size(14.0).color(INK),
-                                )
-                                .wrap(),
-                            );
-                        });
-                    ui.add_space(8.0);
-                }
-            });
-
-        ui.add_space(8.0);
-        ui.add(
-            egui::TextEdit::multiline(&mut self.chat_state.input)
-                .hint_text("Ask about the PDF")
-                .desired_rows(4)
-                .lock_focus(true),
-        );
-        if ui
-            .add_enabled(!self.chat_state.in_flight, egui::Button::new("Send"))
-            .clicked()
-        {
-            self.send_chat_message(ui.ctx());
-        }
     }
 
     fn draw_notes_tab(&mut self, ui: &mut egui::Ui) {
@@ -9067,7 +8774,7 @@ impl eframe::App for PdfEditorApp {
             || !self.active_comment_saves.is_empty()
             || !self.queued_open_paths.is_empty()
             || self.update_state.is_busy()
-            || self.chat_state.in_flight
+            || self.chat_ui.state.in_flight
             || self.ocr_is_active()
             || matches!(
                 self.liquid_state,
@@ -9581,10 +9288,6 @@ fn comment_annotations_for_save_from(annotations: &[EditorAnnotation]) -> Vec<Ed
         .filter(|annotation| matches!(annotation.kind, AnnotationKind::Comment { .. }))
         .cloned()
         .collect()
-}
-
-fn estimate_tokens(text: &str) -> usize {
-    (text.chars().count() / 4).max(1)
 }
 
 fn lerp_color(from: Color32, to: Color32, t: f32) -> Color32 {
