@@ -83,7 +83,7 @@ impl PdfEditorApp {
                     self.liquid_state = LiquidState::Idle;
                     self.status = "Settings saved.".to_owned();
                 }
-                Err(error) => self.status = error,
+                Err(error) => self.push_error_notice(error),
             }
         }
     }

@@ -1404,7 +1404,7 @@ impl PdfEditorApp {
             Err(error) => {
                 self.startup_error = Some(error.clone());
                 self.visible_page_ranges.clear();
-                self.status = error;
+                self.push_error_notice(error);
                 false
             }
         }
@@ -1493,7 +1493,7 @@ impl PdfEditorApp {
         {
             match save_with_annotations(&document.path, &destination, &self.annotations) {
                 Ok(()) => self.status = format!("Saved {}", destination.display()),
-                Err(error) => self.status = error.to_string(),
+                Err(error) => self.push_error_notice(error.to_string()),
             }
         }
     }
@@ -1571,7 +1571,7 @@ impl PdfEditorApp {
             let ocr_text = self.collect_ocr_text();
             match export_text(&destination, document, &ocr_text) {
                 Ok(()) => self.status = format!("Exported {}", destination.display()),
-                Err(error) => self.status = error.to_string(),
+                Err(error) => self.push_error_notice(error.to_string()),
             }
         }
     }
@@ -1592,7 +1592,9 @@ impl PdfEditorApp {
             let contents = format!("{}\n", text.trim_end());
             match std::fs::write(&destination, contents) {
                 Ok(()) => self.status = format!("Downloaded {}", destination.display()),
-                Err(error) => self.status = format!("Could not save Review Mode text: {error}"),
+                Err(error) => {
+                    self.push_error_notice(format!("Could not save Review Mode text: {error}"))
+                }
             }
         }
     }
@@ -1611,7 +1613,7 @@ impl PdfEditorApp {
         {
             match self.export_page_png_on_worker(path, page_index, destination.clone(), 2.0) {
                 Ok(()) => self.status = format!("Exported {}", destination.display()),
-                Err(error) => self.status = error,
+                Err(error) => self.push_error_notice(error),
             }
         }
     }
@@ -2880,7 +2882,7 @@ impl PdfEditorApp {
             {
                 self.pending_page_renders.remove(&page_index);
             }
-            self.status = "PDF render worker stopped.".to_owned();
+            self.push_error_notice("PDF render worker stopped.");
         } else {
             ctx.request_repaint_after(RENDER_POLL_INTERVAL);
         }
@@ -2919,7 +2921,7 @@ impl PdfEditorApp {
             {
                 self.pending_thumbnail_renders.remove(&page_index);
             }
-            self.status = "PDF render worker stopped.".to_owned();
+            self.push_error_notice("PDF render worker stopped.");
         } else {
             ctx.request_repaint_after(RENDER_POLL_INTERVAL);
         }
@@ -3034,7 +3036,7 @@ impl PdfEditorApp {
         };
         if self.render_tx.send(request).is_err() {
             self.pending_native_text.remove(&page_index);
-            self.status = "PDF render worker stopped.".to_owned();
+            self.push_error_notice("PDF render worker stopped.");
             false
         } else {
             true
@@ -3058,7 +3060,7 @@ impl PdfEditorApp {
         };
         if self.render_tx.send(request).is_err() {
             self.pending_text_chars.remove(&page_index);
-            self.status = "PDF render worker stopped.".to_owned();
+            self.push_error_notice("PDF render worker stopped.");
             false
         } else {
             true
@@ -3112,7 +3114,7 @@ impl PdfEditorApp {
 
         self.settings.last_pdf_zoom = zoom;
         if let Err(error) = save_settings(&self.settings) {
-            self.status = format!("Could not save zoom setting: {error}");
+            self.push_error_notice(format!("Could not save zoom setting: {error}"));
         }
     }
 
@@ -3318,7 +3320,7 @@ impl PdfEditorApp {
                 .is_err()
             {
                 self.active_comment_saves.remove(&path);
-                self.status = "PDF worker is not available; comment was not saved.".to_owned();
+                self.push_error_notice("PDF worker is not available; comment was not saved.");
             } else {
                 self.status = "Saving comments...".to_owned();
                 ctx.request_repaint_after(RENDER_POLL_INTERVAL);
@@ -3502,7 +3504,7 @@ impl PdfEditorApp {
                             .clicked()
                         {
                             if let Err(error) = self.save_current_annotations() {
-                                self.status = error;
+                                self.push_error_notice(error);
                             }
                         }
                         ui.add_enabled_ui(has_document, |ui| {
@@ -3536,9 +3538,9 @@ impl PdfEditorApp {
                                             .to_owned();
                                 }
                                 Err(error) => {
-                                    self.status = format!(
+                                    self.push_error_notice(format!(
                                         "Could not open Windows default-app settings: {error}"
-                                    );
+                                    ));
                                 }
                             }
                         }
@@ -4105,7 +4107,7 @@ impl PdfEditorApp {
             .changed()
         {
             if let Err(error) = save_settings(&self.settings) {
-                self.status = format!("Could not save motion setting: {error}");
+                self.push_error_notice(format!("Could not save motion setting: {error}"));
             }
         }
         if ui
@@ -4117,7 +4119,9 @@ impl PdfEditorApp {
             .changed()
         {
             if let Err(error) = save_settings(&self.settings) {
-                self.status = format!("Could not save Review Mode grouping setting: {error}");
+                self.push_error_notice(format!(
+                    "Could not save Review Mode grouping setting: {error}"
+                ));
             }
         }
         if ui
@@ -4129,7 +4133,9 @@ impl PdfEditorApp {
             .changed()
         {
             if let Err(error) = save_settings(&self.settings) {
-                self.status = format!("Could not save Review Mode footnote-region setting: {error}");
+                self.push_error_notice(format!(
+                    "Could not save Review Mode footnote-region setting: {error}"
+                ));
             }
         }
 
@@ -4396,7 +4402,7 @@ impl PdfEditorApp {
                                 self.allow_window_close = true;
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             }
-                            Err(error) => self.status = error,
+                            Err(error) => self.push_error_notice(error),
                         }
                     }
                     if ui.button("Don't save").clicked() {
@@ -5669,6 +5675,7 @@ impl PdfEditorApp {
     /// #33: stop any in-progress speech playback.
     fn stop_liquid_tts(&mut self) {
         if let Some(mut child) = self.tts_child.take() {
+            // Best-effort process cleanup: playback is already detached from app state.
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -6763,7 +6770,7 @@ impl PdfEditorApp {
                 self.status = format!("Correction logged ({action}, {count} line(s)).");
             }
             Err(error) => {
-                self.status = format!("Correction saved; audit log failed: {error}");
+                self.push_error_notice(format!("Correction saved; audit log failed: {error}"));
             }
         }
     }
@@ -6780,7 +6787,9 @@ impl PdfEditorApp {
             DocumentViewMode::LiquidMode2 => "liquid_mode2",
             DocumentViewMode::Pdf => "pdf",
         };
-        let _ = append_reader_event(document, "reflow_rejected", from, &ts);
+        if let Err(error) = append_reader_event(document, "reflow_rejected", from, &ts) {
+            self.push_error_notice(format!("Could not log reflow feedback: {error}"));
+        }
     }
 
     fn save_current_liquid_feedback(&mut self) {
@@ -6790,7 +6799,7 @@ impl PdfEditorApp {
         match save_liquid_feedback(document, &self.liquid_feedback) {
             Ok(()) => {}
             Err(error) => {
-                self.status = error;
+                self.push_error_notice(error);
             }
         }
     }
@@ -6822,7 +6831,7 @@ impl PdfEditorApp {
                 );
             }
             Err(error) => {
-                self.status = error;
+                self.push_error_notice(error);
             }
         }
     }
@@ -8934,7 +8943,7 @@ impl eframe::App for PdfEditorApp {
         if consume_command_shortcut(ctx, egui::Key::S)
             && let Err(error) = self.save_current_annotations()
         {
-            self.status = error;
+            self.push_error_notice(error);
         }
         if consume_command_shortcut(ctx, egui::Key::F) {
             self.focus_search(ctx);
