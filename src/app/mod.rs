@@ -1,12 +1,14 @@
 mod chat_ui;
 mod settings_ui;
 mod search_state;
+mod selection_state;
 mod tts_controller;
 mod update_ui;
 
 use chat_ui::{ChatState, ChatUi};
 use settings_ui::SettingsUi;
 use search_state::SearchState;
+use selection_state::SelectionState;
 use tts_controller::TtsController;
 use update_ui::UpdateUi;
 
@@ -292,10 +294,7 @@ pub struct PdfEditorApp {
     marker_animations: Vec<MarkerAnim>,
     active_tool: Tool,
     sidebar_tab: SidebarTab,
-    text_selection: Option<TextSelection>,
-    liquid_all_selected: bool,
-    selection_anchor: Option<(usize, usize)>,
-    selection_toolbar_rect: Option<Rect>,
+    selection_state: SelectionState,
     selected_text_box: Option<usize>,
     editing_text_box: Option<usize>,
     text_box_focus_request: Option<usize>,
@@ -318,7 +317,6 @@ pub struct PdfEditorApp {
     active_comment_saves: HashMap<PathBuf, u64>,
     text_box_text: String,
     signer_name: String,
-    pending_select_all_text: bool,
     search_state: SearchState,
     ocr_states: Vec<OcrPageState>,
     ocr_progress: Option<OcrProgress>,
@@ -816,10 +814,7 @@ impl PdfEditorApp {
             marker_animations: Vec::new(),
             active_tool: Tool::Select,
             sidebar_tab: SidebarTab::Pages,
-            text_selection: None,
-            liquid_all_selected: false,
-            selection_anchor: None,
-            selection_toolbar_rect: None,
+            selection_state: SelectionState::default(),
             selected_text_box: None,
             editing_text_box: None,
             text_box_focus_request: None,
@@ -842,7 +837,6 @@ impl PdfEditorApp {
             active_comment_saves: HashMap::new(),
             text_box_text: String::new(),
             signer_name: String::new(),
-            pending_select_all_text: false,
             search_state: SearchState::default(),
             ocr_states: Vec::new(),
             ocr_progress: None,
@@ -893,10 +887,10 @@ impl PdfEditorApp {
             annotations_dirty: self.annotations_dirty,
             liquid_feedback: self.liquid_feedback.clone(),
             editing_liquid_feedback: self.editing_liquid_feedback.clone(),
-            text_selection: self.text_selection,
-            liquid_all_selected: self.liquid_all_selected,
-            selection_anchor: self.selection_anchor,
-            selection_toolbar_rect: self.selection_toolbar_rect,
+            text_selection: self.selection_state.text,
+            liquid_all_selected: self.selection_state.liquid_all,
+            selection_anchor: self.selection_state.anchor,
+            selection_toolbar_rect: self.selection_state.toolbar_rect,
             selected_text_box: self.selected_text_box,
             editing_text_box: self.editing_text_box,
             text_box_focus_request: self.text_box_focus_request,
@@ -911,7 +905,7 @@ impl PdfEditorApp {
             drag_start_pdf: self.drag_start_pdf,
             drag_preview: self.drag_preview,
             active_signature_stroke: self.active_signature_stroke.clone(),
-            pending_select_all_text: self.pending_select_all_text,
+            pending_select_all_text: self.selection_state.pending_select_all,
             search_query: self.search_state.query.clone(),
             search_hits: self.search_state.hits.clone(),
             selected_hit: self.search_state.selected_hit,
@@ -965,10 +959,10 @@ impl PdfEditorApp {
         self.annotations_dirty = tab.annotations_dirty;
         self.liquid_feedback = tab.liquid_feedback;
         self.editing_liquid_feedback = tab.editing_liquid_feedback;
-        self.text_selection = tab.text_selection;
-        self.liquid_all_selected = tab.liquid_all_selected;
-        self.selection_anchor = tab.selection_anchor;
-        self.selection_toolbar_rect = tab.selection_toolbar_rect;
+        self.selection_state.text = tab.text_selection;
+        self.selection_state.liquid_all = tab.liquid_all_selected;
+        self.selection_state.anchor = tab.selection_anchor;
+        self.selection_state.toolbar_rect = tab.selection_toolbar_rect;
         self.selected_text_box = tab.selected_text_box;
         self.editing_text_box = tab.editing_text_box;
         self.text_box_focus_request = tab.text_box_focus_request;
@@ -983,7 +977,7 @@ impl PdfEditorApp {
         self.drag_start_pdf = tab.drag_start_pdf;
         self.drag_preview = tab.drag_preview;
         self.active_signature_stroke = tab.active_signature_stroke;
-        self.pending_select_all_text = tab.pending_select_all_text;
+        self.selection_state.pending_select_all = tab.pending_select_all_text;
         self.search_state.query = tab.search_query;
         self.search_state.hits = tab.search_hits;
         self.search_state.selected_hit = tab.selected_hit;
@@ -1067,10 +1061,10 @@ impl PdfEditorApp {
         self.annotations_dirty = false;
         self.liquid_feedback.clear();
         self.editing_liquid_feedback = None;
-        self.text_selection = None;
-        self.liquid_all_selected = false;
-        self.selection_anchor = None;
-        self.selection_toolbar_rect = None;
+        self.selection_state.text = None;
+        self.selection_state.liquid_all = false;
+        self.selection_state.anchor = None;
+        self.selection_state.toolbar_rect = None;
         self.clear_text_box_selection();
         self.text_box_drag = None;
         self.clear_comment_selection();
@@ -1079,7 +1073,7 @@ impl PdfEditorApp {
         self.drag_start_pdf = None;
         self.drag_preview = None;
         self.active_signature_stroke.clear();
-        self.pending_select_all_text = false;
+        self.selection_state.pending_select_all = false;
         self.search_state = SearchState::default();
         self.ocr_states.clear();
         self.ocr_progress = None;
@@ -8036,19 +8030,19 @@ impl PdfEditorApp {
             if let Some(pos) = response.interact_pointer_pos() {
                 if let Some(pdf) = placement.screen_to_pdf(pos) {
                     if let Some(char_index) = self.text_char_index_at(page_index, pdf) {
-                        self.selection_anchor = Some((page_index, char_index));
-                        self.text_selection =
+                        self.selection_state.anchor = Some((page_index, char_index));
+                        self.selection_state.text =
                             Some(TextSelection::new(page_index, char_index, char_index));
                     } else {
-                        self.selection_anchor = None;
-                        self.text_selection = None;
+                        self.selection_state.anchor = None;
+                        self.selection_state.text = None;
                     }
                 }
             }
         }
 
         if response.dragged() {
-            let Some((anchor_page, anchor_index)) = self.selection_anchor else {
+            let Some((anchor_page, anchor_index)) = self.selection_state.anchor else {
                 return;
             };
             if anchor_page != page_index {
@@ -8058,7 +8052,7 @@ impl PdfEditorApp {
             if let Some(pos) = response.interact_pointer_pos() {
                 if let Some(pdf) = placement.screen_to_pdf(pos) {
                     if let Some(char_index) = self.text_char_index_at(page_index, pdf) {
-                        self.text_selection =
+                        self.selection_state.text =
                             Some(TextSelection::new(page_index, anchor_index, char_index));
                     }
                 }
@@ -8066,7 +8060,7 @@ impl PdfEditorApp {
         }
 
         if response.drag_stopped() {
-            self.selection_anchor = None;
+            self.selection_state.anchor = None;
             if self.active_tool == Tool::Marker {
                 if self.selected_text().is_some() {
                     self.mark_selection(self.marker_preset());
@@ -8085,7 +8079,8 @@ impl PdfEditorApp {
         page_index: usize,
     ) {
         let has_selection = self
-            .text_selection
+            .selection_state
+            .text
             .is_some_and(|selection| selection.contains(page_index));
 
         // Remember where the menu was opened: `interact_pointer_pos` is empty
@@ -8142,8 +8137,8 @@ impl PdfEditorApp {
         placement: &PagePlacement,
         page_index: usize,
     ) {
-        let Some(selection) = self.text_selection else {
-            self.selection_toolbar_rect = None;
+        let Some(selection) = self.selection_state.text else {
+            self.selection_state.toolbar_rect = None;
             return;
         };
         if !selection.contains(page_index)
@@ -8152,12 +8147,12 @@ impl PdfEditorApp {
         {
             return;
         }
-        if self.selection_anchor.is_some() {
-            self.selection_toolbar_rect = None;
+        if self.selection_state.anchor.is_some() {
+            self.selection_state.toolbar_rect = None;
             return;
         }
         if self.active_tool == Tool::Marker {
-            self.selection_toolbar_rect = None;
+            self.selection_state.toolbar_rect = None;
             return;
         }
 
@@ -8191,7 +8186,7 @@ impl PdfEditorApp {
                     });
             });
 
-        self.selection_toolbar_rect = Some(inner.response.rect);
+        self.selection_state.toolbar_rect = Some(inner.response.rect);
     }
 
     fn copy_selection(&mut self, ctx: &Context) {
@@ -8205,12 +8200,12 @@ impl PdfEditorApp {
 
     fn copy_liquid_selection(&mut self, ctx: &Context) {
         let Some(text) = self.current_liquid_copy_text() else {
-            self.liquid_all_selected = false;
+            self.selection_state.liquid_all = false;
             self.status = "No Liquid text to copy.".to_owned();
             return;
         };
 
-        self.liquid_all_selected = true;
+        self.selection_state.liquid_all = true;
         self.copy_text_to_clipboard(ctx, text);
     }
 
@@ -8251,7 +8246,7 @@ impl PdfEditorApp {
         let chars = text.chars().count();
         self.clear_text_selection();
         self.clear_text_box_selection();
-        self.liquid_all_selected = true;
+        self.selection_state.liquid_all = true;
         self.status = match self.view_mode {
             DocumentViewMode::LiquidMode2 => {
                 format!("Selected all Review Mode text ({chars} character(s))")
@@ -8282,16 +8277,16 @@ impl PdfEditorApp {
         }
 
         self.clear_text_box_selection();
-        self.text_selection = None;
-        self.liquid_all_selected = false;
-        self.selection_anchor = None;
-        self.selection_toolbar_rect = None;
-        self.pending_select_all_text = true;
+        self.selection_state.text = None;
+        self.selection_state.liquid_all = false;
+        self.selection_state.anchor = None;
+        self.selection_state.toolbar_rect = None;
+        self.selection_state.pending_select_all = true;
         self.finish_pending_select_all_text(ctx);
     }
 
     fn finish_pending_select_all_text(&mut self, ctx: &Context) {
-        if !self.pending_select_all_text {
+        if !self.selection_state.pending_select_all {
             return;
         }
 
@@ -8300,7 +8295,7 @@ impl PdfEditorApp {
             .as_ref()
             .map(|document| (document.path.clone(), document.page_count))
         else {
-            self.pending_select_all_text = false;
+            self.selection_state.pending_select_all = false;
             return;
         };
 
@@ -8333,7 +8328,7 @@ impl PdfEditorApp {
         }
 
         let Some(document) = self.document.as_ref() else {
-            self.pending_select_all_text = false;
+            self.selection_state.pending_select_all = false;
             return;
         };
 
@@ -8355,20 +8350,20 @@ impl PdfEditorApp {
         }
 
         let (Some((start_page, _)), Some((end_page, end_len))) = (first_page, last_page) else {
-            self.pending_select_all_text = false;
+            self.selection_state.pending_select_all = false;
             self.status = "No selectable PDF text found.".to_owned();
             return;
         };
 
-        self.text_selection = Some(TextSelection::range(
+        self.selection_state.text = Some(TextSelection::range(
             start_page,
             0,
             end_page,
             end_len.saturating_sub(1),
         ));
-        self.selection_anchor = None;
-        self.selection_toolbar_rect = None;
-        self.pending_select_all_text = false;
+        self.selection_state.anchor = None;
+        self.selection_state.toolbar_rect = None;
+        self.selection_state.pending_select_all = false;
         self.status = format!("Selected all text ({character_count} character(s))");
         ctx.request_repaint();
     }
@@ -8404,7 +8399,7 @@ impl PdfEditorApp {
     }
 
     fn mark_selection(&mut self, preset: MarkerPreset) {
-        let Some(selection) = self.text_selection else {
+        let Some(selection) = self.selection_state.text else {
             return;
         };
 
@@ -8449,16 +8444,12 @@ impl PdfEditorApp {
     }
 
     fn clear_text_selection(&mut self) {
-        self.text_selection = None;
-        self.liquid_all_selected = false;
-        self.selection_anchor = None;
-        self.selection_toolbar_rect = None;
-        self.pending_select_all_text = false;
+        self.selection_state = SelectionState::default();
     }
 
     fn selected_text(&self) -> Option<String> {
         let document = self.document.as_ref()?;
-        let selection = self.text_selection?;
+        let selection = self.selection_state.text?;
 
         let mut text = String::new();
         for page_index in selection.page_range() {
@@ -8481,7 +8472,7 @@ impl PdfEditorApp {
         let Some(document) = self.document.as_ref() else {
             return Vec::new();
         };
-        let Some(selection) = self.text_selection else {
+        let Some(selection) = self.selection_state.text else {
             return Vec::new();
         };
         if !selection.contains(page_index) {
@@ -8525,7 +8516,8 @@ impl PdfEditorApp {
         };
 
         if self
-            .selection_toolbar_rect
+            .selection_state
+            .toolbar_rect
             .is_some_and(|rect| rect.expand(4.0).contains(pos))
         {
             return true;
@@ -8679,7 +8671,7 @@ impl eframe::App for PdfEditorApp {
             match self.view_mode {
                 DocumentViewMode::Pdf => {
                     if should_copy_pdf_selection_on_shortcut(
-                        self.text_selection.is_some(),
+                        self.selection_state.text.is_some(),
                         copy_requested,
                     ) {
                         consume_copy_shortcut(ctx);
@@ -8688,7 +8680,7 @@ impl eframe::App for PdfEditorApp {
                 }
                 DocumentViewMode::Liquid | DocumentViewMode::LiquidMode2 => {
                     if should_copy_liquid_selection_on_shortcut(
-                        self.liquid_all_selected,
+                        self.selection_state.liquid_all,
                         self.current_liquid_copy_text().is_some(),
                         copy_requested,
                     ) {
@@ -8755,7 +8747,7 @@ impl eframe::App for PdfEditorApp {
             || !self.pending_thumbnail_renders.is_empty()
             || !self.pending_native_text.is_empty()
             || !self.pending_text_chars.is_empty()
-            || self.pending_select_all_text
+            || self.selection_state.pending_select_all
             || !self.pending_comment_saves.is_empty()
             || !self.active_comment_saves.is_empty()
             || !self.queued_open_paths.is_empty()
