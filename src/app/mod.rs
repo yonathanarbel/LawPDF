@@ -2643,7 +2643,7 @@ impl PdfEditorApp {
         page_index: usize,
         render_scale: f32,
     ) {
-        let key = PageRenderKey::new(self.document_epoch, page_index, self.zoom, render_scale);
+        let key = PageRenderKey::new(self.document_epoch, page_index, render_scale);
         if self
             .pending_page_renders
             .get(&page_index)

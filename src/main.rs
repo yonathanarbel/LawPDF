@@ -116,28 +116,77 @@ fn main() -> eframe::Result<()> {
 type DevCommandHandler = fn(Vec<OsString>) -> Result<(), String>;
 
 #[cfg(feature = "devtools")]
-const DEV_COMMANDS: &[(&str, DevCommandHandler)] = &[
-    ("--smoke-open-default", dev_smoke_open_default),
-    ("--smoke-render-worker", dev_smoke_render_worker),
-    ("--bench-scroll", dev_bench_scroll),
-    ("--smoke-liquid", dev_smoke_liquid),
-    ("--smoke-liquid2", dev_smoke_liquid),
-    ("--lm2-assemble-markdown", dev_lm2_assemble_markdown),
-    ("--lm2-timing-baseline", dev_lm2_timing_baseline),
-    ("--lm2-eval", dev_lm2_eval),
-    ("--dump-lm2-features", dev_lm2_feature_dump),
-    ("--dump-lm2-decoder-lattice", dev_lm2_decoder_lattice_dump),
-    ("--lm2-draft", dev_lm2_draft),
-    ("--lm2-source-smoke", dev_lm2_source_smoke),
-    ("--profile-dataset", dev_profile_dataset),
+struct DevCommand {
+    flags: &'static [&'static str],
+    handler: DevCommandHandler,
+}
+
+#[cfg(feature = "devtools")]
+const DEV_COMMANDS: &[DevCommand] = &[
+    DevCommand {
+        flags: &["--smoke-open-default"],
+        handler: dev_smoke_open_default,
+    },
+    DevCommand {
+        flags: &["--smoke-render-worker"],
+        handler: dev_smoke_render_worker,
+    },
+    DevCommand {
+        flags: &["--bench-scroll"],
+        handler: dev_bench_scroll,
+    },
+    DevCommand {
+        flags: &["--smoke-liquid", "--smoke-liquid2"],
+        handler: dev_smoke_liquid,
+    },
+    DevCommand {
+        flags: &["--lm2-assemble-markdown"],
+        handler: dev_lm2_assemble_markdown,
+    },
+    DevCommand {
+        flags: &["--lm2-timing-baseline"],
+        handler: dev_lm2_timing_baseline,
+    },
+    DevCommand {
+        flags: &["--lm2-eval"],
+        handler: dev_lm2_eval,
+    },
+    DevCommand {
+        flags: &["--dump-lm2-features"],
+        handler: dev_lm2_feature_dump,
+    },
+    DevCommand {
+        flags: &["--dump-lm2-decoder-lattice"],
+        handler: dev_lm2_decoder_lattice_dump,
+    },
+    DevCommand {
+        flags: &["--lm2-draft"],
+        handler: dev_lm2_draft,
+    },
+    DevCommand {
+        flags: &["--lm2-source-smoke"],
+        handler: dev_lm2_source_smoke,
+    },
+    DevCommand {
+        flags: &["--profile-dataset"],
+        handler: dev_profile_dataset,
+    },
 ];
 
 #[cfg(feature = "devtools")]
 fn dispatch_dev_command(args: &[OsString]) -> Option<Result<(), String>> {
-    let (flag, handler) = DEV_COMMANDS
+    let command = DEV_COMMANDS.iter().find(|command| {
+        command
+            .flags
+            .iter()
+            .any(|flag| args.iter().any(|arg| arg == OsStr::new(flag)))
+    })?;
+    let flag = command
+        .flags
         .iter()
-        .find(|(flag, _)| args.iter().any(|arg| arg == flag))?;
-    Some(handler(args.to_vec()).map_err(|error| format!("{flag} failed: {error}")))
+        .find(|flag| args.iter().any(|arg| arg == OsStr::new(flag)))
+        .expect("matched dev command has a matching flag");
+    Some((command.handler)(args.to_vec()).map_err(|error| format!("{flag} failed: {error}")))
 }
 
 #[cfg(feature = "devtools")]
@@ -291,7 +340,7 @@ fn smoke_render_worker() {
         }
     }
 
-    let key = render_worker::PageRenderKey::new(1, 0, 1.0, 1.0);
+    let key = render_worker::PageRenderKey::new(1, 0, 1.0);
     if let Err(error) = render_tx.send(render_worker::RenderRequest::Page {
         key,
         path,

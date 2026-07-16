@@ -11,17 +11,14 @@ use crate::pdf_backend::{PdfEngine, RenderQuality, sync_lawpdf_comments};
 pub struct PageRenderKey {
     pub document_epoch: u64,
     pub page_index: usize,
-    pub zoom_key: u32,
     pub render_scale_key: u32,
 }
 
 impl PageRenderKey {
-    pub fn new(document_epoch: u64, page_index: usize, zoom: f32, render_scale: f32) -> Self {
-        let _ = zoom;
+    pub fn new(document_epoch: u64, page_index: usize, render_scale: f32) -> Self {
         Self {
             document_epoch,
             page_index,
-            zoom_key: 0,
             render_scale_key: float_key(render_scale),
         }
     }
@@ -392,7 +389,7 @@ mod tests {
 
     fn page_request(page_index: usize, render_scale: f32) -> RenderRequest {
         RenderRequest::Page {
-            key: PageRenderKey::new(7, page_index, 1.0, render_scale),
+            key: PageRenderKey::new(7, page_index, render_scale),
             path: PathBuf::from("document.pdf"),
             zoom: 1.0,
             render_scale,
