@@ -385,3 +385,70 @@ fn float_key(value: f32) -> u32 {
         0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page_request(page_index: usize, render_scale: f32) -> RenderRequest {
+        RenderRequest::Page {
+            key: PageRenderKey::new(7, page_index, 1.0, render_scale),
+            path: PathBuf::from("document.pdf"),
+            zoom: 1.0,
+            render_scale,
+        }
+    }
+
+    #[test]
+    fn coalescing_supersedes_same_page_and_keeps_distinct_pages() {
+        let (tx, rx) = unbounded();
+        tx.send(page_request(0, 2.0)).unwrap();
+        tx.send(page_request(1, 1.5)).unwrap();
+        tx.send(page_request(0, 3.0)).unwrap();
+        let mut backlog = VecDeque::new();
+
+        let current = coalesce_render_request(page_request(0, 1.0), &rx, &mut backlog);
+
+        match current {
+            RenderRequest::Page {
+                key, render_scale, ..
+            } => {
+                assert_eq!(key.page_index, 0);
+                assert_eq!(render_scale, 3.0);
+            }
+            other => panic!("expected page render, got {other:?}"),
+        }
+        assert_eq!(backlog.len(), 1);
+        assert!(matches!(
+            backlog.pop_front(),
+            Some(RenderRequest::Page {
+                key: PageRenderKey { page_index: 1, .. },
+                render_scale: 1.5,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn coalescing_keeps_thumbnail_and_page_requests_distinct() {
+        let (tx, rx) = unbounded();
+        tx.send(RenderRequest::Thumbnail {
+            key: ThumbnailRenderKey {
+                document_epoch: 7,
+                page_index: 0,
+            },
+            path: PathBuf::from("document.pdf"),
+            render_scale: 0.25,
+        })
+        .unwrap();
+        let mut backlog = VecDeque::new();
+
+        let current = coalesce_render_request(page_request(0, 1.0), &rx, &mut backlog);
+
+        assert!(matches!(current, RenderRequest::Page { .. }));
+        assert!(matches!(
+            backlog.pop_front(),
+            Some(RenderRequest::Thumbnail { .. })
+        ));
+    }
+}
