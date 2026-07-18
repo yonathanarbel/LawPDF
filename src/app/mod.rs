@@ -87,6 +87,8 @@ const SBS_TEXTURE_CACHE_CAP: usize = PAGE_TEXTURE_CACHE_CAP * 2;
 const PAGE_PREFETCH_RADIUS: usize = 3;
 const PAGE_TEXTURE_CACHE_CAP: usize = 32;
 const SMALL_DOCUMENT_PREFETCH_LIMIT: usize = 6;
+const NOTCHED_WHEEL_IMMEDIATE_SHARE: f32 = 0.60;
+const NOTCHED_WHEEL_POINT_CHUNK: f32 = 6.0;
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const UPDATE_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const UPDATE_NOTICE_DURATION: Duration = Duration::from_secs(4);
@@ -113,6 +115,39 @@ const MARKER_SHEEN_CYCLE_BASE: f32 = 12.0;
 const MARKER_SHEEN_CYCLE_VARIANCE: f32 = 5.0;
 const MARKER_SHEEN_ALPHA: f32 = 0.11;
 const MARKER_BREATH_REPAINT: Duration = Duration::from_millis(80);
+
+fn accelerate_notched_wheel(events: &mut Vec<egui::Event>, line_scroll_speed: f32) {
+    let mut accelerated = Vec::with_capacity(events.len() + 4);
+    for event in std::mem::take(events) {
+        match event {
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta,
+                modifiers,
+            } if !modifiers.ctrl && !modifiers.command && delta != Vec2::ZERO => {
+                let immediate = delta * line_scroll_speed * NOTCHED_WHEEL_IMMEDIATE_SHARE;
+                let chunk_count = (immediate.length() / NOTCHED_WHEEL_POINT_CHUNK)
+                    .ceil()
+                    .max(1.0) as usize;
+                let chunk = immediate / chunk_count as f32;
+                for _ in 0..chunk_count {
+                    accelerated.push(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: chunk,
+                        modifiers,
+                    });
+                }
+                accelerated.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: delta * (1.0 - NOTCHED_WHEEL_IMMEDIATE_SHARE),
+                    modifiers,
+                });
+            }
+            other => accelerated.push(other),
+        }
+    }
+    *events = accelerated;
+}
 const MARKER_PRESETS: [MarkerPreset; 6] = [
     MarkerPreset {
         label: "Yellow",
@@ -270,6 +305,7 @@ pub struct PdfEditorApp {
     notices: VecDeque<Notice>,
     zoom: f32,
     target_zoom: f32,
+    document_layout_cache: Option<DocumentLayoutCache>,
     page_textures: HashMap<usize, PageTexture>,
     sbs_mode: Option<SbsModeState>,
     sbs_pane_states: HashMap<u64, SbsPaneState>,
@@ -342,12 +378,28 @@ pub struct PdfEditorApp {
     scroll_target_page: Option<usize>,
     thumbnail_scroll_target: Option<usize>,
     pending_document_scroll_offset: Option<Vec2>,
+    document_viewport_state: Option<DocumentViewportState>,
     visible_page_ranges: Vec<VisiblePageRange>,
     settings: AppSettings,
     settings_ui: SettingsUi,
     status: String,
     show_unsaved_close_prompt: bool,
     allow_window_close: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DocumentPageLayout {
+    top: f32,
+    page_width: f32,
+    page_height: f32,
+    display_size: Vec2,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DocumentViewportState {
+    viewport_width: f32,
+    content_width: f32,
+    offset_x: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,6 +447,46 @@ struct SbsPaneOutput {
     focus_requested: bool,
     replacement_epoch: Option<u64>,
     open_solo: bool,
+}
+
+fn horizontal_offset_after_viewport_resize(
+    previous: Option<DocumentViewportState>,
+    viewport_width: f32,
+    content_width: f32,
+) -> f32 {
+    let viewport_width = viewport_width.max(1.0);
+    let content_width = content_width.max(viewport_width);
+    let max_offset = (content_width - viewport_width).max(0.0);
+    if max_offset <= 0.5 {
+        return 0.0;
+    }
+
+    let center_fraction = previous
+        .map(|state| {
+            if state.content_width <= state.viewport_width + 0.5 {
+                0.5
+            } else {
+                ((state.offset_x + state.viewport_width * 0.5) / state.content_width.max(1.0))
+                    .clamp(0.0, 1.0)
+            }
+        })
+        .unwrap_or(0.5);
+    (content_width * center_fraction - viewport_width * 0.5).clamp(0.0, max_offset)
+}
+
+impl DocumentPageLayout {
+    fn bottom(self) -> f32 {
+        self.top + self.display_size.y
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DocumentLayoutCache {
+    document_epoch: u64,
+    zoom: f32,
+    pages: Arc<[DocumentPageLayout]>,
+    max_page_width: f32,
+    content_height: f32,
 }
 
 #[derive(Debug)]
@@ -516,16 +608,17 @@ enum UpdateUiState {
     Checking,
     Downloading,
     Ready,
+    Restarting,
     Failed { shown_at: Instant },
 }
 
 impl UpdateUiState {
     fn is_busy(&self) -> bool {
-        matches!(self, Self::Checking | Self::Downloading)
+        matches!(self, Self::Checking | Self::Downloading | Self::Restarting)
     }
 
     fn has_ready_update(&self) -> bool {
-        matches!(self, Self::Ready)
+        matches!(self, Self::Ready | Self::Restarting)
     }
 }
 
@@ -818,7 +911,7 @@ impl PdfEditorApp {
         install_paper_theme(&cc.egui_ctx);
 
         let (ocr_tx, ocr_rx) = unbounded();
-        let (render_tx, render_rx) = spawn_render_worker();
+        let (render_tx, render_rx) = spawn_render_worker(Some(cc.egui_ctx.clone()));
         let (document_links_tx, document_links_rx) = unbounded();
         let (liquid_tx, liquid_rx) = unbounded();
         let (liquid_mode2_tx, liquid_mode2_rx) = unbounded();
@@ -862,6 +955,7 @@ impl PdfEditorApp {
             notices: VecDeque::new(),
             zoom: initial_zoom,
             target_zoom: initial_zoom,
+            document_layout_cache: None,
             page_textures: HashMap::new(),
             sbs_mode: None,
             sbs_pane_states: HashMap::new(),
@@ -925,6 +1019,7 @@ impl PdfEditorApp {
             scroll_target_page: Some(0),
             thumbnail_scroll_target: Some(0),
             pending_document_scroll_offset: None,
+            document_viewport_state: None,
             visible_page_ranges: Vec::new(),
             settings,
             settings_ui,
@@ -946,6 +1041,44 @@ impl PdfEditorApp {
         let epoch = self.next_document_epoch;
         self.next_document_epoch = self.next_document_epoch.wrapping_add(1).max(1);
         epoch
+    }
+
+    fn cached_document_layout(&mut self) -> Option<DocumentLayoutCache> {
+        let document = self.document.as_ref()?;
+        let cache_is_current = self.document_layout_cache.as_ref().is_some_and(|cache| {
+            cache.document_epoch == self.document_epoch
+                && cache.zoom.to_bits() == self.zoom.to_bits()
+                && cache.pages.len() == document.pages.len()
+        });
+        if !cache_is_current {
+            let mut content_height = 0.0;
+            let mut max_page_width: f32 = 0.0;
+            let pages = document
+                .pages
+                .iter()
+                .map(|page| {
+                    content_height += DOCUMENT_PAGE_GAP;
+                    let top = content_height;
+                    let display_size = Vec2::new(page.width * self.zoom, page.height * self.zoom);
+                    max_page_width = max_page_width.max(display_size.x);
+                    content_height += display_size.y;
+                    DocumentPageLayout {
+                        top,
+                        page_width: page.width,
+                        page_height: page.height,
+                        display_size,
+                    }
+                })
+                .collect::<Vec<_>>();
+            self.document_layout_cache = Some(DocumentLayoutCache {
+                document_epoch: self.document_epoch,
+                zoom: self.zoom,
+                pages: pages.into(),
+                max_page_width,
+                content_height,
+            });
+        }
+        self.document_layout_cache.clone()
     }
 
     fn active_tab_snapshot(&self, document: LoadedDocument) -> DocumentTab {
@@ -1018,6 +1151,7 @@ impl PdfEditorApp {
         let tab_zoom = normalized_pdf_zoom(tab.zoom);
         let tab_target_zoom = normalized_pdf_zoom(tab.target_zoom);
         self.document = Some(tab.document);
+        self.document_layout_cache = None;
         self.page_index = tab.page_index;
         self.document_epoch = tab.document_epoch;
         self.view_mode = tab.view_mode;
@@ -1069,6 +1203,7 @@ impl PdfEditorApp {
         self.scroll_target_page = tab.scroll_target_page.or(Some(self.page_index));
         self.thumbnail_scroll_target = tab.thumbnail_scroll_target.or(Some(self.page_index));
         self.pending_document_scroll_offset = tab.pending_document_scroll_offset;
+        self.document_viewport_state = None;
         self.visible_page_ranges = tab.visible_page_ranges;
         self.status = tab.status;
         ctx.request_repaint();
@@ -1154,6 +1289,7 @@ impl PdfEditorApp {
         self.sbs_mode = None;
         self.scroll_target_page = Some(self.page_index);
         self.pending_document_scroll_offset = None;
+        self.document_viewport_state = None;
         self.status = "Returned to single-PDF view.".to_owned();
         ctx.request_repaint();
     }
@@ -1255,6 +1391,7 @@ impl PdfEditorApp {
     fn clear_document_state(&mut self) {
         let zoom = self.default_zoom_for_new_document();
         self.document = None;
+        self.document_layout_cache = None;
         self.page_index = 0;
         self.document_epoch = 0;
         self.view_mode = DocumentViewMode::Pdf;
@@ -1299,6 +1436,8 @@ impl PdfEditorApp {
         self.chat_ui.state = ChatState::default();
         self.scroll_target_page = Some(0);
         self.thumbnail_scroll_target = Some(0);
+        self.pending_document_scroll_offset = None;
+        self.document_viewport_state = None;
         self.visible_page_ranges.clear();
         self.status = "Ready".to_owned();
     }
@@ -1452,13 +1591,8 @@ impl PdfEditorApp {
                 }
                 UpdateEvent::Ready(pending) => {
                     self.update_ui.check_in_flight = false;
-                    self.update_ui.next_check = Some(Instant::now() + UPDATE_CHECK_INTERVAL);
-                    self.status = format!(
-                        "LawPDF {} is ready and will install on next launch.",
-                        pending.version
-                    );
-                    self.update_ui.state = UpdateUiState::Ready;
-                    ctx.request_repaint();
+                    self.update_ui.next_check = None;
+                    self.install_ready_update(pending, ctx);
                 }
                 UpdateEvent::Failed(message) => {
                     self.update_ui.check_in_flight = false;
@@ -1511,6 +1645,42 @@ impl PdfEditorApp {
 
         if matches!(self.update_ui.state, UpdateUiState::Downloading) {
             ctx.request_repaint_after(RENDER_POLL_INTERVAL);
+        }
+    }
+
+    fn install_ready_update(&mut self, pending: updater::PendingUpdate, ctx: &Context) {
+        let save_in_flight =
+            !self.pending_comment_saves.is_empty() || !self.active_comment_saves.is_empty();
+        if self.has_unsaved_annotations() || save_in_flight {
+            self.status = format!(
+                "LawPDF {} is ready and will install on next launch.",
+                pending.version
+            );
+            self.update_ui.state = UpdateUiState::Ready;
+            ctx.request_repaint();
+            return;
+        }
+
+        let relaunch_args = std::env::args_os().skip(1).collect::<Vec<_>>();
+        match updater::start_update_helper(&pending, &relaunch_args) {
+            Ok(()) => {
+                self.status = format!("Restarting to install LawPDF {}.", pending.version);
+                self.update_ui.notice = Some(UpdateNotice::new(
+                    "Update downloaded; restarting to install",
+                    UpdateNoticeKind::Working,
+                ));
+                self.update_ui.state = UpdateUiState::Restarting;
+                self.allow_window_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(message) => {
+                self.push_error_notice(message.clone());
+                self.update_ui.next_check = Some(Instant::now() + UPDATE_RETRY_INTERVAL);
+                self.update_ui.state = UpdateUiState::Failed {
+                    shown_at: Instant::now(),
+                };
+                ctx.request_repaint();
+            }
         }
     }
 
@@ -2313,6 +2483,7 @@ impl PdfEditorApp {
 
         if self.is_current_document(document_epoch, path) {
             self.document = Some(document);
+            self.document_layout_cache = None;
             self.page_textures.clear();
             self.thumbnail_textures.clear();
             self.pending_page_renders.clear();
@@ -2824,8 +2995,7 @@ impl PdfEditorApp {
                             .iter()
                             .find(|warning| {
                                 warning.contains("Promoted native CatBoost runtime failed")
-                                    || warning
-                                        .contains("Promoted context two-pass model failed")
+                                    || warning.contains("Promoted context two-pass model failed")
                             })
                             .cloned()
                             .unwrap_or_else(|| {
@@ -3461,7 +3631,10 @@ impl PdfEditorApp {
 
     fn remember_pdf_zoom(&mut self, zoom: f32) {
         let zoom = normalized_pdf_zoom(zoom);
-        let document_path = self.document.as_ref().map(|document| document.path.clone());
+        let document_path = self
+            .document
+            .as_ref()
+            .map(|document| document.path.clone());
         let mut changed = false;
         if (self.settings.last_pdf_zoom - zoom).abs() > f32::EPSILON {
             self.settings.last_pdf_zoom = zoom;
@@ -3927,6 +4100,24 @@ impl PdfEditorApp {
                                 }
                             }
                         }
+                        #[cfg(target_os = "macos")]
+                        if ui
+                            .button("Set as default")
+                            .on_hover_text("Make LawPDF the default macOS PDF reader")
+                            .clicked()
+                        {
+                            match set_macos_default_pdf_reader() {
+                                Ok(()) => {
+                                    self.status =
+                                        "LawPDF is now the default PDF reader on macOS.".to_owned();
+                                }
+                                Err(error) => {
+                                    self.push_error_notice(format!(
+                                        "Could not make LawPDF the default PDF reader: {error}"
+                                    ));
+                                }
+                            }
+                        }
                     });
 
                     ui.add_space(6.0);
@@ -4127,9 +4318,10 @@ impl PdfEditorApp {
                             self.go_to_page(self.page_index.saturating_sub(1));
                         }
 
-                        let page_input_id = ui
-                            .id()
-                            .with(("toolbar-page-number", self.document_epoch));
+                        let page_input_id = ui.id().with((
+                            "toolbar-page-number",
+                            self.document_epoch,
+                        ));
                         let input_had_focus =
                             ui.memory(|memory| memory.has_focus(page_input_id));
                         let current_page_number = if has_document {
@@ -4276,14 +4468,18 @@ impl PdfEditorApp {
         };
 
         let path = document.path.clone();
-        let pages = document.pages.clone();
+        let pages = document
+            .pages
+            .iter()
+            .map(|page| (page.width, page.height))
+            .collect::<Vec<_>>();
 
         let requested_thumbnail = self.thumbnail_scroll_target;
         egui::ScrollArea::vertical().show(ui, |ui| {
             let viewport = ui.clip_rect();
             let render_window = viewport.expand2(Vec2::new(0.0, 700.0));
 
-            for (page_index, page_info) in pages.iter().enumerate() {
+            for (page_index, (page_width, page_height)) in pages.iter().copied().enumerate() {
                 let visible_range = self.visible_range_for_page(page_index);
                 let target_visible = visible_range
                     .map(|range| range.coverage.max(0.24))
@@ -4321,8 +4517,7 @@ impl PdfEditorApp {
                     .show(ui, |ui| {
                         ui.vertical_centered(|ui| {
                             let display_width = 118.0;
-                            let display_height =
-                                display_width * page_info.height / page_info.width.max(1.0);
+                            let display_height = display_width * page_height / page_width.max(1.0);
                             let display_size = Vec2::new(display_width, display_height);
                             let (thumb_rect, response) =
                                 ui.allocate_exact_size(display_size, Sense::click());
@@ -4340,12 +4535,9 @@ impl PdfEditorApp {
                             );
 
                             if should_render {
-                                if let Some(thumbnail) = self.ensure_thumbnail_texture(
-                                    ctx,
-                                    &path,
-                                    page_index,
-                                    page_info.width,
-                                ) {
+                                if let Some(thumbnail) = self
+                                    .ensure_thumbnail_texture(ctx, &path, page_index, page_width)
+                                {
                                     painter.image(
                                         thumbnail.texture_id,
                                         thumb_rect,
@@ -7320,38 +7512,44 @@ impl PdfEditorApp {
                     return;
                 }
 
-                let Some(document) = self.document.as_ref() else {
+                let Some(document_layout) = self.cached_document_layout() else {
                     return;
                 };
-                let path = document.path.clone();
-                let pages = document.pages.clone();
+                let Some(path) = self.document.as_ref().map(|document| document.path.clone())
+                else {
+                    return;
+                };
 
+                let document_scroll_style = &mut ui.style_mut().spacing.scroll;
+                document_scroll_style.floating = false;
+                document_scroll_style.bar_width = 10.0;
+                document_scroll_style.handle_min_length = 48.0;
+                document_scroll_style.dormant_background_opacity = 0.18;
+                document_scroll_style.dormant_handle_opacity = 0.62;
+
+                let requested_scroll_offset = self.pending_document_scroll_offset.take();
                 let mut document_scroll_area = egui::ScrollArea::both()
                     .id_salt("document_pages")
-                    .auto_shrink([false, false]);
-                if let Some(offset) = self.pending_document_scroll_offset.take() {
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(
+                        egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                    );
+                if let Some(offset) = requested_scroll_offset {
                     document_scroll_area = document_scroll_area.scroll_offset(offset);
                 }
 
-                document_scroll_area.show_viewport(ui, |ui, viewport| {
+                let document_scroll_output = document_scroll_area.show_viewport(ui, |ui, viewport| {
                     let requested_scroll_target = self.scroll_target_page;
                     let mut closest_visible_page =
                         requested_scroll_target.unwrap_or(self.page_index);
                     let mut closest_visible_distance = f32::MAX;
 
-                    let mut content_width = viewport.width().max(ui.available_width()).max(1.0);
-                    let mut content_height = 0.0;
-                    let mut page_tops = Vec::with_capacity(pages.len());
-                    let mut display_sizes = Vec::with_capacity(pages.len());
-                    for page_info in &pages {
-                        content_height += DOCUMENT_PAGE_GAP;
-                        page_tops.push(content_height);
-                        let display_size =
-                            Vec2::new(page_info.width * self.zoom, page_info.height * self.zoom);
-                        content_width = document_canvas_width(content_width, display_size.x);
-                        content_height += display_size.y;
-                        display_sizes.push(display_size);
-                    }
+                    let content_width = document_canvas_width(
+                        viewport.width(),
+                        document_layout.max_page_width,
+                    );
+                    let content_height = document_layout.content_height;
+                    let page_layouts = &document_layout.pages;
 
                     let (content_rect, _) = ui.allocate_exact_size(
                         Vec2::new(content_width, content_height),
@@ -7368,7 +7566,7 @@ impl PdfEditorApp {
                     let clip_rect = ui.clip_rect();
                     if (zoom_delta - 1.0).abs() > f32::EPSILON {
                         if let Some(pointer) = ctx.input(|input| input.pointer.hover_pos()) {
-                            if clip_rect.contains(pointer) && !display_sizes.is_empty() {
+                            if clip_rect.contains(pointer) && !page_layouts.is_empty() {
                                 let pointer_in_viewport = pointer - clip_rect.min;
                                 let anchor_content = Pos2::new(
                                     viewport.left() + pointer_in_viewport.x,
@@ -7376,9 +7574,9 @@ impl PdfEditorApp {
                                 );
                                 let mut anchor_page = 0usize;
                                 let mut anchor_distance = f32::MAX;
-                                for (page_index, display_size) in display_sizes.iter().enumerate() {
-                                    let top = page_tops[page_index];
-                                    let bottom = top + display_size.y;
+                                for (page_index, page_layout) in page_layouts.iter().enumerate() {
+                                    let top = page_layout.top;
+                                    let bottom = page_layout.bottom();
                                     if anchor_content.y >= top && anchor_content.y <= bottom {
                                         anchor_page = page_index;
                                         break;
@@ -7392,8 +7590,8 @@ impl PdfEditorApp {
                                     }
                                 }
 
-                                let old_size = display_sizes[anchor_page];
-                                let old_top = page_tops[anchor_page];
+                                let old_size = page_layouts[anchor_page].display_size;
+                                let old_top = page_layouts[anchor_page].top;
                                 let old_left = (content_width - old_size.x).max(0.0) * 0.5;
                                 let y_fraction = if old_size.y > 0.0 {
                                     ((anchor_content.y - old_top) / old_size.y).clamp(0.0, 1.0)
@@ -7407,23 +7605,27 @@ impl PdfEditorApp {
                                 };
 
                                 let new_zoom = normalized_pdf_zoom(self.target_zoom * zoom_delta);
-                                let mut new_content_width =
-                                    viewport.width().max(ui.available_width()).max(1.0);
+                                let mut new_content_width = document_canvas_width(
+                                    viewport.width(),
+                                    0.0,
+                                );
                                 let mut new_content_height = 0.0;
                                 let mut new_page_top = 0.0;
                                 let mut new_page_size = Vec2::ZERO;
-                                for (page_index, page_info) in pages.iter().enumerate() {
+                                for (page_index, page_layout) in page_layouts.iter().enumerate() {
                                     new_content_height += DOCUMENT_PAGE_GAP;
                                     let display_size = Vec2::new(
-                                        page_info.width * new_zoom,
-                                        page_info.height * new_zoom,
+                                        page_layout.page_width * new_zoom,
+                                        page_layout.page_height * new_zoom,
                                     );
                                     if page_index == anchor_page {
                                         new_page_top = new_content_height;
                                         new_page_size = display_size;
                                     }
-                                    new_content_width =
-                                        document_canvas_width(new_content_width, display_size.x);
+                                    new_content_width = document_canvas_width(
+                                        new_content_width,
+                                        display_size.x,
+                                    );
                                     new_content_height += display_size.y;
                                 }
                                 let new_page_left =
@@ -7451,38 +7653,45 @@ impl PdfEditorApp {
                     }
 
                     let render_window = viewport.expand2(Vec2::new(220.0, 900.0));
-                    let mut visible_pages = Vec::new();
+                    let render_start =
+                        page_layouts.partition_point(|page| page.bottom() < render_window.top());
+                    let render_end =
+                        page_layouts.partition_point(|page| page.top <= render_window.bottom());
+                    let mut visible_pages = (render_start..render_end).collect::<Vec<_>>();
+                    if let Some(page_index) = requested_scroll_target
+                        && page_index < page_layouts.len()
+                        && !visible_pages.contains(&page_index)
+                    {
+                        visible_pages.push(page_index);
+                    }
                     let mut visible_page_ranges = Vec::new();
-
-                    for (page_index, display_size) in display_sizes.iter().enumerate() {
-                        let top = page_tops[page_index];
-                        let bottom = top + display_size.y;
-                        let intersects_render_window =
-                            bottom >= render_window.top() && top <= render_window.bottom();
-                        if intersects_render_window || requested_scroll_target == Some(page_index) {
-                            visible_pages.push(page_index);
-                        }
-
+                    let visible_start =
+                        page_layouts.partition_point(|page| page.bottom() < viewport.top());
+                    let visible_end =
+                        page_layouts.partition_point(|page| page.top <= viewport.bottom());
+                    for page_index in visible_start..visible_end {
+                        let page_layout = page_layouts[page_index];
+                        let top = page_layout.top;
+                        let bottom = page_layout.bottom();
                         let visible_top = top.max(viewport.top());
                         let visible_bottom = bottom.min(viewport.bottom());
                         let visible_height = (visible_bottom - visible_top).max(0.0);
-                        if visible_height > 0.5 && display_size.y > 0.0 {
+                        if visible_height > 0.5 && page_layout.display_size.y > 0.0 {
                             visible_page_ranges.push(VisiblePageRange {
                                 page_index,
-                                top_fraction: ((visible_top - top) / display_size.y)
+                                top_fraction: ((visible_top - top) / page_layout.display_size.y)
                                     .clamp(0.0, 1.0),
-                                bottom_fraction: ((visible_bottom - top) / display_size.y)
+                                bottom_fraction: ((visible_bottom - top)
+                                    / page_layout.display_size.y)
                                     .clamp(0.0, 1.0),
-                                coverage: (visible_height / display_size.y).clamp(0.0, 1.0),
+                                coverage: (visible_height / page_layout.display_size.y)
+                                    .clamp(0.0, 1.0),
                             });
                         }
-
-                        if requested_scroll_target.is_none()
-                            && bottom >= viewport.top()
-                            && top <= viewport.bottom()
-                        {
-                            let distance =
-                                ((top + display_size.y * 0.5) - viewport.center().y).abs();
+                        if requested_scroll_target.is_none() {
+                            let distance = ((top + page_layout.display_size.y * 0.5)
+                                - viewport.center().y)
+                                .abs();
                             if distance < closest_visible_distance {
                                 closest_visible_distance = distance;
                                 closest_visible_page = page_index;
@@ -7491,16 +7700,16 @@ impl PdfEditorApp {
                     }
 
                     for page_index in visible_pages {
-                        let page_info = &pages[page_index];
-                        let display_size = display_sizes[page_index];
+                        let page_layout = page_layouts[page_index];
+                        let display_size = page_layout.display_size;
                         let left =
                             content_rect.left() + (content_width - display_size.x).max(0.0) * 0.5;
-                        let top = content_rect.top() + page_tops[page_index];
+                        let top = content_rect.top() + page_layout.top;
                         let rect = Rect::from_min_size(Pos2::new(left, top), display_size);
                         let placement = PagePlacement {
                             rect,
-                            page_width: page_info.width,
-                            page_height: page_info.height,
+                            page_width: page_layout.page_width,
+                            page_height: page_layout.page_height,
                         };
                         let response = ui.interact(
                             rect,
@@ -7650,6 +7859,34 @@ impl PdfEditorApp {
                     if requested_scroll_target.is_some() {
                         self.scroll_target_page = None;
                     }
+                });
+
+                let viewport_width = document_scroll_output.inner_rect.width().max(1.0);
+                let content_width =
+                    document_canvas_width(viewport_width, document_layout.max_page_width);
+                let viewport_resized = self.document_viewport_state.map_or(true, |previous| {
+                    (previous.viewport_width - viewport_width).abs() > 0.5
+                });
+                let mut observed_offset_x = document_scroll_output.state.offset.x;
+                if requested_scroll_offset.is_none() && viewport_resized {
+                    let desired_offset = horizontal_offset_after_viewport_resize(
+                        self.document_viewport_state,
+                        viewport_width,
+                        content_width,
+                    );
+                    if (desired_offset - observed_offset_x).abs() > 0.5 {
+                        self.pending_document_scroll_offset = Some(Vec2::new(
+                            desired_offset,
+                            document_scroll_output.state.offset.y,
+                        ));
+                        observed_offset_x = desired_offset;
+                        ctx.request_repaint();
+                    }
+                }
+                self.document_viewport_state = Some(DocumentViewportState {
+                    viewport_width,
+                    content_width,
+                    offset_x: observed_offset_x,
                 });
             });
         self.draw_liquid_status_popover(ctx);
@@ -9507,17 +9744,9 @@ impl PdfEditorApp {
     }
 
     fn copy_text_to_clipboard(&mut self, ctx: &Context, text: String) {
-        ctx.copy_text(text.clone());
         let chars = text.chars().count();
-        self.status =
-            match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
-                Ok(()) => copy_status_message(chars, None),
-                Err(error) => {
-                    let error = error.to_string();
-                    eprintln!("Copy failed: {error}");
-                    copy_status_message(chars, Some(&error))
-                }
-            };
+        ctx.copy_text(text);
+        self.status = copy_status_message(chars);
     }
 
     fn select_all_current_view_text(&mut self, ctx: &Context) {
@@ -9878,6 +10107,11 @@ impl PdfEditorApp {
 }
 
 impl eframe::App for PdfEditorApp {
+    fn raw_input_hook(&mut self, ctx: &Context, raw_input: &mut egui::RawInput) {
+        let line_scroll_speed = ctx.options(|options| options.input_options.line_scroll_speed);
+        accelerate_notched_wheel(&mut raw_input.events, line_scroll_speed);
+    }
+
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop_liquid_tts();
     }
@@ -9953,24 +10187,14 @@ impl eframe::App for PdfEditorApp {
         if consume_command_shortcut(ctx, egui::Key::Minus) {
             self.set_zoom(self.target_zoom / 1.15);
         }
-        let wants_keyboard_input = ctx.wants_keyboard_input();
         let focused_text_edit = focused_widget_is_text_edit(ctx);
-        let liquid_shortcuts_allowed =
-            liquid_document_shortcuts_allowed(self.view_mode, focused_text_edit);
-        if liquid_shortcuts_allowed && consume_command_shortcut_or_key_event(ctx, egui::Key::A) {
+        let document_shortcuts_allowed = document_shortcuts_allowed(focused_text_edit);
+        if document_shortcuts_allowed && consume_command_shortcut_or_key_event(ctx, egui::Key::A) {
             surrender_focused_non_text_edit(ctx);
             self.select_all_current_view_text(ctx);
         }
-        let document_shortcuts_allowed =
-            document_shortcuts_allowed(self.view_mode, wants_keyboard_input, focused_text_edit);
-        if !liquid_shortcuts_allowed
-            && document_shortcuts_allowed
-            && consume_command_shortcut(ctx, egui::Key::A)
-        {
-            self.select_all_current_view_text(ctx);
-        }
         let copy_requested = copy_shortcut_requested(ctx);
-        if document_shortcuts_allowed || liquid_shortcuts_allowed {
+        if document_shortcuts_allowed && copy_requested {
             match self.view_mode {
                 DocumentViewMode::Pdf => {
                     if should_copy_pdf_selection_on_shortcut(
@@ -9978,7 +10202,11 @@ impl eframe::App for PdfEditorApp {
                         copy_requested,
                     ) {
                         consume_copy_shortcut(ctx);
+                        surrender_focused_non_text_edit(ctx);
                         self.copy_selection(ctx);
+                    } else {
+                        consume_copy_shortcut(ctx);
+                        self.status = "Select PDF text before copying.".to_owned();
                     }
                 }
                 DocumentViewMode::Liquid | DocumentViewMode::LiquidMode2 => {
@@ -9990,6 +10218,9 @@ impl eframe::App for PdfEditorApp {
                         consume_copy_shortcut(ctx);
                         surrender_focused_non_text_edit(ctx);
                         self.copy_liquid_selection(ctx);
+                    } else {
+                        consume_copy_shortcut(ctx);
+                        self.status = "No readable document text is ready to copy.".to_owned();
                     }
                 }
             }
@@ -10078,13 +10309,120 @@ impl eframe::App for PdfEditorApp {
 
 #[cfg(target_os = "windows")]
 fn open_windows_default_pdf_settings() -> Result<(), String> {
-    const DEFAULT_APPS_URI: &str = "ms-settings:defaultapps?registeredAppMachine=LawPDF";
+    use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr};
 
-    std::process::Command::new("explorer.exe")
-        .arg(DEFAULT_APPS_URI)
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut c_void,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show_command: i32,
+        ) -> isize;
+    }
+
+    let uri = std::ffi::OsStr::new(WINDOWS_DEFAULT_APPS_URI)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            ptr::null(),
+            uri.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            1,
+        )
+    };
+
+    if shell_execute_succeeded(result) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Windows could not launch Default Apps (ShellExecuteW code {result})"
+        ))
+    }
+}
+
+#[cfg(target_os = "windows")]
+const WINDOWS_DEFAULT_APPS_URI: &str = "ms-settings:defaultapps?registeredAppMachine=LawPDF";
+
+#[cfg(target_os = "windows")]
+fn shell_execute_succeeded(result: isize) -> bool {
+    result > 32
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_default_pdf_reader() -> Result<(), String> {
+    use std::{ffi::c_void, ptr};
+
+    type CfStringRef = *const c_void;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringCreateWithBytes(
+            allocator: *const c_void,
+            bytes: *const u8,
+            byte_count: isize,
+            encoding: u32,
+            is_external_representation: u8,
+        ) -> CfStringRef;
+        fn CFRelease(value: *const c_void);
+    }
+
+    #[link(name = "CoreServices", kind = "framework")]
+    unsafe extern "C" {
+        fn LSSetDefaultRoleHandlerForContentType(
+            content_type: CfStringRef,
+            role: u32,
+            handler_bundle_id: CfStringRef,
+        ) -> i32;
+    }
+
+    const UTF8_ENCODING: u32 = 0x0800_0100;
+    const VIEWER_ROLE: u32 = 0x0000_0002;
+
+    unsafe fn make_cf_string(value: &str) -> Result<CfStringRef, String> {
+        let string = unsafe {
+            CFStringCreateWithBytes(
+                ptr::null(),
+                value.as_ptr(),
+                value.len() as isize,
+                UTF8_ENCODING,
+                0,
+            )
+        };
+        if string.is_null() {
+            Err(format!("Could not create macOS string for {value}"))
+        } else {
+            Ok(string)
+        }
+    }
+
+    let content_type = unsafe { make_cf_string("com.adobe.pdf")? };
+    let bundle_id = match unsafe { make_cf_string("design.yarbel.lawpdf") } {
+        Ok(bundle_id) => bundle_id,
+        Err(error) => {
+            unsafe { CFRelease(content_type) };
+            return Err(error);
+        }
+    };
+
+    let status =
+        unsafe { LSSetDefaultRoleHandlerForContentType(content_type, VIEWER_ROLE, bundle_id) };
+    unsafe {
+        CFRelease(content_type);
+        CFRelease(bundle_id);
+    }
+
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(format!("Launch Services returned OSStatus {status}"))
+    }
 }
 
 fn toolbar_group(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
@@ -10332,23 +10670,8 @@ fn surrender_focused_non_text_edit(ctx: &Context) {
     }
 }
 
-fn document_shortcuts_allowed(
-    view_mode: DocumentViewMode,
-    wants_keyboard_input: bool,
-    focused_text_edit: bool,
-) -> bool {
-    !wants_keyboard_input
-        || (matches!(
-            view_mode,
-            DocumentViewMode::Liquid | DocumentViewMode::LiquidMode2
-        ) && !focused_text_edit)
-}
-
-fn liquid_document_shortcuts_allowed(view_mode: DocumentViewMode, focused_text_edit: bool) -> bool {
-    matches!(
-        view_mode,
-        DocumentViewMode::Liquid | DocumentViewMode::LiquidMode2
-    ) && !focused_text_edit
+fn document_shortcuts_allowed(focused_text_edit: bool) -> bool {
+    !focused_text_edit
 }
 
 fn should_copy_pdf_selection_on_shortcut(has_pdf_selection: bool, copy_requested: bool) -> bool {
@@ -10370,11 +10693,8 @@ fn input_has_copy_event(input: &egui::InputState) -> bool {
         .any(|event| matches!(event, egui::Event::Copy))
 }
 
-fn copy_status_message(chars: usize, error: Option<&str>) -> String {
-    match error {
-        Some(error) => format!("Copy failed: {error}"),
-        None => format!("Copied {chars} character(s)"),
-    }
+fn copy_status_message(chars: usize) -> String {
+    format!("Copied {chars} character(s)")
 }
 
 fn human_duration(seconds: f64) -> String {
@@ -11575,7 +11895,11 @@ fn zoom_for_new_document(active_target_zoom: Option<f32>, settings: &AppSettings
         .unwrap_or_else(|| normalized_pdf_zoom(settings.last_pdf_zoom))
 }
 
-fn zoom_for_document(path: &Path, active_target_zoom: Option<f32>, settings: &AppSettings) -> f32 {
+fn zoom_for_document(
+    path: &Path,
+    active_target_zoom: Option<f32>,
+    settings: &AppSettings,
+) -> f32 {
     settings
         .zoom_for_document(path)
         .unwrap_or_else(|| zoom_for_new_document(active_target_zoom, settings))
@@ -11905,6 +12229,44 @@ mod app_tests {
     use super::*;
 
     #[test]
+    fn overflowing_document_starts_horizontally_centered() {
+        assert_eq!(
+            horizontal_offset_after_viewport_resize(None, 600.0, 1_000.0),
+            200.0
+        );
+    }
+
+    #[test]
+    fn portrait_resize_centers_a_document_that_previously_fit() {
+        let landscape = DocumentViewportState {
+            viewport_width: 1_000.0,
+            content_width: 1_000.0,
+            offset_x: 0.0,
+        };
+        assert_eq!(
+            horizontal_offset_after_viewport_resize(Some(landscape), 600.0, 1_000.0),
+            200.0
+        );
+    }
+
+    #[test]
+    fn resize_preserves_the_visible_horizontal_center_and_resets_when_content_fits() {
+        let right_of_center = DocumentViewportState {
+            viewport_width: 400.0,
+            content_width: 1_000.0,
+            offset_x: 400.0,
+        };
+        assert_eq!(
+            horizontal_offset_after_viewport_resize(Some(right_of_center), 600.0, 1_000.0),
+            300.0
+        );
+        assert_eq!(
+            horizontal_offset_after_viewport_resize(Some(right_of_center), 1_200.0, 1_000.0),
+            0.0
+        );
+    }
+
+    #[test]
     fn document_canvas_reserves_a_gutter_for_the_page_marker() {
         assert_eq!(document_canvas_width(800.0, 600.0), 800.0);
         assert_eq!(
@@ -12020,6 +12382,158 @@ mod app_tests {
                 .collect::<Vec<_>>(),
             vec!["old error", "new info"]
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_default_apps_uri_targets_lawpdf_registration() {
+        assert_eq!(
+            WINDOWS_DEFAULT_APPS_URI,
+            "ms-settings:defaultapps?registeredAppMachine=LawPDF"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn shell_execute_success_codes_are_above_32() {
+        assert!(!shell_execute_succeeded(0));
+        assert!(!shell_execute_succeeded(32));
+        assert!(shell_execute_succeeded(33));
+    }
+
+    #[test]
+    fn notched_wheel_acceleration_preserves_distance_and_moves_most_immediately() {
+        let original = Vec2::new(0.0, -1.0);
+        let line_speed = 40.0;
+        let mut events = vec![egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: original,
+            modifiers: egui::Modifiers::NONE,
+        }];
+
+        accelerate_notched_wheel(&mut events, line_speed);
+
+        let mut direct_points = Vec2::ZERO;
+        let mut residual_lines = Vec2::ZERO;
+        for event in &events {
+            if let egui::Event::MouseWheel { unit, delta, .. } = event {
+                match unit {
+                    egui::MouseWheelUnit::Point => {
+                        assert!(delta.length() < 8.0);
+                        direct_points += *delta;
+                    }
+                    egui::MouseWheelUnit::Line => residual_lines += *delta,
+                    egui::MouseWheelUnit::Page => {}
+                }
+            }
+        }
+
+        let total_points = direct_points + residual_lines * line_speed;
+        assert!((total_points - original * line_speed).length() < 0.001);
+        assert!((direct_points.length() / (original * line_speed).length() - 0.60).abs() < 0.001);
+
+        let egui_first_frame_share = 1.0 - 0.1_f32.powf((1.0 / 60.0) / 0.1);
+        let accelerated_first_frame_share = NOTCHED_WHEEL_IMMEDIATE_SHARE
+            + (1.0 - NOTCHED_WHEEL_IMMEDIATE_SHARE) * egui_first_frame_share;
+        assert!(egui_first_frame_share < 0.32);
+        assert!(accelerated_first_frame_share > 0.72);
+    }
+
+    #[test]
+    fn notched_wheel_acceleration_leaves_trackpads_and_ctrl_zoom_unchanged() {
+        let point = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: Vec2::new(0.0, -3.0),
+            modifiers: egui::Modifiers::NONE,
+        };
+        let zoom = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: Vec2::new(0.0, -1.0),
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        };
+        let mut events = vec![point.clone(), zoom.clone()];
+
+        accelerate_notched_wheel(&mut events, 40.0);
+
+        assert_eq!(events, vec![point, zoom]);
+    }
+
+    #[test]
+    fn cached_scroll_layout_avoids_deep_page_geometry_clones() {
+        let mut pages = Vec::with_capacity(300);
+        for page_index in 0..300 {
+            let mut page = crate::model::PageInfo::new(612.0, 792.0);
+            for item_index in 0..80 {
+                let rect = PdfRect {
+                    left: item_index as f32,
+                    bottom: page_index as f32,
+                    right: item_index as f32 + 4.0,
+                    top: page_index as f32 + 2.0,
+                };
+                page.path_object_rects.push(rect);
+                page.image_object_rects.push(rect);
+                page.thin_horizontal_object_rects.push(rect);
+                page.thin_vertical_object_rects.push(rect);
+                page.vector_horizontal_rule_rects.push(rect);
+                page.vector_vertical_rule_rects.push(rect);
+                page.vector_ruled_cell_rects.push(rect);
+            }
+            pages.push(page);
+        }
+
+        let iterations = 60;
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            let cloned = std::hint::black_box(pages.clone());
+            let mut top = 0.0;
+            let mut sizes = Vec::with_capacity(cloned.len());
+            for page in cloned {
+                top += DOCUMENT_PAGE_GAP;
+                sizes.push(std::hint::black_box(Vec2::new(
+                    page.width * 1.25,
+                    page.height * 1.25,
+                )));
+                top += page.height * 1.25;
+            }
+            std::hint::black_box((top, sizes));
+        }
+        let baseline = baseline_started.elapsed();
+
+        let mut content_height = 0.0;
+        let layouts = pages
+            .iter()
+            .map(|page| {
+                content_height += DOCUMENT_PAGE_GAP;
+                let layout = DocumentPageLayout {
+                    top: content_height,
+                    page_width: page.width,
+                    page_height: page.height,
+                    display_size: Vec2::new(page.width * 1.25, page.height * 1.25),
+                };
+                content_height += layout.display_size.y;
+                layout
+            })
+            .collect::<Arc<[_]>>();
+        let cached_started = Instant::now();
+        for frame in 0..iterations {
+            let cached = Arc::clone(&layouts);
+            let viewport_top = (frame as f32 * 420.0) % content_height;
+            let start = cached.partition_point(|page| page.bottom() < viewport_top - 900.0);
+            let end = cached.partition_point(|page| page.top <= viewport_top + 1700.0);
+            std::hint::black_box((cached, start, end));
+        }
+        let cached = cached_started.elapsed();
+
+        let baseline_us = baseline.as_secs_f64() * 1_000_000.0 / iterations as f64;
+        let cached_us = cached.as_secs_f64() * 1_000_000.0 / iterations as f64;
+        eprintln!(
+            "scroll-layout baseline={baseline_us:.2} us/frame cached={cached_us:.2} us/frame speedup={:.1}x",
+            baseline_us / cached_us.max(0.001)
+        );
+        assert!(cached < baseline);
     }
 
     fn key_press_input(key: egui::Key, modifiers: egui::Modifiers) -> egui::InputState {
@@ -12564,6 +13078,57 @@ mod app_tests {
     }
 
     #[test]
+    fn windows_copy_event_with_non_text_focus_outputs_selected_text() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.button("Focused button").request_focus();
+            });
+        });
+
+        let mut raw_input = egui::RawInput::default();
+        raw_input.events.push(egui::Event::Copy);
+        let output = ctx.run(raw_input, |ctx| {
+            assert!(ctx.wants_keyboard_input());
+            assert!(!focused_widget_is_text_edit(ctx));
+            assert!(document_shortcuts_allowed(focused_widget_is_text_edit(ctx)));
+            assert!(copy_shortcut_requested(ctx));
+            assert!(consume_copy_shortcut(ctx));
+            ctx.copy_text("selected PDF text".to_owned());
+        });
+
+        assert!(output.platform_output.commands.iter().any(|command| {
+            matches!(
+                command,
+                egui::OutputCommand::CopyText(text) if text == "selected PDF text"
+            )
+        }));
+    }
+
+    #[test]
+    fn copy_event_is_left_for_a_focused_text_editor() {
+        let ctx = egui::Context::default();
+        let mut text = "editable text".to_owned();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut text))
+                    .request_focus();
+            });
+        });
+
+        let mut raw_input = egui::RawInput::default();
+        raw_input.events.push(egui::Event::Copy);
+        let _ = ctx.run(raw_input, |ctx| {
+            assert!(ctx.wants_keyboard_input());
+            assert!(focused_widget_is_text_edit(ctx));
+            assert!(!document_shortcuts_allowed(focused_widget_is_text_edit(
+                ctx
+            )));
+            assert!(copy_shortcut_requested(ctx));
+        });
+    }
+
+    #[test]
     fn copy_shortcut_peek_does_not_consume_command_c() {
         let mut input = key_press_input(
             egui::Key::C,
@@ -12632,47 +13197,39 @@ mod app_tests {
     }
 
     #[test]
-    fn document_shortcuts_allow_liquid_read_only_focus_but_not_text_edit_focus() {
-        assert!(document_shortcuts_allowed(
-            DocumentViewMode::Liquid,
-            true,
-            false
-        ));
-        assert!(document_shortcuts_allowed(
-            DocumentViewMode::LiquidMode2,
-            true,
-            false
-        ));
-        assert!(!document_shortcuts_allowed(
-            DocumentViewMode::LiquidMode2,
-            true,
-            true
-        ));
-        assert!(!document_shortcuts_allowed(
-            DocumentViewMode::Pdf,
-            true,
-            false
-        ));
+    fn every_command_shortcut_uses_the_platform_command_modifier() {
+        for key in [
+            egui::Key::W,
+            egui::Key::O,
+            egui::Key::S,
+            egui::Key::F,
+            egui::Key::Tab,
+            egui::Key::Plus,
+            egui::Key::Equals,
+            egui::Key::Minus,
+            egui::Key::A,
+        ] {
+            let ctx = egui::Context::default();
+            ctx.input_mut(|input| {
+                *input = key_press_input(key, egui::Modifiers::COMMAND);
+            });
+            assert!(consume_command_shortcut_or_key_event(&ctx, key), "{key:?}");
+            assert!(!consume_command_shortcut_or_key_event(&ctx, key), "{key:?}");
+        }
     }
 
     #[test]
-    fn liquid_shortcuts_are_allowed_for_read_only_liquid_views_only() {
-        assert!(liquid_document_shortcuts_allowed(
-            DocumentViewMode::Liquid,
-            false
-        ));
-        assert!(liquid_document_shortcuts_allowed(
-            DocumentViewMode::LiquidMode2,
-            false
-        ));
-        assert!(!liquid_document_shortcuts_allowed(
-            DocumentViewMode::Liquid,
-            true
-        ));
-        assert!(!liquid_document_shortcuts_allowed(
-            DocumentViewMode::Pdf,
-            false
-        ));
+    fn document_selection_shortcuts_allow_non_text_focus_only() {
+        assert!(document_shortcuts_allowed(false));
+        assert!(!document_shortcuts_allowed(true));
+    }
+
+    #[test]
+    fn plain_tool_keys_are_not_command_shortcuts() {
+        for key in [egui::Key::V, egui::Key::M, egui::Key::T, egui::Key::S] {
+            let input = key_press_input(key, egui::Modifiers::NONE);
+            assert!(!input_has_command_shortcut_event(&input, key), "{key:?}");
+        }
     }
 
     #[test]
@@ -12693,11 +13250,8 @@ mod app_tests {
     }
 
     #[test]
-    fn copy_status_message_records_success_and_errors() {
-        assert_eq!(copy_status_message(12, None), "Copied 12 character(s)");
-        let failed = copy_status_message(12, Some("clipboard unavailable"));
-        assert!(failed.contains("Copy failed"));
-        assert!(failed.contains("clipboard unavailable"));
+    fn copy_status_message_records_success() {
+        assert_eq!(copy_status_message(12), "Copied 12 character(s)");
     }
 
     #[test]
@@ -13005,11 +13559,11 @@ mod app_tests {
 
     #[test]
     fn search_hit_offsets_survive_expanding_unicode_lowercase() {
-        let text = "ISTANBUL and Stra\u{df}e";
-        let hits = find_hits(text, "stra\u{df}e", 4, SearchSource::NativeText);
+        let text = "İSTANBUL and Straße";
+        let hits = find_hits(text, "straße", 4, SearchSource::NativeText);
 
         assert_eq!(hits.len(), 1);
-        assert_eq!(&text[hits[0].match_start..hits[0].match_end], "Stra\u{df}e");
+        assert_eq!(&text[hits[0].match_start..hits[0].match_end], "Straße");
     }
 
     #[test]

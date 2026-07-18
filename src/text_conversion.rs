@@ -498,3 +498,60 @@ fn win_ansi_byte(ch: char) -> u8 {
         _ => b'?',
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Cursor, Write};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn docx_is_a_supported_document_source() {
+        assert!(is_convertible_source(Path::new("brief.DOCX")));
+    }
+
+    #[test]
+    fn docx_package_converts_to_a_readable_pdf() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after the Unix epoch")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("lawpdf-docx-test-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("create test directory");
+        let source = directory.join("legal-brief.docx");
+
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <w:document xmlns:w="urn:test"><w:body>
+              <w:p><w:r><w:t>LawPDF DOCX heading</w:t></w:r></w:p>
+              <w:tbl><w:tr>
+                <w:tc><w:p><w:r><w:t>Claim</w:t></w:r></w:p></w:tc>
+                <w:tc><w:p><w:r><w:t>Authority</w:t></w:r></w:p></w:tc>
+              </w:tr></w:tbl>
+              <w:p><w:r><w:t>Line one</w:t><w:br/><w:t>Line two</w:t></w:r></w:p>
+            </w:body></w:document>"#;
+        let mut package = ZipWriter::new(Cursor::new(Vec::new()));
+        package
+            .start_file("word/document.xml", SimpleFileOptions::default())
+            .expect("start DOCX document entry");
+        package
+            .write_all(document_xml.as_bytes())
+            .expect("write DOCX XML");
+        let bytes = package.finish().expect("finish DOCX package").into_inner();
+        std::fs::write(&source, bytes).expect("write DOCX fixture");
+
+        let extracted = extract_docx_text(&source).expect("extract DOCX text");
+        assert_eq!(
+            extracted,
+            "LawPDF DOCX heading\nClaim\nAuthority\nLine one\nLine two"
+        );
+
+        let destination = convert_source_to_pdf(&source).expect("convert DOCX to PDF");
+        let converted = Document::load(&destination).expect("load converted PDF");
+        assert_eq!(converted.get_pages().len(), 1);
+
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+}

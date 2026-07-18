@@ -96,7 +96,7 @@ fn main() -> eframe::Result<()> {
             .with_title(APP_TITLE)
             .with_icon(std::sync::Arc::new(load_app_icon()))
             .with_inner_size([1280.0, 860.0])
-            .with_min_inner_size([980.0, 640.0]),
+            .with_min_inner_size([720.0, 520.0]),
         ..Default::default()
     };
 
@@ -180,12 +180,14 @@ const DEV_COMMANDS: &[DevCommand] = &[
 
 #[cfg(feature = "devtools")]
 fn dispatch_dev_command(args: &[OsString]) -> Option<Result<(), String>> {
-    let command = DEV_COMMANDS.iter().find(|command| {
-        command
-            .flags
-            .iter()
-            .any(|flag| args.iter().any(|arg| arg == OsStr::new(flag)))
-    })?;
+    let command = DEV_COMMANDS
+        .iter()
+        .find(|command| {
+            command
+                .flags
+                .iter()
+                .any(|flag| args.iter().any(|arg| arg == OsStr::new(flag)))
+        })?;
     let flag = command
         .flags
         .iter()
@@ -326,7 +328,7 @@ fn smoke_render_worker() {
             std::process::exit(1);
         }
     };
-    let (render_tx, render_rx) = render_worker::spawn_render_worker();
+    let (render_tx, render_rx) = render_worker::spawn_render_worker(None);
     let (load_tx, load_rx) = crossbeam_channel::unbounded();
     if let Err(error) = render_tx.send(render_worker::RenderRequest::LoadDocument {
         path: path.clone(),

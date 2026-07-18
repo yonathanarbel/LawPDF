@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use eframe::egui::Context;
 
 use crate::model::{EditorAnnotation, LoadedDocument, PageTextChar, RenderedPage};
 use crate::pdf_backend::{PdfEngine, RenderQuality, rotate_pdf_page, sync_lawpdf_comments};
@@ -127,7 +128,9 @@ pub enum RenderEvent {
     },
 }
 
-pub fn spawn_render_worker() -> (Sender<RenderRequest>, Receiver<RenderEvent>) {
+pub fn spawn_render_worker(
+    repaint_context: Option<Context>,
+) -> (Sender<RenderRequest>, Receiver<RenderEvent>) {
     let (request_tx, request_rx) = unbounded();
     let (event_tx, event_rx) = unbounded();
 
@@ -300,7 +303,11 @@ pub fn spawn_render_worker() -> (Sender<RenderRequest>, Receiver<RenderEvent>) {
                 }
             };
 
-            let _ = event_tx.send(event);
+            if event_tx.send(event).is_ok() {
+                if let Some(ctx) = &repaint_context {
+                    ctx.request_repaint();
+                }
+            }
         }
     });
 

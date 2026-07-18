@@ -11,7 +11,6 @@ devtools = []
 
 [dependencies]
 anyhow = "1.0"
-arboard = "3.6"
 crossbeam-channel = "0.5"
 tract-onnx = "0.21"
 eframe = { version = "0.33", default-features = true }
