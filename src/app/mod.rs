@@ -81,6 +81,9 @@ const PAGE_MARKER_TOP_OFFSET: f32 = 12.0;
 const PAGE_MARKER_COLLAPSED_WIDTH: f32 = 28.0;
 const PAGE_MARKER_EXPANDED_WIDTH: f32 = 78.0;
 const PAGE_MARKER_HEIGHT: f32 = 26.0;
+const SBS_PANE_GAP: f32 = 8.0;
+const SBS_PAGE_MARGIN: f32 = 20.0;
+const SBS_TEXTURE_CACHE_CAP: usize = PAGE_TEXTURE_CACHE_CAP * 2;
 const PAGE_PREFETCH_RADIUS: usize = 3;
 const PAGE_TEXTURE_CACHE_CAP: usize = 32;
 const SMALL_DOCUMENT_PREFETCH_LIMIT: usize = 6;
@@ -268,6 +271,10 @@ pub struct PdfEditorApp {
     zoom: f32,
     target_zoom: f32,
     page_textures: HashMap<usize, PageTexture>,
+    sbs_mode: Option<SbsModeState>,
+    sbs_pane_states: HashMap<u64, SbsPaneState>,
+    sbs_page_textures: HashMap<(u64, usize), PageTexture>,
+    sbs_pending_page_renders: HashMap<(u64, usize), PageRenderKey>,
     thumbnail_textures: HashMap<usize, ThumbnailTexture>,
     render_tx: Sender<RenderRequest>,
     render_rx: Receiver<RenderEvent>,
@@ -341,6 +348,53 @@ pub struct PdfEditorApp {
     status: String,
     show_unsaved_close_prompt: bool,
     allow_window_close: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SbsModeState {
+    left_epoch: u64,
+    right_epoch: u64,
+}
+
+impl SbsModeState {
+    fn contains(self, document_epoch: u64) -> bool {
+        self.left_epoch == document_epoch || self.right_epoch == document_epoch
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SbsPaneState {
+    page_index: usize,
+    zoom: f32,
+    scroll_target_page: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct SbsPaneDocument {
+    document_epoch: u64,
+    path: PathBuf,
+    title: String,
+    pages: Vec<(f32, f32)>,
+}
+
+impl SbsPaneDocument {
+    fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SbsSide {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SbsPaneOutput {
+    state: SbsPaneState,
+    focus_requested: bool,
+    replacement_epoch: Option<u64>,
+    open_solo: bool,
 }
 
 #[derive(Debug)]
@@ -809,6 +863,10 @@ impl PdfEditorApp {
             zoom: initial_zoom,
             target_zoom: initial_zoom,
             page_textures: HashMap::new(),
+            sbs_mode: None,
+            sbs_pane_states: HashMap::new(),
+            sbs_page_textures: HashMap::new(),
+            sbs_pending_page_renders: HashMap::new(),
             thumbnail_textures: HashMap::new(),
             render_tx,
             render_rx,
@@ -1017,15 +1075,141 @@ impl PdfEditorApp {
     }
 
     fn switch_to_tab(&mut self, tab_index: usize, ctx: &Context) {
-        if self.active_tab == Some(tab_index) || tab_index >= self.tabs.len() {
+        if tab_index >= self.tabs.len() {
+            return;
+        }
+
+        let target_epoch = self.tabs[tab_index].document_epoch;
+        if let Some(mut mode) = self.sbs_mode
+            && !mode.contains(target_epoch)
+        {
+            if mode.left_epoch == self.document_epoch {
+                mode.left_epoch = target_epoch;
+            } else {
+                mode.right_epoch = target_epoch;
+            }
+            self.sbs_mode = Some(mode);
+            self.seed_sbs_pane_state(target_epoch);
+        }
+        if self.active_tab == Some(tab_index) {
             return;
         }
 
         self.save_active_tab_state();
+        if let Some(state) = self.sbs_pane_states.get(&target_epoch).copied()
+            && let Some(tab) = self.tabs.get_mut(tab_index)
+        {
+            tab.page_index = state.page_index;
+            tab.zoom = state.zoom;
+            tab.target_zoom = state.zoom;
+            tab.scroll_target_page = state.scroll_target_page;
+        }
         let tab = self.tabs[tab_index].clone();
         self.active_tab = Some(tab_index);
         self.startup_error = None;
         self.apply_tab_state(tab, ctx);
+    }
+
+    fn toggle_sbs_mode(&mut self, ctx: &Context) {
+        if self.sbs_mode.is_some() {
+            self.exit_sbs_mode(ctx);
+            return;
+        }
+
+        if self.tabs.len() < 2 {
+            let Some(path) = FileDialog::new()
+                .set_title("Choose a PDF for the second pane")
+                .add_filter("PDF", &["pdf"])
+                .pick_file()
+            else {
+                return;
+            };
+            self.load_document_with_options(path, ctx, false, false, false);
+        }
+
+        if self.tabs.len() < 2 {
+            self.status = "SbS mode needs two different PDFs.".to_owned();
+            return;
+        }
+
+        self.save_active_tab_state();
+        let active_epoch = self.document_epoch;
+        let Some(peer_epoch) = sbs_peer_epoch(&self.tabs, active_epoch) else {
+            self.status = "SbS mode needs two different PDFs.".to_owned();
+            return;
+        };
+        self.sbs_mode = Some(SbsModeState {
+            left_epoch: active_epoch,
+            right_epoch: peer_epoch,
+        });
+        self.seed_sbs_pane_state(active_epoch);
+        self.seed_sbs_pane_state(peer_epoch);
+        self.set_view_mode(DocumentViewMode::Pdf, ctx);
+        self.status =
+            "SbS mode: click either pane to direct page and zoom controls to it.".to_owned();
+        ctx.request_repaint();
+    }
+
+    fn exit_sbs_mode(&mut self, ctx: &Context) {
+        self.sbs_mode = None;
+        self.scroll_target_page = Some(self.page_index);
+        self.pending_document_scroll_offset = None;
+        self.status = "Returned to single-PDF view.".to_owned();
+        ctx.request_repaint();
+    }
+
+    fn seed_sbs_pane_state(&mut self, document_epoch: u64) {
+        if self.sbs_pane_states.contains_key(&document_epoch) {
+            return;
+        }
+        let Some(tab) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.document_epoch == document_epoch)
+        else {
+            return;
+        };
+        self.sbs_pane_states.insert(
+            document_epoch,
+            SbsPaneState {
+                page_index: tab.page_index,
+                zoom: normalized_pdf_zoom(tab.target_zoom),
+                scroll_target_page: Some(tab.page_index),
+            },
+        );
+    }
+
+    fn focus_sbs_document(&mut self, document_epoch: u64, ctx: &Context) {
+        let Some(tab_index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.document_epoch == document_epoch)
+        else {
+            return;
+        };
+        self.switch_to_tab(tab_index, ctx);
+        self.status = format!(
+            "SbS controls now apply to {}.",
+            self.tabs[tab_index].title()
+        );
+    }
+
+    fn repair_sbs_mode_after_tab_change(&mut self) {
+        let Some(mode) = self.sbs_mode else {
+            return;
+        };
+        let epochs = self
+            .tabs
+            .iter()
+            .map(|tab| tab.document_epoch)
+            .collect::<Vec<_>>();
+        let Some(repaired) = repaired_sbs_mode(mode, &epochs) else {
+            self.sbs_mode = None;
+            return;
+        };
+        self.sbs_mode = Some(repaired);
+        self.seed_sbs_pane_state(repaired.left_epoch);
+        self.seed_sbs_pane_state(repaired.right_epoch);
     }
 
     fn close_tab(&mut self, tab_index: usize, ctx: &Context) {
@@ -1033,13 +1217,20 @@ impl PdfEditorApp {
             return;
         }
 
+        let closing_epoch = self.tabs[tab_index].document_epoch;
         let closing_active = self.active_tab == Some(tab_index);
         if !closing_active {
             self.save_active_tab_state();
         }
 
         self.tabs.remove(tab_index);
+        self.sbs_pane_states.remove(&closing_epoch);
+        self.sbs_page_textures
+            .retain(|(document_epoch, _), _| *document_epoch != closing_epoch);
+        self.sbs_pending_page_renders
+            .retain(|(document_epoch, _), _| *document_epoch != closing_epoch);
         if self.tabs.is_empty() {
+            self.sbs_mode = None;
             self.active_tab = None;
             self.clear_document_state();
             ctx.request_repaint();
@@ -1058,6 +1249,7 @@ impl PdfEditorApp {
                 active_tab
             });
         }
+        self.repair_sbs_mode_after_tab_change();
     }
 
     fn clear_document_state(&mut self) {
@@ -1073,6 +1265,10 @@ impl PdfEditorApp {
         self.zoom = zoom;
         self.target_zoom = zoom;
         self.page_textures.clear();
+        self.sbs_mode = None;
+        self.sbs_pane_states.clear();
+        self.sbs_page_textures.clear();
+        self.sbs_pending_page_renders.clear();
         self.thumbnail_textures.clear();
         self.pending_page_renders.clear();
         self.pending_thumbnail_renders.clear();
@@ -1799,10 +1995,33 @@ impl PdfEditorApp {
                 RenderEvent::Page {
                     key,
                     path,
-                    _zoom: _,
+                    _zoom: render_zoom,
                     render_scale,
                     result,
                 } => {
+                    let sbs_cache_key = (key.document_epoch, key.page_index);
+                    let is_sbs_render = self.sbs_pending_page_renders.contains_key(&sbs_cache_key);
+                    if is_sbs_render {
+                        if self
+                            .sbs_pending_page_renders
+                            .get(&sbs_cache_key)
+                            .is_some_and(|pending_key| *pending_key == key)
+                        {
+                            self.sbs_pending_page_renders.remove(&sbs_cache_key);
+                        }
+                        match result {
+                            Ok(rendered) => self.install_sbs_page_texture(
+                                ctx,
+                                key.document_epoch,
+                                rendered,
+                                render_zoom,
+                                render_scale,
+                            ),
+                            Err(error) => self.push_error_notice(error),
+                        }
+                        ctx.request_repaint();
+                        continue;
+                    }
                     if self
                         .pending_page_renders
                         .get(&key.page_index)
@@ -2105,6 +2324,10 @@ impl PdfEditorApp {
             self.thumbnail_scroll_target = Some(page_index);
             self.status = message;
         }
+        self.sbs_page_textures
+            .retain(|(epoch, _), _| *epoch != document_epoch);
+        self.sbs_pending_page_renders
+            .retain(|(epoch, _), _| *epoch != document_epoch);
         ctx.request_repaint();
     }
 
@@ -3533,6 +3756,15 @@ impl PdfEditorApp {
 
             for (index, tab) in self.tabs.iter().enumerate() {
                 let is_active = self.active_tab == Some(index);
+                let sbs_side = self.sbs_mode.and_then(|mode| {
+                    if mode.left_epoch == tab.document_epoch {
+                        Some("L")
+                    } else if mode.right_epoch == tab.document_epoch {
+                        Some("R")
+                    } else {
+                        None
+                    }
+                });
                 let tab_fill = if is_active {
                     Color32::from_rgb(255, 254, 250)
                 } else {
@@ -3583,6 +3815,19 @@ impl PdfEditorApp {
                                 .clicked()
                             {
                                 switch_to = Some(index);
+                            }
+                            if let Some(side) = sbs_side {
+                                ui.label(
+                                    RichText::new(side)
+                                        .small()
+                                        .strong()
+                                        .color(Color32::from_rgb(145, 94, 35)),
+                                )
+                                .on_hover_text(if side == "L" {
+                                    "Shown in the left SbS pane"
+                                } else {
+                                    "Shown in the right SbS pane"
+                                });
                             }
                             let close_text = RichText::new("x").color(if is_active {
                                 Color32::from_rgb(104, 75, 43)
@@ -3700,7 +3945,8 @@ impl PdfEditorApp {
                     ui.add_space(6.0);
 
                     toolbar_group(ui, |ui| {
-                        let pdf_active = self.view_mode == DocumentViewMode::Pdf;
+                        let sbs_active = self.sbs_mode.is_some();
+                        let pdf_active = !sbs_active && self.view_mode == DocumentViewMode::Pdf;
                         if ui
                             .add_enabled(
                                 has_document,
@@ -3717,9 +3963,13 @@ impl PdfEditorApp {
                             ) {
                                 self.log_reflow_rejected(self.view_mode);
                             }
+                            if sbs_active {
+                                self.exit_sbs_mode(ctx);
+                            }
                             self.set_view_mode(DocumentViewMode::Pdf, ctx);
                         }
-                        let liquid_active = self.view_mode == DocumentViewMode::LiquidMode2;
+                        let liquid_active =
+                            !sbs_active && self.view_mode == DocumentViewMode::LiquidMode2;
                         if ui
                             .add_enabled(
                                 has_document,
@@ -3730,7 +3980,32 @@ impl PdfEditorApp {
                             )
                             .clicked()
                         {
+                            if sbs_active {
+                                self.exit_sbs_mode(ctx);
+                            }
                             self.set_view_mode(DocumentViewMode::LiquidMode2, ctx);
+                        }
+                        if ui
+                            .add_enabled(
+                                has_document,
+                                egui::Button::new("SbS").selected(sbs_active),
+                            )
+                            .on_hover_text(
+                                "Open two PDFs side by side with independent scrolling",
+                            )
+                            .clicked()
+                        {
+                            self.toggle_sbs_mode(ctx);
+                        }
+                        if let Some(mut mode) = self.sbs_mode
+                            && ui
+                                .small_button("Swap")
+                                .on_hover_text("Swap the left and right PDFs")
+                                .clicked()
+                        {
+                            std::mem::swap(&mut mode.left_epoch, &mut mode.right_epoch);
+                            self.sbs_mode = Some(mode);
+                            ctx.request_repaint();
                         }
                         if matches!(
                             self.liquid_mode2_state,
@@ -3747,12 +4022,17 @@ impl PdfEditorApp {
                             ui.horizontal(|ui| {
                                 for tool in Tool::ALL {
                                     let selected = self.active_tool == tool;
+                                    let annotation_enabled = self.sbs_mode.is_none();
                                     if toolbar_icon_button(
                                         ui,
                                         ToolbarIcon::for_tool(tool),
                                         selected,
-                                        true,
-                                        tool.tooltip(),
+                                        annotation_enabled,
+                                        if annotation_enabled {
+                                            tool.tooltip()
+                                        } else {
+                                            "Open either pane solo to edit or annotate it"
+                                        },
                                     )
                                     .clicked()
                                     {
@@ -3804,7 +4084,7 @@ impl PdfEditorApp {
                                     ui.spinner().on_hover_text("Saving page rotation…");
                                 }
                             });
-                            if self.active_tool == Tool::Marker {
+                            if self.active_tool == Tool::Marker && self.sbs_mode.is_none() {
                                 ui.add_space(2.0);
                                 ui.horizontal(|ui| {
                                     self.draw_marker_default_palette(ui);
@@ -3916,15 +4196,20 @@ impl PdfEditorApp {
                     ui.add_space(6.0);
 
                     toolbar_group(ui, |ui| {
+                        let search_enabled = has_document && self.sbs_mode.is_none();
                         let search_response = ui.add_enabled(
-                            has_document,
+                            search_enabled,
                             egui::TextEdit::singleline(&mut self.search_state.query)
                                 .hint_text("Find")
                                 .desired_width(190.0),
-                        );
+                        )
+                        .on_disabled_hover_text("Open the active pane solo to search within it");
                         if self.search_state.focus_request {
-                            if has_document {
+                            if search_enabled {
                                 search_response.request_focus();
+                            } else if has_document {
+                                self.status =
+                                    "Open either SbS pane solo to search within it.".to_owned();
                             }
                             self.search_state.focus_request = false;
                         }
@@ -3934,7 +4219,8 @@ impl PdfEditorApp {
                         let pressed_enter = search_response.lost_focus()
                             && ui.input(|input| input.key_pressed(egui::Key::Enter));
                         if ui
-                            .add_enabled(has_document, egui::Button::new("Find"))
+                            .add_enabled(search_enabled, egui::Button::new("Find"))
+                            .on_disabled_hover_text("Open the active pane solo to search within it")
                             .clicked()
                             || pressed_enter
                         {
@@ -7018,6 +7304,11 @@ impl PdfEditorApp {
                     return;
                 }
 
+                if self.sbs_mode.is_some() {
+                    self.draw_sbs_document(ui, ctx);
+                    return;
+                }
+
                 if self.view_mode == DocumentViewMode::Liquid {
                     self.ensure_liquid_started(ctx);
                     self.draw_liquid_document(ui, ctx);
@@ -7362,6 +7653,483 @@ impl PdfEditorApp {
                 });
             });
         self.draw_liquid_status_popover(ctx);
+    }
+
+    fn draw_sbs_document(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+        self.save_active_tab_state();
+        self.repair_sbs_mode_after_tab_change();
+        let Some(mode) = self.sbs_mode else {
+            return;
+        };
+
+        let documents = self
+            .tabs
+            .iter()
+            .map(|tab| SbsPaneDocument {
+                document_epoch: tab.document_epoch,
+                path: tab.document.path.clone(),
+                title: tab.title(),
+                pages: tab
+                    .document
+                    .pages
+                    .iter()
+                    .map(|page| (page.width, page.height))
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let Some(left_document) = documents
+            .iter()
+            .find(|document| document.document_epoch == mode.left_epoch)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(right_document) = documents
+            .iter()
+            .find(|document| document.document_epoch == mode.right_epoch)
+            .cloned()
+        else {
+            return;
+        };
+
+        self.seed_sbs_pane_state(mode.left_epoch);
+        self.seed_sbs_pane_state(mode.right_epoch);
+        let mut left_state = self.sbs_pane_states[&mode.left_epoch];
+        let mut right_state = self.sbs_pane_states[&mode.right_epoch];
+        if self.document_epoch == mode.left_epoch {
+            left_state.page_index = self.page_index;
+            left_state.zoom = self.zoom;
+            left_state.scroll_target_page = self.scroll_target_page;
+        } else if self.document_epoch == mode.right_epoch {
+            right_state.page_index = self.page_index;
+            right_state.zoom = self.zoom;
+            right_state.scroll_target_page = self.scroll_target_page;
+        }
+
+        ui.spacing_mut().item_spacing.x = SBS_PANE_GAP;
+        let mut left_output = None;
+        let mut right_output = None;
+        ui.columns(2, |columns| {
+            columns[0].set_min_height(columns[0].available_height());
+            columns[1].set_min_height(columns[1].available_height());
+            left_output = Some(self.draw_sbs_pane(
+                &mut columns[0],
+                ctx,
+                SbsSide::Left,
+                &left_document,
+                left_state,
+                &documents,
+                mode.right_epoch,
+                self.document_epoch == mode.left_epoch,
+            ));
+            right_output = Some(self.draw_sbs_pane(
+                &mut columns[1],
+                ctx,
+                SbsSide::Right,
+                &right_document,
+                right_state,
+                &documents,
+                mode.left_epoch,
+                self.document_epoch == mode.right_epoch,
+            ));
+        });
+
+        let (Some(left_output), Some(right_output)) = (left_output, right_output) else {
+            return;
+        };
+        self.apply_sbs_pane_output(mode.left_epoch, left_output);
+        self.apply_sbs_pane_output(mode.right_epoch, right_output);
+
+        let mut updated_mode = mode;
+        let mut focus_epoch = None;
+        if let Some(replacement_epoch) = left_output.replacement_epoch
+            && replacement_epoch != updated_mode.right_epoch
+        {
+            updated_mode.left_epoch = replacement_epoch;
+            self.seed_sbs_pane_state(replacement_epoch);
+            focus_epoch = Some(replacement_epoch);
+        }
+        if let Some(replacement_epoch) = right_output.replacement_epoch
+            && replacement_epoch != updated_mode.left_epoch
+        {
+            updated_mode.right_epoch = replacement_epoch;
+            self.seed_sbs_pane_state(replacement_epoch);
+            focus_epoch = Some(replacement_epoch);
+        }
+        self.sbs_mode = Some(updated_mode);
+
+        if left_output.focus_requested {
+            focus_epoch = Some(updated_mode.left_epoch);
+        }
+        if right_output.focus_requested {
+            focus_epoch = Some(updated_mode.right_epoch);
+        }
+        let solo_epoch = if left_output.open_solo {
+            Some(updated_mode.left_epoch)
+        } else if right_output.open_solo {
+            Some(updated_mode.right_epoch)
+        } else {
+            None
+        };
+
+        if let Some(document_epoch) = solo_epoch {
+            self.focus_sbs_document(document_epoch, ctx);
+            self.exit_sbs_mode(ctx);
+        } else if let Some(document_epoch) = focus_epoch
+            && document_epoch != self.document_epoch
+        {
+            self.focus_sbs_document(document_epoch, ctx);
+        }
+    }
+
+    fn apply_sbs_pane_output(&mut self, document_epoch: u64, output: SbsPaneOutput) {
+        self.sbs_pane_states.insert(document_epoch, output.state);
+        if let Some(tab) = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.document_epoch == document_epoch)
+        {
+            tab.page_index = output.state.page_index;
+            tab.zoom = output.state.zoom;
+            tab.target_zoom = output.state.zoom;
+            tab.scroll_target_page = output.state.scroll_target_page;
+        }
+        if document_epoch == self.document_epoch {
+            self.page_index = output.state.page_index;
+            self.scroll_target_page = output.state.scroll_target_page;
+            self.thumbnail_scroll_target = Some(output.state.page_index);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_sbs_pane(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &Context,
+        side: SbsSide,
+        document: &SbsPaneDocument,
+        mut state: SbsPaneState,
+        documents: &[SbsPaneDocument],
+        other_epoch: u64,
+        focused: bool,
+    ) -> SbsPaneOutput {
+        let mut replacement_epoch = None;
+        let mut open_solo = false;
+        let mut page_clicked = false;
+        let pane_stroke = if focused {
+            Stroke::new(2.0, Color32::from_rgb(167, 113, 50))
+        } else {
+            Stroke::new(1.0, Color32::from_rgb(202, 197, 187))
+        };
+        let pane = egui::Frame::NONE
+            .fill(Color32::from_rgb(237, 235, 229))
+            .stroke(pane_stroke)
+            .corner_radius(8)
+            .inner_margin(Margin::same(5))
+            .show(ui, |ui| {
+                ui.set_min_height(ui.available_height());
+                ui.horizontal(|ui| {
+                    let picker_width = (ui.available_width() - 150.0).clamp(110.0, 280.0);
+                    let mut selected_epoch = document.document_epoch;
+                    let picker = egui::ComboBox::from_id_salt(("sbs-document", side))
+                        .width(picker_width)
+                        .selected_text(compact_sbs_title(&document.title))
+                        .show_ui(ui, |ui| {
+                            for candidate in documents {
+                                if candidate.document_epoch == other_epoch {
+                                    continue;
+                                }
+                                ui.selectable_value(
+                                    &mut selected_epoch,
+                                    candidate.document_epoch,
+                                    compact_sbs_title(&candidate.title),
+                                )
+                                .on_hover_text(candidate.path.display().to_string());
+                            }
+                        });
+                    picker
+                        .response
+                        .on_hover_text("Choose which open PDF appears in this pane");
+                    if selected_epoch != document.document_epoch {
+                        replacement_epoch = Some(selected_epoch);
+                    }
+
+                    ui.label(
+                        RichText::new(format!(
+                            "{} / {}",
+                            state.page_index.saturating_add(1).min(document.page_count()),
+                            document.page_count()
+                        ))
+                        .color(MUTED_INK),
+                    )
+                    .on_hover_text("Current page in this pane");
+                    if focused {
+                        ui.label(
+                            RichText::new("ACTIVE")
+                                .small()
+                                .strong()
+                                .color(Color32::from_rgb(138, 88, 32)),
+                        )
+                        .on_hover_text("Toolbar controls apply to this pane");
+                    }
+                    if ui
+                        .small_button("Solo")
+                        .on_hover_text("Open this PDF by itself for editing and annotation")
+                        .clicked()
+                    {
+                        open_solo = true;
+                    }
+                });
+                ui.separator();
+                page_clicked = self.draw_sbs_pages(ui, ctx, document, &mut state);
+            });
+
+        let pane_pressed =
+            pane.response.hovered() && ctx.input(|input| input.pointer.primary_pressed());
+        SbsPaneOutput {
+            state,
+            focus_requested: page_clicked || pane_pressed || replacement_epoch.is_some(),
+            replacement_epoch,
+            open_solo,
+        }
+    }
+
+    fn draw_sbs_pages(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &Context,
+        document: &SbsPaneDocument,
+        state: &mut SbsPaneState,
+    ) -> bool {
+        let scroll_style = &mut ui.style_mut().spacing.scroll;
+        scroll_style.floating = false;
+        scroll_style.bar_width = 9.0;
+        scroll_style.handle_min_length = 42.0;
+        let requested_page = state.scroll_target_page;
+        let mut closest_page = state
+            .page_index
+            .min(document.page_count().saturating_sub(1));
+        let mut closest_distance = f32::MAX;
+        let mut page_clicked = false;
+
+        egui::ScrollArea::both()
+            .id_salt(("sbs-pages", document.document_epoch))
+            .auto_shrink([false, false])
+            .scroll_bar_visibility(
+                egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible,
+            )
+            .show_viewport(ui, |ui, viewport| {
+                let max_page_width = document
+                    .pages
+                    .iter()
+                    .map(|(width, _)| *width)
+                    .fold(1.0_f32, f32::max);
+                let fit_scale = sbs_fit_scale(viewport.width(), max_page_width);
+                let display_zoom = state.zoom * fit_scale;
+                let mut content_height = SBS_PAGE_MARGIN;
+                let mut max_display_width = 1.0_f32;
+                let layouts = document
+                    .pages
+                    .iter()
+                    .map(|(page_width, page_height)| {
+                        let display_size =
+                            Vec2::new(page_width * display_zoom, page_height * display_zoom);
+                        let top = content_height;
+                        content_height += display_size.y + DOCUMENT_PAGE_GAP;
+                        max_display_width = max_display_width.max(display_size.x);
+                        (top, display_size, *page_width, *page_height)
+                    })
+                    .collect::<Vec<_>>();
+                content_height += SBS_PAGE_MARGIN;
+                let content_width = viewport
+                    .width()
+                    .max(max_display_width + SBS_PAGE_MARGIN * 2.0)
+                    .max(1.0);
+                let (content_rect, _) = ui.allocate_exact_size(
+                    Vec2::new(content_width, content_height.max(viewport.height())),
+                    Sense::hover(),
+                );
+
+                let render_window = viewport.expand2(Vec2::new(120.0, 800.0));
+                for (page_index, (top, display_size, page_width, page_height)) in
+                    layouts.iter().copied().enumerate()
+                {
+                    let left =
+                        content_rect.left() + (content_width - display_size.x).max(0.0) * 0.5;
+                    let rect = Rect::from_min_size(
+                        Pos2::new(left, content_rect.top() + top),
+                        display_size,
+                    );
+                    if requested_page == Some(page_index) {
+                        ui.scroll_to_rect(rect, Some(Align::Center));
+                    }
+                    if rect.intersects(viewport) && requested_page.is_none() {
+                        let distance = (rect.center().y - viewport.center().y).abs();
+                        if distance < closest_distance {
+                            closest_distance = distance;
+                            closest_page = page_index;
+                        }
+                    }
+                    if !rect.intersects(render_window) && requested_page != Some(page_index) {
+                        continue;
+                    }
+
+                    let response = ui.interact(
+                        rect,
+                        ui.id()
+                            .with(("sbs-page", document.document_epoch, page_index)),
+                        Sense::click(),
+                    );
+                    page_clicked |= response.clicked();
+                    let painter = ui.painter();
+                    let shadow = Shadow {
+                        offset: [0, 5],
+                        blur: 18,
+                        spread: 0,
+                        color: Color32::from_black_alpha(42),
+                    };
+                    painter.add(shadow.as_shape(rect, 2));
+                    painter.rect_filled(rect, 2, PAPER_FILL);
+                    painter.rect_stroke(
+                        rect,
+                        2,
+                        Stroke::new(1.0, PAPER_STROKE),
+                        egui::StrokeKind::Inside,
+                    );
+                    if let Some(texture_id) = self.ensure_sbs_page_texture(
+                        ctx,
+                        document,
+                        page_index,
+                        display_zoom,
+                        page_width,
+                        page_height,
+                    ) {
+                        painter.image(
+                            texture_id,
+                            rect,
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    } else {
+                        self.draw_page_loading_placeholder(ctx, painter, rect, page_index);
+                    }
+                }
+            });
+
+        state.page_index = closest_page;
+        if requested_page.is_some() {
+            state.scroll_target_page = None;
+        }
+        page_clicked
+    }
+
+    fn ensure_sbs_page_texture(
+        &mut self,
+        ctx: &Context,
+        document: &SbsPaneDocument,
+        page_index: usize,
+        display_zoom: f32,
+        page_width: f32,
+        page_height: f32,
+    ) -> Option<TextureId> {
+        let render_scale = page_render_scale_for_zoom(ctx, display_zoom, page_width, page_height);
+        let cache_key = (document.document_epoch, page_index);
+        let is_current = self
+            .sbs_page_textures
+            .get(&cache_key)
+            .is_some_and(|texture| (texture.render_scale - render_scale).abs() < f32::EPSILON);
+        if !is_current {
+            self.request_sbs_page_render(ctx, document, page_index, display_zoom, render_scale);
+        }
+
+        let last_used = self.next_texture_access();
+        self.sbs_page_textures.get_mut(&cache_key).map(|texture| {
+            texture.last_used = last_used;
+            texture.texture.id()
+        })
+    }
+
+    fn request_sbs_page_render(
+        &mut self,
+        ctx: &Context,
+        document: &SbsPaneDocument,
+        page_index: usize,
+        zoom: f32,
+        render_scale: f32,
+    ) {
+        let cache_key = (document.document_epoch, page_index);
+        let key = PageRenderKey::new(document.document_epoch, page_index, render_scale);
+        if self
+            .sbs_pending_page_renders
+            .get(&cache_key)
+            .is_some_and(|pending| *pending == key)
+        {
+            return;
+        }
+        self.sbs_pending_page_renders.insert(cache_key, key);
+        let request = RenderRequest::Page {
+            key,
+            path: document.path.clone(),
+            zoom,
+            render_scale,
+            fast: false,
+        };
+        if self.render_tx.send(request).is_err() {
+            self.sbs_pending_page_renders.remove(&cache_key);
+            self.push_error_notice("PDF render worker stopped.");
+        } else {
+            ctx.request_repaint_after(RENDER_POLL_INTERVAL);
+        }
+    }
+
+    fn install_sbs_page_texture(
+        &mut self,
+        ctx: &Context,
+        document_epoch: u64,
+        rendered: RenderedPage,
+        zoom: f32,
+        render_scale: f32,
+    ) {
+        let max_texture_side = ctx.input(|input| input.max_texture_side);
+        if rendered.width > max_texture_side || rendered.height > max_texture_side {
+            return;
+        }
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [rendered.width, rendered.height],
+            &rendered.rgba,
+        );
+        let texture = ctx.load_texture(
+            format!(
+                "sbs-page-e{}-{}-z{:.3}-r{:.3}",
+                document_epoch,
+                rendered.page_index + 1,
+                zoom,
+                render_scale
+            ),
+            image,
+            TextureOptions::LINEAR,
+        );
+        let last_used = self.next_texture_access();
+        self.sbs_page_textures.insert(
+            (document_epoch, rendered.page_index),
+            PageTexture {
+                _zoom: zoom,
+                render_scale,
+                last_used,
+                texture,
+            },
+        );
+        while self.sbs_page_textures.len() > SBS_TEXTURE_CACHE_CAP {
+            let Some(victim) = self
+                .sbs_page_textures
+                .iter()
+                .min_by_key(|(_, texture)| texture.last_used)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            self.sbs_page_textures.remove(&victim);
+        }
     }
 
     fn draw_page_loading_placeholder(
@@ -9269,7 +10037,9 @@ impl eframe::App for PdfEditorApp {
         self.advance_zoom_animation(ctx);
 
         self.draw_toolbar(ctx);
-        self.draw_side_panel(ctx);
+        if self.sbs_mode.is_none() {
+            self.draw_side_panel(ctx);
+        }
         self.draw_status_bar(ctx);
         self.draw_document(ctx);
         self.draw_settings_window(ctx);
@@ -9279,6 +10049,7 @@ impl eframe::App for PdfEditorApp {
 
         if self.zoom_is_animating()
             || !self.pending_page_renders.is_empty()
+            || !self.sbs_pending_page_renders.is_empty()
             || !self.pending_thumbnail_renders.is_empty()
             || !self.pending_native_text.is_empty()
             || !self.pending_text_chars.is_empty()
@@ -10821,6 +11592,70 @@ fn page_index_from_input(input: &str, page_count: usize) -> Result<usize, String
     Ok(page_number - 1)
 }
 
+fn sbs_peer_epoch(tabs: &[DocumentTab], active_epoch: u64) -> Option<u64> {
+    tabs.iter()
+        .map(|tab| tab.document_epoch)
+        .find(|document_epoch| *document_epoch != active_epoch)
+}
+
+fn repaired_sbs_mode(mode: SbsModeState, available_epochs: &[u64]) -> Option<SbsModeState> {
+    if available_epochs.len() < 2 {
+        return None;
+    }
+    let mut left_epoch = available_epochs
+        .contains(&mode.left_epoch)
+        .then_some(mode.left_epoch);
+    let mut right_epoch = available_epochs
+        .contains(&mode.right_epoch)
+        .then_some(mode.right_epoch);
+
+    if left_epoch == right_epoch {
+        right_epoch = None;
+    }
+    if left_epoch.is_none() {
+        left_epoch = available_epochs
+            .iter()
+            .copied()
+            .find(|epoch| Some(*epoch) != right_epoch);
+    }
+    if right_epoch.is_none() {
+        right_epoch = available_epochs
+            .iter()
+            .copied()
+            .find(|epoch| Some(*epoch) != left_epoch);
+    }
+    Some(SbsModeState {
+        left_epoch: left_epoch?,
+        right_epoch: right_epoch?,
+    })
+}
+
+fn compact_sbs_title(title: &str) -> String {
+    const MAX_CHARS: usize = 34;
+    if title.chars().count() <= MAX_CHARS {
+        title.to_owned()
+    } else {
+        format!(
+            "{}…",
+            title.chars().take(MAX_CHARS.saturating_sub(1)).collect::<String>()
+        )
+    }
+}
+
+fn sbs_fit_scale(viewport_width: f32, max_page_width: f32) -> f32 {
+    ((viewport_width - SBS_PAGE_MARGIN * 2.0).max(80.0) / max_page_width.max(1.0)).clamp(0.1, 1.0)
+}
+
+fn page_render_scale_for_zoom(ctx: &Context, zoom: f32, page_width: f32, page_height: f32) -> f32 {
+    let device_pixels_per_point = ctx.pixels_per_point().max(1.0);
+    let base_scale = (zoom * device_pixels_per_point * 1.25).clamp(0.25, 3.25);
+    let max_texture_side = ctx.input(|input| input.max_texture_side);
+    let safe_texture_side = max_texture_side.saturating_sub(16).max(256) as f32;
+    let page_side = page_width.max(page_height).max(1.0);
+    let max_scale = ((safe_texture_side / page_side) * 8.0).floor() / 8.0;
+    ((base_scale * 8.0).round() / 8.0).min(max_scale.max(0.25))
+}
+
 fn document_canvas_width(viewport_width: f32, max_page_width: f32) -> f32 {
     viewport_width
         .max(max_page_width + PAGE_MARKER_GUTTER * 2.0)
@@ -11102,6 +11937,38 @@ mod app_tests {
         assert!(page_index_from_input("0", 900).is_err());
         assert!(page_index_from_input("901", 900).is_err());
         assert!(page_index_from_input("page 54", 900).is_err());
+    }
+
+    #[test]
+    fn sbs_mode_keeps_valid_pair_and_replaces_a_closed_side() {
+        let mode = SbsModeState {
+            left_epoch: 11,
+            right_epoch: 22,
+        };
+        assert_eq!(repaired_sbs_mode(mode, &[11, 22, 33]), Some(mode));
+        assert_eq!(
+            repaired_sbs_mode(mode, &[22, 33]),
+            Some(SbsModeState {
+                left_epoch: 33,
+                right_epoch: 22,
+            })
+        );
+        assert_eq!(repaired_sbs_mode(mode, &[22]), None);
+    }
+
+    #[test]
+    fn sbs_fit_scale_shrinks_wide_pages_without_upscaling_narrow_ones() {
+        assert!((sbs_fit_scale(500.0, 600.0) - (460.0 / 600.0)).abs() < 0.001);
+        assert_eq!(sbs_fit_scale(900.0, 600.0), 1.0);
+    }
+
+    #[test]
+    fn sbs_titles_stay_compact_for_two_pane_headers() {
+        let title = compact_sbs_title(
+            "Uniform Commercial Code Negotiable Instruments and Funds Practitioner Treatise",
+        );
+        assert!(title.chars().count() <= 34);
+        assert!(title.ends_with('…'));
     }
 
     #[test]
