@@ -28,6 +28,40 @@ const NANO_ONNX: &[u8] = include_bytes!(concat!(
 const IMGSZ: usize = 512;
 const CONF: f32 = 0.25;
 
+#[derive(Debug, Clone, Copy)]
+struct LetterboxTransform {
+    scale: f64,
+    pad_x: i64,
+    pad_y: i64,
+}
+
+fn letterbox_transform(
+    img_w: usize,
+    img_h: usize,
+    page_w_pts: f64,
+    page_h_pts: f64,
+) -> LetterboxTransform {
+    LetterboxTransform {
+        scale: (IMGSZ as f64 / page_w_pts).min(IMGSZ as f64 / page_h_pts),
+        // floor((imgsz - rendered)/2) — matches the Python letterbox.
+        pad_x: ((IMGSZ as i64 - img_w as i64) as f64 / 2.0).floor() as i64,
+        pad_y: ((IMGSZ as i64 - img_h as i64) as f64 / 2.0).floor() as i64,
+    }
+}
+
+fn unletterbox_bbox(
+    bbox: [f64; 4],
+    transform: LetterboxTransform,
+    page_w_pts: f64,
+    page_h_pts: f64,
+) -> Option<[f64; 4]> {
+    let x0 = ((bbox[0] - transform.pad_x as f64) / transform.scale).max(0.0);
+    let y0 = ((bbox[1] - transform.pad_y as f64) / transform.scale).max(0.0);
+    let x1 = ((bbox[2] - transform.pad_x as f64) / transform.scale).min(page_w_pts);
+    let y1 = ((bbox[3] - transform.pad_y as f64) / transform.scale).min(page_h_pts);
+    (x1 > x0 && y1 > y0).then_some([x0, y0, x1, y1])
+}
+
 /// Class index order baked into the epoch51 head (matches sidecar CLASSES).
 const CLASSES: [&str; 7] = [
     "footnote",
@@ -302,10 +336,9 @@ impl LiquidVision {
         page_w_pts: f64,
         page_h_pts: f64,
     ) -> Result<Vec<LvDetection>> {
-        let scale = (IMGSZ as f64 / page_w_pts).min(IMGSZ as f64 / page_h_pts);
-        // floor((imgsz - rendered)/2) — matches the Python letterbox.
-        let pad_x = ((IMGSZ as i64 - img_w as i64) as f64 / 2.0).floor() as i64;
-        let pad_y = ((IMGSZ as i64 - img_h as i64) as f64 / 2.0).floor() as i64;
+        let transform = letterbox_transform(img_w, img_h, page_w_pts, page_h_pts);
+        let pad_x = transform.pad_x;
+        let pad_y = transform.pad_y;
 
         let plane = IMGSZ * IMGSZ;
         let mut chan = vec![114f32 / 255.0; 3 * plane];
@@ -342,18 +375,19 @@ impl LiquidVision {
             if cls_index < 0 || cls_index as usize >= CLASSES.len() {
                 continue;
             }
-            // letterbox px -> fitz page-point space (y-down)
-            let fx0 = ((out[[0, i, 0]] as f64) - pad_x as f64) / scale;
-            let fy0 = ((out[[0, i, 1]] as f64) - pad_y as f64) / scale; // top edge (y-down)
-            let fx1 = ((out[[0, i, 2]] as f64) - pad_x as f64) / scale;
-            let fy1 = ((out[[0, i, 3]] as f64) - pad_y as f64) / scale; // bottom edge (y-down)
-            let x0 = fx0.max(0.0);
-            let x1 = fx1.min(page_w_pts);
-            let y0 = fy0.max(0.0); // top edge (fitz y-down)
-            let y1 = fy1.min(page_h_pts); // bottom edge (fitz y-down)
-            if x1 <= x0 || y1 <= y0 {
+            let Some([x0, y0, x1, y1]) = unletterbox_bbox(
+                [
+                    out[[0, i, 0]] as f64,
+                    out[[0, i, 1]] as f64,
+                    out[[0, i, 2]] as f64,
+                    out[[0, i, 3]] as f64,
+                ],
+                transform,
+                page_w_pts,
+                page_h_pts,
+            ) else {
                 continue;
-            }
+            };
             let area_norm = ((x1 - x0) * (y1 - y0)) / page_area;
             dets.push(LvDetection {
                 class: CLASSES[cls_index as usize],
@@ -486,4 +520,48 @@ pub fn assign_line_features(
         }
     }
     feat
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
+    }
+
+    #[test]
+    fn letterbox_transform_matches_portrait_page_geometry() {
+        let transform = letterbox_transform(396, 512, 612.0, 792.0);
+
+        assert_close(transform.scale, 512.0 / 792.0);
+        assert_eq!(transform.pad_x, 58);
+        assert_eq!(transform.pad_y, 0);
+    }
+
+    #[test]
+    fn unletterbox_bbox_round_trips_and_clamps_page_bounds() {
+        let transform = letterbox_transform(396, 512, 612.0, 792.0);
+        let full_page = [
+            transform.pad_x as f64,
+            transform.pad_y as f64,
+            transform.pad_x as f64 + 612.0 * transform.scale,
+            transform.pad_y as f64 + 792.0 * transform.scale,
+        ];
+
+        let [x0, y0, x1, y1] = unletterbox_bbox(full_page, transform, 612.0, 792.0).unwrap();
+        assert_close(x0, 0.0);
+        assert_close(y0, 0.0);
+        assert_close(x1, 612.0);
+        assert_close(y1, 792.0);
+
+        assert_eq!(
+            unletterbox_bbox([-20.0, -10.0, 700.0, 900.0], transform, 612.0, 792.0),
+            Some([0.0, 0.0, 612.0, 792.0])
+        );
+        assert_eq!(
+            unletterbox_bbox([0.0, 0.0, 1.0, 1.0], transform, 612.0, 792.0),
+            None
+        );
+    }
 }

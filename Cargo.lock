@@ -2208,10 +2208,9 @@ dependencies = [
 
 [[package]]
 name = "lawpdf"
-version = "0.2.3"
+version = "0.2.7"
 dependencies = [
  "anyhow",
- "arboard",
  "crossbeam-channel",
  "eframe",
  "egui",
@@ -2225,6 +2224,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "time",
  "tract-onnx",
  "winresource",

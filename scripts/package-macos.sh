@@ -90,6 +90,7 @@ mkdir -p "$NATIVE_RUNTIME_DEST" "$CONTEXT_RUNTIME_DEST"
 cp "$NATIVE_RUNTIME_SOURCE/$NATIVE_MODEL" "$NATIVE_RUNTIME_DEST/$NATIVE_MODEL"
 cp "$NATIVE_RUNTIME_SOURCE/$NATIVE_LIBRARY" "$NATIVE_RUNTIME_DEST/$NATIVE_LIBRARY"
 cp "$CONTEXT_RUNTIME_SOURCE/$CONTEXT_MODEL" "$CONTEXT_RUNTIME_DEST/$CONTEXT_MODEL"
+cp "$ROOT/release-manifest.json" "$RESOURCES/release-manifest.json"
 
 if command -v lipo >/dev/null 2>&1; then
   BIN_ARCHS="$(lipo -archs "$MACOS/$APP_NAME")"
@@ -120,6 +121,25 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
   <string>LawPDF</string>
   <key>CFBundleIdentifier</key>
   <string>design.yarbel.lawpdf</string>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>PDF document</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LSHandlerRank</key>
+      <string>Owner</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>com.adobe.pdf</string>
+      </array>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>pdf</string>
+      </array>
+    </dict>
+  </array>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>

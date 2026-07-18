@@ -1,15 +1,20 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ffi::{CStr, CString, OsStr, OsString};
+use std::ffi::{CStr, CString};
+#[cfg(any(feature = "devtools", test))]
+use std::ffi::{OsStr, OsString};
 use std::os::raw::{c_char, c_double, c_float, c_void};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+#[cfg(any(feature = "devtools", test))]
+use std::time::SystemTime;
+use std::time::{Instant, UNIX_EPOCH};
 
 use crossbeam_channel::Sender;
 use libloading::Library;
 use serde::{Deserialize, Serialize};
 
+use crate::hashing::sha256_hex_of_file;
 use crate::layout_roles::{CALLOUT_END, CALLOUT_START};
 use crate::liquid::{
     DeepLiquidSourceLine, DocumentProfileKind, DocumentProfileScore, LiquidBlock, LiquidBlockRole,
@@ -750,16 +755,19 @@ pub(crate) fn lm2_progressive_preview_request(
     (!preview.deep_source_lines.is_empty()).then_some((preview, LM2_PROGRESSIVE_PREVIEW_PAGES))
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Deserialize)]
 struct Lm2EvalExamplesFile {
     lines: Vec<Lm2EvalRow>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Deserialize)]
 struct Lm2EvalLabelsFile {
     labels: Vec<Lm2EvalLabel>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Clone, Deserialize)]
 struct Lm2EvalRow {
     path: String,
@@ -834,6 +842,7 @@ struct Lm2EvalRow {
     dist_to_nearest_rule: Option<f32>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Deserialize)]
 struct Lm2EvalLabel {
     path: String,
@@ -843,6 +852,7 @@ struct Lm2EvalLabel {
     role: String,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2EvalReport {
     model_label: String,
@@ -862,6 +872,7 @@ struct Lm2EvalReport {
     block_quality: Lm2BlockQualityMetrics,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2EvalActionMetric {
     action: &'static str,
@@ -871,12 +882,14 @@ struct Lm2EvalActionMetric {
     f1: f64,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug)]
 struct Lm2EvalItem {
     source: DeepLiquidSourceLine,
     actual: Lm2Action,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2EvalDisagreement {
     path: String,
@@ -901,6 +914,7 @@ struct Lm2EvalDisagreement {
     page_has_footnote_divider: bool,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2BlockQualityMetrics {
     block_count: usize,
@@ -914,6 +928,7 @@ struct Lm2BlockQualityMetrics {
     hyphen_artifacts_per_1000_blocks: f64,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Default)]
 struct Lm2BlockQualityAccumulator {
     block_count: usize,
@@ -924,6 +939,7 @@ struct Lm2BlockQualityAccumulator {
     hyphen_artifacts: usize,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2FeatureDumpReport {
     examples_input: String,
@@ -934,6 +950,7 @@ struct Lm2FeatureDumpReport {
     rows: Vec<Lm2FeatureDumpRow>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2FeatureDumpRow {
     path: String,
@@ -943,6 +960,7 @@ struct Lm2FeatureDumpRow {
     features: Vec<(usize, f64)>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2DecoderLatticeReport {
     schema_version: &'static str,
@@ -957,6 +975,7 @@ struct Lm2DecoderLatticeReport {
     pages: Vec<Lm2DecoderLatticePage>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2DecoderLatticePage {
     path: String,
@@ -964,6 +983,7 @@ struct Lm2DecoderLatticePage {
     lines: Vec<Lm2DecoderLatticeLine>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2DecoderLatticeLine {
     line_index: usize,
@@ -1166,11 +1186,13 @@ fn external_basename_key(path: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Deserialize)]
 struct Lm2DraftInput {
     documents: Vec<Lm2DraftInputDocument>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Deserialize)]
 struct Lm2DraftInputDocument {
     path: String,
@@ -1184,6 +1206,7 @@ struct Lm2DraftInputDocument {
     source_lines: Vec<DeepLiquidSourceLine>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2SourceSmokeReport {
     app_version: &'static str,
@@ -1193,6 +1216,7 @@ struct Lm2SourceSmokeReport {
     documents: Vec<Lm2SourceSmokeDocument>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2SourceSmokeDocument {
     path: String,
@@ -1201,6 +1225,7 @@ struct Lm2SourceSmokeDocument {
     error: Option<String>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2DraftReport {
     schema_version: &'static str,
@@ -1213,6 +1238,7 @@ struct Lm2DraftReport {
     rows: Vec<Lm2DraftRow>,
 }
 
+#[cfg(any(feature = "devtools", test))]
 #[derive(Debug, Serialize)]
 struct Lm2DraftRow {
     path: String,
@@ -1240,6 +1266,7 @@ struct Lm2DraftRow {
     page_has_footnote_divider: bool,
 }
 
+#[cfg(feature = "devtools")]
 pub fn run_lm2_eval(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     let mut examples_input = PathBuf::from(
         "training-data/layout-role-core/lawpdf-layout-role-examples-chandra-expanded-fast-20260604.json",
@@ -1443,6 +1470,7 @@ pub fn run_lm2_eval(args: impl IntoIterator<Item = OsString>) -> Result<(), Stri
     Ok(())
 }
 
+#[cfg(feature = "devtools")]
 pub fn run_lm2_feature_dump(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     let mut examples_input = PathBuf::from(
         "training-data/layout-role-core/lawpdf-layout-role-examples-chandra-expanded-fast-20260604.json",
@@ -1552,6 +1580,7 @@ pub fn run_lm2_feature_dump(args: impl IntoIterator<Item = OsString>) -> Result<
     Ok(())
 }
 
+#[cfg(feature = "devtools")]
 pub fn run_lm2_decoder_lattice_dump(
     args: impl IntoIterator<Item = OsString>,
 ) -> Result<(), String> {
@@ -1703,6 +1732,7 @@ pub fn run_lm2_decoder_lattice_dump(
     Ok(())
 }
 
+#[cfg(feature = "devtools")]
 pub fn run_lm2_draft(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     let mut input_path = PathBuf::from("eval/benchmark-v2/extracted-lines-lm2-source.json");
     let mut output_path: Option<PathBuf> = None;
@@ -1802,6 +1832,7 @@ pub fn run_lm2_draft(args: impl IntoIterator<Item = OsString>) -> Result<(), Str
     Ok(())
 }
 
+#[cfg(feature = "devtools")]
 pub fn run_lm2_source_smoke(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     let mut input_path = PathBuf::from("eval/benchmark-v2/extracted-lines-lm2-source.json");
     let mut output_path: Option<PathBuf> = None;
@@ -3229,40 +3260,44 @@ fn model_is_usable(model: &Lm2Model) -> bool {
 }
 
 fn load_lm2_model() -> Result<Lm2Model, String> {
-    let path = lm2_model_candidates()
-        .into_iter()
+    let candidates = lm2_model_candidates();
+    let path = candidates
+        .iter()
         .find(|path| path.is_file())
-        .ok_or_else(|| "No LM2 model found.".to_owned())?;
+        .cloned()
+        .ok_or_else(|| missing_model_error("legacy LM2 model", &candidates))?;
     let bytes =
         std::fs::read(&path).map_err(|error| format!("Could not read LM2 model: {error}"))?;
     serde_json::from_slice(&bytes).map_err(|error| format!("Could not decode LM2 model: {error}"))
 }
 
 fn load_lm2_native_catboost_model() -> Result<Option<Lm2NativeCatboostModel>, String> {
-    let model_path = std::env::var_os("LAWPDF_LM2_NATIVE_CATBOOST_MODEL")
-        .map(PathBuf::from)
-        .or_else(|| {
-            lm2_native_catboost_runtime_asset_candidates(LM2_NATIVE_CATBOOST_MODEL_FILE)
-                .into_iter()
-                .find(|path| path.is_file())
-        });
-    let Some(model_path) = model_path else {
-        return Ok(None);
-    };
-    let lib_path = std::env::var_os("LAWPDF_LM2_NATIVE_CATBOOST_LIB")
-        .map(PathBuf::from)
-        .or_else(|| {
-            lm2_native_catboost_runtime_asset_candidates(lm2_native_catboost_library_file())
-                .into_iter()
-                .find(|path| path.is_file())
-        })
-        .ok_or_else(|| {
-            format!(
-                "Native CatBoost model {} requires {} or LAWPDF_LM2_NATIVE_CATBOOST_LIB",
-                model_path.display(),
-                lm2_native_catboost_library_file()
-            )
-        })?;
+    let mut model_candidates = Vec::new();
+    if let Some(path) = std::env::var_os("LAWPDF_LM2_NATIVE_CATBOOST_MODEL").map(PathBuf::from) {
+        model_candidates.push(path);
+    }
+    model_candidates.extend(lm2_native_catboost_runtime_asset_candidates(
+        LM2_NATIVE_CATBOOST_MODEL_FILE,
+    ));
+    let model_path = model_candidates
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .ok_or_else(|| missing_model_error("LM2 native CatBoost model", &model_candidates))?;
+    verify_model_asset_hash(&model_path, "native_model")?;
+
+    let mut library_candidates = Vec::new();
+    if let Some(path) = std::env::var_os("LAWPDF_LM2_NATIVE_CATBOOST_LIB").map(PathBuf::from) {
+        library_candidates.push(path);
+    }
+    library_candidates.extend(lm2_native_catboost_runtime_asset_candidates(
+        lm2_native_catboost_library_file(),
+    ));
+    let lib_path = library_candidates
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .ok_or_else(|| missing_model_error("LM2 native CatBoost library", &library_candidates))?;
     let library = unsafe { Library::new(&lib_path) }
         .map_err(|error| format!("Could not load native CatBoost library: {error}"))?;
     let (
@@ -3619,48 +3654,11 @@ fn guarded_pp_prior_action(
 }
 
 fn lm2_model_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(dir) = std::env::var_os("LAWPDF_LM2_MODEL_DIR").map(PathBuf::from) {
-        candidates.push(dir.join("lm2-model.json"));
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("profile-models/lm2-current/lm2-model.json"));
-    }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(exe_dir) = exe.parent()
-    {
-        candidates.push(exe_dir.join("profile-models/lm2-current/lm2-model.json"));
-        candidates.push(exe_dir.join("../Resources/profile-models/lm2-current/lm2-model.json"));
-        candidates.push(exe_dir.join("../../profile-models/lm2-current/lm2-model.json"));
-    }
-    candidates
+    lm2_runtime_asset_candidates("profile-models/lm2-current", "lm2-model.json")
 }
 
 fn lm2_v20_runtime_asset_candidates(file_name: &str) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("profile-models/lm2-v20-runtime").join(file_name));
-    }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(exe_dir) = exe.parent()
-    {
-        candidates.push(
-            exe_dir
-                .join("profile-models/lm2-v20-runtime")
-                .join(file_name),
-        );
-        candidates.push(
-            exe_dir
-                .join("../Resources/profile-models/lm2-v20-runtime")
-                .join(file_name),
-        );
-        candidates.push(
-            exe_dir
-                .join("../../profile-models/lm2-v20-runtime")
-                .join(file_name),
-        );
-    }
-    candidates
+    lm2_runtime_asset_candidates("profile-models/lm2-v20-runtime", file_name)
 }
 
 fn lm2_native_catboost_library_file() -> &'static str {
@@ -3701,9 +3699,12 @@ fn lm2_context_twopass_enabled() -> bool {
 
 fn load_lm2_context_twopass_model() -> Result<Option<Lm2ContextTwopassModel>, String> {
     let candidates = lm2_context_twopass_runtime_asset_candidates(LM2_CONTEXT_TWOPASS_MODEL_FILE);
-    let Some(path) = candidates.into_iter().find(|path| path.is_file()) else {
-        return Ok(None);
-    };
+    let path = candidates
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .ok_or_else(|| missing_model_error("LM2 context two-pass model", &candidates))?;
+    verify_model_asset_hash(&path, "context_model")?;
     let input: Lm2ContextTwopassModelFile = read_json_file(&path)?;
     if input.feature_count != 66 {
         return Err(format!(
@@ -3736,66 +3737,115 @@ fn lm2_context_twopass_runtime_asset_candidates(file_name: &str) -> Vec<PathBuf>
     if let Some(path) = std::env::var_os("LAWPDF_LM2_CONTEXT_TWOPASS_MODEL").map(PathBuf::from) {
         candidates.push(path);
     }
-    if let Some(dir) = std::env::var_os("LAWPDF_LM2_CONTEXT_TWOPASS_DIR").map(PathBuf::from) {
-        candidates.push(dir.join(file_name));
+    candidates.extend(lm2_runtime_asset_candidates(
+        LM2_CONTEXT_TWOPASS_RUNTIME_DIR,
+        file_name,
+    ));
+    candidates
+}
+
+fn lm2_native_catboost_runtime_asset_candidates(file_name: &str) -> Vec<PathBuf> {
+    lm2_runtime_asset_candidates(LM2_NATIVE_CATBOOST_RUNTIME_DIR, file_name)
+}
+
+fn lm2_runtime_asset_candidates(runtime_dir: &str, file_name: &str) -> Vec<PathBuf> {
+    let model_dir = std::env::var_os("LAWPDF_MODEL_DIR").map(PathBuf::from);
+    let exe_path = std::env::current_exe().ok();
+    lm2_runtime_asset_candidates_for(
+        model_dir.as_deref(),
+        exe_path.as_deref(),
+        runtime_dir,
+        file_name,
+    )
+}
+
+fn lm2_runtime_asset_candidates_for(
+    model_dir: Option<&Path>,
+    exe_path: Option<&Path>,
+    runtime_dir: &str,
+    file_name: &str,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(model_dir) = model_dir {
+        let relative_runtime_dir = runtime_dir
+            .strip_prefix("profile-models/")
+            .unwrap_or(runtime_dir);
+        candidates.push(model_dir.join(relative_runtime_dir).join(file_name));
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join(LM2_CONTEXT_TWOPASS_RUNTIME_DIR).join(file_name));
-    }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(exe_dir) = exe.parent()
-    {
+    if let Some(exe_dir) = exe_path.and_then(Path::parent) {
+        candidates.push(exe_dir.join(runtime_dir).join(file_name));
         candidates.push(
             exe_dir
-                .join(LM2_CONTEXT_TWOPASS_RUNTIME_DIR)
-                .join(file_name),
-        );
-        candidates.push(
-            exe_dir
-                .join("../Resources")
-                .join(LM2_CONTEXT_TWOPASS_RUNTIME_DIR)
-                .join(file_name),
-        );
-        candidates.push(
-            exe_dir
-                .join("../../")
-                .join(LM2_CONTEXT_TWOPASS_RUNTIME_DIR)
+                .join("..")
+                .join("Resources")
+                .join(runtime_dir)
                 .join(file_name),
         );
     }
     candidates
 }
 
-fn lm2_native_catboost_runtime_asset_candidates(file_name: &str) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(dir) = std::env::var_os("LAWPDF_LM2_NATIVE_CATBOOST_DIR").map(PathBuf::from) {
-        candidates.push(dir.join(file_name));
+fn missing_model_error(label: &str, candidates: &[PathBuf]) -> String {
+    let probed = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("Missing {label}; probed: {probed}")
+}
+
+#[derive(Debug, Deserialize)]
+struct Lm2ReleaseManifest {
+    runtime_assets: Lm2ReleaseRuntimeAssets,
+}
+
+#[derive(Debug, Deserialize)]
+struct Lm2ReleaseRuntimeAssets {
+    native_model: Lm2ReleaseAsset,
+    context_model: Lm2ReleaseAsset,
+}
+
+#[derive(Debug, Deserialize)]
+struct Lm2ReleaseAsset {
+    sha256: String,
+}
+
+fn verify_model_asset_hash(path: &Path, asset_name: &str) -> Result<(), String> {
+    let Some(manifest_path) = path
+        .parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .take(3)
+        .map(|directory| directory.join("release-manifest.json"))
+        .find(|candidate| candidate.is_file())
+    else {
+        return Ok(());
+    };
+    let bytes = std::fs::read(&manifest_path).map_err(|error| {
+        format!(
+            "Could not read LM2 release manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: Lm2ReleaseManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "Could not decode LM2 release manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let expected = match asset_name {
+        "native_model" => &manifest.runtime_assets.native_model.sha256,
+        "context_model" => &manifest.runtime_assets.context_model.sha256,
+        _ => return Err(format!("Unknown LM2 release-manifest asset: {asset_name}")),
+    };
+    let actual = sha256_hex_of_file(path)?;
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(format!(
+            "LM2 {asset_name} checksum mismatch for {}; expected {expected}, found {actual}",
+            path.display()
+        ));
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join(LM2_NATIVE_CATBOOST_RUNTIME_DIR).join(file_name));
-    }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(exe_dir) = exe.parent()
-    {
-        candidates.push(
-            exe_dir
-                .join(LM2_NATIVE_CATBOOST_RUNTIME_DIR)
-                .join(file_name),
-        );
-        candidates.push(
-            exe_dir
-                .join("../Resources")
-                .join(LM2_NATIVE_CATBOOST_RUNTIME_DIR)
-                .join(file_name),
-        );
-        candidates.push(
-            exe_dir
-                .join("../../")
-                .join(LM2_NATIVE_CATBOOST_RUNTIME_DIR)
-                .join(file_name),
-        );
-    }
-    candidates
+    Ok(())
 }
 
 fn decode_pages(
@@ -6577,6 +6627,7 @@ fn apply_pp_priors(runtime: &Lm2Runtime, line: &DeepLiquidSourceLine, scores: &m
     }
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn action_scores_map(scores: [f64; 3]) -> BTreeMap<String, f64> {
     ACTIONS
         .iter()
@@ -6584,6 +6635,7 @@ fn action_scores_map(scores: [f64; 3]) -> BTreeMap<String, f64> {
         .collect()
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn start_scores_map(role_hint: Option<LiquidBlockRole>, scale: f64) -> BTreeMap<String, f64> {
     ACTIONS
         .iter()
@@ -6644,6 +6696,7 @@ fn start_feature_map(line: &DeepLiquidSourceLine) -> BTreeMap<String, f64> {
     features
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn transition_scores_map(
     previous_line: &DeepLiquidSourceLine,
     line: &DeepLiquidSourceLine,
@@ -8090,6 +8143,7 @@ fn normalize_features(mut features: Vec<(usize, f64)>) -> Vec<(usize, f64)> {
     merged
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn build_lm2_blocks(
     fallback_title: &str,
     decoded: &[(DeepLiquidSourceLine, Lm2Action)],
@@ -8161,14 +8215,14 @@ fn build_lm2_blocks_with_grouping(
             continue;
         }
         if *action == Lm2Action::HideNoise {
-            flush_block(
-                &mut blocks,
-                &mut sources,
-                &mut current_text,
-                &mut current_refs,
-                current_role,
-            );
             if line.role_hint == Some(LiquidBlockRole::Table) {
+                flush_block(
+                    &mut blocks,
+                    &mut sources,
+                    &mut current_text,
+                    &mut current_refs,
+                    current_role,
+                );
                 let text = clean_lm2_line_text(&line.text);
                 if !text.is_empty() {
                     let block_index = blocks.len();
@@ -8182,9 +8236,9 @@ fn build_lm2_blocks_with_grouping(
                         lines: vec![line_ref(line, LiquidBlockRole::Table)],
                     });
                 }
+                current_last_line = None;
+                current_group_index = None;
             }
-            current_last_line = None;
-            current_group_index = None;
             continue;
         }
         let role = role_for_decoded_line(line, *action, blocks.is_empty());
@@ -8210,7 +8264,11 @@ fn build_lm2_blocks_with_grouping(
             && role == LiquidBlockRole::Paragraph
             && current_last_line.as_ref().is_some_and(|previous| {
                 if let Some(group_index) = line_group_index.get(&line.id).copied() {
-                    current_group_index != Some(group_index)
+                    if previous.page_index == line.page_index {
+                        current_group_index != Some(group_index)
+                    } else {
+                        paragraph_boundary(previous, line)
+                    }
                 } else {
                     paragraph_boundary(previous, line)
                 }
@@ -8344,12 +8402,13 @@ fn flush_action_neutral_blocksplit(
         return;
     }
     let block_index = blocks.len();
-    let text = refs
-        .iter()
-        .map(|line| clean_lm2_line_text(&line.text))
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut text = String::new();
+    for line in refs.iter() {
+        let cleaned = clean_lm2_line_text(&line.text);
+        if !cleaned.is_empty() {
+            append_line(&mut text, &cleaned);
+        }
+    }
     if text.trim().is_empty() {
         refs.clear();
         return;
@@ -8520,9 +8579,6 @@ fn lm2_blocksplit_should_split(
         LiquidBlockRole::Paragraph | LiquidBlockRole::Marginalia
     ) {
         return false;
-    }
-    if line_ref.page_index != previous_ref.page_index {
-        return true;
     }
     if lm2_blocksplit_divider_like(&line_ref.text)
         || lm2_blocksplit_divider_like(&previous_ref.text)
@@ -8740,7 +8796,9 @@ fn should_join_preserved_hyphen(existing: &str, next: &str) -> bool {
 
 fn paragraph_boundary(previous: &DeepLiquidSourceLine, line: &DeepLiquidSourceLine) -> bool {
     if previous.page_index != line.page_index {
-        return true;
+        let previous_sentence_end = lm2_blocksplit_ends_like_paragraph(&previous.text);
+        let indent = (line.left - previous.left) / line.page_width.max(1.0);
+        return previous_sentence_end && indent > 0.025;
     }
     if same_visual_row_fragment(previous, line) {
         return false;
@@ -9975,6 +10033,7 @@ fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String
         .map_err(|error| format!("Could not parse {}: {error}", path.display()))
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn reject_label_like_path(path: &Path) -> Result<(), String> {
     let lower = path
         .to_string_lossy()
@@ -10033,6 +10092,7 @@ fn annotate_pp_prior(runtime: &Lm2Runtime, path: &str, line: &mut DeepLiquidSour
     line.pp_prior_score = Some(prior.score);
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn eval_sources_for_rows(
     rows: Vec<Lm2EvalRow>,
     use_example_role_hints: bool,
@@ -10815,6 +10875,7 @@ fn leading_note_marker(text: &str) -> Option<u16> {
     (digits > 0 && (1..=500).contains(&value)).then_some(value as u16)
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn eval_source_line(row: &Lm2EvalRow, use_example_role_hints: bool) -> DeepLiquidSourceLine {
     let page_width = row.page_width.unwrap_or(1.0).max(1.0);
     let page_height = row.page_height.unwrap_or(1.0).max(1.0);
@@ -10970,6 +11031,7 @@ fn normalize_role_name(name: &str) -> String {
     name.trim().to_ascii_lowercase().replace('-', "_")
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn action_for_role_name(role: &str) -> Lm2Action {
     match normalize_role_name(role).as_str() {
         "footnote" | "marginalia" => Lm2Action::Marginalia,
@@ -10979,6 +11041,7 @@ fn action_for_role_name(role: &str) -> Lm2Action {
     }
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn lm2_eval_report(
     model_label: String,
     pp_prior_source: Option<String>,
@@ -11037,6 +11100,7 @@ fn lm2_eval_report(
     }
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn ratio(numerator: usize, denominator: usize) -> f64 {
     if denominator == 0 {
         0.0
@@ -11045,6 +11109,7 @@ fn ratio(numerator: usize, denominator: usize) -> f64 {
     }
 }
 
+#[cfg(any(feature = "devtools", test))]
 impl Lm2BlockQualityAccumulator {
     fn add_page(&mut self, decoded: &[(DeepLiquidSourceLine, Lm2Action)]) {
         if decoded.is_empty() {
@@ -11094,6 +11159,7 @@ impl Lm2BlockQualityAccumulator {
     }
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn count_hyphen_artifacts(text: &str) -> usize {
     let chars = text.chars().collect::<Vec<_>>();
     chars
@@ -11105,6 +11171,34 @@ fn count_hyphen_artifacts(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lm2_runtime_asset_candidates_follow_stable_order() {
+        let model_dir = Path::new("C:/lawpdf-models");
+        let exe_path = Path::new("C:/Program Files/LawPDF/lawpdf.exe");
+        let candidates = lm2_runtime_asset_candidates_for(
+            Some(model_dir),
+            Some(exe_path),
+            LM2_NATIVE_CATBOOST_RUNTIME_DIR,
+            LM2_NATIVE_CATBOOST_MODEL_FILE,
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                model_dir
+                    .join("lm2-native-catboost-runtime")
+                    .join(LM2_NATIVE_CATBOOST_MODEL_FILE),
+                Path::new("C:/Program Files/LawPDF")
+                    .join(LM2_NATIVE_CATBOOST_RUNTIME_DIR)
+                    .join(LM2_NATIVE_CATBOOST_MODEL_FILE),
+                Path::new("C:/Program Files/LawPDF")
+                    .join("..")
+                    .join("Resources")
+                    .join(LM2_NATIVE_CATBOOST_RUNTIME_DIR)
+                    .join(LM2_NATIVE_CATBOOST_MODEL_FILE),
+            ]
+        );
+    }
 
     fn lm2_test_source_line(
         id: &str,
@@ -14412,6 +14506,51 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["p0:l2".to_owned()]
         );
+    }
+
+    #[test]
+    fn paragraph_continues_across_source_page_without_indent() {
+        let previous = lm2_test_source_line(
+            "p0:l9",
+            9,
+            "The rule continues across the source page.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let mut next = lm2_test_source_line(
+            "p1:l0",
+            0,
+            "Its application remains contested.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        next.page_index = 1;
+        assert!(!paragraph_boundary(&previous, &next));
+    }
+
+    #[test]
+    fn clear_indent_can_start_approximate_paragraph_across_page() {
+        let previous = lm2_test_source_line(
+            "p0:l9",
+            9,
+            "The first paragraph ends here.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let mut next = lm2_test_source_line(
+            "p1:l0",
+            0,
+            "A new paragraph begins here.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        next.page_index = 1;
+        next.left = previous.left + 0.04;
+        assert!(paragraph_boundary(&previous, &next));
     }
 
     #[test]

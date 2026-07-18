@@ -70,7 +70,7 @@ fn send_paths_to_primary(paths: &[PathBuf]) -> bool {
     stream.read_exact(&mut ack).is_ok() && &ack == ACK
 }
 
-fn write_message(stream: &mut TcpStream, paths: &[PathBuf]) -> io::Result<()> {
+fn write_message(stream: &mut impl Write, paths: &[PathBuf]) -> io::Result<()> {
     let payloads = paths
         .iter()
         .take(MAX_PATHS_PER_MESSAGE)
@@ -89,7 +89,7 @@ fn write_message(stream: &mut TcpStream, paths: &[PathBuf]) -> io::Result<()> {
     stream.flush()
 }
 
-fn read_message(stream: &mut TcpStream) -> io::Result<Vec<PathBuf>> {
+fn read_message(stream: &mut impl Read) -> io::Result<Vec<PathBuf>> {
     let mut magic = vec![0_u8; MAGIC.len()];
     stream.read_exact(&mut magic)?;
     if &magic != MAGIC {
@@ -126,8 +126,63 @@ fn read_message(stream: &mut TcpStream) -> io::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn read_u32(stream: &mut TcpStream) -> io::Result<u32> {
+fn read_u32(stream: &mut impl Read) -> io::Result<u32> {
     let mut bytes = [0_u8; 4];
     stream.read_exact(&mut bytes)?;
     Ok(u32::from_le_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn message_frame_round_trips_paths() {
+        let expected = vec![
+            PathBuf::from(r"C:\cases\alpha.pdf"),
+            PathBuf::from("relative/unicode-β.pdf"),
+        ];
+        let mut frame = Vec::new();
+        write_message(&mut frame, &expected).unwrap();
+
+        let actual = read_message(&mut Cursor::new(frame)).unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn message_frame_rejects_oversized_path_length() {
+        let mut frame = MAGIC.to_vec();
+        frame.extend_from_slice(&1_u32.to_le_bytes());
+        frame.extend_from_slice(&((MAX_PATH_BYTES + 1) as u32).to_le_bytes());
+
+        let error = read_message(&mut Cursor::new(frame)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("path is too large"));
+    }
+
+    #[test]
+    fn message_frame_rejects_bad_magic_and_malformed_payload() {
+        let mut bad_magic = vec![0_u8; MAGIC.len()];
+        bad_magic.extend_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(
+            read_message(&mut Cursor::new(bad_magic))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut invalid_utf8 = MAGIC.to_vec();
+        invalid_utf8.extend_from_slice(&1_u32.to_le_bytes());
+        invalid_utf8.extend_from_slice(&1_u32.to_le_bytes());
+        invalid_utf8.push(0xff);
+        assert_eq!(
+            read_message(&mut Cursor::new(invalid_utf8))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 }

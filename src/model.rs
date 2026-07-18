@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     Select,
@@ -19,9 +21,18 @@ impl Tool {
             Tool::Signature => "E-sign",
         }
     }
+
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            Tool::Select => "Select text and annotations (V)",
+            Tool::Marker => "Highlight or underline text (M)",
+            Tool::TextBox => "Add a text box (T)",
+            Tool::Signature => "Draw an electronic signature (S)",
+        }
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PdfRect {
     pub left: f32,
     pub bottom: f32,
@@ -98,7 +109,7 @@ pub struct EditorAnnotation {
     pub kind: AnnotationKind,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PageInfo {
     pub width: f32,
     pub height: f32,
@@ -187,7 +198,7 @@ impl PageInfo {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PageTextChar {
     pub ch: char,
     pub rect: Option<PdfRect>,
@@ -196,7 +207,7 @@ pub struct PageTextChar {
     pub italic: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PageLink {
     pub rect: PdfRect,
     pub url: String,
@@ -212,6 +223,10 @@ pub struct LoadedDocument {
     pub native_text_loaded: Vec<bool>,
     pub text_chars: Vec<Option<Vec<PageTextChar>>>,
     pub links: Vec<Vec<PageLink>>,
+    pub links_loaded: bool,
+    /// Large-document performance mode keeps opening, searching, and rendering
+    /// responsive by deferring expensive page-layout analysis.
+    pub optimized: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -237,11 +252,12 @@ impl SearchSource {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchHit {
     pub page_index: usize,
     pub source: SearchSource,
     pub match_start: usize,
+    pub match_end: usize,
     pub snippet: String,
 }
 

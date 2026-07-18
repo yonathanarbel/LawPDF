@@ -17,10 +17,12 @@ use crate::model::{
     AnnotationKind, EditorAnnotation, LoadedDocument, MarkerStyle, PageInfo, PageLink,
     PageTextChar, PdfRect, RenderedPage,
 };
+use crate::performance_cache::{CachedDocumentMetadata, PerformanceCache};
 
 pub struct PdfEngine {
     pdfium: &'static Pdfium,
     open_documents: RefCell<VecDeque<OpenPdfDocument>>,
+    performance_cache: PerformanceCache,
 }
 
 struct OpenPdfDocument {
@@ -44,6 +46,8 @@ pub struct VisionPage {
 }
 
 const OPEN_DOCUMENT_CACHE_CAP: usize = 3;
+const OPTIMIZED_DOCUMENT_MIN_BYTES: u64 = 16 * 1024 * 1024;
+const OPTIMIZED_DOCUMENT_MIN_PAGES: usize = 200;
 static PDFIUM: OnceLock<Result<&'static Pdfium, String>> = OnceLock::new();
 pub const LAWPDF_COMMENT_ID_PREFIX: &str = "LawPDF-comment-";
 const LAWPDF_CROPBOX_LOCAL_COORDS_ENV: &str = "LAWPDF_CROPBOX_LOCAL_COORDS";
@@ -65,7 +69,96 @@ impl PdfEngine {
         Ok(Self {
             pdfium,
             open_documents: RefCell::new(VecDeque::new()),
+            performance_cache: PerformanceCache::new(),
         })
+    }
+
+    pub fn load_document_adaptive(
+        &self,
+        path: &Path,
+        optimize_large_documents: bool,
+    ) -> Result<LoadedDocument> {
+        if !optimize_large_documents {
+            return self.load_document(path);
+        }
+
+        let file_is_large = fs::metadata(path)
+            .map(|metadata| metadata.len() >= OPTIMIZED_DOCUMENT_MIN_BYTES)
+            .unwrap_or(false);
+        let page_count = self.with_open_document(path, |document| {
+            Ok(document.pages().len() as usize)
+        })?;
+        if file_is_large || page_count >= OPTIMIZED_DOCUMENT_MIN_PAGES {
+            self.load_document_optimized(path)
+        } else {
+            self.load_document(path)
+        }
+    }
+
+    fn load_document_optimized(&self, path: &Path) -> Result<LoadedDocument> {
+        if let Some(cached) = self.performance_cache.load_document_metadata(path, true) {
+            return Ok(self.optimized_document_from_metadata(path, cached));
+        }
+
+        let metadata = self.with_open_document(path, |document| {
+            let page_count = document.pages().len() as usize;
+            let mut pages = Vec::with_capacity(page_count);
+            for page_index in 0..page_count {
+                let page = document
+                    .pages()
+                    .get(page_index as u16)
+                    .with_context(|| format!("failed to read page {}", page_index + 1))?;
+                let crop_box = cropbox_local_coords_enabled()
+                    .then(|| page_crop_box_if_distinct_from_media(&page))
+                    .flatten();
+                let width = crop_box
+                    .map(|box_| visible_page_extent(box_.width(), page.width().value))
+                    .unwrap_or(page.width().value);
+                let height = crop_box
+                    .map(|box_| visible_page_extent(box_.height(), page.height().value))
+                    .unwrap_or(page.height().value);
+                let mut page_info =
+                    PageInfo::with_footnote_divider_y_from_top(width, height, None);
+                if let Some(box_) = crop_box {
+                    page_info = page_info.with_coordinate_offset(box_.left, box_.bottom);
+                }
+                pages.push(page_info);
+            }
+            Ok(CachedDocumentMetadata {
+                links: vec![Vec::new(); page_count],
+                pages,
+                optimized: true,
+            })
+        })?;
+        self.performance_cache
+            .save_document_metadata(path, &metadata);
+        Ok(self.optimized_document_from_metadata(path, metadata))
+    }
+
+    fn optimized_document_from_metadata(
+        &self,
+        path: &Path,
+        metadata: CachedDocumentMetadata,
+    ) -> LoadedDocument {
+        let mut document = loaded_document_from_metadata(path, metadata);
+        if let Some(links) = self.performance_cache.load_document_links(path) {
+            document.links = links;
+            document.links_loaded = true;
+        }
+        document
+    }
+
+    pub fn load_document_links(
+        &self,
+        path: &Path,
+        page_count: usize,
+    ) -> Result<Vec<Vec<PageLink>>> {
+        if let Some(links) = self.performance_cache.load_document_links(path) {
+            return Ok(links);
+        }
+        let links = load_pdf_web_links(path, page_count)?;
+        self.performance_cache.save_document_links(path, &links);
+        Ok(links)
     }
 
     pub fn load_document(&self, path: &Path) -> Result<LoadedDocument> {
@@ -146,12 +239,17 @@ impl PdfEngine {
                 native_text_loaded,
                 text_chars,
                 links,
+                links_loaded: true,
+                optimized: false,
             })
         })
     }
 
     pub fn load_page_text(&self, path: &Path, page_index: usize) -> Result<String> {
-        self.with_open_document(path, |document| {
+        if let Some(text) = self.performance_cache.load_page_text(path, page_index) {
+            return Ok(text);
+        }
+        let text = self.with_open_document(path, |document| {
             let page = document
                 .pages()
                 .get(page_index as u16)
@@ -162,7 +260,10 @@ impl PdfEngine {
                 .with_context(|| format!("failed to read text on page {}", page_index + 1))?;
 
             Ok(text_page.all())
-        })
+        })?;
+        self.performance_cache
+            .save_page_text(path, page_index, &text);
+        Ok(text)
     }
 
     pub fn load_page_text_chars(
@@ -170,7 +271,13 @@ impl PdfEngine {
         path: &Path,
         page_index: usize,
     ) -> Result<Vec<PageTextChar>> {
-        self.with_open_document(path, |document| {
+        if let Some(chars) = self
+            .performance_cache
+            .load_page_text_chars(path, page_index)
+        {
+            return Ok(chars);
+        }
+        let chars = self.with_open_document(path, |document| {
             let page = document
                 .pages()
                 .get(page_index as u16)
@@ -181,7 +288,10 @@ impl PdfEngine {
                 .with_context(|| format!("failed to read text on page {}", page_index + 1))?;
 
             Ok(extract_text_chars(&text_page))
-        })
+        })?;
+        self.performance_cache
+            .save_page_text_chars(path, page_index, &chars);
+        Ok(chars)
     }
 
     pub fn render_page(&self, path: &Path, page_index: usize, zoom: f32) -> Result<RenderedPage> {
@@ -195,7 +305,14 @@ impl PdfEngine {
         zoom: f32,
         quality: RenderQuality,
     ) -> Result<RenderedPage> {
-        self.with_open_document(path, |document| {
+        let fast = quality == RenderQuality::Fast;
+        if let Some(rendered) = self
+            .performance_cache
+            .load_rendered_page(path, page_index, zoom, fast)
+        {
+            return Ok(rendered);
+        }
+        let rendered = self.with_open_document(path, |document| {
             let page = document
                 .pages()
                 .get(page_index as u16)
@@ -232,7 +349,10 @@ impl PdfEngine {
                 height: height as usize,
                 rgba: image.into_raw(),
             })
-        })
+        })?;
+        self.performance_cache
+            .save_rendered_page(path, &rendered, zoom, fast);
+        Ok(rendered)
     }
 
     /// Render a page for LiquidVision (LmV tier): letterbox-ready RGB raster
@@ -325,6 +445,30 @@ impl PdfEngine {
             .front()
             .ok_or_else(|| anyhow!("internal PDF cache is empty"))?;
         operation(&open_document.document)
+    }
+}
+
+fn loaded_document_from_metadata(
+    path: &Path,
+    metadata: CachedDocumentMetadata,
+) -> LoadedDocument {
+    let page_count = metadata.pages.len();
+    let title = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Untitled PDF")
+        .to_owned();
+    LoadedDocument {
+        path: path.to_path_buf(),
+        title,
+        page_count,
+        pages: metadata.pages,
+        native_text: vec![String::new(); page_count],
+        native_text_loaded: vec![false; page_count],
+        text_chars: vec![None; page_count],
+        links: metadata.links,
+        links_loaded: false,
+        optimized: metadata.optimized,
     }
 }
 
@@ -1152,7 +1296,7 @@ pub fn save_with_annotations(
 ) -> Result<()> {
     let mut document = Document::load(source)
         .with_context(|| format!("failed to load source PDF {}", source.display()))?;
-    remove_lawpdf_comment_annotations(&mut document)?;
+    remove_lawpdf_owned_annotations(&mut document)?;
     let pages = document.get_pages();
 
     for annotation in annotations {
@@ -1168,11 +1312,73 @@ pub fn save_with_annotations(
 
     document.prune_objects();
     document.compress();
-    document
-        .save(destination)
-        .with_context(|| format!("failed to save {}", destination.display()))?;
+    if source == destination {
+        save_document_in_place(&mut document, destination)?;
+    } else {
+        document
+            .save(destination)
+            .with_context(|| format!("failed to save {}", destination.display()))?;
+    }
 
     Ok(())
+}
+
+pub fn rotate_pdf_page(source: &Path, page_index: usize, clockwise: bool) -> Result<i64> {
+    let mut document = Document::load(source)
+        .with_context(|| format!("failed to load source PDF {}", source.display()))?;
+    let page_number = page_index as u32 + 1;
+    let page_id = document
+        .get_pages()
+        .get(&page_number)
+        .copied()
+        .ok_or_else(|| anyhow!("PDF has no page {page_number}"))?;
+    let current_rotation = inherited_page_rotation(&document, page_id)?;
+    let delta = if clockwise { 90 } else { -90 };
+    let rotation = (current_rotation + delta).rem_euclid(360);
+
+    document
+        .get_object_mut(page_id)?
+        .as_dict_mut()?
+        .set("Rotate", Object::Integer(rotation));
+    document.prune_objects();
+    document.compress();
+    save_document_in_place(&mut document, source)?;
+    Ok(rotation)
+}
+
+fn inherited_page_rotation(document: &Document, page_id: ObjectId) -> Result<i64> {
+    let mut object_id = page_id;
+    for _ in 0..64 {
+        let dictionary = document.get_object(object_id)?.as_dict()?;
+        if let Ok(value) = dictionary.get(b"Rotate") {
+            return pdf_integer(document, value)
+                .map(|rotation| rotation.rem_euclid(360))
+                .ok_or_else(|| anyhow!("PDF page has an invalid Rotate value"));
+        }
+        let Some(parent_id) = dictionary
+            .get(b"Parent")
+            .ok()
+            .and_then(|parent| match parent {
+                Object::Reference(id) => Some(*id),
+                _ => None,
+            })
+        else {
+            return Ok(0);
+        };
+        object_id = parent_id;
+    }
+    Err(anyhow!("PDF page tree is too deeply nested"))
+}
+
+fn pdf_integer(document: &Document, value: &Object) -> Option<i64> {
+    match value {
+        Object::Integer(value) => Some(*value),
+        Object::Reference(id) => document
+            .get_object(*id)
+            .ok()
+            .and_then(|value| pdf_integer(document, value)),
+        _ => None,
+    }
 }
 
 pub fn load_pdf_web_links(source: &Path, page_count: usize) -> Result<Vec<Vec<PageLink>>> {
@@ -1200,11 +1406,11 @@ pub fn load_pdf_web_links(source: &Path, page_count: usize) -> Result<Vec<Vec<Pa
     Ok(links)
 }
 
-pub fn load_lawpdf_comments(source: &Path) -> Result<Vec<EditorAnnotation>> {
+pub fn load_lawpdf_annotations(source: &Path) -> Result<Vec<EditorAnnotation>> {
     let document = Document::load(source)
         .with_context(|| format!("failed to load source PDF {}", source.display()))?;
     let pages = document.get_pages();
-    let mut comments = Vec::new();
+    let mut annotations = Vec::new();
 
     for (page_number, page_id) in pages {
         let page_index = page_number.saturating_sub(1) as usize;
@@ -1219,34 +1425,43 @@ pub fn load_lawpdf_comments(source: &Path) -> Result<Vec<EditorAnnotation>> {
         match annots {
             Object::Array(annots) => {
                 for annot in &annots {
-                    if let Some(comment) =
-                        lawpdf_comment_from_annotation(&document, annot, page_index)
+                    if let Some(annotation) =
+                        lawpdf_owned_annotation_from_pdf(&document, annot, page_index)
                     {
-                        comments.push(comment);
+                        annotations.push(annotation);
                     }
                 }
             }
             Object::Reference(annots_id) => {
                 if let Ok(annots) = document.get_object(annots_id).and_then(Object::as_array) {
                     for annot in annots {
-                        if let Some(comment) =
-                            lawpdf_comment_from_annotation(&document, annot, page_index)
+                        if let Some(annotation) =
+                            lawpdf_owned_annotation_from_pdf(&document, annot, page_index)
                         {
-                            comments.push(comment);
+                            annotations.push(annotation);
                         }
                     }
                 }
             }
             annot => {
-                if let Some(comment) = lawpdf_comment_from_annotation(&document, &annot, page_index)
+                if let Some(annotation) =
+                    lawpdf_owned_annotation_from_pdf(&document, &annot, page_index)
                 {
-                    comments.push(comment);
+                    annotations.push(annotation);
                 }
             }
         }
     }
 
-    Ok(comments)
+    Ok(annotations)
+}
+
+#[cfg(test)]
+fn load_lawpdf_comments(source: &Path) -> Result<Vec<EditorAnnotation>> {
+    Ok(load_lawpdf_annotations(source)?
+        .into_iter()
+        .filter(|annotation| matches!(annotation.kind, AnnotationKind::Comment { .. }))
+        .collect())
 }
 
 pub fn sync_lawpdf_comments(source: &Path, comments: &[EditorAnnotation]) -> Result<usize> {
@@ -1538,6 +1753,7 @@ fn annotation_to_pdf_object(annotation: &EditorAnnotation) -> Object {
                 "C" => color_array(*color_rgb),
                 "CA" => Object::Real(*opacity),
                 "Contents" => literal(contents),
+                "LawPDF" => Object::Boolean(true),
                 "F" => Object::Integer(4),
             })
         }
@@ -1574,6 +1790,7 @@ fn annotation_to_pdf_object(annotation: &EditorAnnotation) -> Object {
             "C" => color_array(*color_rgb),
             // Private key: the on-text anchor point for the dotted leader.
             "LawA" => Object::Array(vec![Object::Real(anchor.0), Object::Real(anchor.1)]),
+            "LawPDF" => Object::Boolean(true),
             "F" => Object::Integer(4),
         }),
         AnnotationKind::Signature {
@@ -1649,6 +1866,49 @@ fn lawpdf_comment_from_annotation(
             created_at,
             updated_at,
             anchor,
+        },
+    })
+}
+
+fn lawpdf_owned_annotation_from_pdf(
+    document: &Document,
+    annotation: &Object,
+    page_index: usize,
+) -> Option<EditorAnnotation> {
+    let dict = annotation_dict(document, annotation)?;
+    if is_lawpdf_comment_dict(dict) {
+        return lawpdf_comment_from_annotation(document, annotation, page_index);
+    }
+    if !is_lawpdf_owned_dict(dict) {
+        return None;
+    }
+    let subtype = dict.get(b"Subtype").ok().and_then(pdf_object_text)?;
+    let style = if subtype.eq_ignore_ascii_case("Highlight") {
+        MarkerStyle::Highlight
+    } else if subtype.eq_ignore_ascii_case("Underline") {
+        MarkerStyle::Underline
+    } else {
+        return None;
+    };
+    let rect = dict.get(b"Rect").ok().and_then(pdf_rect_from_object)?;
+    let color_rgb = dict
+        .get(b"C")
+        .ok()
+        .and_then(pdf_color_from_object)
+        .unwrap_or([1.0, 0.93, 0.45]);
+    let opacity = dict
+        .get(b"CA")
+        .ok()
+        .and_then(pdf_number)
+        .unwrap_or(0.42)
+        .clamp(0.0, 1.0);
+    Some(EditorAnnotation {
+        page_index,
+        rect,
+        kind: AnnotationKind::Marker {
+            color_rgb,
+            opacity,
+            style,
         },
     })
 }
@@ -1735,6 +1995,17 @@ fn normalize_web_url(uri: &str) -> Option<String> {
 }
 
 fn remove_lawpdf_comment_annotations(document: &mut Document) -> Result<usize> {
+    remove_lawpdf_annotations_matching(document, false)
+}
+
+fn remove_lawpdf_owned_annotations(document: &mut Document) -> Result<usize> {
+    remove_lawpdf_annotations_matching(document, true)
+}
+
+fn remove_lawpdf_annotations_matching(
+    document: &mut Document,
+    include_owned: bool,
+) -> Result<usize> {
     let pages = document.get_pages();
     let mut removed = 0usize;
     let mut removed_object_ids = Vec::new();
@@ -1755,6 +2026,7 @@ fn remove_lawpdf_comment_annotations(document: &mut Document) -> Result<usize> {
                     annots,
                     &mut removed_object_ids,
                     &mut removed,
+                    include_owned,
                 );
                 document
                     .get_object_mut(page_id)?
@@ -1772,13 +2044,14 @@ fn remove_lawpdf_comment_annotations(document: &mut Document) -> Result<usize> {
                     annots,
                     &mut removed_object_ids,
                     &mut removed,
+                    include_owned,
                 );
                 let annots_array = document.get_object_mut(annots_id)?.as_array_mut()?;
                 annots_array.clear();
                 annots_array.extend(filtered);
             }
             annot => {
-                if is_lawpdf_comment_annotation(document, &annot) {
+                if is_matching_lawpdf_annotation(document, &annot, include_owned) {
                     document
                         .get_object_mut(page_id)?
                         .as_dict_mut()?
@@ -1801,10 +2074,11 @@ fn filter_lawpdf_comment_annots(
     annots: Vec<Object>,
     removed_object_ids: &mut Vec<ObjectId>,
     removed: &mut usize,
+    include_owned: bool,
 ) -> Vec<Object> {
     let mut kept = Vec::with_capacity(annots.len());
     for annot in annots {
-        if is_lawpdf_comment_annotation(document, &annot) {
+        if is_matching_lawpdf_annotation(document, &annot, include_owned) {
             if let Object::Reference(id) = annot {
                 removed_object_ids.push(id);
             }
@@ -1816,8 +2090,14 @@ fn filter_lawpdf_comment_annots(
     kept
 }
 
-fn is_lawpdf_comment_annotation(document: &Document, annotation: &Object) -> bool {
-    annotation_dict(document, annotation).is_some_and(is_lawpdf_comment_dict)
+fn is_matching_lawpdf_annotation(
+    document: &Document,
+    annotation: &Object,
+    include_owned: bool,
+) -> bool {
+    annotation_dict(document, annotation).is_some_and(|dict| {
+        is_lawpdf_comment_dict(dict) || (include_owned && is_lawpdf_owned_dict(dict))
+    })
 }
 
 fn is_lawpdf_comment_dict(dict: &Dictionary) -> bool {
@@ -1825,6 +2105,10 @@ fn is_lawpdf_comment_dict(dict: &Dictionary) -> bool {
         .ok()
         .and_then(pdf_object_text)
         .is_some_and(|id| id.starts_with(LAWPDF_COMMENT_ID_PREFIX))
+}
+
+fn is_lawpdf_owned_dict(dict: &Dictionary) -> bool {
+    matches!(dict.get(b"LawPDF"), Ok(Object::Boolean(true))) || is_lawpdf_comment_dict(dict)
 }
 
 fn annotation_dict<'a>(document: &'a Document, annotation: &'a Object) -> Option<&'a Dictionary> {
@@ -2007,6 +2291,74 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rotate_pdf_page_persists_and_normalizes_quarter_turns() {
+        let path = std::env::temp_dir().join(format!(
+            "lawpdf-rotate-page-{}-unit.pdf",
+            std::process::id()
+        ));
+        write_blank_pdf(&path);
+
+        assert_eq!(rotate_pdf_page(&path, 0, true).unwrap(), 90);
+        assert_eq!(stored_page_rotation(&path), 90);
+        assert_eq!(rotate_pdf_page(&path, 0, false).unwrap(), 0);
+        assert_eq!(stored_page_rotation(&path), 0);
+        assert_eq!(rotate_pdf_page(&path, 0, false).unwrap(), 270);
+        assert_eq!(stored_page_rotation(&path), 270);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rotate_pdf_page_respects_inherited_rotation() {
+        let path = std::env::temp_dir().join(format!(
+            "lawpdf-rotate-inherited-{}-unit.pdf",
+            std::process::id()
+        ));
+        write_blank_pdf(&path);
+        let mut document = Document::load(&path).unwrap();
+        let page_id = document.get_pages()[&1];
+        let parent_id = match document
+            .get_object(page_id)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"Parent")
+            .unwrap()
+        {
+            Object::Reference(id) => *id,
+            _ => panic!("expected page parent reference"),
+        };
+        document
+            .get_object_mut(parent_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Rotate", Object::Integer(270));
+        save_document_in_place(&mut document, &path).unwrap();
+
+        assert_eq!(rotate_pdf_page(&path, 0, true).unwrap(), 0);
+        assert_eq!(stored_page_rotation(&path), 0);
+
+        let _ = fs::remove_file(path);
+    }
+
+    fn stored_page_rotation(path: &Path) -> i64 {
+        let document = Document::load(path).unwrap();
+        let page_id = document.get_pages()[&1];
+        match document
+            .get_object(page_id)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"Rotate")
+            .unwrap()
+        {
+            Object::Integer(rotation) => *rotation,
+            _ => panic!("expected integer page rotation"),
+        }
+    }
+
+    #[test]
     fn vector_rules_from_operations_extracts_stroked_rect_cells() {
         let operations = vec![
             Operation::new(
@@ -2058,6 +2410,57 @@ mod tests {
         assert_eq!(rule.right, 60.0);
         assert!((rule.bottom - 19.5).abs() < 0.001);
         assert!((rule.top - 20.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn in_place_save_round_trips_highlights_and_comments_without_duplicates() {
+        let path = std::env::temp_dir().join(format!(
+            "lawpdf-annotations-roundtrip-{}-unit.pdf",
+            std::process::id()
+        ));
+        write_blank_pdf(&path);
+        let annotations = vec![
+            EditorAnnotation {
+                page_index: 0,
+                rect: PdfRect::new(72.0, 650.0, 220.0, 668.0),
+                kind: AnnotationKind::Marker {
+                    color_rgb: [1.0, 0.93, 0.45],
+                    opacity: 0.42,
+                    style: MarkerStyle::Highlight,
+                },
+            },
+            EditorAnnotation {
+                page_index: 0,
+                rect: PdfRect::new(500.0, 650.0, 530.0, 680.0),
+                kind: AnnotationKind::Comment {
+                    id: format!("{LAWPDF_COMMENT_ID_PREFIX}roundtrip"),
+                    text: "Remember this point".to_owned(),
+                    color_rgb: [1.0, 0.78, 0.28],
+                    created_at: "2026-07-12T00:00:00Z".to_owned(),
+                    updated_at: "2026-07-12T00:00:00Z".to_owned(),
+                    anchor: (210.0, 659.0),
+                },
+            },
+        ];
+
+        save_with_annotations(&path, &path, &annotations).unwrap();
+        assert_eq!(load_lawpdf_annotations(&path).unwrap().len(), 2);
+        save_with_annotations(&path, &path, &annotations).unwrap();
+        let loaded = load_lawpdf_annotations(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().any(|annotation| matches!(
+            annotation.kind,
+            AnnotationKind::Marker {
+                style: MarkerStyle::Highlight,
+                ..
+            }
+        )));
+        assert!(
+            loaded
+                .iter()
+                .any(|annotation| matches!(annotation.kind, AnnotationKind::Comment { .. }))
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]

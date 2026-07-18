@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -8,12 +8,14 @@ use std::time::Duration;
 use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
 
+use crate::hashing::sha256_hex_of_file;
 use crate::settings::app_data_dir;
 
 const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/yonathanarbel/LawPDF/releases/latest";
 const PORTABLE_ASSET_NAME: &str = "LawPDF-windows-portable-x64.zip";
 const INSTALLER_ASSET_NAME: &str = "LawPDFSetup-x64.exe";
+const SHA256SUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
 const USER_AGENT: &str = concat!("LawPDF/", env!("CARGO_PKG_VERSION"));
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -33,6 +35,8 @@ pub struct PendingUpdate {
     pub package_kind: UpdatePackageKind,
     pub asset_path: PathBuf,
     pub release_url: String,
+    #[serde(default)]
+    pub expected_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,15 +60,7 @@ struct GithubAsset {
     browser_download_url: String,
 }
 
-pub fn updates_enabled() -> bool {
-    true
-}
-
 pub fn spawn_update_check(tx: Sender<UpdateEvent>) {
-    if !updates_enabled() {
-        return;
-    }
-
     thread::spawn(move || {
         let _ = tx.send(UpdateEvent::Checking);
         if let Err(error) = check_and_stage_update(&tx) {
@@ -74,15 +70,21 @@ pub fn spawn_update_check(tx: Sender<UpdateEvent>) {
 }
 
 pub fn load_pending_update() -> Option<PendingUpdate> {
-    if !updates_enabled() {
-        return None;
-    }
-
     let path = pending_update_path()?;
     let bytes = std::fs::read(&path).ok()?;
-    let pending = serde_json::from_slice::<PendingUpdate>(&bytes).ok()?;
+    let pending = match serde_json::from_slice::<PendingUpdate>(&bytes) {
+        Ok(pending) => pending,
+        Err(_) => {
+            let _ = std::fs::remove_file(path);
+            return None;
+        }
+    };
     if !pending.asset_path.exists() || !is_newer_version(&pending.version, CURRENT_VERSION) {
         let _ = std::fs::remove_file(path);
+        return None;
+    }
+    if verify_pending_update(&pending).is_err() {
+        discard_pending_update(&pending, &path);
         return None;
     }
     Some(pending)
@@ -103,6 +105,12 @@ pub fn start_update_helper(
     pending: &PendingUpdate,
     relaunch_args: &[OsString],
 ) -> Result<(), String> {
+    if let Err(error) = verify_pending_update(pending) {
+        if let Some(path) = pending_update_path() {
+            discard_pending_update(pending, &path);
+        }
+        return Err(error);
+    }
     let script_path = write_update_script(pending, relaunch_args)?;
     let mut command = Command::new("powershell.exe");
     command
@@ -151,16 +159,59 @@ fn check_and_stage_update(tx: &Sender<UpdateEvent>) -> Result<(), String> {
         .iter()
         .find(|asset| asset.name.eq_ignore_ascii_case(asset_name))
         .ok_or_else(|| format!("Release {version} does not include {asset_name}."))?;
+    let Some(checksums_asset) = release
+        .assets
+        .iter()
+        .find(|asset| asset.name.eq_ignore_ascii_case(SHA256SUMS_ASSET_NAME))
+    else {
+        let _ = tx.send(UpdateEvent::Failed(
+            "Release is missing SHA256SUMS.txt; not updating.".to_owned(),
+        ));
+        return Ok(());
+    };
+    let checksums = download_text_asset(checksums_asset)?;
+    let expected_sha256 = parse_sha256sums(&checksums)
+        .into_iter()
+        .find(|(_, name)| name.eq_ignore_ascii_case(&asset.name))
+        .map(|(hash, _)| hash)
+        .ok_or_else(|| {
+            format!(
+                "SHA256SUMS.txt does not contain a checksum for {}.",
+                asset.name
+            )
+        })?;
+    if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(format!(
+            "SHA256SUMS.txt contains an invalid checksum for {}.",
+            asset.name
+        ));
+    }
 
     let _ = tx.send(UpdateEvent::Detected {
         version: version.clone(),
     });
     let asset_path = download_asset(tx, &version, asset)?;
+    let actual_sha256 = match sha256_hex_of_file(&asset_path) {
+        Ok(hash) => hash,
+        Err(error) => {
+            let _ = std::fs::remove_file(&asset_path);
+            return Err(error);
+        }
+    };
+    if !actual_sha256.eq_ignore_ascii_case(&expected_sha256) {
+        let _ = std::fs::remove_file(&asset_path);
+        let _ = tx.send(UpdateEvent::Failed(format!(
+            "Update checksum mismatch; expected {expected_sha256}, downloaded {actual_sha256}. The package was discarded."
+        )));
+        return Ok(());
+    }
     let pending = PendingUpdate {
         version,
         package_kind,
         asset_path,
         release_url: release.html_url,
+        expected_sha256: expected_sha256.to_ascii_lowercase(),
     };
     write_pending_update(&pending)?;
     let _ = tx.send(UpdateEvent::Ready(pending));
@@ -179,6 +230,20 @@ fn fetch_latest_release() -> Result<GithubRelease, String> {
         .map_err(|error| format!("Could not check for updates: {error}"))?
         .json::<GithubRelease>()
         .map_err(|error| format!("Could not read update metadata: {error}"))
+}
+
+fn download_text_asset(asset: &GithubAsset) -> Result<String, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|error| format!("Could not create checksum downloader: {error}"))?
+        .get(&asset.browser_download_url)
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .send()
+        .and_then(|response| response.error_for_status())
+        .map_err(|error| format!("Could not download SHA256SUMS.txt: {error}"))?
+        .text()
+        .map_err(|error| format!("Could not read SHA256SUMS.txt: {error}"))
 }
 
 fn download_asset(
@@ -223,6 +288,43 @@ fn download_asset(
     std::fs::rename(&partial_path, &asset_path)
         .map_err(|error| format!("Could not stage update package: {error}"))?;
     Ok(asset_path)
+}
+
+fn parse_sha256sums(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let hash_end = line.find(char::is_whitespace)?;
+            let hash = line[..hash_end].trim();
+            let name = line[hash_end..]
+                .trim_start()
+                .strip_prefix('*')
+                .unwrap_or_else(|| line[hash_end..].trim_start())
+                .trim();
+            (!hash.is_empty() && !name.is_empty()).then(|| (hash.to_owned(), name.to_owned()))
+        })
+        .collect()
+}
+
+fn verify_pending_update(pending: &PendingUpdate) -> Result<(), String> {
+    let expected = pending.expected_sha256.trim();
+    if expected.is_empty() {
+        return Err("Staged update has no trusted SHA-256 checksum; it was discarded.".to_owned());
+    }
+    let actual = sha256_hex_of_file(&pending.asset_path)?;
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(format!(
+            "Staged update checksum mismatch; expected {expected}, found {actual}. It was discarded."
+        ));
+    }
+    Ok(())
+}
+
+fn discard_pending_update(pending: &PendingUpdate, manifest_path: &Path) {
+    if updates_dir().is_some_and(|dir| pending.asset_path.starts_with(dir)) {
+        let _ = std::fs::remove_file(&pending.asset_path);
+    }
+    let _ = std::fs::remove_file(manifest_path);
 }
 
 fn preferred_package_kind() -> UpdatePackageKind {
@@ -440,4 +542,85 @@ fn version_numbers(version: &str) -> Vec<u64> {
         .filter(|part| !part.is_empty())
         .map(|part| part.parse::<u64>().unwrap_or(0))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn parses_standard_sha256sums_format() {
+        let parsed = parse_sha256sums(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  LawPDFSetup-x64.exe\n\
+             bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb LawPDF-macos.zip\n",
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                (
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                    "LawPDFSetup-x64.exe".to_owned()
+                ),
+                (
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                    "LawPDF-macos.zip".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_star_prefixed_names_and_crlf() {
+        let parsed = parse_sha256sums(
+            "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC *LawPDF-windows-portable-x64.zip\r\n",
+        );
+        assert_eq!(
+            parsed,
+            vec![(
+                "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC".to_owned(),
+                "LawPDF-windows-portable-x64.zip".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn missing_sha256_entry_stays_missing() {
+        let parsed = parse_sha256sums(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  other.zip\n",
+        );
+        assert!(
+            parsed
+                .iter()
+                .all(|(_, name)| !name.eq_ignore_ascii_case(INSTALLER_ASSET_NAME))
+        );
+    }
+
+    #[test]
+    fn hashes_file_with_known_content() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "lawpdf-sha256-test-{}-{unique}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"abc").expect("write hash fixture");
+        let hash = sha256_hex_of_file(&path).expect("hash fixture");
+        let _ = std::fs::remove_file(path);
+        assert_eq!(
+            hash,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn compares_release_versions_and_rejects_garbage() {
+        assert!(!is_newer_version("v0.2.6", "0.2.6"));
+        assert!(is_newer_version("0.2.10", "0.2.9"));
+        assert!(is_newer_version("0.3", "0.2.6"));
+        assert!(!is_newer_version("garbage", "0.2.6"));
+        assert!(!is_newer_version("garbage", "also-garbage"));
+    }
 }
