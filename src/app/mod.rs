@@ -324,6 +324,7 @@ pub struct PdfEditorApp {
     comment_color_index: usize,
     pending_comment_saves: HashMap<PathBuf, PendingCommentSave>,
     active_comment_saves: HashMap<PathBuf, u64>,
+    page_rotation_in_flight: bool,
     text_box_text: String,
     signer_name: String,
     search_state: SearchState,
@@ -855,6 +856,7 @@ impl PdfEditorApp {
             comment_color_index: 0,
             pending_comment_saves: HashMap::new(),
             active_comment_saves: HashMap::new(),
+            page_rotation_in_flight: false,
             text_box_text: String::new(),
             signer_name: String::new(),
             search_state: SearchState::default(),
@@ -1488,6 +1490,32 @@ impl PdfEditorApp {
         Ok(())
     }
 
+    fn rotate_current_page(&mut self, clockwise: bool) {
+        if self.page_rotation_in_flight {
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let path = document.path.clone();
+        let page_index = self.page_index;
+        match self.render_tx.send(RenderRequest::RotatePage {
+            document_epoch: self.document_epoch,
+            path,
+            page_index,
+            clockwise,
+        }) {
+            Ok(()) => {
+                self.page_rotation_in_flight = true;
+                let direction = if clockwise { "right" } else { "left" };
+                self.status = format!("Rotating page {} {direction}...", page_index + 1);
+            }
+            Err(error) => {
+                self.push_error_notice(format!("Could not rotate page: {error}"));
+            }
+        }
+    }
+
     fn save_all_dirty_annotations(&mut self) -> Result<(), String> {
         self.save_active_tab_state();
         for tab in &mut self.tabs {
@@ -1984,6 +2012,28 @@ impl PdfEditorApp {
                     }
                     ctx.request_repaint();
                 }
+                RenderEvent::PageRotated {
+                    document_epoch,
+                    path,
+                    page_index,
+                    result,
+                } => {
+                    self.page_rotation_in_flight = false;
+                    match result {
+                        Ok((document, rotation)) => self.install_rotated_document(
+                            document_epoch,
+                            &path,
+                            page_index,
+                            document,
+                            rotation,
+                            ctx,
+                        ),
+                        Err(error) => {
+                            self.push_error_notice(format!("Could not rotate page: {error}"));
+                            ctx.request_repaint();
+                        }
+                    }
+                }
             }
         }
     }
@@ -2012,6 +2062,50 @@ impl PdfEditorApp {
                 Err(error) => eprintln!("Could not cache PDF hyperlinks: {error}"),
             }
         }
+    }
+
+    fn install_rotated_document(
+        &mut self,
+        document_epoch: u64,
+        path: &Path,
+        page_index: usize,
+        document: LoadedDocument,
+        rotation: i64,
+        ctx: &Context,
+    ) {
+        let message = format!(
+            "Page {} rotation saved at {} degrees.",
+            page_index + 1,
+            rotation
+        );
+        if let Some(tab) = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.document_epoch == document_epoch && tab.document.path.as_path() == path)
+        {
+            tab.document = document.clone();
+            tab.page_textures.clear();
+            tab.thumbnail_textures.clear();
+            tab.scroll_target_page = Some(page_index);
+            tab.thumbnail_scroll_target = Some(page_index);
+            tab.visible_page_ranges.clear();
+            tab.status = message.clone();
+        }
+
+        if self.is_current_document(document_epoch, path) {
+            self.document = Some(document);
+            self.page_textures.clear();
+            self.thumbnail_textures.clear();
+            self.pending_page_renders.clear();
+            self.pending_thumbnail_renders.clear();
+            self.pending_native_text.clear();
+            self.pending_text_chars.clear();
+            self.visible_page_ranges.clear();
+            self.scroll_target_page = Some(page_index);
+            self.thumbnail_scroll_target = Some(page_index);
+            self.status = message;
+        }
+        ctx.request_repaint();
     }
 
     fn load_document_on_worker(&self, path: PathBuf) -> Result<LoadedDocument, String> {
@@ -3651,14 +3745,63 @@ impl PdfEditorApp {
                     toolbar_group(ui, |ui| {
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
-                                for (tool, label) in [
-                                    (Tool::Select, "V"),
-                                    (Tool::Marker, "M"),
-                                    (Tool::TextBox, "T"),
-                                    (Tool::Signature, "S"),
-                                ] {
-                                    ui.selectable_value(&mut self.active_tool, tool, label)
-                                        .on_hover_text(tool.label());
+                                for tool in Tool::ALL {
+                                    let selected = self.active_tool == tool;
+                                    if toolbar_icon_button(
+                                        ui,
+                                        ToolbarIcon::for_tool(tool),
+                                        selected,
+                                        true,
+                                        tool.tooltip(),
+                                    )
+                                    .clicked()
+                                    {
+                                        self.active_tool = tool;
+                                    }
+                                }
+
+                                let rotation_enabled = has_document
+                                    && self.view_mode == DocumentViewMode::Pdf
+                                    && !self.page_rotation_in_flight;
+                                ui.add_enabled_ui(rotation_enabled, |ui| {
+                                    let (rotate_response, _) =
+                                        egui::containers::menu::MenuButton::from_button(
+                                            egui::Button::new("").min_size(Vec2::splat(28.0)),
+                                        )
+                                        .ui(ui, |ui| {
+                                            if ui
+                                                .button("Rotate 90° left")
+                                                .on_hover_text(
+                                                    "Turn the current page 90° counterclockwise and save it in this PDF",
+                                                )
+                                                .clicked()
+                                            {
+                                                self.rotate_current_page(false);
+                                                ui.close();
+                                            }
+                                            if ui
+                                                .button("Rotate 90° right")
+                                                .on_hover_text(
+                                                    "Turn the current page 90° clockwise and save it in this PDF",
+                                                )
+                                                .clicked()
+                                            {
+                                                self.rotate_current_page(true);
+                                                ui.close();
+                                            }
+                                        });
+                                    paint_toolbar_icon(
+                                        ui.painter(),
+                                        rotate_response.rect,
+                                        ToolbarIcon::Rotate,
+                                        toolbar_icon_color(ui, &rotate_response, rotation_enabled),
+                                    );
+                                    rotate_response.on_disabled_hover_text(
+                                        "Rotate the current page by 90° (saved in this PDF)",
+                                    );
+                                });
+                                if self.page_rotation_in_flight {
+                                    ui.spinner().on_hover_text("Saving page rotation…");
                                 }
                             });
                             if self.active_tool == Tool::Marker {
@@ -3698,20 +3841,72 @@ impl PdfEditorApp {
                                 has_document && self.page_index > 0,
                                 egui::Button::new("<"),
                             )
+                            .on_disabled_hover_text("Previous page")
                             .clicked()
                         {
                             self.go_to_page(self.page_index.saturating_sub(1));
                         }
-                        ui.label(format!(
-                            "{} / {}",
-                            if has_document { self.page_index + 1 } else { 0 },
-                            page_count
-                        ));
+
+                        let page_input_id = ui
+                            .id()
+                            .with(("toolbar-page-number", self.document_epoch));
+                        let input_had_focus =
+                            ui.memory(|memory| memory.has_focus(page_input_id));
+                        let current_page_number = if has_document {
+                            self.page_index + 1
+                        } else {
+                            0
+                        };
+                        let mut page_number_text = ui.ctx().data_mut(|data| {
+                            data.get_temp::<String>(page_input_id)
+                                .unwrap_or_else(|| current_page_number.to_string())
+                        });
+                        if !input_had_focus {
+                            page_number_text = current_page_number.to_string();
+                        }
+                        let page_input_response = ui
+                            .add_enabled(
+                                has_document,
+                                egui::TextEdit::singleline(&mut page_number_text)
+                                    .id(page_input_id)
+                                    .desired_width(42.0)
+                                    .horizontal_align(Align::Center),
+                            )
+                            .on_disabled_hover_text("Type a page number and press Enter");
+                        if page_input_response.changed() {
+                            page_number_text.retain(|character| character.is_ascii_digit());
+                        }
+                        let enter_pressed = ui.input(|input| {
+                            input.key_pressed(egui::Key::Enter)
+                                || input.key_pressed(egui::Key::Tab)
+                        });
+                        let submit_page_number = has_document
+                            && (page_input_response.lost_focus()
+                                || (page_input_response.has_focus() && enter_pressed));
+                        if submit_page_number {
+                            match page_index_from_input(&page_number_text, page_count) {
+                                Ok(page_index) => {
+                                    self.go_to_page(page_index);
+                                    page_number_text = (page_index + 1).to_string();
+                                }
+                                Err(message) => {
+                                    self.status = message;
+                                    page_number_text = current_page_number.to_string();
+                                }
+                            }
+                            ui.memory_mut(|memory| memory.surrender_focus(page_input_id));
+                        }
+                        ui.ctx().data_mut(|data| {
+                            data.insert_temp(page_input_id, page_number_text);
+                        });
+                        ui.label(format!("/ {page_count}"))
+                            .on_hover_text("Total pages in this PDF");
                         if ui
                             .add_enabled(
                                 has_document && self.page_index + 1 < page_count,
                                 egui::Button::new(">"),
                             )
+                            .on_disabled_hover_text("Next page")
                             .clicked()
                         {
                             self.go_to_page(self.page_index + 1);
@@ -9091,6 +9286,7 @@ impl eframe::App for PdfEditorApp {
             || self.selection_state.pending_select_all
             || !self.pending_comment_saves.is_empty()
             || !self.active_comment_saves.is_empty()
+            || self.page_rotation_in_flight
             || !self.queued_open_paths.is_empty()
             || self.update_ui.state.is_busy()
             || self.chat_ui.state.in_flight
@@ -9129,6 +9325,140 @@ fn toolbar_group(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
         .show(ui, |ui| {
             ui.horizontal(add_contents);
         });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolbarIcon {
+    Select,
+    Marker,
+    TextBox,
+    Signature,
+    Rotate,
+}
+
+impl ToolbarIcon {
+    fn for_tool(tool: Tool) -> Self {
+        match tool {
+            Tool::Select => Self::Select,
+            Tool::Marker => Self::Marker,
+            Tool::TextBox => Self::TextBox,
+            Tool::Signature => Self::Signature,
+        }
+    }
+}
+
+fn toolbar_icon_button(
+    ui: &mut egui::Ui,
+    icon: ToolbarIcon,
+    selected: bool,
+    enabled: bool,
+    tooltip: &str,
+) -> egui::Response {
+    let response = ui.add_enabled(
+        enabled,
+        egui::Button::new("")
+            .selected(selected)
+            .min_size(Vec2::splat(28.0)),
+    );
+    paint_toolbar_icon(
+        ui.painter(),
+        response.rect,
+        icon,
+        toolbar_icon_color(ui, &response, enabled),
+    );
+    response.on_disabled_hover_text(tooltip)
+}
+
+fn toolbar_icon_color(ui: &egui::Ui, response: &egui::Response, enabled: bool) -> Color32 {
+    if enabled {
+        ui.style().interact(response).fg_stroke.color
+    } else {
+        ui.visuals().weak_text_color()
+    }
+}
+
+fn paint_toolbar_icon(
+    painter: &egui::Painter,
+    button_rect: Rect,
+    icon: ToolbarIcon,
+    color: Color32,
+) {
+    let center = button_rect.center();
+    let point = |x: f32, y: f32| Pos2::new(center.x + x, center.y + y);
+    let stroke = Stroke::new(1.65, color);
+
+    match icon {
+        ToolbarIcon::Select => {
+            let outline = vec![
+                point(-6.0, -8.0),
+                point(-6.0, 5.0),
+                point(-1.5, 1.2),
+                point(2.2, 7.5),
+                point(5.0, 5.8),
+                point(1.2, -0.2),
+                point(7.0, -0.3),
+                point(-6.0, -8.0),
+            ];
+            painter.add(egui::Shape::line(outline, stroke));
+        }
+        ToolbarIcon::Marker => {
+            let body = vec![
+                point(-5.7, 4.8),
+                point(1.8, -6.8),
+                point(6.2, -3.9),
+                point(-1.3, 7.0),
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                body,
+                color.linear_multiply(0.16),
+                stroke,
+            ));
+            painter.line_segment([point(-5.5, 6.9), point(1.0, 6.9)], stroke);
+        }
+        ToolbarIcon::TextBox => {
+            painter.line_segment([point(-7.0, -7.0), point(-3.5, -7.0)], stroke);
+            painter.line_segment([point(-7.0, -7.0), point(-7.0, 7.0)], stroke);
+            painter.line_segment([point(-7.0, 7.0), point(-3.5, 7.0)], stroke);
+            painter.line_segment([point(7.0, -7.0), point(3.5, -7.0)], stroke);
+            painter.line_segment([point(7.0, -7.0), point(7.0, 7.0)], stroke);
+            painter.line_segment([point(7.0, 7.0), point(3.5, 7.0)], stroke);
+            painter.text(
+                center,
+                Align2::CENTER_CENTER,
+                "T",
+                FontId::proportional(15.0),
+                color,
+            );
+        }
+        ToolbarIcon::Signature => {
+            let signature = vec![
+                point(-7.0, 3.3),
+                point(-5.2, -1.8),
+                point(-3.3, 3.0),
+                point(-1.2, -4.3),
+                point(0.3, 2.5),
+                point(2.5, -0.6),
+                point(4.0, 2.4),
+                point(7.0, 0.2),
+            ];
+            painter.add(egui::Shape::line(signature, stroke));
+            painter.line_segment([point(-7.0, 6.2), point(7.0, 6.2)], Stroke::new(1.0, color));
+        }
+        ToolbarIcon::Rotate => {
+            let arc = (0..=18)
+                .map(|step| {
+                    let angle = -2.45 + step as f32 * 4.6 / 18.0;
+                    point(angle.cos() * 6.5, angle.sin() * 6.5)
+                })
+                .collect::<Vec<_>>();
+            painter.add(egui::Shape::line(arc, stroke));
+            painter.add(egui::Shape::convex_polygon(
+                vec![point(-6.0, -7.2), point(-7.8, -2.0), point(-2.6, -3.4)],
+                color,
+                Stroke::NONE,
+            ));
+        }
+    }
 }
 
 fn consume_command_shortcut(ctx: &Context, key: egui::Key) -> bool {
@@ -10480,6 +10810,17 @@ fn zoom_for_document(path: &Path, active_target_zoom: Option<f32>, settings: &Ap
         .unwrap_or_else(|| zoom_for_new_document(active_target_zoom, settings))
 }
 
+fn page_index_from_input(input: &str, page_count: usize) -> Result<usize, String> {
+    let page_number = input
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "Enter a valid page number.".to_owned())?;
+    if page_number == 0 || page_number > page_count {
+        return Err(format!("Enter a page number from 1 to {page_count}."));
+    }
+    Ok(page_number - 1)
+}
+
 fn document_canvas_width(viewport_width: f32, max_page_width: f32) -> f32 {
     viewport_width
         .max(max_page_width + PAGE_MARKER_GUTTER * 2.0)
@@ -10746,6 +11087,21 @@ mod app_tests {
         assert_eq!(marker.top(), page.top() + PAGE_MARKER_TOP_OFFSET);
         assert!(marker.right() < page.left());
         assert!(marker.left() >= page.left() - PAGE_MARKER_GUTTER);
+    }
+
+    #[test]
+    fn typed_page_number_maps_to_zero_based_page_index() {
+        assert_eq!(page_index_from_input("54", 900), Ok(53));
+        assert_eq!(page_index_from_input(" 1 ", 900), Ok(0));
+        assert_eq!(page_index_from_input("900", 900), Ok(899));
+    }
+
+    #[test]
+    fn typed_page_number_rejects_invalid_or_out_of_range_values() {
+        assert!(page_index_from_input("", 900).is_err());
+        assert!(page_index_from_input("0", 900).is_err());
+        assert!(page_index_from_input("901", 900).is_err());
+        assert!(page_index_from_input("page 54", 900).is_err());
     }
 
     #[test]

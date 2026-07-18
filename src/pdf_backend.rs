@@ -1323,6 +1323,64 @@ pub fn save_with_annotations(
     Ok(())
 }
 
+pub fn rotate_pdf_page(source: &Path, page_index: usize, clockwise: bool) -> Result<i64> {
+    let mut document = Document::load(source)
+        .with_context(|| format!("failed to load source PDF {}", source.display()))?;
+    let page_number = page_index as u32 + 1;
+    let page_id = document
+        .get_pages()
+        .get(&page_number)
+        .copied()
+        .ok_or_else(|| anyhow!("PDF has no page {page_number}"))?;
+    let current_rotation = inherited_page_rotation(&document, page_id)?;
+    let delta = if clockwise { 90 } else { -90 };
+    let rotation = (current_rotation + delta).rem_euclid(360);
+
+    document
+        .get_object_mut(page_id)?
+        .as_dict_mut()?
+        .set("Rotate", Object::Integer(rotation));
+    document.prune_objects();
+    document.compress();
+    save_document_in_place(&mut document, source)?;
+    Ok(rotation)
+}
+
+fn inherited_page_rotation(document: &Document, page_id: ObjectId) -> Result<i64> {
+    let mut object_id = page_id;
+    for _ in 0..64 {
+        let dictionary = document.get_object(object_id)?.as_dict()?;
+        if let Ok(value) = dictionary.get(b"Rotate") {
+            return pdf_integer(document, value)
+                .map(|rotation| rotation.rem_euclid(360))
+                .ok_or_else(|| anyhow!("PDF page has an invalid Rotate value"));
+        }
+        let Some(parent_id) = dictionary
+            .get(b"Parent")
+            .ok()
+            .and_then(|parent| match parent {
+                Object::Reference(id) => Some(*id),
+                _ => None,
+            })
+        else {
+            return Ok(0);
+        };
+        object_id = parent_id;
+    }
+    Err(anyhow!("PDF page tree is too deeply nested"))
+}
+
+fn pdf_integer(document: &Document, value: &Object) -> Option<i64> {
+    match value {
+        Object::Integer(value) => Some(*value),
+        Object::Reference(id) => document
+            .get_object(*id)
+            .ok()
+            .and_then(|value| pdf_integer(document, value)),
+        _ => None,
+    }
+}
+
 pub fn load_pdf_web_links(source: &Path, page_count: usize) -> Result<Vec<Vec<PageLink>>> {
     let document = Document::load(source)
         .with_context(|| format!("failed to load source PDF {}", source.display()))?;
@@ -2231,6 +2289,74 @@ pub fn sidecar_path_for_export(source: &Path, suffix: &str, extension: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotate_pdf_page_persists_and_normalizes_quarter_turns() {
+        let path = std::env::temp_dir().join(format!(
+            "lawpdf-rotate-page-{}-unit.pdf",
+            std::process::id()
+        ));
+        write_blank_pdf(&path);
+
+        assert_eq!(rotate_pdf_page(&path, 0, true).unwrap(), 90);
+        assert_eq!(stored_page_rotation(&path), 90);
+        assert_eq!(rotate_pdf_page(&path, 0, false).unwrap(), 0);
+        assert_eq!(stored_page_rotation(&path), 0);
+        assert_eq!(rotate_pdf_page(&path, 0, false).unwrap(), 270);
+        assert_eq!(stored_page_rotation(&path), 270);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rotate_pdf_page_respects_inherited_rotation() {
+        let path = std::env::temp_dir().join(format!(
+            "lawpdf-rotate-inherited-{}-unit.pdf",
+            std::process::id()
+        ));
+        write_blank_pdf(&path);
+        let mut document = Document::load(&path).unwrap();
+        let page_id = document.get_pages()[&1];
+        let parent_id = match document
+            .get_object(page_id)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"Parent")
+            .unwrap()
+        {
+            Object::Reference(id) => *id,
+            _ => panic!("expected page parent reference"),
+        };
+        document
+            .get_object_mut(parent_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Rotate", Object::Integer(270));
+        save_document_in_place(&mut document, &path).unwrap();
+
+        assert_eq!(rotate_pdf_page(&path, 0, true).unwrap(), 0);
+        assert_eq!(stored_page_rotation(&path), 0);
+
+        let _ = fs::remove_file(path);
+    }
+
+    fn stored_page_rotation(path: &Path) -> i64 {
+        let document = Document::load(path).unwrap();
+        let page_id = document.get_pages()[&1];
+        match document
+            .get_object(page_id)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"Rotate")
+            .unwrap()
+        {
+            Object::Integer(rotation) => *rotation,
+            _ => panic!("expected integer page rotation"),
+        }
+    }
 
     #[test]
     fn vector_rules_from_operations_extracts_stroked_rect_cells() {

@@ -21,6 +21,15 @@ impl Tool {
             Tool::Signature => "E-sign",
         }
     }
+
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            Tool::Select => "Select text and annotations (V)",
+            Tool::Marker => "Highlight or underline text (M)",
+            Tool::TextBox => "Add a text box (T)",
+            Tool::Signature => "Draw an electronic signature (S)",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

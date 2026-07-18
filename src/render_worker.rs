@@ -5,7 +5,7 @@ use std::thread;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
 use crate::model::{EditorAnnotation, LoadedDocument, PageTextChar, RenderedPage};
-use crate::pdf_backend::{PdfEngine, RenderQuality, sync_lawpdf_comments};
+use crate::pdf_backend::{PdfEngine, RenderQuality, rotate_pdf_page, sync_lawpdf_comments};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PageRenderKey {
@@ -79,6 +79,12 @@ pub enum RenderRequest {
         generation: u64,
         comments: Vec<EditorAnnotation>,
     },
+    RotatePage {
+        document_epoch: u64,
+        path: PathBuf,
+        page_index: usize,
+        clockwise: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -112,6 +118,12 @@ pub enum RenderEvent {
         path: PathBuf,
         generation: u64,
         result: Result<usize, String>,
+    },
+    PageRotated {
+        document_epoch: u64,
+        path: PathBuf,
+        page_index: usize,
+        result: Result<(LoadedDocument, i64), String>,
     },
 }
 
@@ -265,6 +277,27 @@ pub fn spawn_render_worker() -> (Sender<RenderRequest>, Receiver<RenderEvent>) {
                             .map_err(|error| error.to_string()),
                     }
                 }
+                RenderRequest::RotatePage {
+                    document_epoch,
+                    path,
+                    page_index,
+                    clockwise,
+                } => {
+                    engine.close_document(&path);
+                    let result = rotate_pdf_page(&path, page_index, clockwise)
+                        .and_then(|rotation| {
+                            engine
+                                .load_document_adaptive(&path, true)
+                                .map(|document| (document, rotation))
+                        })
+                        .map_err(|error| error.to_string());
+                    RenderEvent::PageRotated {
+                        document_epoch,
+                        path: path.clone(),
+                        page_index,
+                        result,
+                    }
+                }
             };
 
             let _ = event_tx.send(event);
@@ -308,7 +341,8 @@ fn request_priority(request: &RenderRequest) -> u8 {
         RenderRequest::LoadDocument { .. }
         | RenderRequest::PageImmediate { .. }
         | RenderRequest::ExportPagePng { .. }
-        | RenderRequest::SyncComments { .. } => 0,
+        | RenderRequest::SyncComments { .. }
+        | RenderRequest::RotatePage { .. } => 0,
         RenderRequest::Page { .. } => 1,
         RenderRequest::TextCharsAsync { .. } => 2,
         RenderRequest::Thumbnail { .. } => 3,
@@ -440,6 +474,17 @@ fn error_event(request: RenderRequest, message: String) -> RenderEvent {
             document_epoch,
             path,
             generation,
+            result: Err(message),
+        },
+        RenderRequest::RotatePage {
+            document_epoch,
+            path,
+            page_index,
+            ..
+        } => RenderEvent::PageRotated {
+            document_epoch,
+            path,
+            page_index,
             result: Err(message),
         },
     }
