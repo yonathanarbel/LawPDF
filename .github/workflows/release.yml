@@ -116,7 +116,7 @@ jobs:
         run: bash scripts/package-macos.sh
 
       - name: Create macOS SHA-256 manifest fragment
-        run: shasum -a 256 dist/LawPDF-macos.zip > dist/SHA256SUMS-macos.txt
+        run: (cd dist && shasum -a 256 LawPDF-macos.zip > SHA256SUMS-macos.txt)
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
