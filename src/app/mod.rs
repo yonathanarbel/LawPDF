@@ -75,6 +75,12 @@ const ZOOM_ANIMATION_SPEED: f32 = 18.0;
 const MAX_LIQUID_OUTLINE_ITEMS: usize = 80;
 const THUMBNAIL_SCROLL_SECONDS: f32 = 0.28;
 const DOCUMENT_PAGE_GAP: f32 = 24.0;
+const PAGE_MARKER_GUTTER: f32 = 96.0;
+const PAGE_MARKER_GAP: f32 = 12.0;
+const PAGE_MARKER_TOP_OFFSET: f32 = 12.0;
+const PAGE_MARKER_COLLAPSED_WIDTH: f32 = 28.0;
+const PAGE_MARKER_EXPANDED_WIDTH: f32 = 78.0;
+const PAGE_MARKER_HEIGHT: f32 = 26.0;
 const PAGE_PREFETCH_RADIUS: usize = 3;
 const PAGE_TEXTURE_CACHE_CAP: usize = 32;
 const SMALL_DOCUMENT_PREFETCH_LIMIT: usize = 6;
@@ -1371,7 +1377,7 @@ impl PdfEditorApp {
         let page_count = document.page_count;
         let title = document.title.clone();
         let optimized = document.optimized;
-        let zoom = self.default_zoom_for_new_document();
+        let zoom = self.zoom_for_document(&document.path);
         let ocr_states = load_ocr_cache(&document.path, page_count)
             .unwrap_or_else(|| vec![OcrPageState::Idle; page_count]);
         let annotations = load_lawpdf_annotations(&document.path).unwrap_or_default();
@@ -3128,13 +3134,29 @@ impl PdfEditorApp {
         )
     }
 
+    fn zoom_for_document(&self, path: &Path) -> f32 {
+        zoom_for_document(
+            path,
+            self.document.as_ref().map(|_| self.target_zoom),
+            &self.settings,
+        )
+    }
+
     fn remember_pdf_zoom(&mut self, zoom: f32) {
         let zoom = normalized_pdf_zoom(zoom);
-        if (self.settings.last_pdf_zoom - zoom).abs() <= f32::EPSILON {
+        let document_path = self.document.as_ref().map(|document| document.path.clone());
+        let mut changed = false;
+        if (self.settings.last_pdf_zoom - zoom).abs() > f32::EPSILON {
+            self.settings.last_pdf_zoom = zoom;
+            changed = true;
+        }
+        if let Some(path) = document_path {
+            changed |= self.settings.remember_document_zoom(&path, zoom);
+        }
+        if !changed {
             return;
         }
 
-        self.settings.last_pdf_zoom = zoom;
         if let Err(error) = save_settings(&self.settings) {
             self.push_error_notice(format!("Could not save zoom setting: {error}"));
         }
@@ -6840,7 +6862,7 @@ impl PdfEditorApp {
                         page_tops.push(content_height);
                         let display_size =
                             Vec2::new(page_info.width * self.zoom, page_info.height * self.zoom);
-                        content_width = content_width.max(display_size.x);
+                        content_width = document_canvas_width(content_width, display_size.x);
                         content_height += display_size.y;
                         display_sizes.push(display_size);
                     }
@@ -6914,7 +6936,8 @@ impl PdfEditorApp {
                                         new_page_top = new_content_height;
                                         new_page_size = display_size;
                                     }
-                                    new_content_width = new_content_width.max(display_size.x);
+                                    new_content_width =
+                                        document_canvas_width(new_content_width, display_size.x);
                                     new_content_height += display_size.y;
                                 }
                                 let new_page_left =
@@ -7042,21 +7065,63 @@ impl PdfEditorApp {
                             self.request_text_chars(ctx, &path, page_index);
                         }
 
-                        let chip_rect = Rect::from_min_size(
-                            rect.left_top() + Vec2::new(12.0, 12.0),
-                            Vec2::new(78.0, 26.0),
+                        let chip_state_id =
+                            ui.id()
+                                .with(("page-chip-collapsed", self.document_epoch, page_index));
+                        let mut chip_collapsed = ctx
+                            .data_mut(|data| data.get_temp::<bool>(chip_state_id))
+                            .unwrap_or(false);
+                        let chip_animation_id =
+                            ui.id()
+                                .with(("page-chip-animation", self.document_epoch, page_index));
+                        let expanded_t =
+                            ctx.animate_bool_with_time(chip_animation_id, !chip_collapsed, 0.18);
+                        let chip_width = egui::lerp(
+                            PAGE_MARKER_COLLAPSED_WIDTH..=PAGE_MARKER_EXPANDED_WIDTH,
+                            expanded_t,
                         );
-                        painter.rect_filled(
+                        let chip_rect = page_marker_rect(rect, chip_width);
+                        let chip_response = ui
+                            .interact(
+                                chip_rect,
+                                ui.id().with(("page-chip", self.document_epoch, page_index)),
+                                Sense::click(),
+                            )
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .on_hover_text(if chip_collapsed {
+                                "Expand page label"
+                            } else {
+                                "Collapse page label"
+                            });
+                        let page_chip_clicked = chip_response.clicked();
+                        if page_chip_clicked {
+                            chip_collapsed = !chip_collapsed;
+                            ctx.data_mut(|data| {
+                                data.insert_temp(chip_state_id, chip_collapsed);
+                            });
+                            ctx.request_repaint();
+                        }
+                        let chip_painter = painter.with_clip_rect(chip_rect);
+                        chip_painter.rect_filled(
                             chip_rect,
                             13,
                             Color32::from_rgba_unmultiplied(45, 39, 32, 168),
                         );
-                        painter.text(
+                        let expanded_alpha = (expanded_t * 255.0).round() as u8;
+                        let compact_alpha = ((1.0 - expanded_t) * 255.0).round() as u8;
+                        chip_painter.text(
                             chip_rect.center(),
                             Align2::CENTER_CENTER,
                             format!("Page {}", page_index + 1),
                             FontId::proportional(14.0),
-                            Color32::from_rgb(255, 252, 244),
+                            Color32::from_rgba_unmultiplied(255, 252, 244, expanded_alpha),
+                        );
+                        chip_painter.text(
+                            chip_rect.center(),
+                            Align2::CENTER_CENTER,
+                            format!("{}", page_index + 1),
+                            FontId::proportional(14.0),
+                            Color32::from_rgba_unmultiplied(255, 252, 244, compact_alpha),
                         );
 
                         let painter = ui.painter_at(rect);
@@ -7066,7 +7131,8 @@ impl PdfEditorApp {
                         self.draw_annotations(&painter, &placement, page_index);
                         self.draw_drag_preview(&painter, &placement, page_index);
                         self.draw_hovered_web_link(&painter, &response, &placement, page_index);
-                        let mut annotation_interacted =
+                        let mut annotation_interacted = page_chip_clicked;
+                        annotation_interacted |=
                             self.draw_text_box_controls(ui, ctx, &placement, page_index);
                         annotation_interacted |=
                             self.draw_text_box_action_palette(ctx, &placement, page_index);
@@ -10408,6 +10474,28 @@ fn zoom_for_new_document(active_target_zoom: Option<f32>, settings: &AppSettings
         .unwrap_or_else(|| normalized_pdf_zoom(settings.last_pdf_zoom))
 }
 
+fn zoom_for_document(path: &Path, active_target_zoom: Option<f32>, settings: &AppSettings) -> f32 {
+    settings
+        .zoom_for_document(path)
+        .unwrap_or_else(|| zoom_for_new_document(active_target_zoom, settings))
+}
+
+fn document_canvas_width(viewport_width: f32, max_page_width: f32) -> f32 {
+    viewport_width
+        .max(max_page_width + PAGE_MARKER_GUTTER * 2.0)
+        .max(1.0)
+}
+
+fn page_marker_rect(page_rect: Rect, width: f32) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(
+            page_rect.left() - PAGE_MARKER_GAP - width,
+            page_rect.top() + PAGE_MARKER_TOP_OFFSET,
+        ),
+        Vec2::new(width, PAGE_MARKER_HEIGHT),
+    )
+}
+
 fn liquid_note_blocks(blocks: &[LiquidBlock]) -> Vec<&LiquidBlock> {
     blocks
         .iter()
@@ -10639,6 +10727,26 @@ fn tab_title(document: &LoadedDocument) -> String {
 #[cfg(test)]
 mod app_tests {
     use super::*;
+
+    #[test]
+    fn document_canvas_reserves_a_gutter_for_the_page_marker() {
+        assert_eq!(document_canvas_width(800.0, 600.0), 800.0);
+        assert_eq!(
+            document_canvas_width(700.0, 600.0),
+            600.0 + PAGE_MARKER_GUTTER * 2.0
+        );
+    }
+
+    #[test]
+    fn page_marker_sits_in_the_grey_gutter_without_overlapping_the_page() {
+        let page = Rect::from_min_size(Pos2::new(200.0, 40.0), Vec2::new(600.0, 800.0));
+        let marker = page_marker_rect(page, PAGE_MARKER_EXPANDED_WIDTH);
+
+        assert_eq!(marker.right(), page.left() - PAGE_MARKER_GAP);
+        assert_eq!(marker.top(), page.top() + PAGE_MARKER_TOP_OFFSET);
+        assert!(marker.right() < page.left());
+        assert!(marker.left() >= page.left() - PAGE_MARKER_GUTTER);
+    }
 
     #[test]
     fn notice_queue_keeps_only_the_newest_five_items() {
@@ -11188,6 +11296,17 @@ mod app_tests {
         settings.last_pdf_zoom = 1.65;
 
         assert_eq!(zoom_for_new_document(None, &settings), 1.65);
+    }
+
+    #[test]
+    fn remembered_document_zoom_overrides_the_active_documents_zoom() {
+        let mut settings = AppSettings::default();
+        let remembered = Path::new("C:/docs/remembered.pdf");
+        let new_document = Path::new("C:/docs/new.pdf");
+        settings.remember_document_zoom(remembered, 2.1);
+
+        assert_eq!(zoom_for_document(remembered, Some(1.4), &settings), 2.1);
+        assert_eq!(zoom_for_document(new_document, Some(1.4), &settings), 1.4);
     }
 
     #[test]

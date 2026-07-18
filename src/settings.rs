@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,9 @@ pub struct AppSettings {
     pub groq_api_key: String,
     #[serde(default = "default_pdf_zoom")]
     pub last_pdf_zoom: f32,
+    /// Last zoom selected for each PDF, keyed by its normalized absolute path.
+    #[serde(default)]
+    pub pdf_zoom_by_document: BTreeMap<String, f32>,
     /// When true, highlights appear instantly instead of animating the
     /// "laying-down" ink stroke. Honors users who prefer reduced motion.
     #[serde(default)]
@@ -36,6 +40,7 @@ impl Default for AppSettings {
             openai_api_key: String::new(),
             groq_api_key: String::new(),
             last_pdf_zoom: DEFAULT_PDF_ZOOM,
+            pdf_zoom_by_document: BTreeMap::new(),
             reduce_motion: false,
             optimize_large_documents: true,
             liquid_mode2_use_pymupdf_blocks: false,
@@ -99,6 +104,39 @@ pub fn normalized_pdf_zoom(zoom: f32) -> f32 {
     }
 }
 
+pub fn pdf_document_key(path: &Path) -> String {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let key = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        key.to_lowercase()
+    } else {
+        key
+    }
+}
+
+impl AppSettings {
+    pub fn zoom_for_document(&self, path: &Path) -> Option<f32> {
+        self.pdf_zoom_by_document
+            .get(&pdf_document_key(path))
+            .copied()
+            .map(normalized_pdf_zoom)
+    }
+
+    pub fn remember_document_zoom(&mut self, path: &Path, zoom: f32) -> bool {
+        let key = pdf_document_key(path);
+        let zoom = normalized_pdf_zoom(zoom);
+        if self
+            .pdf_zoom_by_document
+            .get(&key)
+            .is_some_and(|saved| (*saved - zoom).abs() <= f32::EPSILON)
+        {
+            return false;
+        }
+        self.pdf_zoom_by_document.insert(key, zoom);
+        true
+    }
+}
+
 pub fn load_settings() -> AppSettings {
     let Some(path) = settings_path() else {
         return AppSettings::default();
@@ -128,6 +166,13 @@ pub(crate) fn load_settings_from(path: &Path) -> AppSettings {
         }
     };
     settings.last_pdf_zoom = normalized_pdf_zoom(settings.last_pdf_zoom);
+    settings.pdf_zoom_by_document.retain(|key, zoom| {
+        if key.trim().is_empty() {
+            return false;
+        }
+        *zoom = normalized_pdf_zoom(*zoom);
+        true
+    });
     settings
 }
 
@@ -217,6 +262,10 @@ mod tests {
             openai_api_key: "openai".to_owned(),
             groq_api_key: "groq".to_owned(),
             last_pdf_zoom: 2.25,
+            pdf_zoom_by_document: BTreeMap::from([
+                ("c:/docs/first.pdf".to_owned(), 1.5),
+                ("c:/docs/second.pdf".to_owned(), 2.0),
+            ]),
             reduce_motion: true,
             optimize_large_documents: false,
             liquid_mode2_use_pymupdf_blocks: true,
@@ -230,6 +279,7 @@ mod tests {
         assert_eq!(actual.openai_api_key, expected.openai_api_key);
         assert_eq!(actual.groq_api_key, expected.groq_api_key);
         assert_eq!(actual.last_pdf_zoom, expected.last_pdf_zoom);
+        assert_eq!(actual.pdf_zoom_by_document, expected.pdf_zoom_by_document);
         assert_eq!(actual.reduce_motion, expected.reduce_motion);
         assert_eq!(
             actual.optimize_large_documents,
@@ -243,6 +293,37 @@ mod tests {
             actual.liquid_mode2_use_pp_footnote_regions,
             expected.liquid_mode2_use_pp_footnote_regions
         );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn document_zoom_is_path_specific_and_normalized() {
+        let mut settings = AppSettings::default();
+        let first = Path::new("C:/docs/First.pdf");
+        let second = Path::new("C:/docs/Second.pdf");
+
+        assert!(settings.remember_document_zoom(first, 1.8));
+        assert!(!settings.remember_document_zoom(first, 1.8));
+        assert!(settings.remember_document_zoom(second, 9.0));
+
+        assert_eq!(settings.zoom_for_document(first), Some(1.8));
+        assert_eq!(settings.zoom_for_document(second), Some(MAX_PDF_ZOOM));
+        assert_eq!(
+            settings.zoom_for_document(Path::new("C:/docs/Other.pdf")),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_settings_without_document_zoom_map_still_load() {
+        let path = temp_settings_path("legacy-zoom");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, br#"{"last_pdf_zoom":1.6}"#).unwrap();
+
+        let settings = load_settings_from(&path);
+
+        assert_eq!(settings.last_pdf_zoom, 1.6);
+        assert!(settings.pdf_zoom_by_document.is_empty());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
