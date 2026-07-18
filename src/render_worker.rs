@@ -34,6 +34,7 @@ pub struct ThumbnailRenderKey {
 pub enum RenderRequest {
     LoadDocument {
         path: PathBuf,
+        optimize_large_documents: bool,
         reply: Sender<Result<LoadedDocument, String>>,
     },
     TextCharsAsync {
@@ -51,11 +52,13 @@ pub enum RenderRequest {
         path: PathBuf,
         zoom: f32,
         render_scale: f32,
+        fast: bool,
     },
     PageImmediate {
         path: PathBuf,
         page_index: usize,
         render_scale: f32,
+        fast: bool,
         reply: Sender<Result<RenderedPage, String>>,
     },
     Thumbnail {
@@ -130,15 +133,18 @@ pub fn spawn_render_worker() -> (Sender<RenderRequest>, Receiver<RenderEvent>) {
 
         let mut backlog = VecDeque::new();
         loop {
-            let Some(request) = backlog.pop_front().or_else(|| request_rx.recv().ok()) else {
+            let Some(request) = next_prioritized_request(&request_rx, &mut backlog) else {
                 break;
             };
-            let request = coalesce_render_request(request, &request_rx, &mut backlog);
             let event = match request {
-                RenderRequest::LoadDocument { path, reply } => {
+                RenderRequest::LoadDocument {
+                    path,
+                    optimize_large_documents,
+                    reply,
+                } => {
                     let _ = reply.send(
                         engine
-                            .load_document(&path)
+                            .load_document_adaptive(&path, optimize_large_documents)
                             .map_err(|error| error.to_string()),
                     );
                     continue;
@@ -172,24 +178,44 @@ pub fn spawn_render_worker() -> (Sender<RenderRequest>, Receiver<RenderEvent>) {
                     path,
                     zoom,
                     render_scale,
+                    fast,
                 } => RenderEvent::Page {
                     key,
                     path: path.clone(),
                     _zoom: zoom,
                     render_scale,
                     result: engine
-                        .render_page(&path, key.page_index, render_scale)
+                        .render_page_with_quality(
+                            &path,
+                            key.page_index,
+                            render_scale,
+                            if fast {
+                                RenderQuality::Fast
+                            } else {
+                                RenderQuality::Crisp
+                            },
+                        )
                         .map_err(|error| error.to_string()),
                 },
                 RenderRequest::PageImmediate {
                     path,
                     page_index,
                     render_scale,
+                    fast,
                     reply,
                 } => {
                     let _ = reply.send(
                         engine
-                            .render_page(&path, page_index, render_scale)
+                            .render_page_with_quality(
+                                &path,
+                                page_index,
+                                render_scale,
+                                if fast {
+                                    RenderQuality::Fast
+                                } else {
+                                    RenderQuality::Crisp
+                                },
+                            )
                             .map_err(|error| error.to_string()),
                     );
                     continue;
@@ -248,6 +274,49 @@ pub fn spawn_render_worker() -> (Sender<RenderRequest>, Receiver<RenderEvent>) {
     (request_tx, event_rx)
 }
 
+fn next_prioritized_request(
+    request_rx: &Receiver<RenderRequest>,
+    backlog: &mut VecDeque<RenderRequest>,
+) -> Option<RenderRequest> {
+    if backlog.is_empty() {
+        backlog.push_back(request_rx.recv().ok()?);
+    }
+    while let Ok(request) = request_rx.try_recv() {
+        push_coalesced(backlog, request);
+    }
+    let best = backlog
+        .iter()
+        .enumerate()
+        .min_by_key(|(index, request)| (request_priority(request), *index))
+        .map(|(index, _)| index)?;
+    backlog.remove(best)
+}
+
+fn push_coalesced(backlog: &mut VecDeque<RenderRequest>, request: RenderRequest) {
+    if let Some(target) = coalescing_target(&request)
+        && let Some(position) = backlog
+            .iter()
+            .position(|pending| coalescing_target(pending).as_ref() == Some(&target))
+    {
+        backlog.remove(position);
+    }
+    backlog.push_back(request);
+}
+
+fn request_priority(request: &RenderRequest) -> u8 {
+    match request {
+        RenderRequest::LoadDocument { .. }
+        | RenderRequest::PageImmediate { .. }
+        | RenderRequest::ExportPagePng { .. }
+        | RenderRequest::SyncComments { .. } => 0,
+        RenderRequest::Page { .. } => 1,
+        RenderRequest::TextCharsAsync { .. } => 2,
+        RenderRequest::Thumbnail { .. } => 3,
+        RenderRequest::TextPageAsync { .. } => 4,
+    }
+}
+
+#[cfg(test)]
 fn coalesce_render_request(
     mut request: RenderRequest,
     request_rx: &Receiver<RenderRequest>,
@@ -327,6 +396,7 @@ fn error_event(request: RenderRequest, message: String) -> RenderEvent {
             path,
             zoom,
             render_scale,
+            ..
         } => RenderEvent::Page {
             key,
             path,
@@ -393,6 +463,7 @@ mod tests {
             path: PathBuf::from("document.pdf"),
             zoom: 1.0,
             render_scale,
+            fast: false,
         }
     }
 
@@ -448,4 +519,35 @@ mod tests {
             Some(RenderRequest::Thumbnail { .. })
         ));
     }
+
+    #[test]
+    fn visible_page_render_overtakes_queued_search_extraction() {
+        let (tx, rx) = unbounded();
+        tx.send(RenderRequest::TextPageAsync {
+            document_epoch: 7,
+            path: PathBuf::from("document.pdf"),
+            page_index: 100,
+        })
+        .unwrap();
+        tx.send(page_request(3, 1.0)).unwrap();
+        let mut backlog = VecDeque::new();
+
+        let next = next_prioritized_request(&rx, &mut backlog).unwrap();
+
+        assert!(matches!(
+            next,
+            RenderRequest::Page {
+                key: PageRenderKey { page_index: 3, .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            backlog.pop_front(),
+            Some(RenderRequest::TextPageAsync {
+                page_index: 100,
+                ..
+            })
+        ));
+    }
+
 }

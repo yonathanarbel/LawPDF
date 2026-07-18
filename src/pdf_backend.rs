@@ -17,10 +17,12 @@ use crate::model::{
     AnnotationKind, EditorAnnotation, LoadedDocument, MarkerStyle, PageInfo, PageLink,
     PageTextChar, PdfRect, RenderedPage,
 };
+use crate::performance_cache::{CachedDocumentMetadata, PerformanceCache};
 
 pub struct PdfEngine {
     pdfium: &'static Pdfium,
     open_documents: RefCell<VecDeque<OpenPdfDocument>>,
+    performance_cache: PerformanceCache,
 }
 
 struct OpenPdfDocument {
@@ -44,6 +46,8 @@ pub struct VisionPage {
 }
 
 const OPEN_DOCUMENT_CACHE_CAP: usize = 3;
+const OPTIMIZED_DOCUMENT_MIN_BYTES: u64 = 16 * 1024 * 1024;
+const OPTIMIZED_DOCUMENT_MIN_PAGES: usize = 200;
 static PDFIUM: OnceLock<Result<&'static Pdfium, String>> = OnceLock::new();
 pub const LAWPDF_COMMENT_ID_PREFIX: &str = "LawPDF-comment-";
 const LAWPDF_CROPBOX_LOCAL_COORDS_ENV: &str = "LAWPDF_CROPBOX_LOCAL_COORDS";
@@ -65,7 +69,96 @@ impl PdfEngine {
         Ok(Self {
             pdfium,
             open_documents: RefCell::new(VecDeque::new()),
+            performance_cache: PerformanceCache::new(),
         })
+    }
+
+    pub fn load_document_adaptive(
+        &self,
+        path: &Path,
+        optimize_large_documents: bool,
+    ) -> Result<LoadedDocument> {
+        if !optimize_large_documents {
+            return self.load_document(path);
+        }
+
+        let file_is_large = fs::metadata(path)
+            .map(|metadata| metadata.len() >= OPTIMIZED_DOCUMENT_MIN_BYTES)
+            .unwrap_or(false);
+        let page_count = self.with_open_document(path, |document| {
+            Ok(document.pages().len() as usize)
+        })?;
+        if file_is_large || page_count >= OPTIMIZED_DOCUMENT_MIN_PAGES {
+            self.load_document_optimized(path)
+        } else {
+            self.load_document(path)
+        }
+    }
+
+    fn load_document_optimized(&self, path: &Path) -> Result<LoadedDocument> {
+        if let Some(cached) = self.performance_cache.load_document_metadata(path, true) {
+            return Ok(self.optimized_document_from_metadata(path, cached));
+        }
+
+        let metadata = self.with_open_document(path, |document| {
+            let page_count = document.pages().len() as usize;
+            let mut pages = Vec::with_capacity(page_count);
+            for page_index in 0..page_count {
+                let page = document
+                    .pages()
+                    .get(page_index as u16)
+                    .with_context(|| format!("failed to read page {}", page_index + 1))?;
+                let crop_box = cropbox_local_coords_enabled()
+                    .then(|| page_crop_box_if_distinct_from_media(&page))
+                    .flatten();
+                let width = crop_box
+                    .map(|box_| visible_page_extent(box_.width(), page.width().value))
+                    .unwrap_or(page.width().value);
+                let height = crop_box
+                    .map(|box_| visible_page_extent(box_.height(), page.height().value))
+                    .unwrap_or(page.height().value);
+                let mut page_info =
+                    PageInfo::with_footnote_divider_y_from_top(width, height, None);
+                if let Some(box_) = crop_box {
+                    page_info = page_info.with_coordinate_offset(box_.left, box_.bottom);
+                }
+                pages.push(page_info);
+            }
+            Ok(CachedDocumentMetadata {
+                links: vec![Vec::new(); page_count],
+                pages,
+                optimized: true,
+            })
+        })?;
+        self.performance_cache
+            .save_document_metadata(path, &metadata);
+        Ok(self.optimized_document_from_metadata(path, metadata))
+    }
+
+    fn optimized_document_from_metadata(
+        &self,
+        path: &Path,
+        metadata: CachedDocumentMetadata,
+    ) -> LoadedDocument {
+        let mut document = loaded_document_from_metadata(path, metadata);
+        if let Some(links) = self.performance_cache.load_document_links(path) {
+            document.links = links;
+            document.links_loaded = true;
+        }
+        document
+    }
+
+    pub fn load_document_links(
+        &self,
+        path: &Path,
+        page_count: usize,
+    ) -> Result<Vec<Vec<PageLink>>> {
+        if let Some(links) = self.performance_cache.load_document_links(path) {
+            return Ok(links);
+        }
+        let links = load_pdf_web_links(path, page_count)?;
+        self.performance_cache.save_document_links(path, &links);
+        Ok(links)
     }
 
     pub fn load_document(&self, path: &Path) -> Result<LoadedDocument> {
@@ -146,12 +239,17 @@ impl PdfEngine {
                 native_text_loaded,
                 text_chars,
                 links,
+                links_loaded: true,
+                optimized: false,
             })
         })
     }
 
     pub fn load_page_text(&self, path: &Path, page_index: usize) -> Result<String> {
-        self.with_open_document(path, |document| {
+        if let Some(text) = self.performance_cache.load_page_text(path, page_index) {
+            return Ok(text);
+        }
+        let text = self.with_open_document(path, |document| {
             let page = document
                 .pages()
                 .get(page_index as u16)
@@ -162,7 +260,10 @@ impl PdfEngine {
                 .with_context(|| format!("failed to read text on page {}", page_index + 1))?;
 
             Ok(text_page.all())
-        })
+        })?;
+        self.performance_cache
+            .save_page_text(path, page_index, &text);
+        Ok(text)
     }
 
     pub fn load_page_text_chars(
@@ -170,7 +271,13 @@ impl PdfEngine {
         path: &Path,
         page_index: usize,
     ) -> Result<Vec<PageTextChar>> {
-        self.with_open_document(path, |document| {
+        if let Some(chars) = self
+            .performance_cache
+            .load_page_text_chars(path, page_index)
+        {
+            return Ok(chars);
+        }
+        let chars = self.with_open_document(path, |document| {
             let page = document
                 .pages()
                 .get(page_index as u16)
@@ -181,7 +288,10 @@ impl PdfEngine {
                 .with_context(|| format!("failed to read text on page {}", page_index + 1))?;
 
             Ok(extract_text_chars(&text_page))
-        })
+        })?;
+        self.performance_cache
+            .save_page_text_chars(path, page_index, &chars);
+        Ok(chars)
     }
 
     pub fn render_page(&self, path: &Path, page_index: usize, zoom: f32) -> Result<RenderedPage> {
@@ -195,7 +305,14 @@ impl PdfEngine {
         zoom: f32,
         quality: RenderQuality,
     ) -> Result<RenderedPage> {
-        self.with_open_document(path, |document| {
+        let fast = quality == RenderQuality::Fast;
+        if let Some(rendered) = self
+            .performance_cache
+            .load_rendered_page(path, page_index, zoom, fast)
+        {
+            return Ok(rendered);
+        }
+        let rendered = self.with_open_document(path, |document| {
             let page = document
                 .pages()
                 .get(page_index as u16)
@@ -232,7 +349,10 @@ impl PdfEngine {
                 height: height as usize,
                 rgba: image.into_raw(),
             })
-        })
+        })?;
+        self.performance_cache
+            .save_rendered_page(path, &rendered, zoom, fast);
+        Ok(rendered)
     }
 
     /// Render a page for LiquidVision (LmV tier): letterbox-ready RGB raster
@@ -325,6 +445,30 @@ impl PdfEngine {
             .front()
             .ok_or_else(|| anyhow!("internal PDF cache is empty"))?;
         operation(&open_document.document)
+    }
+}
+
+fn loaded_document_from_metadata(
+    path: &Path,
+    metadata: CachedDocumentMetadata,
+) -> LoadedDocument {
+    let page_count = metadata.pages.len();
+    let title = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Untitled PDF")
+        .to_owned();
+    LoadedDocument {
+        path: path.to_path_buf(),
+        title,
+        page_count,
+        pages: metadata.pages,
+        native_text: vec![String::new(); page_count],
+        native_text_loaded: vec![false; page_count],
+        text_chars: vec![None; page_count],
+        links: metadata.links,
+        links_loaded: false,
+        optimized: metadata.optimized,
     }
 }
 

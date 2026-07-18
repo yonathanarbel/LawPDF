@@ -20,6 +20,9 @@ pub struct AppSettings {
     /// "laying-down" ink stroke. Honors users who prefer reduced motion.
     #[serde(default)]
     pub reduce_motion: bool,
+    /// Automatically use the cached, low-latency reader path for large PDFs.
+    #[serde(default = "default_true")]
+    pub optimize_large_documents: bool,
     #[serde(default)]
     pub liquid_mode2_use_pymupdf_blocks: bool,
     #[serde(default)]
@@ -34,6 +37,7 @@ impl Default for AppSettings {
             groq_api_key: String::new(),
             last_pdf_zoom: DEFAULT_PDF_ZOOM,
             reduce_motion: false,
+            optimize_large_documents: true,
             liquid_mode2_use_pymupdf_blocks: false,
             liquid_mode2_use_pp_footnote_regions: false,
         }
@@ -81,6 +85,10 @@ fn default_openrouter_api_key() -> String {
 
 fn default_pdf_zoom() -> f32 {
     DEFAULT_PDF_ZOOM
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub fn normalized_pdf_zoom(zoom: f32) -> f32 {
@@ -210,6 +218,7 @@ mod tests {
             groq_api_key: "groq".to_owned(),
             last_pdf_zoom: 2.25,
             reduce_motion: true,
+            optimize_large_documents: false,
             liquid_mode2_use_pymupdf_blocks: true,
             liquid_mode2_use_pp_footnote_regions: true,
         };
@@ -222,6 +231,10 @@ mod tests {
         assert_eq!(actual.groq_api_key, expected.groq_api_key);
         assert_eq!(actual.last_pdf_zoom, expected.last_pdf_zoom);
         assert_eq!(actual.reduce_motion, expected.reduce_motion);
+        assert_eq!(
+            actual.optimize_large_documents,
+            expected.optimize_large_documents
+        );
         assert_eq!(
             actual.liquid_mode2_use_pymupdf_blocks,
             expected.liquid_mode2_use_pymupdf_blocks

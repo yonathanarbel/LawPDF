@@ -13,6 +13,7 @@ mod liquid_smoke;
 mod liquidvision;
 mod model;
 mod ocr;
+mod performance_cache;
 mod pdf_backend;
 #[cfg(feature = "devtools")]
 mod profile_dataset;
@@ -132,6 +133,10 @@ const DEV_COMMANDS: &[DevCommand] = &[
         handler: dev_smoke_render_worker,
     },
     DevCommand {
+        flags: &["--bench-pdf-search"],
+        handler: dev_bench_pdf_search,
+    },
+    DevCommand {
         flags: &["--bench-scroll"],
         handler: dev_bench_scroll,
     },
@@ -199,6 +204,11 @@ fn dev_smoke_open_default(_args: Vec<OsString>) -> Result<(), String> {
 fn dev_smoke_render_worker(_args: Vec<OsString>) -> Result<(), String> {
     smoke_render_worker();
     Ok(())
+}
+
+#[cfg(feature = "devtools")]
+fn dev_bench_pdf_search(_args: Vec<OsString>) -> Result<(), String> {
+    bench_pdf_search()
 }
 
 #[cfg(feature = "devtools")]
@@ -320,6 +330,7 @@ fn smoke_render_worker() {
     let (load_tx, load_rx) = crossbeam_channel::unbounded();
     if let Err(error) = render_tx.send(render_worker::RenderRequest::LoadDocument {
         path: path.clone(),
+        optimize_large_documents: true,
         reply: load_tx,
     }) {
         eprintln!("Failed to send load request: {error}");
@@ -340,12 +351,17 @@ fn smoke_render_worker() {
         }
     }
 
-    let key = render_worker::PageRenderKey::new(1, 0, 1.0);
+    let render_scale = std::env::var("LAWPDF_SMOKE_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(1.0);
+    let key = render_worker::PageRenderKey::new(1, 0, render_scale);
     if let Err(error) = render_tx.send(render_worker::RenderRequest::Page {
         key,
         path,
         zoom: 1.0,
-        render_scale: 1.0,
+        render_scale,
+        fast: false,
     }) {
         eprintln!("Failed to send render request: {error}");
         std::process::exit(1);
@@ -370,6 +386,79 @@ fn smoke_render_worker() {
             std::process::exit(1);
         }
     }
+}
+
+#[cfg(feature = "devtools")]
+fn bench_pdf_search() -> Result<(), String> {
+    use std::time::Instant;
+
+    let path = smoke_pdf_path().map_err(|error| format!("{error:#}"))?;
+    let query = std::env::var("LAWPDF_SEARCH_QUERY")
+        .unwrap_or_else(|_| "instrument".to_owned())
+        .to_lowercase();
+    let engine = pdf_backend::PdfEngine::new().map_err(|error| format!("{error:#}"))?;
+    let opened_at = Instant::now();
+    let document = engine
+        .load_document_adaptive(&path, true)
+        .map_err(|error| format!("{error:#}"))?;
+    let metadata_seconds = opened_at.elapsed().as_secs_f64();
+
+    for pass in 1..=2 {
+        let started = Instant::now();
+        let mut text_bytes = 0usize;
+        let mut matches = 0usize;
+        let mut first_hit_page = None;
+        for page_index in 0..document.page_count {
+            let text = engine
+                .load_page_text(&path, page_index)
+                .map_err(|error| format!("{error:#}"))?;
+            text_bytes += text.len();
+            let page_matches = text.to_lowercase().matches(&query).count();
+            matches += page_matches;
+            if page_matches > 0 && first_hit_page.is_none() {
+                first_hit_page = Some(page_index);
+            }
+        }
+        if let Some(page_index) = first_hit_page {
+            let text = engine
+                .load_page_text(&path, page_index)
+                .map_err(|error| format!("{error:#}"))?;
+            let chars = engine
+                .load_page_text_chars(&path, page_index)
+                .map_err(|error| format!("{error:#}"))?;
+            if let Some(start) = text.to_lowercase().find(&query) {
+                let end = start + query.len();
+                let start_char = text[..start].chars().count();
+                let end_char = text[..end].chars().count();
+                let geometry_text = chars
+                    .get(start_char..end_char)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|char| char.ch)
+                    .collect::<String>();
+                println!(
+                    "Search pass {pass}: first hit page={} geometry_text={geometry_text:?}",
+                    page_index + 1
+                );
+            }
+        }
+        println!(
+            "Search pass {pass}: pages={} text_bytes={text_bytes} matches={matches} elapsed={:.3}s",
+            document.page_count,
+            started.elapsed().as_secs_f64()
+        );
+    }
+    let links_started = Instant::now();
+    let links = engine
+        .load_document_links(&path, document.page_count)
+        .map_err(|error| format!("{error:#}"))?;
+    let link_count = links.iter().map(Vec::len).sum::<usize>();
+    println!(
+        "Hyperlinks: count={link_count} elapsed={:.3}s",
+        links_started.elapsed().as_secs_f64()
+    );
+    println!("Metadata elapsed={metadata_seconds:.3}s");
+    Ok(())
 }
 
 #[cfg(feature = "devtools")]
