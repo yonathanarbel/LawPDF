@@ -5,7 +5,7 @@ mod selection_state;
 mod tts_controller;
 mod update_ui;
 
-use chat_ui::{ChatState, ChatUi};
+use chat_ui::{ChatState, ChatUi, estimate_tokens};
 use settings_ui::SettingsUi;
 use search_state::SearchState;
 use selection_state::SelectionState;
@@ -31,8 +31,9 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use crate::chat::{CHAT_MODELS, ChatEvent, ChatMessage, ChatRequest, ChatRole, spawn_chat_job};
 use crate::layout_roles;
 use crate::liquid::{
-    DeepLiquidConfig, DocumentProfileKind, LiquidBlock, LiquidBlockRole, LiquidDocument,
-    LiquidEvent, LiquidRequest, LiquidSourceLineRef, hidden_contents_mask_for_display,
+    DeepLiquidConfig, DocumentProfileKind, FootnoteMode, LiquidBlock, LiquidBlockRole,
+    LiquidDocument, LiquidEvent, LiquidRequest, LiquidSourceLineRef, MarkdownOptions,
+    hidden_contents_mask_for_display, liquid_document_markdown,
     should_hide_contents_block_for_display, should_prefer_ocr_page_text, spawn_liquid_job,
 };
 use crate::liquid2::{
@@ -292,6 +293,9 @@ pub struct PdfEditorApp {
     view_mode: DocumentViewMode,
     liquid_state: LiquidState,
     liquid_mode2_state: LiquidState,
+    liquid_mode2_complete: bool,
+    pending_markdown_copy: bool,
+    pending_markdown_request: Option<PendingMarkdownRequest>,
     liquid_notice_dismissed: bool,
     liquid_text_scale: f32,
     liquid_max_width: f32,
@@ -584,6 +588,28 @@ enum LiquidState {
     Failed(String),
 }
 
+#[derive(Debug, Clone)]
+enum MarkdownDestination {
+    Clipboard,
+    File(PathBuf),
+}
+
+#[derive(Debug, Clone)]
+struct PendingMarkdownRequest {
+    document_epoch: u64,
+    path: PathBuf,
+    options: MarkdownOptions,
+    destination: MarkdownDestination,
+    ocr_attempted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkdownPreparationOutcome {
+    Wait,
+    Ready,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiquidOutlineItem {
     level: usize,
@@ -654,6 +680,7 @@ enum UpdateNoticeKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NoticeSeverity {
     Info,
+    Warning,
     Error,
 }
 
@@ -851,6 +878,7 @@ struct DocumentTab {
     view_mode: DocumentViewMode,
     liquid_state: LiquidState,
     liquid_mode2_state: LiquidState,
+    liquid_mode2_complete: bool,
     liquid_notice_dismissed: bool,
     zoom: f32,
     target_zoom: f32,
@@ -942,6 +970,9 @@ impl PdfEditorApp {
             view_mode: DocumentViewMode::Pdf,
             liquid_state: LiquidState::Idle,
             liquid_mode2_state: LiquidState::Idle,
+            liquid_mode2_complete: false,
+            pending_markdown_copy: false,
+            pending_markdown_request: None,
             liquid_notice_dismissed: false,
             liquid_text_scale: 1.0,
             liquid_max_width: 920.0,
@@ -1089,6 +1120,7 @@ impl PdfEditorApp {
             view_mode: self.view_mode,
             liquid_state: self.liquid_state.clone(),
             liquid_mode2_state: self.liquid_mode2_state.clone(),
+            liquid_mode2_complete: self.liquid_mode2_complete,
             liquid_notice_dismissed: self.liquid_notice_dismissed,
             zoom: self.zoom,
             target_zoom: self.target_zoom,
@@ -1157,6 +1189,7 @@ impl PdfEditorApp {
         self.view_mode = tab.view_mode;
         self.liquid_state = tab.liquid_state;
         self.liquid_mode2_state = tab.liquid_mode2_state;
+        self.liquid_mode2_complete = tab.liquid_mode2_complete;
         self.liquid_notice_dismissed = tab.liquid_notice_dismissed;
         self.zoom = tab_zoom;
         self.target_zoom = tab_target_zoom;
@@ -1230,6 +1263,16 @@ impl PdfEditorApp {
             return;
         }
 
+        let pending_for_current = self
+            .pending_markdown_request
+            .as_ref()
+            .is_some_and(|request| self.is_current_document(request.document_epoch, &request.path));
+        if pending_for_current {
+            self.finish_pending_markdown_fallback(
+                "source tab changed while layout analysis was running",
+                ctx,
+            );
+        }
         self.save_active_tab_state();
         if let Some(state) = self.sbs_pane_states.get(&target_epoch).copied()
             && let Some(tab) = self.tabs.get_mut(tab_index)
@@ -1354,6 +1397,13 @@ impl PdfEditorApp {
         }
 
         let closing_epoch = self.tabs[tab_index].document_epoch;
+        let closing_pending_markdown = self
+            .pending_markdown_request
+            .as_ref()
+            .is_some_and(|request| request.document_epoch == closing_epoch);
+        if closing_pending_markdown {
+            self.finish_pending_markdown_fallback("source tab was closed", ctx);
+        }
         let closing_active = self.active_tab == Some(tab_index);
         if !closing_active {
             self.save_active_tab_state();
@@ -1398,6 +1448,9 @@ impl PdfEditorApp {
         self.stop_liquid_tts();
         self.liquid_state = LiquidState::Idle;
         self.liquid_mode2_state = LiquidState::Idle;
+        self.liquid_mode2_complete = false;
+        self.pending_markdown_copy = false;
+        self.pending_markdown_request = None;
         self.liquid_notice_dismissed = false;
         self.zoom = zoom;
         self.target_zoom = zoom;
@@ -1769,6 +1822,7 @@ impl PdfEditorApp {
             view_mode: DocumentViewMode::Pdf,
             liquid_state: LiquidState::Idle,
             liquid_mode2_state: LiquidState::Idle,
+            liquid_mode2_complete: false,
             liquid_notice_dismissed: false,
             zoom,
             target_zoom: zoom,
@@ -1963,6 +2017,233 @@ impl PdfEditorApp {
         }
     }
 
+    fn markdown_options(&self) -> MarkdownOptions {
+        MarkdownOptions {
+            footnotes: self.settings.markdown_copy_footnotes,
+            include_tables: self.settings.markdown_copy_include_tables,
+            include_metadata: self.settings.markdown_copy_include_metadata,
+        }
+    }
+
+    fn request_markdown_copy(&mut self, ctx: &Context) {
+        self.request_markdown(MarkdownDestination::Clipboard, ctx);
+    }
+
+    fn export_markdown_dialog(&mut self, ctx: &Context) {
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let file_name = default_output_name(&document.path, "review-mode", "md");
+        let Some(destination) =
+            self.pick_save_path("Export Markdown", &file_name, "Markdown", &["md"])
+        else {
+            return;
+        };
+        self.request_markdown(MarkdownDestination::File(destination), ctx);
+    }
+
+    fn request_markdown(&mut self, destination: MarkdownDestination, ctx: &Context) {
+        if self.pending_markdown_request.is_some() {
+            self.status = "Markdown preparation is already in progress.".to_owned();
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        self.pending_markdown_copy = matches!(destination, MarkdownDestination::Clipboard);
+        self.pending_markdown_request = Some(PendingMarkdownRequest {
+            document_epoch: self.document_epoch,
+            path: document.path.clone(),
+            options: self.markdown_options(),
+            destination,
+            ocr_attempted: false,
+        });
+        self.status = "Preparing document structure for Markdown...".to_owned();
+        self.finish_pending_markdown_from_current_state(ctx);
+        if self.pending_markdown_request.is_some() {
+            self.ensure_liquid_mode2_started(ctx);
+            self.finish_pending_markdown_from_current_state(ctx);
+        }
+        ctx.request_repaint_after(RENDER_POLL_INTERVAL);
+    }
+
+    fn finish_pending_markdown_from_current_state(&mut self, ctx: &Context) {
+        let matches_current = self
+            .pending_markdown_request
+            .as_ref()
+            .is_some_and(|request| self.is_current_document(request.document_epoch, &request.path));
+        if !matches_current {
+            return;
+        }
+        match markdown_preparation_outcome(&self.liquid_mode2_state, self.liquid_mode2_complete) {
+            MarkdownPreparationOutcome::Ready => {
+                if let LiquidState::Ready(document) = self.liquid_mode2_state.clone() {
+                    self.handle_completed_markdown_document(document, ctx);
+                }
+            }
+            MarkdownPreparationOutcome::Failed => {
+                if let LiquidState::Failed(error) = self.liquid_mode2_state.clone() {
+                    self.finish_pending_markdown_fallback(&error, ctx);
+                }
+            }
+            MarkdownPreparationOutcome::Wait => {}
+        }
+    }
+
+    fn handle_completed_markdown_document(&mut self, document: LiquidDocument, ctx: &Context) {
+        if liquid_document_needs_ocr(&document) {
+            let Some((document_epoch, path, ocr_attempted)) =
+                self.pending_markdown_request.as_ref().map(|request| {
+                    (
+                        request.document_epoch,
+                        request.path.clone(),
+                        request.ocr_attempted,
+                    )
+                })
+            else {
+                return;
+            };
+            if ocr_attempted {
+                self.finish_pending_markdown_fallback(
+                    "OCR did not produce readable document structure",
+                    ctx,
+                );
+                return;
+            }
+            if let Some(request) = self.pending_markdown_request.as_mut() {
+                request.ocr_attempted = true;
+            }
+            if !self.is_current_document(document_epoch, &path) {
+                self.finish_pending_markdown_fallback(
+                    "OCR preparation requires the source tab to remain open",
+                    ctx,
+                );
+                return;
+            }
+            if has_usable_ocr_text(&self.ocr_states) {
+                self.liquid_mode2_state = LiquidState::Idle;
+                self.liquid_mode2_complete = false;
+                self.status = "Rebuilding document structure from OCR text...".to_owned();
+                self.ensure_liquid_mode2_started(ctx);
+            } else if !self.ocr_is_active() {
+                self.start_ocr();
+                self.status = "No selectable text found; running OCR for Markdown...".to_owned();
+            }
+            return;
+        }
+        self.finish_pending_markdown_success(&document, ctx);
+    }
+
+    fn finish_pending_markdown_success(&mut self, document: &LiquidDocument, ctx: &Context) {
+        let Some(request) = self.pending_markdown_request.take() else {
+            return;
+        };
+        self.pending_markdown_copy = false;
+        let export = liquid_document_markdown(document, &request.options);
+        let ocr_pages = self.markdown_ocr_page_count(request.document_epoch, &request.path);
+        let summary = markdown_export_summary(
+            export.word_count,
+            estimate_tokens(&export.text),
+            export.footnote_count,
+            &export.warnings,
+            ocr_pages,
+        );
+        match request.destination {
+            MarkdownDestination::Clipboard => {
+                self.copy_text_to_clipboard(ctx, export.text);
+                let message = format!("Copied as Markdown — {summary}");
+                self.status = message.clone();
+                self.push_info_notice(message);
+            }
+            MarkdownDestination::File(destination) => {
+                let contents = format!("{}\n", export.text.trim_end());
+                match std::fs::write(&destination, contents) {
+                    Ok(()) => {
+                        let message =
+                            format!("Exported Markdown — {summary} — {}", destination.display());
+                        self.status = message.clone();
+                        self.push_info_notice(message);
+                    }
+                    Err(error) => {
+                        self.push_error_notice(format!("Could not save Markdown: {error}"));
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish_pending_markdown_fallback(&mut self, reason: &str, ctx: &Context) {
+        let Some(request) = self.pending_markdown_request.take() else {
+            return;
+        };
+        self.pending_markdown_copy = false;
+        let text = self
+            .markdown_source_for(request.document_epoch, &request.path)
+            .map(|(document, states)| {
+                join_plain_text_pages(&collect_liquid_source_pages_for(&document, &states))
+            })
+            .unwrap_or_default();
+        let warning = format!(
+            "Copied as plain text — layout analysis unavailable ({})",
+            compact_reason(reason)
+        );
+        match request.destination {
+            MarkdownDestination::Clipboard => {
+                self.copy_text_to_clipboard(ctx, text);
+                self.status = warning.clone();
+                self.push_warning_notice(warning);
+            }
+            MarkdownDestination::File(destination) => {
+                let contents = format!("{}\n", text.trim_end());
+                match std::fs::write(&destination, contents) {
+                    Ok(()) => {
+                        let message = format!(
+                            "Exported plain text to {} — layout analysis unavailable ({})",
+                            destination.display(),
+                            compact_reason(reason)
+                        );
+                        self.status = message.clone();
+                        self.push_warning_notice(message);
+                    }
+                    Err(error) => {
+                        self.push_error_notice(format!(
+                            "Could not save plain-text fallback: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    fn markdown_source_for(
+        &self,
+        document_epoch: u64,
+        path: &Path,
+    ) -> Option<(LoadedDocument, Vec<OcrPageState>)> {
+        if self.is_current_document(document_epoch, path) {
+            return self
+                .document
+                .clone()
+                .map(|document| (document, self.ocr_states.clone()));
+        }
+        self.tabs
+            .iter()
+            .find(|tab| tab.document_epoch == document_epoch && tab.document.path == path)
+            .map(|tab| (tab.document.clone(), tab.ocr_states.clone()))
+    }
+
+    fn markdown_ocr_page_count(&self, document_epoch: u64, path: &Path) -> usize {
+        self.markdown_source_for(document_epoch, path)
+            .map(|(document, states)| markdown_ocr_page_count_for(&document, &states))
+            .unwrap_or_default()
+    }
+
+    fn save_markdown_settings(&mut self) {
+        if let Err(error) = save_settings(&self.settings) {
+            self.push_error_notice(format!("Could not save Markdown settings: {error}"));
+        }
+    }
+
     fn export_png_dialog(&mut self) {
         let Some(document) = self.document.as_ref() else {
             return;
@@ -2154,8 +2435,28 @@ impl PdfEditorApp {
             && has_usable_ocr_text(&self.ocr_states)
         {
             self.liquid_mode2_state = LiquidState::Idle;
+            self.liquid_mode2_complete = false;
             self.status = "OCR ready; rebuilding Review Mode...".to_owned();
             self.ensure_liquid_mode2_started(ctx);
+        }
+        let pending_ocr_finished = self
+            .pending_markdown_request
+            .as_ref()
+            .is_some_and(|request| {
+                request.ocr_attempted
+                    && self.is_current_document(request.document_epoch, &request.path)
+                    && !self.ocr_is_active()
+                    && liquid_state_needs_ocr(&self.liquid_mode2_state)
+            });
+        if pending_ocr_finished {
+            if has_usable_ocr_text(&self.ocr_states) {
+                self.liquid_mode2_state = LiquidState::Idle;
+                self.liquid_mode2_complete = false;
+                self.status = "OCR ready; rebuilding document structure...".to_owned();
+                self.ensure_liquid_mode2_started(ctx);
+            } else {
+                self.finish_pending_markdown_fallback("OCR did not produce readable text", ctx);
+            }
         }
     }
 
@@ -2316,6 +2617,7 @@ impl PdfEditorApp {
                         && self.pending_native_text.is_empty()
                     {
                         self.liquid_mode2_state = LiquidState::Idle;
+                        self.liquid_mode2_complete = false;
                         self.ensure_liquid_mode2_started(ctx);
                     }
                 }
@@ -2367,6 +2669,7 @@ impl PdfEditorApp {
                         && self.pending_native_text.is_empty()
                     {
                         self.liquid_mode2_state = LiquidState::Idle;
+                        self.liquid_mode2_complete = false;
                         self.ensure_liquid_mode2_started(ctx);
                     }
                 }
@@ -2717,27 +3020,7 @@ impl PdfEditorApp {
     }
 
     fn collect_liquid_source_pages(&self, document: &LoadedDocument) -> Vec<String> {
-        (0..document.page_count)
-            .map(|page_index| {
-                let native = document
-                    .native_text
-                    .get(page_index)
-                    .map(|text| text.trim())
-                    .unwrap_or_default();
-                let ocr = self
-                    .ocr_states
-                    .get(page_index)
-                    .and_then(OcrPageState::text)
-                    .unwrap_or_default();
-                if should_prefer_ocr_page_text(native, ocr) {
-                    ocr.to_owned()
-                } else if !native.is_empty() {
-                    native.to_owned()
-                } else {
-                    ocr.to_owned()
-                }
-            })
-            .collect()
+        collect_liquid_source_pages_for(document, &self.ocr_states)
     }
 
     fn collect_liquid_source_pages_with_layout_text(
@@ -2935,14 +3218,24 @@ impl PdfEditorApp {
             return;
         }
 
-        if let Some(document) = self.document.as_ref().and_then(|source| {
-            load_fast_cached_liquid_mode2_document(
-                &source.path,
-                self.settings.liquid_mode2_use_pymupdf_blocks,
-                self.settings.liquid_mode2_use_pp_footnote_regions,
-            )
-        }) {
+        let rebuilding_from_ocr = self
+            .pending_markdown_request
+            .as_ref()
+            .is_some_and(|request| {
+                request.ocr_attempted
+                    && self.is_current_document(request.document_epoch, &request.path)
+            });
+        if !rebuilding_from_ocr
+            && let Some(document) = self.document.as_ref().and_then(|source| {
+                load_fast_cached_liquid_mode2_document(
+                    &source.path,
+                    self.settings.liquid_mode2_use_pymupdf_blocks,
+                    self.settings.liquid_mode2_use_pp_footnote_regions,
+                )
+            })
+        {
             self.liquid_mode2_state = LiquidState::Ready(document);
+            self.liquid_mode2_complete = true;
             self.status = "LM2 ready from cache.".to_owned();
             ctx.request_repaint();
             return;
@@ -2977,6 +3270,7 @@ impl PdfEditorApp {
             external_emissions_path: None,
         };
         self.liquid_mode2_state = LiquidState::Preparing;
+        self.liquid_mode2_complete = false;
         self.status = "Preparing Review Mode...".to_owned();
         spawn_liquid_mode2_job(request, self.liquid_mode2_tx.clone());
         ctx.request_repaint_after(RENDER_POLL_INTERVAL);
@@ -2987,6 +3281,7 @@ impl PdfEditorApp {
             let complete = event.complete;
             let preview_page_count = event.preview_page_count;
             let mut error_notice = None;
+            let mut completed_document = None;
             let next_state = match event.result {
                 Ok(document) => {
                     let status = if complete {
@@ -3010,6 +3305,9 @@ impl PdfEditorApp {
                             preview_page_count.unwrap_or(0)
                         )
                     };
+                    if complete {
+                        completed_document = Some(document.clone());
+                    }
                     (LiquidState::Ready(document), status)
                 }
                 Err(error) => {
@@ -3020,13 +3318,28 @@ impl PdfEditorApp {
 
             if self.is_current_document(event.document_epoch, &event.path) {
                 self.liquid_mode2_state = next_state.0;
+                self.liquid_mode2_complete = complete && completed_document.is_some();
                 self.status = next_state.1;
                 ctx.request_repaint();
             } else if let Some(tab) = self.tabs.iter_mut().find(|tab| {
                 tab.document_epoch == event.document_epoch && tab.document.path == event.path
             }) {
                 tab.liquid_mode2_state = next_state.0;
+                tab.liquid_mode2_complete = complete && completed_document.is_some();
                 tab.status = next_state.1;
+            }
+            let pending_matches = self
+                .pending_markdown_request
+                .as_ref()
+                .is_some_and(|request| {
+                    request.document_epoch == event.document_epoch && request.path == event.path
+                });
+            if pending_matches {
+                if let Some(document) = completed_document {
+                    self.handle_completed_markdown_document(document, ctx);
+                } else if let Some(error) = error_notice.as_deref() {
+                    self.finish_pending_markdown_fallback(error, ctx);
+                }
             }
             if let Some(error) = error_notice {
                 self.push_error_notice(error);
@@ -3476,6 +3789,17 @@ impl PdfEditorApp {
         }
 
         if waiting > 0 {
+            if requested == 0
+                && self.pending_native_text.is_empty()
+                && self
+                    .pending_markdown_request
+                    .as_ref()
+                    .is_some_and(|request| {
+                        self.is_current_document(request.document_epoch, &request.path)
+                    })
+            {
+                self.finish_pending_markdown_fallback("PDF text worker is unavailable", ctx);
+            }
             self.status = if requested > 0 {
                 format!("{status} ({requested} page(s) queued)")
             } else {
@@ -3522,6 +3846,17 @@ impl PdfEditorApp {
         }
 
         if waiting > 0 {
+            if requested == 0
+                && self.pending_text_chars.is_empty()
+                && self
+                    .pending_markdown_request
+                    .as_ref()
+                    .is_some_and(|request| {
+                        self.is_current_document(request.document_epoch, &request.path)
+                    })
+            {
+                self.finish_pending_markdown_fallback("PDF layout worker is unavailable", ctx);
+            }
             self.status = if requested > 0 {
                 format!("{status} ({requested} page(s) queued)")
             } else {
@@ -4073,12 +4408,84 @@ impl PdfEditorApp {
                                     self.export_text_dialog(ctx);
                                     ui.close();
                                 }
+                                if ui.button("Markdown (.md)").clicked() {
+                                    self.export_markdown_dialog(ctx);
+                                    ui.close();
+                                }
                                 if ui.button("PNG").clicked() {
                                     self.export_png_dialog();
                                     ui.close();
                                 }
                             });
                         });
+                        let markdown_busy = self.pending_markdown_request.is_some();
+                        if markdown_busy {
+                            ui.spinner();
+                        }
+                        let mut markdown_settings_changed = false;
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            if ui
+                                .add_enabled(
+                                    has_document && !markdown_busy,
+                                    egui::Button::new(if self.pending_markdown_copy {
+                                        "Preparing…"
+                                    } else {
+                                        "Copy MD"
+                                    }),
+                                )
+                                .on_hover_text(
+                                    "Copy the whole article as Markdown for pasting into an AI chat\nCtrl/Cmd+Shift+C",
+                                )
+                                .clicked()
+                            {
+                                self.request_markdown_copy(ctx);
+                            }
+                            ui.add_enabled_ui(has_document && !markdown_busy, |ui| {
+                                ui.menu_button("v", |ui| {
+                                    ui.label(RichText::new("Markdown copy").strong());
+                                    ui.separator();
+                                    ui.label("Footnotes");
+                                    markdown_settings_changed |= ui
+                                        .selectable_value(
+                                            &mut self.settings.markdown_copy_footnotes,
+                                            FootnoteMode::Inline,
+                                            "Inline",
+                                        )
+                                        .changed();
+                                    markdown_settings_changed |= ui
+                                        .selectable_value(
+                                            &mut self.settings.markdown_copy_footnotes,
+                                            FootnoteMode::Endnotes,
+                                            "Endnotes",
+                                        )
+                                        .changed();
+                                    markdown_settings_changed |= ui
+                                        .selectable_value(
+                                            &mut self.settings.markdown_copy_footnotes,
+                                            FootnoteMode::Omit,
+                                            "Omit",
+                                        )
+                                        .changed();
+                                    ui.separator();
+                                    markdown_settings_changed |= ui
+                                        .checkbox(
+                                            &mut self.settings.markdown_copy_include_tables,
+                                            "Include tables",
+                                        )
+                                        .changed();
+                                    markdown_settings_changed |= ui
+                                        .checkbox(
+                                            &mut self.settings.markdown_copy_include_metadata,
+                                            "Include metadata",
+                                        )
+                                        .changed();
+                                });
+                            });
+                        });
+                        if markdown_settings_changed {
+                            self.save_markdown_settings();
+                        }
                         #[cfg(target_os = "windows")]
                         if ui
                             .button("Set as default")
@@ -5073,6 +5480,10 @@ impl PdfEditorApp {
         self.push_notice(message, NoticeSeverity::Info);
     }
 
+    fn push_warning_notice(&mut self, message: impl Into<String>) {
+        self.push_notice(message, NoticeSeverity::Warning);
+    }
+
     fn draw_notices(&mut self, ctx: &Context) {
         let now = Instant::now();
         prune_notices_at(&mut self.notices, now);
@@ -5101,6 +5512,7 @@ impl PdfEditorApp {
                         let alpha = (246.0 * visibility) as u8;
                         let accent = match notice.severity {
                             NoticeSeverity::Info => Color32::from_rgb(55, 104, 137),
+                            NoticeSeverity::Warning => Color32::from_rgb(166, 105, 24),
                             NoticeSeverity::Error => Color32::from_rgb(164, 54, 54),
                         };
                         egui::Frame::NONE
@@ -5122,6 +5534,7 @@ impl PdfEditorApp {
                                     ui.label(
                                         RichText::new(match notice.severity {
                                             NoticeSeverity::Info => "i",
+                                            NoticeSeverity::Warning => "⚠",
                                             NoticeSeverity::Error => "!",
                                         })
                                         .strong()
@@ -5697,6 +6110,7 @@ impl PdfEditorApp {
                                 ui.label(RichText::new(error).color(self.liquid_muted_color()));
                                 if ui.button("Retry Review Mode").clicked() {
                                     self.liquid_mode2_state = LiquidState::Idle;
+                                    self.liquid_mode2_complete = false;
                                     self.ensure_liquid_mode2_started(ctx);
                                 }
                             }
@@ -10193,6 +10607,10 @@ impl eframe::App for PdfEditorApp {
             surrender_focused_non_text_edit(ctx);
             self.select_all_current_view_text(ctx);
         }
+        if document_shortcuts_allowed && consume_markdown_copy_shortcut(ctx) {
+            surrender_focused_non_text_edit(ctx);
+            self.request_markdown_copy(ctx);
+        }
         let copy_requested = copy_shortcut_requested(ctx);
         if document_shortcuts_allowed && copy_requested {
             match self.view_mode {
@@ -10604,6 +11022,39 @@ fn input_has_command_shortcut_event(input: &egui::InputState, key: egui::Key) ->
 
 fn command_shortcut(key: egui::Key) -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, key)
+}
+
+fn markdown_copy_shortcut() -> egui::KeyboardShortcut {
+    let mut modifiers = egui::Modifiers::COMMAND;
+    modifiers.shift = true;
+    egui::KeyboardShortcut::new(modifiers, egui::Key::C)
+}
+
+fn consume_markdown_copy_shortcut(ctx: &Context) -> bool {
+    ctx.input_mut(|input| {
+        if input.consume_shortcut(&markdown_copy_shortcut()) {
+            return true;
+        }
+        let mut consumed = false;
+        input.events.retain(|event| {
+            let is_shortcut = matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::C,
+                    modifiers,
+                    pressed: true,
+                    ..
+                } if markdown_copy_modifiers_match(*modifiers)
+            );
+            consumed |= is_shortcut;
+            !is_shortcut
+        });
+        consumed
+    })
+}
+
+fn markdown_copy_modifiers_match(modifiers: egui::Modifiers) -> bool {
+    modifiers.shift && !modifiers.alt && (modifiers.ctrl || modifiers.command || modifiers.mac_cmd)
 }
 
 fn copy_shortcut_requested(ctx: &Context) -> bool {
@@ -11759,15 +12210,44 @@ fn liquid_state_needs_ocr(state: &LiquidState) -> bool {
     }
 }
 
+fn markdown_preparation_outcome(state: &LiquidState, complete: bool) -> MarkdownPreparationOutcome {
+    match state {
+        LiquidState::Ready(_) if complete => MarkdownPreparationOutcome::Ready,
+        LiquidState::Failed(_) => MarkdownPreparationOutcome::Failed,
+        _ => MarkdownPreparationOutcome::Wait,
+    }
+}
+
 fn liquid_document_needs_ocr(document: &LiquidDocument) -> bool {
-    document
+    let explicitly_scanned = document
         .profile
         .as_ref()
         .is_some_and(|profile| profile.kind == DocumentProfileKind::ScannedImageOnly)
         || document
             .warnings
             .iter()
-            .any(|warning| warning.contains("No selectable text found"))
+            .any(|warning| warning.contains("No selectable text found"));
+    let substantive_words = document
+        .blocks
+        .iter()
+        .filter(|block| {
+            !matches!(
+                block.role,
+                LiquidBlockRole::Title
+                    | LiquidBlockRole::AuthorInfo
+                    | LiquidBlockRole::Marginalia
+                    | LiquidBlockRole::Contents
+                    | LiquidBlockRole::Header
+                    | LiquidBlockRole::Footer
+                    | LiquidBlockRole::Footnote
+                    | LiquidBlockRole::Metadata
+                    | LiquidBlockRole::SectionBreak
+                    | LiquidBlockRole::Noise
+            )
+        })
+        .map(|block| block.text.split_whitespace().count())
+        .sum::<usize>();
+    explicitly_scanned || substantive_words < 5
 }
 
 /// #23: is a block readable body content (as opposed to a note or page furniture)?
@@ -11887,6 +12367,132 @@ fn has_usable_ocr_text(states: &[OcrPageState]) -> bool {
         .iter()
         .filter_map(OcrPageState::text)
         .any(|text| !text.trim().is_empty())
+}
+
+fn collect_liquid_source_pages_for(
+    document: &LoadedDocument,
+    ocr_states: &[OcrPageState],
+) -> Vec<String> {
+    (0..document.page_count)
+        .map(|page_index| {
+            let native = document
+                .native_text
+                .get(page_index)
+                .map(|text| text.trim())
+                .unwrap_or_default();
+            let ocr = ocr_states
+                .get(page_index)
+                .and_then(OcrPageState::text)
+                .map(str::trim)
+                .unwrap_or_default();
+            if should_prefer_ocr_page_text(native, ocr) {
+                ocr.to_owned()
+            } else if !native.is_empty() {
+                native.to_owned()
+            } else {
+                ocr.to_owned()
+            }
+        })
+        .collect()
+}
+
+fn markdown_ocr_page_count_for(document: &LoadedDocument, ocr_states: &[OcrPageState]) -> usize {
+    (0..document.page_count)
+        .filter(|page_index| {
+            let native = document
+                .native_text
+                .get(*page_index)
+                .map(|text| text.trim())
+                .unwrap_or_default();
+            let ocr = ocr_states
+                .get(*page_index)
+                .and_then(OcrPageState::text)
+                .map(str::trim)
+                .unwrap_or_default();
+            !ocr.is_empty() && (native.is_empty() || should_prefer_ocr_page_text(native, ocr))
+        })
+        .count()
+}
+
+fn join_plain_text_pages(pages: &[String]) -> String {
+    pages
+        .iter()
+        .map(|page| page.trim())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+        .trim()
+        .to_owned()
+}
+
+fn markdown_export_summary(
+    word_count: usize,
+    estimated_tokens: usize,
+    footnote_count: usize,
+    warnings: &[String],
+    ocr_page_count: usize,
+) -> String {
+    let mut summary = format!(
+        "{} {} (≈{} tokens), {} {}",
+        format_count(word_count),
+        if word_count == 1 { "word" } else { "words" },
+        compact_token_count(estimated_tokens),
+        format_count(footnote_count),
+        if footnote_count == 1 {
+            "footnote"
+        } else {
+            "footnotes"
+        }
+    );
+    if ocr_page_count > 0 {
+        summary.push_str(&format!(
+            ", includes OCR text from {} scanned {}",
+            format_count(ocr_page_count),
+            if ocr_page_count == 1 { "page" } else { "pages" }
+        ));
+    }
+    if !warnings.is_empty() {
+        summary.push_str("; ");
+        summary.push_str(
+            &warnings
+                .iter()
+                .map(|warning| compact_reason(warning))
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
+    }
+    summary
+}
+
+fn format_count(value: usize) -> String {
+    let digits = value.to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            formatted.push(',');
+        }
+        formatted.push(ch);
+    }
+    formatted
+}
+
+fn compact_token_count(value: usize) -> String {
+    if value < 1_000 {
+        return format_count(value);
+    }
+    format!("{}k", (value + 500) / 1_000)
+}
+
+fn compact_reason(reason: &str) -> String {
+    let compact = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let shortened = chars.by_ref().take(140).collect::<String>();
+    if chars.next().is_some() {
+        format!("{}…", shortened.trim_end())
+    } else if shortened.is_empty() {
+        "unknown error".to_owned()
+    } else {
+        shortened
+    }
 }
 
 fn zoom_for_new_document(active_target_zoom: Option<f32>, settings: &AppSettings) -> f32 {
@@ -13003,8 +13609,20 @@ mod app_tests {
         );
         assert!(liquid_document_needs_ocr(&by_warning));
 
-        let ordinary = test_liquid_document(Some(DocumentProfileKind::GeneralDocument), vec![]);
+        let mut ordinary = test_liquid_document(Some(DocumentProfileKind::GeneralDocument), vec![]);
+        ordinary.blocks.push(test_liquid_block(
+            LiquidBlockRole::Paragraph,
+            "This ordinary document has enough readable body text.",
+        ));
         assert!(!liquid_document_needs_ocr(&ordinary));
+
+        let mut title_only =
+            test_liquid_document(Some(DocumentProfileKind::GeneralDocument), vec![]);
+        title_only.blocks.push(test_liquid_block(
+            LiquidBlockRole::Title,
+            "Image-only flyer",
+        ));
+        assert!(liquid_document_needs_ocr(&title_only));
     }
 
     #[test]
@@ -13252,6 +13870,83 @@ mod app_tests {
     #[test]
     fn copy_status_message_records_success() {
         assert_eq!(copy_status_message(12), "Copied 12 character(s)");
+    }
+
+    #[test]
+    fn markdown_copy_shortcut_requires_command_shift_c() {
+        let mut ctrl_shift = egui::Modifiers::default();
+        ctrl_shift.ctrl = true;
+        ctrl_shift.shift = true;
+        assert!(markdown_copy_modifiers_match(ctrl_shift));
+
+        let mut command_shift = egui::Modifiers::default();
+        command_shift.command = true;
+        command_shift.shift = true;
+        assert!(markdown_copy_modifiers_match(command_shift));
+
+        assert!(!markdown_copy_modifiers_match(egui::Modifiers::COMMAND));
+        let mut alt_command_shift = command_shift;
+        alt_command_shift.alt = true;
+        assert!(!markdown_copy_modifiers_match(alt_command_shift));
+    }
+
+    #[test]
+    fn markdown_preparation_waits_for_complete_output_and_falls_back_on_failure() {
+        let document = test_liquid_document(Some(DocumentProfileKind::LawReviewArticle), vec![]);
+        assert_eq!(
+            markdown_preparation_outcome(&LiquidState::Idle, false),
+            MarkdownPreparationOutcome::Wait
+        );
+        assert_eq!(
+            markdown_preparation_outcome(&LiquidState::Ready(document.clone()), false),
+            MarkdownPreparationOutcome::Wait
+        );
+        assert_eq!(
+            markdown_preparation_outcome(&LiquidState::Ready(document), true),
+            MarkdownPreparationOutcome::Ready
+        );
+        assert_eq!(
+            markdown_preparation_outcome(&LiquidState::Failed("worker stopped".to_owned()), false),
+            MarkdownPreparationOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn markdown_export_summary_reports_counts_and_caveats() {
+        let warnings = vec![
+            "footnotes appended as endnotes (low link confidence)".to_owned(),
+            "table reconstruction is fenced text".to_owned(),
+        ];
+        assert_eq!(
+            markdown_export_summary(24_300, 33_100, 214, &warnings, 7),
+            "24,300 words (≈33k tokens), 214 footnotes, includes OCR text from 7 scanned pages; footnotes appended as endnotes (low link confidence); table reconstruction is fenced text"
+        );
+        assert_eq!(
+            markdown_export_summary(1, 4, 1, &[], 0),
+            "1 word (≈4 tokens), 1 footnote"
+        );
+    }
+
+    #[test]
+    fn plain_text_fallback_preserves_page_order() {
+        let pages = vec![
+            " Page one. ".to_owned(),
+            String::new(),
+            "Page three.\n".to_owned(),
+        ];
+        assert_eq!(
+            join_plain_text_pages(&pages),
+            "Page one.\n\n\n\nPage three."
+        );
+    }
+
+    #[test]
+    fn fallback_reason_is_single_line_and_bounded() {
+        let reason = format!("worker\nfailed {}", "x".repeat(200));
+        let compact = compact_reason(&reason);
+        assert!(!compact.contains('\n'));
+        assert!(compact.chars().count() <= 141);
+        assert!(compact.ends_with('…'));
     }
 
     #[test]

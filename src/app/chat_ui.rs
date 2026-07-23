@@ -315,6 +315,6 @@ impl PdfEditorApp {
     }
 }
 
-fn estimate_tokens(text: &str) -> usize {
+pub(super) fn estimate_tokens(text: &str) -> usize {
     (text.chars().count() / 4).max(1)
 }

@@ -11,7 +11,6 @@ mod cleaning;
 mod config;
 mod deep;
 mod footnote_links;
-#[allow(dead_code)]
 mod markdown;
 mod model;
 mod normalization;
@@ -51,9 +50,8 @@ use profile::{DocumentProfileInput, classify_document_profile};
 pub use config::*;
 pub use footnote_links::attach_footnote_links;
 #[allow(unused_imports)]
-pub use markdown::{
-    FootnoteMode, MarkdownExport, MarkdownOptions, liquid_document_markdown,
-};
+pub use markdown::MarkdownExport;
+pub use markdown::{FootnoteMode, MarkdownOptions, liquid_document_markdown};
 use model::LlmProvider;
 #[allow(unused_imports)]
 pub use model::{
