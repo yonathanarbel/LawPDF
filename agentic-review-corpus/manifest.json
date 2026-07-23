@@ -1,0 +1,287 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-07-23T18:50:11.639011+00:00",
+  "purpose": "Five-article evidence pack for agentic review of LawPDF classification and final Markdown quality",
+  "article_count": 5,
+  "total_source_lines": 9961,
+  "artifact_counts": {
+    "original_pdf": 5,
+    "final_markdown": 5,
+    "line_classification_csv": 5
+  },
+  "articles": [
+    {
+      "id": "011",
+      "title": "CHAPTER THREE CO-GOVERNANCE AND THE FUTURE OF AI REGULATION",
+      "qa_tier": "known_hard_case",
+      "qa_note": "The generator omitted 19 standalone footnote-separator fragments, but two separators and note fragments remain fused into body paragraphs upstream.",
+      "generator_warnings": [
+        "omitted 19 duplicated footnote-separator fragment(s) from the article body"
+      ],
+      "source_pdf": "originals/011-co-governance.pdf",
+      "final_markdown": "markdown/011-co-governance.md",
+      "line_classifications": "classifications/011-co-governance.csv",
+      "source_line_count": 1163,
+      "final_block_count": 98,
+      "classification": {
+        "row_count": 1163,
+        "runtime_action_counts": {
+          "hide_noise": 31,
+          "keep": 863,
+          "marginalia": 269
+        },
+        "shadow_action_counts": {
+          "hide_noise": 51,
+          "keep": 768,
+          "marginalia": 344
+        },
+        "review_priority_counts": {
+          "high": 148,
+          "medium": 107,
+          "normal": 908
+        },
+        "runtime_shadow_disagreement_count": 106,
+        "runtime_shadow_disagreement_rate": 0.091143594153
+      },
+      "markdown_metrics": {
+        "bytes_utf8": 60102,
+        "heading_count": 8,
+        "heading_counts_by_level": {
+          "1": 1,
+          "2": 2,
+          "3": 5,
+          "4": 0,
+          "5": 0,
+          "6": 0
+        },
+        "footnote_definition_count": 167,
+        "footnote_reference_id_count": 167,
+        "unresolved_footnote_ids": [],
+        "private_use_marker_characters": []
+      },
+      "sha256": {
+        "source_pdf": "c0a57954c37f4027c0c6376cb3ee939804c59f748ef3f354df40abf32af7eed4",
+        "final_markdown": "13015e6a9d866e20d34500f364bac717b41d273fa4e8ee1bbb46ac99eae0711f",
+        "line_classifications": "61325137f297e64f8bf611515984d624e9acc98aa6ae2cc5aaddcae1a079c82b"
+      }
+    },
+    {
+      "id": "037",
+      "title": "The Cost of Justice at the Dawn of AI",
+      "qa_tier": "best_available_with_known_artifacts",
+      "qa_note": "Lowercase alphabetic subsections correctly map to H4 and linked footnotes resolve, but a few unattached numeric note markers remain at paragraph starts (including 126, 130, and 161).",
+      "generator_warnings": [],
+      "source_pdf": "originals/037-cost-of-justice-ai.pdf",
+      "final_markdown": "markdown/037-cost-of-justice-ai.md",
+      "line_classifications": "classifications/037-cost-of-justice-ai.csv",
+      "source_line_count": 2775,
+      "final_block_count": 238,
+      "classification": {
+        "row_count": 2775,
+        "runtime_action_counts": {
+          "hide_noise": 105,
+          "keep": 1775,
+          "marginalia": 895
+        },
+        "shadow_action_counts": {
+          "hide_noise": 217,
+          "keep": 1790,
+          "marginalia": 768
+        },
+        "review_priority_counts": {
+          "high": 159,
+          "medium": 314,
+          "normal": 2302
+        },
+        "runtime_shadow_disagreement_count": 175,
+        "runtime_shadow_disagreement_rate": 0.063063063063
+      },
+      "markdown_metrics": {
+        "bytes_utf8": 201298,
+        "heading_count": 19,
+        "heading_counts_by_level": {
+          "1": 1,
+          "2": 7,
+          "3": 2,
+          "4": 9,
+          "5": 0,
+          "6": 0
+        },
+        "footnote_definition_count": 312,
+        "footnote_reference_id_count": 312,
+        "unresolved_footnote_ids": [],
+        "private_use_marker_characters": []
+      },
+      "sha256": {
+        "source_pdf": "86e8e7024631b873ca3780fd3e22016f3046e9dc811dbbbe1259ed6b7916bd27",
+        "final_markdown": "8b81bb4f160ef31ca0297f4b64d5c11f93b82e7cc1f36adadf57c5ddc5ac8d1a",
+        "line_classifications": "0e37de97a6ebf48e79c627c75e475d03284caa3aeebd2dc142adc1713be45753"
+      }
+    },
+    {
+      "id": "042",
+      "title": "BEYOND INTENT: ESTABLISHING DISCRIMINATORY PURPOSE IN ALGORITHMIC RISK ASSESSMENT",
+      "qa_tier": "known_hard_case",
+      "qa_note": "Includes a suspected upstream heading-role false positive around \"Massachusetts v. Feeney\".",
+      "generator_warnings": [
+        "omitted 20 duplicated footnote-separator fragment(s) from the article body"
+      ],
+      "source_pdf": "originals/042-beyond-intent.pdf",
+      "final_markdown": "markdown/042-beyond-intent.md",
+      "line_classifications": "classifications/042-beyond-intent.csv",
+      "source_line_count": 1062,
+      "final_block_count": 107,
+      "classification": {
+        "row_count": 1062,
+        "runtime_action_counts": {
+          "hide_noise": 23,
+          "keep": 778,
+          "marginalia": 261
+        },
+        "shadow_action_counts": {
+          "hide_noise": 53,
+          "keep": 567,
+          "marginalia": 442
+        },
+        "review_priority_counts": {
+          "high": 297,
+          "medium": 92,
+          "normal": 673
+        },
+        "runtime_shadow_disagreement_count": 211,
+        "runtime_shadow_disagreement_rate": 0.19868173258
+      },
+      "markdown_metrics": {
+        "bytes_utf8": 60802,
+        "heading_count": 11,
+        "heading_counts_by_level": {
+          "1": 1,
+          "2": 6,
+          "3": 4,
+          "4": 0,
+          "5": 0,
+          "6": 0
+        },
+        "footnote_definition_count": 132,
+        "footnote_reference_id_count": 132,
+        "unresolved_footnote_ids": [],
+        "private_use_marker_characters": []
+      },
+      "sha256": {
+        "source_pdf": "ddd80e4a1ccdeb49cb25790ec9a9e70985e528f368bfd3905825c32bd5b6b224",
+        "final_markdown": "5353e85fef6209848a58569499f9ed5b01dd20b740cb65704341d860c2f7bb46",
+        "line_classifications": "d600a118d39e0d0029a5b371c4aded1e4e42bd29abbac9f99cb6f4cf58653b3a"
+      }
+    },
+    {
+      "id": "047",
+      "title": "ANTISEMITISM, ANTI-ZIONISM, AND TITLE VI: A GUIDE FOR THE PERPLEXED Benjamin Eidelson∗ & Deborah Hellman∗∗",
+      "qa_tier": "known_hard_case",
+      "qa_note": "The generator omitted 20 standalone footnote-separator fragments, but unattached numeric note markers remain at paragraph starts (including 16, 30, and 131).",
+      "generator_warnings": [
+        "omitted 20 duplicated footnote-separator fragment(s) from the article body"
+      ],
+      "source_pdf": "originals/047-antisemitism-title-vi.pdf",
+      "final_markdown": "markdown/047-antisemitism-title-vi.md",
+      "line_classifications": "classifications/047-antisemitism-title-vi.csv",
+      "source_line_count": 1163,
+      "final_block_count": 101,
+      "classification": {
+        "row_count": 1163,
+        "runtime_action_counts": {
+          "hide_noise": 28,
+          "keep": 834,
+          "marginalia": 301
+        },
+        "shadow_action_counts": {
+          "hide_noise": 59,
+          "keep": 702,
+          "marginalia": 402
+        },
+        "review_priority_counts": {
+          "high": 222,
+          "medium": 113,
+          "normal": 828
+        },
+        "runtime_shadow_disagreement_count": 136,
+        "runtime_shadow_disagreement_rate": 0.116938950989
+      },
+      "markdown_metrics": {
+        "bytes_utf8": 57909,
+        "heading_count": 9,
+        "heading_counts_by_level": {
+          "1": 1,
+          "2": 5,
+          "3": 3,
+          "4": 0,
+          "5": 0,
+          "6": 0
+        },
+        "footnote_definition_count": 127,
+        "footnote_reference_id_count": 127,
+        "unresolved_footnote_ids": [],
+        "private_use_marker_characters": []
+      },
+      "sha256": {
+        "source_pdf": "9aa528cd509e638c8affccd6faa4cb695afa6e55624f8b2c81228ff7517d6045",
+        "final_markdown": "5bae248ef5b39a172521cb70ab9956d90d0ab75fd113f490517816bbb5c90784",
+        "line_classifications": "82b6a41999c9aabe8bfb7b6af7d14c164ca0bcb7117976e670bef3523e3f3edf"
+      }
+    },
+    {
+      "id": "057",
+      "title": "CONTRACT-WRAPPED PROPERTY Danielle D’Onfro CONTENTS CONTRACT-WRAPPED PROPERTY Danielle D’Onfro∗",
+      "qa_tier": "known_hard_case",
+      "qa_note": "Includes suspected upstream heading-role false positives in warranty and citation prose.",
+      "generator_warnings": [
+        "omitted 76 duplicated footnote-separator fragment(s) from the article body"
+      ],
+      "source_pdf": "originals/057-contract-wrapped-property.pdf",
+      "final_markdown": "markdown/057-contract-wrapped-property.md",
+      "line_classifications": "classifications/057-contract-wrapped-property.csv",
+      "source_line_count": 3798,
+      "final_block_count": 393,
+      "classification": {
+        "row_count": 3798,
+        "runtime_action_counts": {
+          "hide_noise": 93,
+          "keep": 2837,
+          "marginalia": 868
+        },
+        "shadow_action_counts": {
+          "hide_noise": 226,
+          "keep": 2389,
+          "marginalia": 1183
+        },
+        "review_priority_counts": {
+          "high": 592,
+          "medium": 436,
+          "normal": 2770
+        },
+        "runtime_shadow_disagreement_count": 460,
+        "runtime_shadow_disagreement_rate": 0.121116377041
+      },
+      "markdown_metrics": {
+        "bytes_utf8": 198926,
+        "heading_count": 28,
+        "heading_counts_by_level": {
+          "1": 1,
+          "2": 12,
+          "3": 14,
+          "4": 1,
+          "5": 0,
+          "6": 0
+        },
+        "footnote_definition_count": 458,
+        "footnote_reference_id_count": 458,
+        "unresolved_footnote_ids": [],
+        "private_use_marker_characters": []
+      },
+      "sha256": {
+        "source_pdf": "4232630b601777be478cf8aea492e071f24a607799afe25677343773209f8f76",
+        "final_markdown": "a1d9b22768408fa88da69fc5ab2d4c17c0c9ccf074d6373f88ad312864061836",
+        "line_classifications": "221e342cb4c68900de88f2a0c57faafff4457e97ac215ea0be4d7b369d87dcde"
+      }
+    }
+  ]
+}

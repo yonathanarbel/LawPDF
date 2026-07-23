@@ -154,6 +154,7 @@ pub fn liquid_document_markdown(
     let mut heading_context = HeadingContext::default();
     let mut last_source_text: Option<String> = None;
     let mut last_special_section = None;
+    let mut omitted_footnote_separator_fragments = 0usize;
     for (index, block) in document.blocks.iter().enumerate() {
         if matches!(
             block.role,
@@ -168,6 +169,10 @@ pub fn liquid_document_markdown(
             .get(&index)
             .map(String::as_str)
             .unwrap_or(&block.text);
+        if block.role != LiquidBlockRole::SectionBreak && starts_with_footnote_separator(raw_text) {
+            omitted_footnote_separator_fragments += 1;
+            continue;
+        }
         let source_key = normalize_whitespace(&strip_callout_sentinels(raw_text));
         if !source_key.is_empty()
             && last_source_text
@@ -300,6 +305,11 @@ pub fn liquid_document_markdown(
             last_source_text = Some(source_key);
         }
     }
+    if omitted_footnote_separator_fragments > 0 {
+        warnings.push(format!(
+            "omitted {omitted_footnote_separator_fragments} duplicated footnote-separator fragment(s) from the article body"
+        ));
+    }
 
     let footnote_count = match options.footnotes {
         FootnoteMode::Inline if footnotes_inlined => {
@@ -321,7 +331,7 @@ pub fn liquid_document_markdown(
         FootnoteMode::Omit => 0,
     };
 
-    let text = writer.finish();
+    let text = finalize_markdown(writer.finish());
     let word_count = text
         .split_whitespace()
         .filter(|word| word.chars().any(char::is_alphanumeric))
@@ -423,6 +433,7 @@ impl HeadingContext {
                 self.last_letter = Some(letter);
                 3
             }
+            HeadingEnumerator::LowerLetter => 4,
         }
     }
 }
@@ -431,6 +442,7 @@ fn heading_level(text: &str, role: LiquidBlockRole) -> u8 {
     match leading_heading_enumerator(text) {
         Some(HeadingEnumerator::Arabic) => 4,
         Some(HeadingEnumerator::Letter(_)) => 3,
+        Some(HeadingEnumerator::LowerLetter) => 4,
         Some(HeadingEnumerator::Roman { value, len: 1 }) => {
             let letter = text
                 .trim_start()
@@ -463,6 +475,7 @@ fn heading_level(text: &str, role: LiquidBlockRole) -> u8 {
 enum HeadingEnumerator {
     Roman { value: u16, len: usize },
     Letter(u8),
+    LowerLetter,
     Arabic,
 }
 
@@ -489,6 +502,9 @@ fn leading_heading_enumerator(text: &str) -> Option<HeadingEnumerator> {
     }
     if dotted && token.len() == 1 && token.as_bytes()[0].is_ascii_uppercase() {
         return Some(HeadingEnumerator::Letter(token.as_bytes()[0]));
+    }
+    if dotted && token.len() == 1 && token.as_bytes()[0].is_ascii_lowercase() {
+        return Some(HeadingEnumerator::LowerLetter);
     }
     None
 }
@@ -1113,6 +1129,16 @@ fn normalize_and_escape_body(text: &str) -> String {
     render_marker_placeholders(&escape_body_text(&text))
 }
 
+fn starts_with_footnote_separator(text: &str) -> bool {
+    strip_callout_sentinels(text)
+        .trim_start()
+        .chars()
+        .take_while(|ch| matches!(ch, '-' | '_' | '\u{2010}'..='\u{2015}'))
+        .take(24)
+        .count()
+        == 24
+}
+
 fn normalize_heading_text(text: &str) -> String {
     let text = normalize_whitespace(&strip_callout_sentinels(text));
     render_marker_placeholders(&text.replace("[^", "\\[^"))
@@ -1125,6 +1151,18 @@ fn normalize_whitespace(text: &str) -> String {
 fn strip_callout_sentinels(text: &str) -> String {
     text.chars()
         .filter(|ch| !matches!(*ch, CALLOUT_START | CALLOUT_END))
+        .collect()
+}
+
+fn finalize_markdown(text: String) -> String {
+    let text = render_marker_placeholders(&strip_callout_sentinels(&text));
+    text.chars()
+        .filter(|ch| {
+            !matches!(
+                *ch,
+                CALLOUT_START | CALLOUT_END | MARKDOWN_MARKER_START | MARKDOWN_MARKER_END
+            )
+        })
         .collect()
 }
 
@@ -1293,6 +1331,8 @@ mod tests {
             ("C. Remedies", LiquidBlockRole::Heading, 3),
             ("D. Damages", LiquidBlockRole::Heading, 3),
             ("1. Rule", LiquidBlockRole::Heading, 4),
+            ("a. First application", LiquidBlockRole::Heading, 4),
+            ("b. Second application", LiquidBlockRole::Subheading, 4),
             ("Introduction", LiquidBlockRole::Subheading, 2),
             ("Conclusion", LiquidBlockRole::Heading, 2),
             ("Background", LiquidBlockRole::Heading, 2),
@@ -1321,6 +1361,14 @@ mod tests {
         let mut uncertain = HeadingContext::default();
         assert_eq!(uncertain.level("I. First", LiquidBlockRole::Heading), 2);
         assert_eq!(uncertain.level("C. First", LiquidBlockRole::Heading), 3);
+
+        let mut nested = HeadingContext::default();
+        assert_eq!(nested.level("A. First", LiquidBlockRole::Heading), 3);
+        assert_eq!(nested.level("a. Nested first", LiquidBlockRole::Heading), 4);
+        assert_eq!(
+            nested.level("b. Nested second", LiquidBlockRole::Subheading),
+            4
+        );
     }
 
     #[test]
@@ -1483,6 +1531,51 @@ mod tests {
         assert!(export.text.contains("\\12. Number-like body"));
         assert!(export.text.contains("Keep § 2, mid_word, and *stars*."));
         assert!(export.text.contains("Literal \\[^collision] marker."));
+    }
+
+    #[test]
+    fn final_export_strips_private_marker_sentinels_from_fenced_tables() {
+        let document = document(vec![block(
+            LiquidBlockRole::Table,
+            "Cell\u{E000}3\u{E001} Other\u{E100}4\u{E101} Broken\u{E100}5",
+        )]);
+
+        let export = liquid_document_markdown(&document, &MarkdownOptions::default());
+
+        assert!(export.text.contains("Cell3 Other[^4] Broken5"));
+        assert!(
+            !export
+                .text
+                .chars()
+                .any(|ch| matches!(ch, '\u{E000}' | '\u{E001}' | '\u{E100}' | '\u{E101}'))
+        );
+    }
+
+    #[test]
+    fn final_export_omits_misclassified_footnote_separator_fragments() {
+        let separator = "\u{2013}".repeat(61);
+        let document = document(vec![
+            block(LiquidBlockRole::Paragraph, "Body paragraph."),
+            block(
+                LiquidBlockRole::Paragraph,
+                &format!("{separator} duplicated footnote continuation"),
+            ),
+            block(LiquidBlockRole::SectionBreak, &separator),
+            block(LiquidBlockRole::Paragraph, "Following paragraph."),
+        ]);
+
+        let export = liquid_document_markdown(&document, &MarkdownOptions::default());
+
+        assert!(export.text.contains("Body paragraph."));
+        assert!(!export.text.contains("duplicated footnote continuation"));
+        assert!(export.text.contains("***"));
+        assert!(export.text.contains("Following paragraph."));
+        assert!(
+            export
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("omitted 1 duplicated"))
+        );
     }
 
     #[test]

@@ -4480,7 +4480,9 @@ impl PdfEditorApp {
                                             "Include metadata",
                                         )
                                         .changed();
-                                });
+                                })
+                                .response
+                                .on_hover_text("Markdown options");
                             });
                         });
                         if markdown_settings_changed {
