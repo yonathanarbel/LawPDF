@@ -11,6 +11,7 @@ mod cleaning;
 mod config;
 mod deep;
 mod footnote_links;
+mod markdown;
 mod model;
 mod normalization;
 mod paragraphs;
@@ -48,6 +49,9 @@ use profile::{DocumentProfileInput, classify_document_profile};
 // Re-exports from the new focused modules (Phase 1+ extraction in progress).
 pub use config::*;
 pub use footnote_links::attach_footnote_links;
+#[allow(unused_imports)]
+pub use markdown::MarkdownExport;
+pub use markdown::{FootnoteMode, MarkdownOptions, liquid_document_markdown};
 use model::LlmProvider;
 #[allow(unused_imports)]
 pub use model::{

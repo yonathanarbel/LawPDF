@@ -1,0 +1,53 @@
+{
+  "title": "027_q2_scanned_image_only_059_q2_scanned_image_only__.pdf",
+  "blocks": [
+    {
+      "role": "title",
+      "text": "Scanned Correspondence"
+    },
+    {
+      "role": "lead",
+      "text": "OCR recovered this opening line from a scanned page."
+    },
+    {
+      "role": "author_info",
+      "text": "Office of the Author"
+    },
+    {
+      "role": "section_break",
+      "text": ""
+    },
+    {
+      "role": "heading",
+      "text": "Introduction"
+    },
+    {
+      "role": "paragraph",
+      "text": "The original had no selectable text; spacing and line breaks were reconstructed."
+    },
+    {
+      "role": "list_item",
+      "text": "First recovered item"
+    },
+    {
+      "role": "list_item",
+      "text": "Second recovered item"
+    },
+    {
+      "role": "noise",
+      "text": "036123057"
+    }
+  ],
+  "profile": {
+    "kind": "other",
+    "confidence": 0.72,
+    "scores": [],
+    "evidence": []
+  },
+  "noise_lines_removed": 1,
+  "llm_used": false,
+  "warnings": [
+    "Fixture truncated from OCR-derived cached real output ac8abaca40a8ffa7."
+  ],
+  "source_signature": "fixture-ac8abaca40a8ffa7"
+}

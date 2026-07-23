@@ -1,0 +1,69 @@
+{
+  "title": "ON THE SCALES OF PRIVATE LAW: NANO CONTRACTS",
+  "blocks": [
+    {
+      "role": "title",
+      "text": "ON THE SCALES OF PRIVATE LAW: NANO CONTRACTS"
+    },
+    {
+      "role": "header",
+      "text": "NANO CONTRACTS 11/14/2023 2:12 AM"
+    },
+    {
+      "role": "metadata",
+      "text": "Published: 37 HARVARD JOURNAL OF LAW & TECHNOLOGY (2024)"
+    },
+    {
+      "role": "author_info",
+      "text": "Yonathan A. Arbel"
+    },
+    {
+      "role": "footnote",
+      "text": "* Associate Professor of Law, University of Alabama School of Law."
+    },
+    {
+      "role": "lead",
+      "text": "Contracts are falling in scale."
+    },
+    {
+      "role": "paragraph",
+      "text": "This Article offers the first comprehensive study of these Lilliputian agreements."
+    },
+    {
+      "role": "contents",
+      "text": "I. Introduction .... 1"
+    },
+    {
+      "role": "heading",
+      "text": "I. Introduction"
+    },
+    {
+      "role": "subheading",
+      "text": "A. Defining Nano Contracts"
+    },
+    {
+      "role": "heading",
+      "text": "1. Duration"
+    },
+    {
+      "role": "table",
+      "text": "Contract type    Duration\nNano             Seconds"
+    },
+    {
+      "role": "caption",
+      "text": "Table 1. Contract scale"
+    }
+  ],
+  "profile": {
+    "kind": "law_review_article",
+    "confidence": 0.96,
+    "scores": [],
+    "evidence": []
+  },
+  "noise_lines_removed": 2,
+  "llm_used": false,
+  "warnings": [
+    "Fixture truncated from front-matter-heavy cached real output ae27a7cb97ffba99."
+  ],
+  "source_signature": "fixture-ae27a7cb97ffba99"
+}

@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::liquid::FootnoteMode;
+
 pub const DEFAULT_PDF_ZOOM: f32 = 1.25;
 pub const MIN_PDF_ZOOM: f32 = 0.35;
 pub const MAX_PDF_ZOOM: f32 = 5.0;
@@ -31,6 +33,12 @@ pub struct AppSettings {
     pub liquid_mode2_use_pymupdf_blocks: bool,
     #[serde(default)]
     pub liquid_mode2_use_pp_footnote_regions: bool,
+    #[serde(default)]
+    pub markdown_copy_footnotes: FootnoteMode,
+    #[serde(default = "default_true")]
+    pub markdown_copy_include_tables: bool,
+    #[serde(default)]
+    pub markdown_copy_include_metadata: bool,
 }
 
 impl Default for AppSettings {
@@ -45,6 +53,9 @@ impl Default for AppSettings {
             optimize_large_documents: true,
             liquid_mode2_use_pymupdf_blocks: false,
             liquid_mode2_use_pp_footnote_regions: false,
+            markdown_copy_footnotes: FootnoteMode::Inline,
+            markdown_copy_include_tables: true,
+            markdown_copy_include_metadata: false,
         }
     }
 }
@@ -270,6 +281,9 @@ mod tests {
             optimize_large_documents: false,
             liquid_mode2_use_pymupdf_blocks: true,
             liquid_mode2_use_pp_footnote_regions: true,
+            markdown_copy_footnotes: FootnoteMode::Endnotes,
+            markdown_copy_include_tables: false,
+            markdown_copy_include_metadata: true,
         };
 
         save_settings_to(&expected, &path).unwrap();
@@ -292,6 +306,18 @@ mod tests {
         assert_eq!(
             actual.liquid_mode2_use_pp_footnote_regions,
             expected.liquid_mode2_use_pp_footnote_regions
+        );
+        assert_eq!(
+            actual.markdown_copy_footnotes,
+            expected.markdown_copy_footnotes
+        );
+        assert_eq!(
+            actual.markdown_copy_include_tables,
+            expected.markdown_copy_include_tables
+        );
+        assert_eq!(
+            actual.markdown_copy_include_metadata,
+            expected.markdown_copy_include_metadata
         );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
@@ -324,6 +350,9 @@ mod tests {
 
         assert_eq!(settings.last_pdf_zoom, 1.6);
         assert!(settings.pdf_zoom_by_document.is_empty());
+        assert_eq!(settings.markdown_copy_footnotes, FootnoteMode::Inline);
+        assert!(settings.markdown_copy_include_tables);
+        assert!(!settings.markdown_copy_include_metadata);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

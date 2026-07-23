@@ -1,0 +1,93 @@
+{
+  "title": "The Interpretation of Commercial Contracts: An Empirical Study",
+  "blocks": [
+    {
+      "role": "title",
+      "text": "The Interpretation of Commercial Contracts: An Empirical Study"
+    },
+    {
+      "role": "author_info",
+      "text": "Uri Benoliel"
+    },
+    {
+      "role": "metadata",
+      "text": "Published: Alabama Law Review 69, no. 2 (2017): 469-494"
+    },
+    {
+      "role": "abstract",
+      "text": "This study examines how sophisticated parties choose contract interpretation rules."
+    },
+    {
+      "role": "heading",
+      "text": "I. Introduction"
+    },
+    {
+      "role": "paragraph",
+      "text": "Contract interpretation plays a significant role in American law.1"
+    },
+    {
+      "role": "subheading",
+      "text": "A. Competing Approaches"
+    },
+    {
+      "role": "quote",
+      "text": "Text and context both matter.\nThe parties' choices reveal their priorities."
+    },
+    {
+      "role": "footnote",
+      "text": "1. Richard A. Posner, The Law and Economics of Contract Interpretation, 83 Tex. L. Rev. 1581 (2005)."
+    },
+    {
+      "role": "header",
+      "text": "69 ALA. L. REV. 469"
+    },
+    {
+      "role": "footer",
+      "text": "470"
+    }
+  ],
+  "block_source_lines": [
+    {
+      "block_index": 5,
+      "lines": [
+        {
+          "page_index": 1,
+          "line_index": 7,
+          "text": "Contract interpretation plays a significant role in American law.1",
+          "role": "paragraph"
+        }
+      ]
+    }
+  ],
+  "footnote_links": [
+    {
+      "body_block_index": 5,
+      "body_marker_ordinal": 0,
+      "marker": 1,
+      "note_block_index": 8,
+      "body_page_index": 1,
+      "note_page_index": 1
+    }
+  ],
+  "footnote_link_integrity": {
+    "detectable_markers": 1,
+    "landed": 1,
+    "unmatched": 0,
+    "ambiguous": 0,
+    "note_heads": 1,
+    "landing_rate": 1.0,
+    "ambiguous_rate": 0.0
+  },
+  "profile": {
+    "kind": "law_review_article",
+    "confidence": 0.99,
+    "scores": [],
+    "evidence": []
+  },
+  "noise_lines_removed": 2,
+  "llm_used": false,
+  "warnings": [
+    "Fixture truncated from cached real output ad2d597dab60b71b."
+  ],
+  "source_signature": "fixture-ad2d597dab60b71b"
+}

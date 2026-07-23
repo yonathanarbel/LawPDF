@@ -1,0 +1,392 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-07-23T18:50:11.639011+00:00",
+  "active_runtime_model": "lm2-heuristic-fallback",
+  "active_runtime_note": "Actual local runtime used for the extracted actions and confidence columns. On this Windows run, LawPDF reported its heuristic fallback.",
+  "shadow_model": {
+    "label": "lm2-catboost-augmented-epoch51lv-relabels-tc.cbm (shadow only)",
+    "path_at_generation": "C:\\Users\\yonat\\Box\\Gmailer\\lawpdf\\profile-models\\lm2-native-catboost-runtime\\lm2-catboost-augmented-epoch51lv-relabels-tc.cbm",
+    "sha256": "e9537a1f934c015674e3274af4ceaa5b095a54266a7abb456da025ebba32aa05",
+    "classes_in_probability_order": [
+      "hide_noise",
+      "keep",
+      "marginalia"
+    ],
+    "feature_count": 131,
+    "feature_names_in_model_order": [
+      "page_width",
+      "page_height",
+      "page_index",
+      "page_index_norm",
+      "x0_norm",
+      "y0_norm",
+      "x1_norm",
+      "y1_norm",
+      "width_norm",
+      "height_norm",
+      "center_x_norm",
+      "center_y_norm",
+      "left_margin_ratio",
+      "right_margin_ratio",
+      "indent_both",
+      "margin_symmetry",
+      "line_width_ratio",
+      "indent_vs_body",
+      "width_vs_body",
+      "line_index",
+      "line_index_norm",
+      "font_size",
+      "font_ratio_page",
+      "font_ratio_doc",
+      "doc_font_body_z",
+      "doc_font_footnote_z",
+      "doc_font_body_size",
+      "doc_font_footnote_size",
+      "doc_repeated_text_count",
+      "doc_note_marker",
+      "doc_note_marker_page_delta",
+      "lines_from_doc_start",
+      "prev4_dotleader_count",
+      "prev4_spaced_dotleader_count",
+      "prev4_strong_dotleader_count",
+      "internal_space_run_max",
+      "numeric_token_count",
+      "percent_token_count",
+      "char_count",
+      "word_count",
+      "alpha_count",
+      "digit_count",
+      "punct_count",
+      "uppercase_ratio",
+      "digit_ratio",
+      "punct_ratio",
+      "leading_whitespace_count",
+      "trailing_punct_count",
+      "liquidvision_score",
+      "liquidvision_coverage",
+      "liquidvision_region_area_norm",
+      "liquidvision_page_region_count",
+      "liquidvision_page_footnote_count",
+      "liquidvision_page_table_figure_count",
+      "liquidvision_footnote_score",
+      "liquidvision_table_score",
+      "liquidvision_figure_score",
+      "liquidvision_body_score",
+      "liquidvision_heading_score",
+      "liquidvision_furniture_score",
+      "liquidvision_frontmatter_score",
+      "is_first_page",
+      "is_first_two_pages",
+      "front_matter_zone",
+      "bold",
+      "italic",
+      "centered",
+      "margin_centered",
+      "is_block_indented",
+      "prev_line_indented",
+      "below_footnote_divider",
+      "page_has_footnote_divider",
+      "doc_repeated_edge_text",
+      "doc_repeated_top_edge",
+      "doc_repeated_bottom_edge",
+      "doc_repeated_numeric_pattern",
+      "doc_vertical_axis_like",
+      "doc_vertical_numeric_axis_like",
+      "doc_vertical_short_text_axis_like",
+      "page_table_column_like",
+      "table_numeric_cell_like",
+      "doc_note_marker_first_on_page",
+      "doc_note_marker_mid_sequence_page",
+      "doc_note_marker_follows_previous_page",
+      "starts_digit",
+      "starts_numeric_note_marker",
+      "starts_roman_marker",
+      "starts_symbol_marker",
+      "has_legal_note_cue",
+      "has_dotleader",
+      "has_long_dash_run",
+      "prev_line_has_dotleader",
+      "prev4_toc_leader_context",
+      "has_large_internal_space_gap",
+      "columnar_numeric_text_like",
+      "page_number_like",
+      "contains_page_word",
+      "contains_do_not_delete",
+      "short_numeric_body_fragment_like",
+      "short_alpha_body_fragment_like",
+      "year_header_furniture_like",
+      "mostly_caps",
+      "all_caps_short",
+      "contains_section_symbol",
+      "contains_citation_reporter",
+      "liquidvision_has_region",
+      "liquidvision_is_footnote",
+      "liquidvision_is_table",
+      "liquidvision_is_figure",
+      "liquidvision_is_body",
+      "liquidvision_is_heading",
+      "liquidvision_is_furniture",
+      "liquidvision_is_frontmatter",
+      "liquidvision_routes_hide_noise",
+      "liquidvision_routes_marginalia",
+      "liquidvision_keep_veto",
+      "page_zone_y",
+      "page_zone_x",
+      "width_bucket",
+      "height_bucket",
+      "font_ratio_page_bucket",
+      "font_ratio_doc_bucket",
+      "font_size_bucket",
+      "line_position_bucket",
+      "leading_marker_type",
+      "first_token_shape",
+      "terminal_punct",
+      "page_parity",
+      "liquidvision_class",
+      "liquidvision_route",
+      "catboost_text"
+    ],
+    "use": "Offline shadow predictions and per-prediction SHAP attribution; not represented as the active runtime."
+  },
+  "shap": {
+    "method": "CatBoost exact ShapValues",
+    "scope": "predicted shadow class for each source line",
+    "ranking": "three greatest absolute SHAP contributions",
+    "sign": "positive supports the predicted class; negative opposes the predicted class",
+    "base_value_excluded_from_top_features": true
+  },
+  "pca": {
+    "method": "PCA via NumPy SVD",
+    "scope": "all source lines across all five articles",
+    "input": "116 exact numeric LM2/CatBoost features",
+    "standardization": "population mean 0 and standard deviation 1",
+    "constant_features_removed": [
+      "contains_do_not_delete",
+      "doc_vertical_numeric_axis_like",
+      "has_large_internal_space_gap",
+      "leading_whitespace_count",
+      "liquidvision_body_score",
+      "liquidvision_coverage",
+      "liquidvision_figure_score",
+      "liquidvision_footnote_score",
+      "liquidvision_frontmatter_score",
+      "liquidvision_furniture_score",
+      "liquidvision_has_region",
+      "liquidvision_heading_score",
+      "liquidvision_is_body",
+      "liquidvision_is_figure",
+      "liquidvision_is_footnote",
+      "liquidvision_is_frontmatter",
+      "liquidvision_is_furniture",
+      "liquidvision_is_heading",
+      "liquidvision_is_table",
+      "liquidvision_keep_veto",
+      "liquidvision_page_footnote_count",
+      "liquidvision_page_region_count",
+      "liquidvision_page_table_figure_count",
+      "liquidvision_region_area_norm",
+      "liquidvision_routes_hide_noise",
+      "liquidvision_routes_marginalia",
+      "liquidvision_score",
+      "liquidvision_table_score",
+      "page_height",
+      "page_width"
+    ],
+    "retained_feature_count": 86,
+    "components": [
+      {
+        "component": "PC1",
+        "explained_variance_ratio": 0.167893428157,
+        "top_loadings": [
+          {
+            "feature": "width_vs_body",
+            "loading": 0.209401546301
+          },
+          {
+            "feature": "line_width_ratio",
+            "loading": 0.209313316707
+          },
+          {
+            "feature": "width_norm",
+            "loading": 0.20900988849
+          },
+          {
+            "feature": "x1_norm",
+            "loading": 0.205203126952
+          },
+          {
+            "feature": "right_margin_ratio",
+            "loading": -0.205031015116
+          },
+          {
+            "feature": "font_ratio_doc",
+            "loading": 0.204901817484
+          },
+          {
+            "feature": "margin_symmetry",
+            "loading": 0.204657361138
+          },
+          {
+            "feature": "doc_font_body_z",
+            "loading": 0.204142287446
+          },
+          {
+            "feature": "doc_font_footnote_z",
+            "loading": 0.201684004862
+          },
+          {
+            "feature": "font_size",
+            "loading": 0.197099564348
+          }
+        ]
+      },
+      {
+        "component": "PC2",
+        "explained_variance_ratio": 0.096890224272,
+        "top_loadings": [
+          {
+            "feature": "word_count",
+            "loading": 0.223933905042
+          },
+          {
+            "feature": "char_count",
+            "loading": 0.207724845627
+          },
+          {
+            "feature": "line_index",
+            "loading": 0.198959110746
+          },
+          {
+            "feature": "line_index_norm",
+            "loading": 0.198959110746
+          },
+          {
+            "feature": "y1_norm",
+            "loading": -0.195346275906
+          },
+          {
+            "feature": "center_y_norm",
+            "loading": -0.195073061859
+          },
+          {
+            "feature": "y0_norm",
+            "loading": -0.194784534857
+          },
+          {
+            "feature": "indent_vs_body",
+            "loading": -0.194641956372
+          },
+          {
+            "feature": "left_margin_ratio",
+            "loading": -0.191854946979
+          },
+          {
+            "feature": "doc_repeated_top_edge",
+            "loading": -0.187917556953
+          }
+        ]
+      },
+      {
+        "component": "PC3",
+        "explained_variance_ratio": 0.087899728478,
+        "top_loadings": [
+          {
+            "feature": "prev4_toc_leader_context",
+            "loading": 0.325193378348
+          },
+          {
+            "feature": "prev_line_has_dotleader",
+            "loading": 0.325193378348
+          },
+          {
+            "feature": "prev4_strong_dotleader_count",
+            "loading": 0.323933290403
+          },
+          {
+            "feature": "prev4_dotleader_count",
+            "loading": 0.323933290403
+          },
+          {
+            "feature": "has_dotleader",
+            "loading": 0.322645432999
+          },
+          {
+            "feature": "prev4_spaced_dotleader_count",
+            "loading": 0.286781930711
+          },
+          {
+            "feature": "punct_count",
+            "loading": 0.240970244485
+          },
+          {
+            "feature": "punct_ratio",
+            "loading": 0.209298438376
+          },
+          {
+            "feature": "front_matter_zone",
+            "loading": 0.207719767972
+          },
+          {
+            "feature": "is_first_two_pages",
+            "loading": 0.20347815502
+          }
+        ]
+      }
+    ],
+    "interpretation": "PCA describes global feature variance, not classifier decision importance. Use the per-line SHAP columns for prediction attribution."
+  },
+  "csv_schema": {
+    "version": 1,
+    "encoding": "UTF-8",
+    "row_unit": "one extracted PDF source line",
+    "columns": [
+      "article_id",
+      "article_title",
+      "source_pdf",
+      "page_number",
+      "page_index",
+      "line_index",
+      "line_id",
+      "text",
+      "final_block_index",
+      "final_block_role",
+      "role_hint",
+      "active_runtime_model",
+      "runtime_action",
+      "runtime_action_confidence",
+      "runtime_emission_argmax_action",
+      "runtime_emission_argmax_confidence",
+      "runtime_score_hide_noise",
+      "runtime_score_keep",
+      "runtime_score_marginalia",
+      "shadow_model",
+      "shadow_catboost_action",
+      "shadow_catboost_confidence",
+      "shadow_prob_hide_noise",
+      "shadow_prob_keep",
+      "shadow_prob_marginalia",
+      "runtime_shadow_disagreement",
+      "review_priority",
+      "top_feature_1_name",
+      "top_feature_1_value",
+      "top_feature_1_shap",
+      "top_feature_2_name",
+      "top_feature_2_value",
+      "top_feature_2_shap",
+      "top_feature_3_name",
+      "top_feature_3_value",
+      "top_feature_3_shap",
+      "pc1",
+      "pc2",
+      "pc3",
+      "y_bottom_ratio",
+      "font_ratio_page",
+      "font_ratio_doc",
+      "below_footnote_divider",
+      "page_has_footnote_divider",
+      "doc_note_marker"
+    ],
+    "boolean_encoding": "lowercase true/false",
+    "missing_final_block": "final_block_index is empty and final_block_role is hidden"
+  }
+}
