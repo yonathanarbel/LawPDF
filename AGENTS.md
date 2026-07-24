@@ -21,6 +21,15 @@ project cache, and all module build directories to `C:\tmp\lawpdf-android`.
 Never invoke bare Gradle in this checkout because its default project cache is
 `android\.gradle`, which Box will try to sync.
 
+## Keep research and training materials private
+
+Research and training scripts, datasets, prompts, model-development utilities, and
+experimental run artifacts are private. Never add them to this public repository.
+Keep private tooling outside the checkout in an adjacent private workspace such as
+`../lawpdf-private/`. Public `tools/` content must be limited to release,
+verification, or end-user QA utilities that are intentionally approved for
+publication.
+
 ## End development cycles with a Windows test install
 
 At the end of every LawPDF development cycle:
