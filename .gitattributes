@@ -16,6 +16,7 @@
 *.dll binary
 *.dylib binary
 *.ico binary
+*.jar binary
 *.onnx binary
 *.png binary
 *.ttf binary

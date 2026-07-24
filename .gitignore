@@ -8,6 +8,8 @@
 /output/
 /liquid2-cache/
 /.lawpdf/
+/android/.gradle/
+/android/**/build/
 __pycache__/
 *.py[cod]
 *$py.class
