@@ -18,6 +18,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, default=Path("release-manifest.json"))
     parser.add_argument("--platform", choices=("host", "macos", "windows"), default="host")
     parser.add_argument("--require-platform-library", action="store_true")
+    parser.add_argument(
+        "--expected-version",
+        help="Fail unless Cargo.toml and the release manifest match this version.",
+    )
     return parser.parse_args()
 
 
@@ -51,6 +55,11 @@ def main() -> int:
         errors.append(
             f"Cargo version {cargo_version!r} != manifest version "
             f"{manifest['product']['version']!r}"
+        )
+    if args.expected_version and cargo_version != args.expected_version:
+        errors.append(
+            f"Cargo version {cargo_version!r} != expected release version "
+            f"{args.expected_version!r}"
         )
 
     runtime_assets = manifest["runtime_assets"]

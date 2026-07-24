@@ -46,8 +46,6 @@ pub struct VisionPage {
 }
 
 const OPEN_DOCUMENT_CACHE_CAP: usize = 3;
-const OPTIMIZED_DOCUMENT_MIN_BYTES: u64 = 16 * 1024 * 1024;
-const OPTIMIZED_DOCUMENT_MIN_PAGES: usize = 200;
 static PDFIUM: OnceLock<Result<&'static Pdfium, String>> = OnceLock::new();
 pub const LAWPDF_COMMENT_ID_PREFIX: &str = "LawPDF-comment-";
 const LAWPDF_CROPBOX_LOCAL_COORDS_ENV: &str = "LAWPDF_CROPBOX_LOCAL_COORDS";
@@ -82,17 +80,7 @@ impl PdfEngine {
             return self.load_document(path);
         }
 
-        let file_is_large = fs::metadata(path)
-            .map(|metadata| metadata.len() >= OPTIMIZED_DOCUMENT_MIN_BYTES)
-            .unwrap_or(false);
-        let page_count = self.with_open_document(path, |document| {
-            Ok(document.pages().len() as usize)
-        })?;
-        if file_is_large || page_count >= OPTIMIZED_DOCUMENT_MIN_PAGES {
-            self.load_document_optimized(path)
-        } else {
-            self.load_document(path)
-        }
+        self.load_document_optimized(path)
     }
 
     fn load_document_optimized(&self, path: &Path) -> Result<LoadedDocument> {
@@ -117,8 +105,7 @@ impl PdfEngine {
                 let height = crop_box
                     .map(|box_| visible_page_extent(box_.height(), page.height().value))
                     .unwrap_or(page.height().value);
-                let mut page_info =
-                    PageInfo::with_footnote_divider_y_from_top(width, height, None);
+                let mut page_info = PageInfo::with_footnote_divider_y_from_top(width, height, None);
                 if let Some(box_) = crop_box {
                     page_info = page_info.with_coordinate_offset(box_.left, box_.bottom);
                 }
@@ -133,6 +120,11 @@ impl PdfEngine {
         self.performance_cache
             .save_document_metadata(path, &metadata);
         Ok(self.optimized_document_from_metadata(path, metadata))
+    }
+
+    #[cfg(feature = "devtools")]
+    pub fn load_document_metadata_only(&self, path: &Path) -> Result<LoadedDocument> {
+        self.load_document_optimized(path)
     }
 
     fn optimized_document_from_metadata(
@@ -340,14 +332,25 @@ impl PdfEngine {
                 .render_with_config(&config)
                 .with_context(|| format!("failed to render page {}", page_index + 1))?;
 
-            let image = bitmap.as_image().to_rgba8();
-            let (width, height) = image.dimensions();
+            #[cfg(feature = "bench-image-conversion")]
+            let (width, height, rgba) = {
+                let image = bitmap.as_image().to_rgba8();
+                let (width, height) = image.dimensions();
+                (width, height, image.into_raw())
+            };
+
+            #[cfg(not(feature = "bench-image-conversion"))]
+            let (width, height, rgba) = (
+                bitmap.width() as u32,
+                bitmap.height() as u32,
+                bitmap.as_rgba_bytes(),
+            );
 
             Ok(RenderedPage {
                 page_index,
                 width: width as usize,
                 height: height as usize,
-                rgba: image.into_raw(),
+                rgba,
             })
         })?;
         self.performance_cache
@@ -448,10 +451,7 @@ impl PdfEngine {
     }
 }
 
-fn loaded_document_from_metadata(
-    path: &Path,
-    metadata: CachedDocumentMetadata,
-) -> LoadedDocument {
+fn loaded_document_from_metadata(path: &Path, metadata: CachedDocumentMetadata) -> LoadedDocument {
     let page_count = metadata.pages.len();
     let title = path
         .file_name()

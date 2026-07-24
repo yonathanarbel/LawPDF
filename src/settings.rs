@@ -26,7 +26,7 @@ pub struct AppSettings {
     /// "laying-down" ink stroke. Honors users who prefer reduced motion.
     #[serde(default)]
     pub reduce_motion: bool,
-    /// Automatically use the cached, low-latency reader path for large PDFs.
+    /// Automatically use the cached, low-latency path when opening PDFs.
     #[serde(default = "default_true")]
     pub optimize_large_documents: bool,
     #[serde(default)]
@@ -39,6 +39,9 @@ pub struct AppSettings {
     pub markdown_copy_include_tables: bool,
     #[serde(default)]
     pub markdown_copy_include_metadata: bool,
+    /// Suppress the one-time, non-modal macOS default-reader suggestion.
+    #[serde(default)]
+    pub macos_default_reader_prompt_dismissed: bool,
 }
 
 impl Default for AppSettings {
@@ -56,6 +59,7 @@ impl Default for AppSettings {
             markdown_copy_footnotes: FootnoteMode::Inline,
             markdown_copy_include_tables: true,
             markdown_copy_include_metadata: false,
+            macos_default_reader_prompt_dismissed: false,
         }
     }
 }
@@ -209,14 +213,31 @@ fn corrupt_settings_backup_path(path: &Path) -> PathBuf {
 }
 
 pub fn app_data_dir() -> Option<PathBuf> {
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .map(|path| path.join("LawPDF"))
-        .or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .map(|path| path.join(".lawpdf"))
-        })
+    #[cfg(windows)]
+    {
+        return std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|path| path.join("LawPDF"));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|path| path.join("Library/Application Support/LawPDF"));
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .map(|path| path.join("LawPDF"))
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|path| path.join(".local/share/LawPDF"))
+            })
+    }
 }
 
 fn settings_path() -> Option<PathBuf> {
@@ -284,6 +305,7 @@ mod tests {
             markdown_copy_footnotes: FootnoteMode::Endnotes,
             markdown_copy_include_tables: false,
             markdown_copy_include_metadata: true,
+            macos_default_reader_prompt_dismissed: true,
         };
 
         save_settings_to(&expected, &path).unwrap();
@@ -318,6 +340,10 @@ mod tests {
         assert_eq!(
             actual.markdown_copy_include_metadata,
             expected.markdown_copy_include_metadata
+        );
+        assert_eq!(
+            actual.macos_default_reader_prompt_dismissed,
+            expected.macos_default_reader_prompt_dismissed
         );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }

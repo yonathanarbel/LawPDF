@@ -12,6 +12,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Machine-local workspace configuration and evaluation inputs
+/.cargo/config.toml
+/to-evaluate/
+
 # Local/generated archives and platform metadata
 /lawpdf-code-root.tar.gz
 ._*

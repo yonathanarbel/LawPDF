@@ -4,7 +4,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="LawPDF"
 PROFILE="${LAWPDF_MACOS_PROFILE:-release}"
-TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+TARGET_DIR="${CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/lawpdf-target}"
+export CARGO_TARGET_DIR="$TARGET_DIR"
+DIST_DIR="${LAWPDF_DIST_DIR:-$ROOT/dist}"
 BUILD_ARGS=(--locked)
 VERSION="$(awk -F ' *= *' '$1 == "version" {gsub(/\"/, "", $2); print $2; exit}' "$ROOT/Cargo.toml")"
 
@@ -17,12 +19,13 @@ cd "$ROOT"
 cargo build "${BUILD_ARGS[@]}"
 
 BIN="$TARGET_DIR/$PROFILE/lawpdf"
-APP_DIR="$ROOT/dist/$APP_NAME.app"
+APP_DIR="$DIST_DIR/$APP_NAME.app"
 CONTENTS="$APP_DIR/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 FRAMEWORKS="$CONTENTS/Frameworks"
 
+mkdir -p "$DIST_DIR"
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS" "$RESOURCES" "$FRAMEWORKS"
 
@@ -162,6 +165,11 @@ PLIST
 sed -i.bak "s/__VERSION__/$VERSION/g" "$CONTENTS/Info.plist"
 rm -f "$CONTENTS/Info.plist.bak"
 
+plutil -lint "$CONTENTS/Info.plist" >/dev/null
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$CONTENTS/Info.plist")" == "design.yarbel.lawpdf" ]]
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDocumentTypes:0:CFBundleTypeRole' "$CONTENTS/Info.plist")" == "Viewer" ]]
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDocumentTypes:0:LSItemContentTypes:0' "$CONTENTS/Info.plist")" == "com.adobe.pdf" ]]
+
 VERIFY_WORKDIR="${TMPDIR:-/tmp}/lawpdf-package-runtime-verify"
 mkdir -p "$VERIFY_WORKDIR"
 (
@@ -169,13 +177,18 @@ mkdir -p "$VERIFY_WORKDIR"
   "$MACOS/$APP_NAME" --lm2-runtime-status --require-native --require-context >/dev/null
 )
 
-if command -v codesign >/dev/null 2>&1; then
-  codesign --force --deep --sign - "$APP_DIR" >/dev/null 2>&1 || true
+if command -v xattr >/dev/null 2>&1; then
+  xattr -cr "$APP_DIR"
 fi
 
-ZIP="$ROOT/dist/LawPDF-macos.zip"
+if command -v codesign >/dev/null 2>&1; then
+  codesign --force --deep --sign - "$APP_DIR"
+  codesign --verify --deep --strict "$APP_DIR"
+fi
+
+ZIP="$DIST_DIR/LawPDF-macos.zip"
 rm -f "$ZIP"
-(cd "$ROOT/dist" && zip -r -q "$(basename "$ZIP")" "$APP_NAME.app")
+(cd "$DIST_DIR" && zip -r -q "$(basename "$ZIP")" "$APP_NAME.app")
 
 echo "$APP_DIR"
 echo "$ZIP"

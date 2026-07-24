@@ -7,6 +7,8 @@ pub(super) struct UpdateUi {
     pub(super) check_in_flight: bool,
     pub(super) notice: Option<UpdateNotice>,
     pub(super) next_check: Option<Instant>,
+    pub(super) download_version: Option<String>,
+    pub(super) download_progress: Option<(u64, Option<u64>)>,
 }
 
 impl UpdateUi {
@@ -22,6 +24,8 @@ impl UpdateUi {
             check_in_flight: true,
             notice,
             next_check: None,
+            download_version: None,
+            download_progress: None,
         }
     }
 }

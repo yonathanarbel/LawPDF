@@ -38,6 +38,10 @@ pub enum RenderRequest {
         optimize_large_documents: bool,
         reply: Sender<Result<LoadedDocument, String>>,
     },
+    EnrichDocument {
+        document_epoch: u64,
+        path: PathBuf,
+    },
     TextCharsAsync {
         document_epoch: u64,
         path: PathBuf,
@@ -90,6 +94,11 @@ pub enum RenderRequest {
 
 #[derive(Debug)]
 pub enum RenderEvent {
+    DocumentEnriched {
+        document_epoch: u64,
+        path: PathBuf,
+        result: Result<LoadedDocument, String>,
+    },
     Page {
         key: PageRenderKey,
         path: PathBuf,
@@ -164,6 +173,16 @@ pub fn spawn_render_worker(
                     );
                     continue;
                 }
+                RenderRequest::EnrichDocument {
+                    document_epoch,
+                    path,
+                } => RenderEvent::DocumentEnriched {
+                    document_epoch,
+                    path: path.clone(),
+                    result: engine
+                        .load_document(&path)
+                        .map_err(|error| error.to_string()),
+                },
                 RenderRequest::TextCharsAsync {
                     document_epoch,
                     path,
@@ -346,6 +365,7 @@ fn push_coalesced(backlog: &mut VecDeque<RenderRequest>, request: RenderRequest)
 fn request_priority(request: &RenderRequest) -> u8 {
     match request {
         RenderRequest::LoadDocument { .. }
+        | RenderRequest::EnrichDocument { .. }
         | RenderRequest::PageImmediate { .. }
         | RenderRequest::ExportPagePng { .. }
         | RenderRequest::SyncComments { .. }
@@ -412,6 +432,14 @@ fn error_event(request: RenderRequest, message: String) -> RenderEvent {
                 result: Err("PDF worker failed before loading document".to_owned()),
             }
         }
+        RenderRequest::EnrichDocument {
+            document_epoch,
+            path,
+        } => RenderEvent::DocumentEnriched {
+            document_epoch,
+            path,
+            result: Err(message),
+        },
         RenderRequest::TextCharsAsync {
             document_epoch,
             path,
@@ -508,6 +536,45 @@ fn float_key(value: f32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::Path;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use lopdf::{Document, Object, dictionary};
+
+    fn write_blank_pdf(path: &Path) {
+        let mut document = Document::with_version("1.5");
+        let catalog_id = document.new_object_id();
+        let pages_id = document.new_object_id();
+        let page_id = document.new_object_id();
+
+        document.objects.insert(
+            catalog_id,
+            Object::Dictionary(dictionary! {
+                "Type" => Object::Name(b"Catalog".to_vec()),
+                "Pages" => Object::Reference(pages_id),
+            }),
+        );
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => Object::Name(b"Pages".to_vec()),
+                "Kids" => Object::Array(vec![Object::Reference(page_id)]),
+                "Count" => Object::Integer(1),
+            }),
+        );
+        document.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => Object::Name(b"Page".to_vec()),
+                "Parent" => Object::Reference(pages_id),
+                "MediaBox" => Object::Array(vec![0.into(), 0.into(), 612.into(), 792.into()]),
+                "Resources" => Object::Dictionary(dictionary! {}),
+            }),
+        );
+        document.trailer.set("Root", Object::Reference(catalog_id));
+        document.save(path).unwrap();
+    }
 
     fn page_request(page_index: usize, render_scale: f32) -> RenderRequest {
         RenderRequest::Page {
@@ -602,4 +669,59 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn enrichment_loads_full_layout_after_fast_open() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "lawpdf-worker-enrichment-{}-{nonce}.pdf",
+            std::process::id()
+        ));
+        write_blank_pdf(&path);
+
+        let (request_tx, event_rx) = spawn_render_worker(None);
+        let (reply_tx, reply_rx) = unbounded();
+        request_tx
+            .send(RenderRequest::LoadDocument {
+                path: path.clone(),
+                optimize_large_documents: true,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let opened = reply_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("worker did not reply to fast open")
+            .expect("fast open failed");
+        assert!(opened.optimized);
+
+        request_tx
+            .send(RenderRequest::EnrichDocument {
+                document_epoch: 42,
+                path: path.clone(),
+            })
+            .unwrap();
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("worker did not finish enrichment");
+        match event {
+            RenderEvent::DocumentEnriched {
+                document_epoch,
+                path: event_path,
+                result,
+            } => {
+                assert_eq!(document_epoch, 42);
+                assert_eq!(event_path, path);
+                let enriched = result.expect("full enrichment failed");
+                assert!(!enriched.optimized);
+                assert_eq!(enriched.page_count, 1);
+                assert_eq!(enriched.pages.len(), 1);
+            }
+            other => panic!("expected document enrichment, got {other:?}"),
+        }
+
+        drop(request_tx);
+        let _ = fs::remove_file(path);
+    }
 }

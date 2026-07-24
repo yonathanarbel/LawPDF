@@ -1,6 +1,7 @@
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
@@ -12,9 +13,11 @@ const ACK: &[u8; 3] = b"OK\n";
 const MAX_PATHS_PER_MESSAGE: usize = 256;
 const MAX_PATH_BYTES: usize = 32 * 1024;
 const IPC_TIMEOUT: Duration = Duration::from_secs(2);
+static REPAINT_CONTEXT: OnceLock<egui::Context> = OnceLock::new();
 
 pub enum InstanceMode {
     Primary {
+        incoming_paths_tx: Sender<Vec<PathBuf>>,
         incoming_paths_rx: Receiver<Vec<PathBuf>>,
     },
     SecondarySent,
@@ -24,13 +27,19 @@ pub fn initialize(startup_paths: &[PathBuf]) -> InstanceMode {
     match TcpListener::bind(LAWPDF_INSTANCE_ADDR) {
         Ok(listener) => {
             let (incoming_paths_tx, incoming_paths_rx) = unbounded();
-            spawn_listener(listener, incoming_paths_tx);
-            InstanceMode::Primary { incoming_paths_rx }
+            spawn_listener(listener, incoming_paths_tx.clone());
+            InstanceMode::Primary {
+                incoming_paths_tx,
+                incoming_paths_rx,
+            }
         }
         Err(_) if send_paths_to_primary(startup_paths) => InstanceMode::SecondarySent,
         Err(_) => {
-            let (_incoming_paths_tx, incoming_paths_rx) = unbounded();
-            InstanceMode::Primary { incoming_paths_rx }
+            let (incoming_paths_tx, incoming_paths_rx) = unbounded();
+            InstanceMode::Primary {
+                incoming_paths_tx,
+                incoming_paths_rx,
+            }
         }
     }
 }
@@ -50,9 +59,20 @@ fn spawn_listener(listener: TcpListener, incoming_paths_tx: Sender<Vec<PathBuf>>
             if incoming_paths_tx.send(paths).is_err() {
                 break;
             }
+            request_repaint();
             let _ = stream.write_all(ACK);
         }
     });
+}
+
+pub fn set_repaint_context(ctx: &egui::Context) {
+    let _ = REPAINT_CONTEXT.set(ctx.clone());
+}
+
+pub fn request_repaint() {
+    if let Some(ctx) = REPAINT_CONTEXT.get() {
+        ctx.request_repaint();
+    }
 }
 
 fn send_paths_to_primary(paths: &[PathBuf]) -> bool {
