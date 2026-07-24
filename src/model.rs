@@ -224,8 +224,8 @@ pub struct LoadedDocument {
     pub text_chars: Vec<Option<Vec<PageTextChar>>>,
     pub links: Vec<Vec<PageLink>>,
     pub links_loaded: bool,
-    /// Large-document performance mode keeps opening, searching, and rendering
-    /// responsive by deferring expensive page-layout analysis.
+    /// Fast-opening mode keeps opening, searching, and rendering responsive by
+    /// deferring expensive page-layout analysis until Review Mode needs it.
     pub optimized: bool,
 }
 

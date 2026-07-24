@@ -13,6 +13,8 @@ jobs:
   windows:
     name: Windows x64
     runs-on: windows-latest
+    env:
+      CARGO_TARGET_DIR: C:\tmp\lawpdf-target
 
     steps:
       - name: Checkout
@@ -30,7 +32,22 @@ jobs:
 
       - name: Verify release manifest and assets
         shell: pwsh
-        run: python tools\verify_release_manifest.py --platform windows --require-platform-library
+        run: |
+          $arguments = @(
+            "tools\verify_release_manifest.py",
+            "--platform", "windows",
+            "--require-platform-library"
+          )
+          if ($env:GITHUB_REF -like "refs/tags/*") {
+            $arguments += @("--expected-version", $env:GITHUB_REF_NAME.TrimStart("v"))
+          }
+          python @arguments
+
+      - name: Run updater and settings regression tests
+        shell: pwsh
+        run: |
+          cargo test --release --locked --target x86_64-pc-windows-msvc settings::tests
+          cargo test --release --locked --target x86_64-pc-windows-msvc updater::tests
 
       - name: Build release
         shell: pwsh
@@ -39,8 +56,9 @@ jobs:
       - name: Stage target executable
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path target\release | Out-Null
-          Copy-Item target\x86_64-pc-windows-msvc\release\lawpdf.exe target\release\lawpdf.exe -Force
+          $stagingDir = Join-Path $env:CARGO_TARGET_DIR "release"
+          New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
+          Copy-Item (Join-Path $env:CARGO_TARGET_DIR "x86_64-pc-windows-msvc\release\lawpdf.exe") (Join-Path $stagingDir "lawpdf.exe") -Force
 
       - name: Build portable zip
         shell: pwsh
@@ -101,6 +119,8 @@ jobs:
   macos:
     name: macOS arm64
     runs-on: macos-15
+    env:
+      CARGO_TARGET_DIR: /tmp/lawpdf-target
 
     steps:
       - name: Checkout
@@ -110,7 +130,17 @@ jobs:
         run: rustup default stable
 
       - name: Verify release manifest and assets
-        run: python3 tools/verify_release_manifest.py --platform macos --require-platform-library
+        run: |
+          args=(--platform macos --require-platform-library)
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            args+=(--expected-version "${GITHUB_REF_NAME#v}")
+          fi
+          python3 tools/verify_release_manifest.py "${args[@]}"
+
+      - name: Run updater and settings regression tests
+        run: |
+          cargo test --release --locked settings::tests
+          cargo test --release --locked updater::tests
 
       - name: Build and verify app bundle
         run: bash scripts/package-macos.sh

@@ -31,10 +31,18 @@ Extract the ZIP and move `LawPDF.app` to Applications. Because this release is
 not notarized through the Mac App Store, the first launch may require
 Control-clicking the app, choosing **Open**, and confirming once.
 
+LawPDF offers a small, one-time prompt when it is not your default PDF reader.
+You can also change the association later with **Set as default** in the LawPDF
+toolbar.
+
+Automatic updates show download progress, verify the release checksum and app
+signature, restart LawPDF to install, and confirm the installed version in a
+top-right status card.
+
 ## Features
 
 - Review Mode for comfortable law review reading.
-- Optional Windows default-PDF-reader integration.
+- Optional Windows and macOS default-PDF-reader integration.
 - Continuous multi-page PDF viewing and zoom.
 - Native text selection, search, and copy.
 - Highlights, underlining, comments, free-text boxes, and signatures.

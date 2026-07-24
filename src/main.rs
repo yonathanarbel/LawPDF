@@ -11,10 +11,12 @@ mod liquid2;
 #[cfg(feature = "devtools")]
 mod liquid_smoke;
 mod liquidvision;
+#[cfg(target_os = "macos")]
+mod macos_open_files;
 mod model;
 mod ocr;
-mod performance_cache;
 mod pdf_backend;
+mod performance_cache;
 #[cfg(feature = "devtools")]
 mod profile_dataset;
 mod render_worker;
@@ -79,10 +81,17 @@ fn main() -> eframe::Result<()> {
             .collect::<Vec<_>>()
     };
     let single_instance = single_instance::initialize(&startup_paths);
-    let incoming_paths_rx = match single_instance {
-        single_instance::InstanceMode::Primary { incoming_paths_rx } => incoming_paths_rx,
+    let (incoming_paths_tx, incoming_paths_rx) = match single_instance {
+        single_instance::InstanceMode::Primary {
+            incoming_paths_tx,
+            incoming_paths_rx,
+        } => (incoming_paths_tx, incoming_paths_rx),
         single_instance::InstanceMode::SecondarySent => return Ok(()),
     };
+    #[cfg(target_os = "macos")]
+    let macos_open_files = macos_open_files::install(incoming_paths_tx);
+    #[cfg(not(target_os = "macos"))]
+    let _ = incoming_paths_tx;
     if let Some(pending_update) = updater::load_pending_update() {
         let relaunch_args = std::env::args_os().skip(1).collect::<Vec<_>>();
         match updater::start_update_helper(&pending_update, &relaunch_args) {
@@ -104,10 +113,17 @@ fn main() -> eframe::Result<()> {
         APP_TITLE,
         options,
         Box::new(move |cc| {
+            #[cfg(target_os = "macos")]
+            {
+                macos_open_files.register();
+            }
+            single_instance::set_repaint_context(&cc.egui_ctx);
             Ok(Box::new(PdfEditorApp::new(
                 cc,
                 startup_paths.clone(),
                 incoming_paths_rx.clone(),
+                #[cfg(target_os = "macos")]
+                macos_open_files,
             )))
         }),
     )
@@ -180,14 +196,12 @@ const DEV_COMMANDS: &[DevCommand] = &[
 
 #[cfg(feature = "devtools")]
 fn dispatch_dev_command(args: &[OsString]) -> Option<Result<(), String>> {
-    let command = DEV_COMMANDS
-        .iter()
-        .find(|command| {
-            command
-                .flags
-                .iter()
-                .any(|flag| args.iter().any(|arg| arg == OsStr::new(flag)))
-        })?;
+    let command = DEV_COMMANDS.iter().find(|command| {
+        command
+            .flags
+            .iter()
+            .any(|flag| args.iter().any(|arg| arg == OsStr::new(flag)))
+    })?;
     let flag = command
         .flags
         .iter()

@@ -46,16 +46,11 @@ impl PerformanceCache {
             "{key}-{}-v{CACHE_VERSION}.json",
             mode_label(optimized)
         ));
-        let cached: CachedDocumentMetadata =
-            serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+        let cached: CachedDocumentMetadata = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
         (cached.optimized == optimized).then_some(cached)
     }
 
-    pub fn save_document_metadata(
-        &self,
-        source: &Path,
-        metadata: &CachedDocumentMetadata,
-    ) {
+    pub fn save_document_metadata(&self, source: &Path, metadata: &CachedDocumentMetadata) {
         let (Some(key), Some(root)) = (document_key(source), &self.root) else {
             return;
         };
@@ -87,12 +82,7 @@ impl PerformanceCache {
         serde_json::from_slice(&bytes).ok()
     }
 
-    pub fn save_page_text_chars(
-        &self,
-        source: &Path,
-        page_index: usize,
-        chars: &[PageTextChar],
-    ) {
+    pub fn save_page_text_chars(&self, source: &Path, page_index: usize, chars: &[PageTextChar]) {
         let Some(path) = self.page_path(source, "chars", page_index, "json") else {
             return;
         };
@@ -154,17 +144,14 @@ impl PerformanceCache {
             return;
         };
         let mut png = Vec::new();
-        let result = PngEncoder::new_with_quality(
-            &mut png,
-            CompressionType::Fast,
-            FilterType::Adaptive,
-        )
-        .write_image(
-            &rendered.rgba,
-            rendered.width as u32,
-            rendered.height as u32,
-            ExtendedColorType::Rgba8,
-        );
+        let result =
+            PngEncoder::new_with_quality(&mut png, CompressionType::Fast, FilterType::Adaptive)
+                .write_image(
+                    &rendered.rgba,
+                    rendered.width as u32,
+                    rendered.height as u32,
+                    ExtendedColorType::Rgba8,
+                );
         if result.is_ok() {
             let _ = write_atomic(&path, &png);
             if let Some(parent) = path.parent() {
@@ -220,6 +207,19 @@ impl PerformanceCache {
 }
 
 fn cache_root() -> Option<PathBuf> {
+    #[cfg(feature = "devtools")]
+    if std::env::var("LAWPDF_DISABLE_PERFORMANCE_CACHE")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+    {
+        return None;
+    }
+
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
@@ -246,7 +246,12 @@ fn document_key(source: &Path) -> Option<String> {
     hasher.update(metadata.len().to_le_bytes());
     hasher.update(modified.to_le_bytes());
     let digest = hasher.finalize();
-    Some(digest[..16].iter().map(|byte| format!("{byte:02x}")).collect())
+    Some(
+        digest[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
 }
 
 fn mode_label(optimized: bool) -> &'static str {
