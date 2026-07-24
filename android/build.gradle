@@ -1,0 +1,16 @@
+plugins {
+    id "com.android.application" version "8.7.3" apply false
+}
+
+// This checkout lives in Box Drive. Keep every generated Android artifact out of
+// the synced tree even when Gradle is invoked without its usual defaults.
+def externalBuildRoot = System.getenv("LAWPDF_ANDROID_BUILD_DIR")
+if (externalBuildRoot == null || externalBuildRoot.trim().isEmpty()) {
+    def tempRoot = System.getenv("TEMP") ?: System.getProperty("java.io.tmpdir")
+    externalBuildRoot = new File(tempRoot, "lawpdf-android-build").absolutePath
+}
+
+layout.buildDirectory = file(new File(externalBuildRoot, "root"))
+subprojects {
+    layout.buildDirectory = file(new File(externalBuildRoot, project.name))
+}
