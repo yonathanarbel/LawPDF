@@ -8259,7 +8259,8 @@ fn build_lm2_blocks_with_grouping(
         let starts_new_note = current_role == LiquidBlockRole::Marginalia
             && role == LiquidBlockRole::Marginalia
             && !current_text.is_empty()
-            && looks_like_marginalia_note_block_start(&line.text);
+            && looks_like_marginalia_note_block_start(&line.text)
+            && !looks_like_citation_continuation(&line.text);
         let starts_new_paragraph = current_role == LiquidBlockRole::Paragraph
             && role == LiquidBlockRole::Paragraph
             && current_last_line.as_ref().is_some_and(|previous| {
@@ -8804,15 +8805,42 @@ fn paragraph_boundary(previous: &DeepLiquidSourceLine, line: &DeepLiquidSourceLi
         return false;
     }
     let gap = vertical_gap(previous, line);
-    let left_delta = ((line.left - previous.left).abs() / line.page_width.max(1.0)).max(0.0);
+    let page_width = line.page_width.max(1.0);
+    let left_delta = ((line.left - previous.left).abs() / page_width).max(0.0);
+    // Signed, so a line that starts further right than its predecessor counts
+    // as a first-line indent while a line returning to the body margin (the
+    // line after a block quote) does not.
+    let first_line_indent = (line.left - previous.left) / page_width;
     let previous_sentence_end = previous
         .text
         .trim_end()
         .chars()
         .last()
         .is_some_and(|ch| matches!(ch, '.' | '?' | '!' | '"' | '\'' | ')'));
-    gap > 0.030 || (previous_sentence_end && (gap > 0.016 || left_delta > 0.055))
+    // A paragraph's last line usually ends on a footnote marker, which leaves
+    // a callout sentinel or a bare digit as the final character, so the plain
+    // punctuation test above misses precisely the lines that end paragraphs.
+    let previous_ends_paragraph = previous_sentence_end
+        || lm2_blocksplit_ends_like_paragraph(&strip_callout_sentinels_lm2(&previous.text));
+    gap > 0.030
+        || (previous_sentence_end && (gap > 0.016 || left_delta > 0.055))
+        || (previous_ends_paragraph && first_line_indent > PARAGRAPH_FIRST_LINE_INDENT)
 }
+
+fn strip_callout_sentinels_lm2(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !matches!(*ch, CALLOUT_START | CALLOUT_END))
+        .collect()
+}
+
+/// Minimum signed first-line indent, as a fraction of page width, that marks a
+/// new paragraph on the same page.
+///
+/// Law reviews mark paragraphs with a first-line indent and no extra leading.
+/// Measured across ten articles the indent runs 0.015–0.059 of page width, so
+/// the previous `left_delta > 0.055` test fired on only one of them; every
+/// other document ran its whole body together into a single block.
+const PARAGRAPH_FIRST_LINE_INDENT: f32 = 0.012;
 
 fn same_visual_row_fragment(previous: &DeepLiquidSourceLine, line: &DeepLiquidSourceLine) -> bool {
     if previous.page_index != line.page_index || line.line_index != previous.line_index + 1 {
@@ -8914,13 +8942,40 @@ fn source_line_note_markers(line: &DeepLiquidSourceLine, role: LiquidBlockRole) 
     if line.doc_note_marker > 0 {
         markers.push(line.doc_note_marker);
     }
-    if let Some(marker) = leading_note_marker(&line.text) {
+    if let Some(marker) = note_head_marker(&line.text) {
         markers.push(marker);
     }
     markers.extend(sentineled_note_markers(&line.text));
     markers.sort_unstable();
     markers.dedup();
     markers
+}
+
+/// Leading note number of a footnote definition, accepting both the bare
+/// `12 Text` form and the punctuated `12. Text` form.
+///
+/// [`leading_note_marker`] only recognises the bare form, which loses every
+/// note in the many journals that print `12.`; this is applied to lines
+/// already classified as a footnote or marginalia, so the punctuated form
+/// cannot be confused with a numbered list item in body text.
+fn note_head_marker(text: &str) -> Option<u16> {
+    if let Some(marker) = leading_note_marker(text) {
+        return Some(marker);
+    }
+    if !looks_like_marginalia_note_block_start(text) {
+        return None;
+    }
+    let mut value = 0u32;
+    let mut digits = 0usize;
+    for ch in text.trim_start().chars() {
+        let Some(digit) = ch.to_digit(10) else { break };
+        value = value * 10 + digit;
+        digits += 1;
+        if digits > 4 {
+            return None;
+        }
+    }
+    (digits > 0 && (1..=500).contains(&value)).then_some(value as u16)
 }
 
 fn sentineled_note_markers(text: &str) -> Vec<u16> {
@@ -9698,6 +9753,55 @@ fn looks_like_marginalia_note_block_start(text: &str) -> bool {
         .skip_while(|ch| ch.is_whitespace())
         .next()
         .is_some_and(|ch| ch.is_ascii_uppercase())
+}
+
+/// True when a line opens like the middle of a legal citation rather than a
+/// new footnote: a volume number, an all-caps reporter or journal name, then a
+/// page number — `106 VA. L. REV. 611 (2020)`.
+///
+/// Such a line satisfies [`looks_like_marginalia_note_block_start`] (digits,
+/// space, capital), so without this guard a footnote that wraps onto a line
+/// beginning with a citation is split in two. The tail then fails to link and
+/// surfaces as stray body text. Note text that merely starts with a capital —
+/// `245 See infra ...`, `167 Id. at 2366.` — is not all-caps and is unaffected.
+fn looks_like_citation_continuation(text: &str) -> bool {
+    let mut tokens = text.trim_start().split_whitespace();
+    let Some(volume) = tokens.next() else {
+        return false;
+    };
+    if volume.is_empty() || volume.len() > 4 || !volume.chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    for _ in 0..8 {
+        let Some(token) = tokens.next() else {
+            return false;
+        };
+        if token.starts_with(|ch: char| ch.is_ascii_digit()) {
+            // Reached the page number, so at least one reporter token was seen.
+            return true;
+        }
+        if !is_reporter_token(token) {
+            return false;
+        }
+    }
+    false
+}
+
+/// A token that can appear in the reporter or code name of a citation:
+/// `VA.`, `L.`, `REV.`, `Ind.`, `Tex.`, `S.W.2d`, `U.S.C.`, `&`, `§`.
+///
+/// Ordinary prose words also start with a capital, so this is deliberately
+/// permissive; [`looks_like_citation_continuation`] only accepts a run of
+/// these when it is followed by a page number, and prose reaches a lowercase
+/// word first.
+fn is_reporter_token(token: &str) -> bool {
+    if token == "&" || token == "\u{00A7}" {
+        return true;
+    }
+    token.starts_with(|ch: char| ch.is_ascii_uppercase())
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '\'' | '&'))
 }
 
 fn has_legal_note_cue(lower: &str) -> bool {
@@ -11503,6 +11607,44 @@ mod tests {
         ));
     }
 
+    /// A wrapped footnote continuing onto a citation must not be read as a new
+    /// note, while genuine note text that opens with a capital still is.
+    #[test]
+    fn citation_continuations_are_not_note_starts() {
+        for citation in [
+            "106 VA. L. REV. 611 (2020) (arguing that any right must be based on limits).",
+            "69 U. MIAMI L. REV. 499, 513 (2015).",
+            "24 INT'L REV. L. & ECON. 209, 209-10 (2004).",
+            "13 CARDOZO L. REV. 1891, 1892 (1992).",
+            "12 U.S.C. 5491 (2012).",
+            "12 U.S.C. \u{00A7} 5491 (2012).",
+            "38 Ind. 89, 95-96 (1871); Brisbin v. Cleary, 1 N.W. 825 (Minn. 1879).",
+            "299 S.W.2d 933, 938 (Tex. 1957).",
+            "373 S.E.2d 9, 10 (Ga. 1988).",
+        ] {
+            assert!(
+                looks_like_citation_continuation(citation),
+                "expected a citation continuation: {citation}"
+            );
+        }
+
+        for note in [
+            "245 See infra text accompanying notes 287-289.",
+            "167 Id. at 2366.",
+            "126 Today, many believe that robust discovery increased litigation.",
+            "88 See Symposium, The Vanishing Trial, 1 J. EMPIRICAL LEGAL STUD. at v.",
+            "1 Some have criticized focusing on AI alignment.",
+            "45 Brown v. Board of Educ., 347 U.S. 483 (1954).",
+            "166 Id.",
+            "128 I will further explore this topic in future work.",
+        ] {
+            assert!(
+                !looks_like_citation_continuation(note),
+                "expected a note start: {note}"
+            );
+        }
+    }
+
     #[test]
     fn build_lm2_blocks_splits_punctuated_marginalia_note_starts() {
         let decoded = vec![
@@ -11766,8 +11908,12 @@ mod tests {
         second.page_width = 612.0;
         let decoded = vec![(first, Lm2Action::Keep), (second, Lm2Action::Keep)];
 
+        // Assembly now splits on the first-line indent itself, so the block
+        // arrives already separated and the post-pass leaves it alone. The
+        // post-pass still matters for the tiers that run it, hence both
+        // assertions.
         let (_, mut blocks, mut sources) = build_lm2_blocks("", &decoded);
-        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks.len(), 2);
 
         apply_action_neutral_blocksplit(&mut blocks, &mut sources, &decoded);
 

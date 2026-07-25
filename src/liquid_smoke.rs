@@ -10,8 +10,9 @@ use serde_json::Value;
 use crate::layout_roles;
 use crate::liquid::{
     DeepLiquidSourceLine, DocumentProfile, LiquidBlock, LiquidBlockRole, LiquidBlockSourceLines,
-    LiquidFootnoteLinkIntegrity, LiquidRequest, prepare_liquid_document,
-    should_prefer_ocr_page_text, should_try_ocr_page_text,
+    LiquidDocument, LiquidFootnoteLinkIntegrity, LiquidRequest, MarkdownOptions,
+    liquid_document_markdown, prepare_liquid_document, should_prefer_ocr_page_text,
+    should_try_ocr_page_text,
 };
 use crate::liquid2::{
     LiquidMode2Request, LiquidMode2Timing, lm2_progressive_preview_request,
@@ -52,6 +53,11 @@ struct LiquidSmokeReport {
 
 #[derive(Debug, Serialize)]
 struct LiquidSmokeDocument {
+    /// The prepared document, retained so the Copy MD exporter can render it
+    /// through the real generator instead of the smoke renderer. Skipped in
+    /// the report JSON, which already carries the derived fields.
+    #[serde(skip)]
+    liquid: Option<LiquidDocument>,
     path: String,
     extraction_version: String,
     extraction_stats: layout_roles::ExtractionStats,
@@ -310,6 +316,94 @@ struct Lm2MarkdownBlockAnchor {
     text: String,
     source_line_ids: Vec<String>,
     source_lines: Vec<crate::liquid::LiquidSourceLineRef>,
+}
+
+/// Headless equivalent of the Review Mode **Copy MD** action.
+///
+/// `--lm2-assemble-markdown` renders blocks with the smoke renderer, which
+/// skips footnote linking and the final generator's assembly rules, so it
+/// cannot be used to evaluate shipped Markdown quality. This runs the same
+/// generator the app calls, with the same default options.
+pub fn run_lm2_copy_md(args: impl IntoIterator<Item = OsString>) -> Result<()> {
+    let mut output_dir = None;
+    let mut input_paths = Vec::new();
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        if arg == OsStr::new("--lm2-copy-md") {
+            continue;
+        }
+        if arg == OsStr::new("--output") {
+            let value = args.next().context("--output needs a directory path")?;
+            output_dir = Some(PathBuf::from(value));
+            continue;
+        }
+        if arg.to_string_lossy().starts_with("--") {
+            bail!("unknown Copy MD argument: {}", arg.to_string_lossy());
+        }
+        input_paths.push(PathBuf::from(arg));
+    }
+
+    let output_dir = output_dir.context("--output is required")?;
+    if input_paths.is_empty() {
+        bail!("pass at least one PDF path");
+    }
+    std::fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+
+    let engine = PdfEngine::new().context("failed to initialize PDF engine")?;
+    let mut failures = 0usize;
+    for path in &input_paths {
+        let smoke = smoke_document(
+            &engine, path, false, false, 3, false, false, false, true, false, false, None,
+        );
+        let Some(document) = smoke.liquid.as_ref() else {
+            failures += 1;
+            eprintln!(
+                "{}: {}",
+                path.display(),
+                smoke.error.as_deref().unwrap_or("no document produced")
+            );
+            continue;
+        };
+        let export = liquid_document_markdown(document, &MarkdownOptions::default());
+        let stem = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "document".to_owned());
+        let markdown_path = output_dir.join(format!("{stem}.md"));
+        std::fs::write(&markdown_path, &export.text)
+            .with_context(|| format!("failed to write {}", markdown_path.display()))?;
+        let integrity = document
+            .footnote_link_integrity
+            .as_ref()
+            .map(|integrity| {
+                format!(
+                    ", landing {:.3} ({}/{} landed, {} unmatched, {} ambiguous, {} note heads)",
+                    integrity.landing_rate,
+                    integrity.landed,
+                    integrity.detectable_markers,
+                    integrity.unmatched,
+                    integrity.ambiguous,
+                    integrity.note_heads
+                )
+            })
+            .unwrap_or_default();
+        println!(
+            "{stem}: {} block(s), {} footnote link(s){integrity}{}",
+            document.blocks.len(),
+            document.footnote_links.len(),
+            if export.warnings.is_empty() {
+                String::new()
+            } else {
+                format!("\n    warnings: {}", export.warnings.join("; "))
+            }
+        );
+    }
+    if failures > 0 {
+        bail!("{failures} document(s) failed");
+    }
+    Ok(())
 }
 
 pub fn run_lm2_assemble_markdown(args: impl IntoIterator<Item = OsString>) -> Result<()> {
@@ -1088,6 +1182,7 @@ fn smoke_document(
         Ok(document) => document,
         Err(error) => {
             return LiquidSmokeDocument {
+                liquid: None,
                 path: path.display().to_string(),
                 extraction_version: layout_roles::extraction_version().to_owned(),
                 extraction_stats: Default::default(),
@@ -1188,6 +1283,7 @@ fn smoke_document(
     if source_lines_only {
         let source_line_count = source_lines.as_ref().map_or(0, Vec::len);
         return LiquidSmokeDocument {
+            liquid: None,
             path: path.display().to_string(),
             extraction_version: extraction_report.extraction_version.clone(),
             extraction_stats: extraction_report.stats,
@@ -1300,6 +1396,7 @@ fn smoke_document(
                 .map(|block| compact_sample(&block.text))
                 .collect::<Vec<_>>();
             let profile = liquid.profile.clone();
+            let liquid_document = liquid.clone();
             let blocks = include_blocks.then(|| {
                 smoke_blocks_with_source_line_ids(&liquid.blocks, &liquid.block_source_lines)
             });
@@ -1307,6 +1404,7 @@ fn smoke_document(
                 include_source_lines.then(|| smoke_block_source_lines(&liquid.block_source_lines));
 
             LiquidSmokeDocument {
+                liquid: Some(liquid_document),
                 path: path.display().to_string(),
                 extraction_version: extraction_report.extraction_version.clone(),
                 extraction_stats: extraction_report.stats,
@@ -1339,6 +1437,7 @@ fn smoke_document(
             }
         }
         Err(error) => LiquidSmokeDocument {
+            liquid: None,
             path: path.display().to_string(),
             extraction_version: extraction_report.extraction_version.clone(),
             extraction_stats: extraction_report.stats,

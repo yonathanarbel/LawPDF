@@ -165,6 +165,10 @@ const DEV_COMMANDS: &[DevCommand] = &[
         handler: dev_lm2_assemble_markdown,
     },
     DevCommand {
+        flags: &["--lm2-copy-md"],
+        handler: dev_lm2_copy_md,
+    },
+    DevCommand {
         flags: &["--lm2-timing-baseline"],
         handler: dev_lm2_timing_baseline,
     },
@@ -240,6 +244,11 @@ fn dev_smoke_liquid(args: Vec<OsString>) -> Result<(), String> {
 #[cfg(feature = "devtools")]
 fn dev_lm2_assemble_markdown(args: Vec<OsString>) -> Result<(), String> {
     liquid_smoke::run_lm2_assemble_markdown(args.into_iter()).map_err(|error| format!("{error:#}"))
+}
+
+#[cfg(feature = "devtools")]
+fn dev_lm2_copy_md(args: Vec<OsString>) -> Result<(), String> {
+    liquid_smoke::run_lm2_copy_md(args.into_iter()).map_err(|error| format!("{error:#}"))
 }
 
 #[cfg(feature = "devtools")]

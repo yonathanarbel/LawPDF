@@ -9,6 +9,14 @@ const CALLOUT_START: char = '\u{E000}';
 const CALLOUT_END: char = '\u{E001}';
 const MARKDOWN_MARKER_START: char = '\u{E100}';
 const MARKDOWN_MARKER_END: char = '\u{E101}';
+/// Consecutive dash-like glyphs that mark a printed footnote separator rule.
+const FOOTNOTE_SEPARATOR_MIN_RUN: usize = 24;
+/// Below this share of markers matched to a note, the document is probably
+/// being misread rather than merely under-linked, so fall back to endnotes.
+const MIN_FOOTNOTE_LANDING_RATE: f32 = 0.75;
+/// Ambiguous matches are the ones that can attach a citation to the wrong
+/// sentence, so they are gated far more tightly than unmatched markers.
+const MAX_FOOTNOTE_AMBIGUOUS_RATE: f32 = 0.02;
 const LOW_LINK_CONFIDENCE_WARNING: &str =
     "footnote linking below confidence threshold; notes appended as a section";
 
@@ -84,10 +92,20 @@ pub fn liquid_document_markdown(
     let footnotes_inlined = match options.footnotes {
         FootnoteMode::Inline if !has_non_author_notes && document.footnote_links.is_empty() => true,
         FootnoteMode::Inline => {
+            // Gate on correctness, not coverage. A marker that found no note
+            // head simply does not become a link, so a low landing rate costs
+            // reach; what would put a citation on the wrong sentence is an
+            // ambiguous match, or a placement failure, which `too_many_failed`
+            // below already catches. Gating on landing alone discarded 416
+            // correct links in one held-out article because 51 of its 468
+            // markers had no matching note.
             let integrity_is_usable = document
                 .footnote_link_integrity
                 .as_ref()
-                .is_some_and(|integrity| integrity.landing_rate >= 0.9);
+                .is_some_and(|integrity| {
+                    integrity.landing_rate >= MIN_FOOTNOTE_LANDING_RATE
+                        && integrity.ambiguous_rate <= MAX_FOOTNOTE_AMBIGUOUS_RATE
+                });
             if !integrity_is_usable {
                 warnings.push(LOW_LINK_CONFIDENCE_WARNING.to_owned());
                 false
@@ -155,6 +173,7 @@ pub fn liquid_document_markdown(
     let mut last_source_text: Option<String> = None;
     let mut last_special_section = None;
     let mut omitted_footnote_separator_fragments = 0usize;
+    let mut omitted_footnote_separator_rules = 0usize;
     for (index, block) in document.blocks.iter().enumerate() {
         if matches!(
             block.role,
@@ -165,13 +184,25 @@ pub fn liquid_document_markdown(
             continue;
         }
 
-        let raw_text = inline_blocks
+        let mut raw_text = inline_blocks
             .get(&index)
             .map(String::as_str)
             .unwrap_or(&block.text);
-        if block.role != LiquidBlockRole::SectionBreak && starts_with_footnote_separator(raw_text) {
-            omitted_footnote_separator_fragments += 1;
-            continue;
+        // A block can begin with the PDF's footnote-separator rule and then
+        // continue into real content. Drop the rule, not the block: discarding
+        // the whole block silently deletes body prose.
+        let separator_trimmed;
+        if block.role != LiquidBlockRole::SectionBreak {
+            if let Some(prefix) = footnote_separator_prefix_len(raw_text) {
+                let remainder = raw_text[prefix..].trim_start();
+                if normalize_whitespace(&strip_callout_sentinels(remainder)).is_empty() {
+                    omitted_footnote_separator_fragments += 1;
+                    continue;
+                }
+                separator_trimmed = remainder.to_string();
+                raw_text = &separator_trimmed;
+                omitted_footnote_separator_rules += 1;
+            }
         }
         let source_key = normalize_whitespace(&strip_callout_sentinels(raw_text));
         if !source_key.is_empty()
@@ -307,7 +338,12 @@ pub fn liquid_document_markdown(
     }
     if omitted_footnote_separator_fragments > 0 {
         warnings.push(format!(
-            "omitted {omitted_footnote_separator_fragments} duplicated footnote-separator fragment(s) from the article body"
+            "omitted {omitted_footnote_separator_fragments} standalone footnote-separator rule(s) from the article body"
+        ));
+    }
+    if omitted_footnote_separator_rules > 0 {
+        warnings.push(format!(
+            "stripped a leading footnote-separator rule from {omitted_footnote_separator_rules} block(s), keeping the text that followed"
         ));
     }
 
@@ -1129,14 +1165,27 @@ fn normalize_and_escape_body(text: &str) -> String {
     render_marker_placeholders(&escape_body_text(&text))
 }
 
-fn starts_with_footnote_separator(text: &str) -> bool {
-    strip_callout_sentinels(text)
-        .trim_start()
-        .chars()
-        .take_while(|ch| matches!(ch, '-' | '_' | '\u{2010}'..='\u{2015}'))
-        .take(24)
-        .count()
-        == 24
+/// Length in bytes of a leading PDF footnote-separator rule, if `text` opens
+/// with one.
+///
+/// The rule is a run of at least [`FOOTNOTE_SEPARATOR_MIN_RUN`] dash-like
+/// glyphs, optionally preceded by whitespace or callout sentinels. Returns the
+/// offset just past the run so the caller can keep whatever follows it.
+fn footnote_separator_prefix_len(text: &str) -> Option<usize> {
+    let mut run = 0usize;
+    let mut end = 0usize;
+    for (offset, ch) in text.char_indices() {
+        match ch {
+            CALLOUT_START | CALLOUT_END => continue,
+            ch if ch.is_whitespace() && run == 0 => continue,
+            '-' | '_' | '\u{2010}'..='\u{2015}' => {
+                run += 1;
+                end = offset + ch.len_utf8();
+            }
+            _ => break,
+        }
+    }
+    (run >= FOOTNOTE_SEPARATOR_MIN_RUN).then_some(end)
 }
 
 fn normalize_heading_text(text: &str) -> String {
@@ -1163,7 +1212,19 @@ fn finalize_markdown(text: String) -> String {
                 CALLOUT_START | CALLOUT_END | MARKDOWN_MARKER_START | MARKDOWN_MARKER_END
             )
         })
+        .map(map_symbol_font_glyph)
         .collect()
+}
+
+/// Map the Symbol/Wingdings list glyphs that PDFs encode in the private-use
+/// area onto real Unicode. Left unmapped they render as tofu in every viewer.
+fn map_symbol_font_glyph(ch: char) -> char {
+    match ch {
+        '\u{F0B7}' | '\u{F0A7}' | '\u{F0B0}' => '\u{2022}', // Symbol bullets
+        '\u{F0FC}' => '\u{2713}',                           // Wingdings check
+        '\u{F0D8}' | '\u{F0E0}' => '\u{2192}',              // Wingdings arrows
+        other => other,
+    }
 }
 
 fn escape_body_text(text: &str) -> String {
@@ -1450,7 +1511,7 @@ mod tests {
             block(LiquidBlockRole::Footnote, "4 Authority."),
         ]);
         add_link(&mut low_integrity, 0, 0, 4, 1);
-        low_integrity.footnote_link_integrity = Some(integrity(0.89));
+        low_integrity.footnote_link_integrity = Some(integrity(0.60));
         let export = liquid_document_markdown(&low_integrity, &MarkdownOptions::default());
         assert!(!export.footnotes_inlined);
         assert!(export.text.contains("## Notes"));
@@ -1465,6 +1526,35 @@ mod tests {
         failed.blocks[0].text = "Claim without marker.".to_owned();
         failed.footnote_link_integrity = Some(integrity(1.0));
         let export = liquid_document_markdown(&failed, &MarkdownOptions::default());
+        assert!(!export.footnotes_inlined);
+        assert!(export.text.contains("## Notes"));
+    }
+
+    /// Unmatched markers cost reach, not correctness, so a partially linked
+    /// document still links. An ambiguous match can attach a citation to the
+    /// wrong sentence, so it falls back to endnotes.
+    #[test]
+    fn partial_coverage_links_but_ambiguity_falls_back() {
+        let mut partial = document(vec![
+            block(LiquidBlockRole::Paragraph, "Claim.\u{E000}4\u{E001}"),
+            block(LiquidBlockRole::Footnote, "4 Authority."),
+        ]);
+        add_link(&mut partial, 0, 0, 4, 1);
+        let mut under_linked = integrity(0.80);
+        under_linked.ambiguous_rate = 0.0;
+        partial.footnote_link_integrity = Some(under_linked);
+        let export = liquid_document_markdown(&partial, &MarkdownOptions::default());
+        assert!(export.footnotes_inlined);
+        assert!(
+            !export
+                .warnings
+                .contains(&LOW_LINK_CONFIDENCE_WARNING.to_owned())
+        );
+
+        let mut ambiguous = integrity(0.98);
+        ambiguous.ambiguous_rate = 0.10;
+        partial.footnote_link_integrity = Some(ambiguous);
+        let export = liquid_document_markdown(&partial, &MarkdownOptions::default());
         assert!(!export.footnotes_inlined);
         assert!(export.text.contains("## Notes"));
     }
@@ -1552,14 +1642,11 @@ mod tests {
     }
 
     #[test]
-    fn final_export_omits_misclassified_footnote_separator_fragments() {
+    fn final_export_omits_standalone_footnote_separator_rules() {
         let separator = "\u{2013}".repeat(61);
         let document = document(vec![
             block(LiquidBlockRole::Paragraph, "Body paragraph."),
-            block(
-                LiquidBlockRole::Paragraph,
-                &format!("{separator} duplicated footnote continuation"),
-            ),
+            block(LiquidBlockRole::Paragraph, &separator),
             block(LiquidBlockRole::SectionBreak, &separator),
             block(LiquidBlockRole::Paragraph, "Following paragraph."),
         ]);
@@ -1567,14 +1654,47 @@ mod tests {
         let export = liquid_document_markdown(&document, &MarkdownOptions::default());
 
         assert!(export.text.contains("Body paragraph."));
-        assert!(!export.text.contains("duplicated footnote continuation"));
+        assert!(!export.text.contains(&separator));
         assert!(export.text.contains("***"));
         assert!(export.text.contains("Following paragraph."));
         assert!(
             export
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("omitted 1 duplicated"))
+                .any(|warning| warning.contains("omitted 1 standalone"))
+        );
+    }
+
+    /// A block that opens with the separator rule and then continues into body
+    /// prose must keep the prose. Discarding the whole block dropped 11,463
+    /// tokens across the five-article review corpus.
+    #[test]
+    fn final_export_keeps_body_text_after_a_leading_footnote_separator() {
+        let separator = "\u{2013}".repeat(61);
+        let document = document(vec![
+            block(LiquidBlockRole::Paragraph, "Body paragraph."),
+            block(
+                LiquidBlockRole::Paragraph,
+                &format!(
+                    "{separator} In keeping with the analysis above, we will \
+                     describe the relevant protected characteristic here as \
+                     racial Jewishness."
+                ),
+            ),
+            block(LiquidBlockRole::Paragraph, "Following paragraph."),
+        ]);
+
+        let export = liquid_document_markdown(&document, &MarkdownOptions::default());
+
+        assert!(export.text.contains("In keeping with the analysis above"));
+        assert!(export.text.contains("racial Jewishness."));
+        assert!(!export.text.contains(&separator));
+        assert!(export.text.contains("Following paragraph."));
+        assert!(
+            export
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("stripped a leading footnote-separator rule from 1"))
         );
     }
 
