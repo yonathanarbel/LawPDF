@@ -27,8 +27,9 @@ Two selection rules, both learned from being burned:
 
 ## Baseline, v0.2.11
 
-`lawreview-50-baseline-20260725.json` holds the full run, including the 18
-non-article documents, for reference.
+Numbers below are the record; the per-defect JSON is regenerable from the
+commands at the end and is deliberately not tracked. Nothing derived belongs in
+this repository, which lives in a synced folder.
 
 | Set | Docs | Mean source recall | Worst | Critical defects | Zero footnotes |
 |---|---:|---:|---:|---:|---:|
