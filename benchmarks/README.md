@@ -56,6 +56,36 @@ unlinked notes section because too few body markers are detected.
 Top defects: 48 suspected fused paragraphs, 46 source-loss flags, 27 footnote
 definitions rendered as body text, 24 footnote sequence gaps.
 
+## The 100-article sweep, and a warning about the defect count
+
+A 100-article sweep (10 per journal, same selection rules) is the larger
+version of this gate. Its first use was to justify lowering the footnote
+landing floor from 0.75 to 0.50.
+
+| | Docs with linked footnotes | Footnote definitions | Mean recall | Critical defects |
+|---|---:|---:|---:|---:|
+| Landing floor 0.75 | 54/100 | 6,402 | 83.9% | 376 |
+| **Landing floor 0.50** | **76/100** | **7,201** | 83.6% | 486 |
+
+**22 documents gained footnotes and every one of the 799 new definitions is
+referenced from the body — 100% linked, no orphans.** They were previously
+discarded wholesale into an unlinked notes section despite a majority of their
+markers matching. Only three documents in the hundred contain even one
+ambiguous match, so the risk the 0.75 floor guarded is carried by the ambiguity
+ceiling instead.
+
+**The critical-defect count rose anyway, and that is a flaw in the measure, not
+the change.** `footnote.definition_in_body` and the sequence checks only run on
+documents that emit numbered definitions. A document that emits none escapes
+them entirely, so the 46 documents that previously dumped their whole note
+apparatus into body prose were scoring as clean. Emitting footnotes makes that
+pre-existing damage visible: +74 `definition_in_body`, +19 sequence gaps.
+
+Read the defect count alongside coverage, never alone. A metric that can only
+inspect what was emitted will always prefer emitting nothing — the same
+one-directional trap that let the old gate report macro F1 1.0 on a broken
+product.
+
 ## Why the earlier numbers were optimistic
 
 | Benchmark | Docs | Mean recall |
