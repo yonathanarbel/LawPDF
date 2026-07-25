@@ -173,6 +173,9 @@ const LM2_NATIVE_CATBOOST_FLOAT_FEATURES: [&str; 116] = [
     "liquidvision_routes_marginalia",
     "liquidvision_keep_veto",
 ];
+/// How far a note number may step backwards before the line is read as
+/// something other than a new note head.
+const NOTE_NUMBER_BACKWARD_TOLERANCE: u16 = 10;
 const LM2_NATIVE_CATBOOST_CAT_FEATURES: [&str; 14] = [
     "page_zone_y",
     "page_zone_x",
@@ -1578,6 +1581,141 @@ pub fn run_lm2_feature_dump(args: impl IntoIterator<Item = OsString>) -> Result<
         println!("{json}");
     }
     Ok(())
+}
+
+/// Export the exact feature matrix the native CatBoost runtime consumes, with
+/// labels, so the model can be retrained outside the app.
+///
+/// Emits JSONL: one object per line with the action label, the 116 float
+/// features in `LM2_NATIVE_CATBOOST_FLOAT_FEATURES` order, the 14 categorical
+/// features in `LM2_NATIVE_CATBOOST_CAT_FEATURES` order, and the text feature.
+/// Reusing the runtime's own feature builders is the point: a model trained on
+/// features assembled anywhere else cannot be loaded by the runtime.
+#[cfg(feature = "devtools")]
+pub fn run_lm2_training_export(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
+    let mut examples_input = PathBuf::from(
+        "training-data/layout-role-core/lawpdf-layout-role-examples-chandra-expanded-fast-20260604.json",
+    );
+    let mut output_path: Option<PathBuf> = None;
+    let mut limit = usize::MAX;
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        if arg == OsStr::new("--dump-lm2-training") {
+            continue;
+        }
+        if arg == OsStr::new("--examples-input") {
+            examples_input = args
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| "--examples-input needs a path".to_owned())?;
+            continue;
+        }
+        if arg == OsStr::new("--output") {
+            output_path = Some(
+                args.next()
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--output needs a path".to_owned())?,
+            );
+            continue;
+        }
+        if arg == OsStr::new("--limit") {
+            limit = args
+                .next()
+                .ok_or_else(|| "--limit needs an integer".to_owned())?
+                .to_string_lossy()
+                .parse::<usize>()
+                .map_err(|error| format!("invalid --limit: {error}"))?;
+            continue;
+        }
+        return Err(format!(
+            "unknown LM2 training export argument: {}",
+            arg.to_string_lossy()
+        ));
+    }
+
+    let output_path = output_path.ok_or_else(|| "--output is required".to_owned())?;
+    let examples: Lm2EvalExamplesFile = read_json_file(&examples_input)?;
+    let entries = eval_sources_for_rows(examples.lines, false);
+
+    use std::io::Write as _;
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let file = std::fs::File::create(&output_path).map_err(|error| error.to_string())?;
+    let mut writer = std::io::BufWriter::new(file);
+
+    let mut written = 0usize;
+    let mut skipped_unlabelled = 0usize;
+    for (row, source) in entries.into_iter().take(limit) {
+        let Some(role) = row.role.as_deref() else {
+            skipped_unlabelled += 1;
+            continue;
+        };
+        let Some(action) = lm2_training_action_for_role_name(role) else {
+            skipped_unlabelled += 1;
+            continue;
+        };
+        let feature_map = lm2_numeric_catboost_features(&source);
+        let floats = LM2_NATIVE_CATBOOST_FLOAT_FEATURES
+            .iter()
+            .map(|name| feature_map.get(*name).copied().unwrap_or(0.0))
+            .collect::<Vec<_>>();
+        let cats = lm2_native_catboost_cat_features(&source);
+        let text = collapse_whitespace(&source.text)
+            .chars()
+            .take(500)
+            .collect::<String>();
+        let record = Lm2TrainingRow {
+            y: action.as_str(),
+            role,
+            doc: row.path.as_str(),
+            page_index: row.page_index,
+            line_index: row.line_index,
+            f: floats,
+            c: cats,
+            t: text,
+        };
+        let json = serde_json::to_string(&record).map_err(|error| error.to_string())?;
+        writeln!(writer, "{json}").map_err(|error| error.to_string())?;
+        written += 1;
+    }
+    writer.flush().map_err(|error| error.to_string())?;
+    println!(
+        "wrote {written} row(s) to {} ({skipped_unlabelled} unlabelled skipped); {} float + {} cat + 1 text feature(s)",
+        output_path.display(),
+        LM2_NATIVE_CATBOOST_FLOAT_FEATURES.len(),
+        LM2_NATIVE_CATBOOST_CAT_FEATURES.len()
+    );
+    Ok(())
+}
+
+/// Map an example's role name onto the runtime action space. Mirrors
+/// [`lm2_context_action_for_role`] but works from the serialized role strings
+/// used by the training corpora.
+#[cfg(feature = "devtools")]
+fn lm2_training_action_for_role_name(role: &str) -> Option<Lm2Action> {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "footnote" | "marginalia" => Some(Lm2Action::Marginalia),
+        "table" | "caption" | "contents" | "header" | "footer" | "header_footer" | "metadata"
+        | "section_break" | "noise" => Some(Lm2Action::HideNoise),
+        "body" | "heading" | "subheading" | "title" | "author_info" | "list_item" | "syllabus"
+        | "issue" | "key_clause" | "quote" => Some(Lm2Action::Keep),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "devtools")]
+#[derive(Debug, Serialize)]
+struct Lm2TrainingRow<'a> {
+    y: &'a str,
+    role: &'a str,
+    doc: &'a str,
+    page_index: usize,
+    line_index: usize,
+    f: Vec<f64>,
+    c: Vec<String>,
+    t: String,
 }
 
 #[cfg(feature = "devtools")]
@@ -8176,6 +8314,9 @@ fn build_lm2_blocks_with_grouping(
     let mut current_last_line: Option<DeepLiquidSourceLine> = None;
     let line_group_index = grouping_line_group_index(grouping);
     let mut current_group_index: Option<usize> = None;
+    // Note numbers run upward through an article. Tracking the current one
+    // lets a numbered list inside a footnote be told from a real note head.
+    let mut current_note_number: Option<u16> = None;
 
     if let Some(recovered) = &recovered_title {
         for (index, line) in recovered.lines.iter().enumerate() {
@@ -8256,11 +8397,13 @@ fn build_lm2_blocks_with_grouping(
             role,
             LiquidBlockRole::Title | LiquidBlockRole::Heading | LiquidBlockRole::Subheading
         );
+        let candidate_note_number = note_head_marker(&line.text);
         let starts_new_note = current_role == LiquidBlockRole::Marginalia
             && role == LiquidBlockRole::Marginalia
             && !current_text.is_empty()
             && looks_like_marginalia_note_block_start(&line.text)
-            && !looks_like_citation_continuation(&line.text);
+            && !looks_like_citation_continuation(&line.text)
+            && !breaks_note_monotonicity(current_note_number, candidate_note_number);
         let starts_new_paragraph = current_role == LiquidBlockRole::Paragraph
             && role == LiquidBlockRole::Paragraph
             && current_last_line.as_ref().is_some_and(|previous| {
@@ -8291,6 +8434,12 @@ fn build_lm2_blocks_with_grouping(
             );
             current_role = role;
             current_group_index = line_group_index.get(&line.id).copied();
+        }
+        if starts_new_note || current_role != LiquidBlockRole::Marginalia {
+            current_note_number = candidate_note_number;
+        } else if let Some(number) = candidate_note_number.filter(|_| current_note_number.is_none())
+        {
+            current_note_number = Some(number);
         }
         append_line(&mut current_text, &line.text);
         current_refs.push(line_ref(line, role));
@@ -9802,6 +9951,22 @@ fn is_reporter_token(token: &str) -> bool {
         && token
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '\'' | '&'))
+}
+
+/// True when treating `candidate` as the next note head would break the
+/// upward run of note numbers by more than a stray digit could explain.
+///
+/// Footnotes are numbered consecutively through an article, so a line reading
+/// "1. If X is clearly illegal" arriving while note 194 is open is a numbered
+/// list inside that note, not note 1. Small backward steps are tolerated
+/// because a genuine restart or a misread digit should not merge two notes.
+fn breaks_note_monotonicity(current: Option<u16>, candidate: Option<u16>) -> bool {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) => {
+            current > candidate && current - candidate > NOTE_NUMBER_BACKWARD_TOLERANCE
+        }
+        _ => false,
+    }
 }
 
 fn has_legal_note_cue(lower: &str) -> bool {
@@ -11605,6 +11770,19 @@ mod tests {
         assert!(!looks_like_marginalia_note_block_start(
             "2024. The statute continues"
         ));
+    }
+
+    /// A numbered list inside a footnote must not restart the note sequence.
+    #[test]
+    fn numbered_lists_inside_a_note_do_not_start_a_new_note() {
+        // "1." arriving while note 194 is open is pseudocode, not note 1.
+        assert!(breaks_note_monotonicity(Some(194), Some(1)));
+        assert!(breaks_note_monotonicity(Some(500), Some(137)));
+        // Genuine forward progress and small steps back are left alone.
+        assert!(!breaks_note_monotonicity(Some(194), Some(195)));
+        assert!(!breaks_note_monotonicity(Some(12), Some(8)));
+        assert!(!breaks_note_monotonicity(None, Some(1)));
+        assert!(!breaks_note_monotonicity(Some(3), None));
     }
 
     /// A wrapped footnote continuing onto a citation must not be read as a new

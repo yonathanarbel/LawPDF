@@ -219,6 +219,19 @@ pub fn liquid_document_markdown(
                 let text = normalize_heading_text(raw_text);
                 if text.is_empty() {
                     false
+                } else if !reads_like_heading(&level_text) {
+                    // Law reviews italicise case names, and a stray italic
+                    // fragment upstream is easily mistaken for a heading. An
+                    // outline entry never ends mid-clause, so render the text
+                    // as the prose it is rather than emit `## Raich,`.
+                    let body = normalize_and_escape_body(raw_text);
+                    if body.is_empty() {
+                        false
+                    } else {
+                        writer.push(body, BlockJoin::Loose);
+                        last_special_section = None;
+                        true
+                    }
                 } else {
                     let level = heading_context.level(&level_text, block.role);
                     writer.push(
@@ -1188,6 +1201,33 @@ fn footnote_separator_prefix_len(text: &str) -> Option<usize> {
     (run >= FOOTNOTE_SEPARATOR_MIN_RUN).then_some(end)
 }
 
+/// Whether a block classified as a heading actually reads like one.
+///
+/// A section heading is a complete label: it does not trail off in a comma or
+/// semicolon, and it is not a case citation. Italic case names inside body and
+/// footnote prose are the common false positive, and emitting them as `##`
+/// breaks the document outline.
+fn reads_like_heading(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.ends_with([',', ';', ':']) {
+        return false;
+    }
+    // "Brown v. Board", "Reed v. Goertz" - a reporter-style party separator in
+    // a short line is a citation fragment, not a section title.
+    let words = trimmed.split_whitespace().count();
+    if words <= 12
+        && trimmed
+            .split_whitespace()
+            .any(|token| matches!(token, "v." | "v" | "vs."))
+    {
+        return false;
+    }
+    true
+}
+
 fn normalize_heading_text(text: &str) -> String {
     let text = normalize_whitespace(&strip_callout_sentinels(text));
     render_marker_placeholders(&text.replace("[^", "\\[^"))
@@ -1639,6 +1679,27 @@ mod tests {
                 .chars()
                 .any(|ch| matches!(ch, '\u{E000}' | '\u{E001}' | '\u{E100}' | '\u{E101}'))
         );
+    }
+
+    /// Italic case names inside prose are the common false heading. They must
+    /// render as body text, while real section titles keep their level.
+    #[test]
+    fn citation_fragments_do_not_become_headings() {
+        let document = document(vec![
+            block(LiquidBlockRole::Heading, "I. INTRODUCTION"),
+            block(LiquidBlockRole::Heading, "Raich,"),
+            block(LiquidBlockRole::Heading, "Alito in Reed v. Goertz,"),
+            block(LiquidBlockRole::Heading, "Massachusetts v. Feeney"),
+            block(LiquidBlockRole::Paragraph, "Body."),
+        ]);
+
+        let export = liquid_document_markdown(&document, &MarkdownOptions::default());
+
+        assert!(export.text.contains("# I. INTRODUCTION"));
+        assert!(export.text.contains("Raich,"));
+        assert!(!export.text.contains("# Raich,"));
+        assert!(!export.text.contains("# Alito in Reed v. Goertz,"));
+        assert!(!export.text.contains("# Massachusetts v. Feeney"));
     }
 
     #[test]

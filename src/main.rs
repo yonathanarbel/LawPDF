@@ -181,6 +181,10 @@ const DEV_COMMANDS: &[DevCommand] = &[
         handler: dev_lm2_feature_dump,
     },
     DevCommand {
+        flags: &["--dump-lm2-training"],
+        handler: dev_lm2_training_export,
+    },
+    DevCommand {
         flags: &["--dump-lm2-decoder-lattice"],
         handler: dev_lm2_decoder_lattice_dump,
     },
@@ -264,6 +268,11 @@ fn dev_lm2_eval(args: Vec<OsString>) -> Result<(), String> {
 #[cfg(feature = "devtools")]
 fn dev_lm2_feature_dump(args: Vec<OsString>) -> Result<(), String> {
     liquid2::run_lm2_feature_dump(args.into_iter())
+}
+
+#[cfg(feature = "devtools")]
+fn dev_lm2_training_export(args: Vec<OsString>) -> Result<(), String> {
+    liquid2::run_lm2_training_export(args.into_iter())
 }
 
 #[cfg(feature = "devtools")]
