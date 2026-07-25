@@ -181,6 +181,10 @@ const DEV_COMMANDS: &[DevCommand] = &[
         handler: dev_lm2_feature_dump,
     },
     DevCommand {
+        flags: &["--dump-char-metrics"],
+        handler: dev_char_metrics_dump,
+    },
+    DevCommand {
         flags: &["--dump-lm2-training"],
         handler: dev_lm2_training_export,
     },
@@ -268,6 +272,11 @@ fn dev_lm2_eval(args: Vec<OsString>) -> Result<(), String> {
 #[cfg(feature = "devtools")]
 fn dev_lm2_feature_dump(args: Vec<OsString>) -> Result<(), String> {
     liquid2::run_lm2_feature_dump(args.into_iter())
+}
+
+#[cfg(feature = "devtools")]
+fn dev_char_metrics_dump(args: Vec<OsString>) -> Result<(), String> {
+    liquid_smoke::run_char_metrics_dump(args.into_iter()).map_err(|error| format!("{error:#}"))
 }
 
 #[cfg(feature = "devtools")]

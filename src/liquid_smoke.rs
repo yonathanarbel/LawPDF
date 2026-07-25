@@ -318,6 +318,77 @@ struct Lm2MarkdownBlockAnchor {
     source_lines: Vec<crate::liquid::LiquidSourceLineRef>,
 }
 
+/// Dump the per-glyph metrics the extractor actually sees on one page.
+///
+/// Superscript detection keys on font size and glyph baseline, and those come
+/// from pdfium. When marker detection fails on a document, the question is
+/// what pdfium reported, not what another PDF library reports for the same
+/// file — so print it directly.
+#[cfg(feature = "devtools")]
+pub fn run_char_metrics_dump(args: impl IntoIterator<Item = OsString>) -> Result<()> {
+    let mut input: Option<PathBuf> = None;
+    let mut page_index = 0usize;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == OsStr::new("--dump-char-metrics") {
+            continue;
+        }
+        if arg == OsStr::new("--page") {
+            page_index = args
+                .next()
+                .context("--page needs an index")?
+                .to_string_lossy()
+                .parse()
+                .context("invalid --page")?;
+            continue;
+        }
+        input = Some(PathBuf::from(arg));
+    }
+    let path = input.context("pass a PDF path")?;
+
+    let engine = PdfEngine::new().context("failed to initialize PDF engine")?;
+    let chars = engine.load_page_text_chars(&path, page_index)?;
+
+    let sizes = chars
+        .iter()
+        .filter_map(|c| c.font_size)
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .collect::<Vec<_>>();
+    let with_rect = chars.iter().filter(|c| c.rect.is_some()).count();
+    println!(
+        "page {page_index}: {} chars, {} with font_size, {} with rect",
+        chars.len(),
+        sizes.len(),
+        with_rect
+    );
+    if !sizes.is_empty() {
+        let mut sorted = sizes.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        println!(
+            "  font_size min {:.2} p50 {:.2} max {:.2}, distinct {}",
+            sorted[0],
+            sorted[sorted.len() / 2],
+            sorted[sorted.len() - 1],
+            sorted
+                .iter()
+                .map(|s| (s * 100.0).round() as i64)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        );
+    }
+    // Superscript detection needs a digit to differ from the body run in size
+    // or baseline, so print both for the first digits on the page.
+    for c in chars.iter().filter(|c| c.ch.is_ascii_digit()).take(25) {
+        println!(
+            "    digit {:?} size={:?} bottom={:?}",
+            c.ch,
+            c.font_size.map(|s| (s * 100.0).round() / 100.0),
+            c.rect.map(|r| (r.bottom * 100.0).round() / 100.0)
+        );
+    }
+    Ok(())
+}
+
 /// Headless equivalent of the Review Mode **Copy MD** action.
 ///
 /// `--lm2-assemble-markdown` renders blocks with the smoke renderer, which

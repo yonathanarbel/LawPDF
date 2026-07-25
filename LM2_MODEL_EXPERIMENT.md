@@ -150,11 +150,30 @@ either signal. Result: landing moved 0.555→0.600 and 0.800→0.815 on two
 articles, 0.500→0.467 on another, and c09 did not move at all; defects and
 recall were unchanged at 43 and 85.7%. The change was reverted.
 
-pdfium's per-glyph metrics evidently differ from the PyMuPDF measurements the
-hypothesis was built on. Diagnosing this properly needs instrumentation inside
-the extraction path rather than inference from a second PDF library — that is
-the next concrete piece of work, and it is worth more than anything left in the
-model.
+So I instrumented the extractor instead of inferring from a second library.
+`lawpdf --dump-char-metrics --page N file.pdf` prints what pdfium actually
+reports per glyph. On page 3 of each article:
+
+| | Distinct font sizes | Superscript digits report |
+|---|---:|---|
+| c06 (links 1.000) | 5 | **6.00** against body 11.04 — clearly separable |
+| c09 (links 0.562) | 9 | **10.00**, the same as body, sharing the line's baseline |
+
+**In c09 pdfium reports no size and no baseline difference for superscripts at
+all.** The signal the detector needs is absent from the text layer as pdfium
+presents it, which is why neither the size threshold nor the baseline test can
+work, and why adding the baseline test changed nothing.
+
+PyMuPDF, reading the same file, *does* report size-7 raised glyphs. So the
+information exists in the PDF and is lost in this extraction path. That makes
+the next step concrete and narrow: find out why pdfium collapses superscript
+metrics on these volumes — character-level API choice, font-matrix handling, or
+`loose_bounds` versus `tight_bounds`. Swapping to `tight_bounds` alone does not
+do it: positions shift by ~2pt and the digits still report body size.
+
+This matters out of proportion to its size. Older and OCR-rebuilt volumes are
+most of a 330k-document law review corpus, and on them the product currently
+recovers footnote text but cannot link any of it.
 
 ## Leakage
 
