@@ -175,6 +175,28 @@ This matters out of proportion to its size. Older and OCR-rebuilt volumes are
 most of a 330k-document law review corpus, and on them the product currently
 recovers footnote text but cannot link any of it.
 
+### Follow-up: the signal is in the glyph box, but not separably
+
+`rect` comes from pdfium's **loose** bounds, which are the font's em box and so
+identical for every glyph on a line — measured on one article, every glyph
+reported height 11.06. That is why a baseline test could not work. **Tight**
+bounds trace the drawn glyph and do vary: on the same article digit heights run
+4.04 to 6.89, and 422 of 1,636 digits fall below 0.78 of the line's tall-glyph
+height.
+
+So the information exists. It is not separable by a global ratio:
+
+| Threshold on tight-bounds height | Held-out 12 result |
+|---|---|
+| 0.78 of line p90 | 44 critical (worse); one article regressed from landing 1.000 to 0.965 |
+| 0.65 of line p90 | fires on nothing; byte-identical to baseline |
+
+Body digits — page numbers, years, citation volumes — overlap superscripts in
+rendered height once a document has been through OCR. Both attempts were
+reverted. A working detector will need more than height alone: the run's
+position relative to the word it follows, agreement with the note sequence, or
+a per-document calibration rather than a per-line ratio.
+
 ## Leakage
 
 Model comparisons use only the held-out five. Matching sampled source lines

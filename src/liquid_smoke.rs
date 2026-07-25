@@ -376,14 +376,43 @@ pub fn run_char_metrics_dump(args: impl IntoIterator<Item = OsString>) -> Result
                 .len()
         );
     }
-    // Superscript detection needs a digit to differ from the body run in size
-    // or baseline, so print both for the first digits on the page.
-    for c in chars.iter().filter(|c| c.ch.is_ascii_digit()).take(25) {
+    // A superscript has to differ from the body run in reported size, in
+    // baseline, or in rendered glyph height. Some producers scale superscripts
+    // through the text matrix rather than the font size, which leaves the
+    // reported size at the body value while the drawn box shrinks, so compare
+    // all three.
+    let round2 = |value: f32| (value * 100.0).round() / 100.0;
+    let letter_heights = |filter: fn(char) -> bool| {
+        let mut heights = chars
+            .iter()
+            .filter(|c| filter(c.ch))
+            .filter_map(|c| c.rect.map(|r| r.top - r.bottom))
+            .filter(|h| h.is_finite() && *h > 0.0)
+            .collect::<Vec<_>>();
+        heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        heights
+    };
+    let alpha = letter_heights(|ch| ch.is_ascii_alphabetic());
+    let digits = letter_heights(|ch| ch.is_ascii_digit());
+    if !alpha.is_empty() && !digits.is_empty() {
         println!(
-            "    digit {:?} size={:?} bottom={:?}",
+            "  glyph height: letters p50 {:.2}, digits min {:.2} p50 {:.2} max {:.2}",
+            alpha[alpha.len() / 2],
+            digits[0],
+            digits[digits.len() / 2],
+            digits[digits.len() - 1]
+        );
+        let letter_median = alpha[alpha.len() / 2];
+        let shrunk = digits.iter().filter(|h| **h < letter_median * 0.80).count();
+        println!("  digits under 0.80x letter height: {shrunk}/{}", digits.len());
+    }
+    for c in chars.iter().filter(|c| c.ch.is_ascii_digit()).take(20) {
+        println!(
+            "    digit {:?} size={:?} bottom={:?} height={:?}",
             c.ch,
-            c.font_size.map(|s| (s * 100.0).round() / 100.0),
-            c.rect.map(|r| (r.bottom * 100.0).round() / 100.0)
+            c.font_size.map(round2),
+            c.rect.map(|r| round2(r.bottom)),
+            c.rect.map(|r| round2(r.top - r.bottom))
         );
     }
     Ok(())

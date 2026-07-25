@@ -766,6 +766,13 @@ def print_report(report: DocumentReport, verbose: bool) -> None:
 
 
 def main(argv: Iterable[str]) -> int:
+    # Defect details quote source text, which routinely contains characters the
+    # Windows console codepage cannot encode. Redirecting stdout would
+    # otherwise abort the run partway through.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(
         description="Verify structural integrity of LawPDF Markdown exports."
     )
