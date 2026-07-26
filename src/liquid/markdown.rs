@@ -937,6 +937,7 @@ fn build_inline_notes(
     let mut definitions = author_notes.definitions;
     let mut links = document.footnote_links.iter().collect::<Vec<_>>();
     links.sort_by_key(|link| (link.note_block_index, link.marker));
+    let mut consumed_ranges: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
     let mut seen_labels = definitions
         .iter()
         .map(|definition| definition.label.clone())
@@ -997,6 +998,20 @@ fn build_inline_notes(
             ));
             continue;
         }
+        let normalized_block = normalize_whitespace(&strip_callout_sentinels(&block.text));
+        if let Some(range) = note_range_for_marker(
+            &normalized_block,
+            link.marker,
+            markers_by_note
+                .get(&link.note_block_index)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        ) {
+            consumed_ranges
+                .entry(link.note_block_index)
+                .or_insert_with(Vec::new)
+                .push(range);
+        }
         definitions.push(FootnoteDefinition {
             label,
             text,
@@ -1018,14 +1033,33 @@ fn build_inline_notes(
     let mut continuation_target: Option<(usize, usize)> = None;
     for index in note_indices {
         if emitted_note_blocks.contains(index) || author_notes.note_blocks.contains(index) {
-            // The definition for this block began at its first linked note
-            // head; anything printed before that head belongs to earlier notes
-            // that never linked, and would otherwise be dropped.
-            if let Some(block) = document.blocks.get(*index) {
-                let markers = markers_by_note.get(index).map(Vec::as_slice).unwrap_or(&[]);
-                let prefix = note_text_before_first_head(&block.text, markers);
-                if prefix.chars().any(char::is_alphanumeric) {
-                    unlinked.push(escape_footnote_text(&prefix));
+            // Definitions are cut per marker and those cuts do not tile the
+            // block. Emit every stretch of the block that no definition
+            // claimed, so a slicing gap cannot become a deletion.
+            // Only blocks whose definitions reported a consumed range can have
+            // a residual computed. A symbol-marked author note reports none, and
+            // treating its whole block as unclaimed would emit it twice.
+            if let (Some(block), Some(recorded)) =
+                (document.blocks.get(*index), consumed_ranges.get(index))
+            {
+                let normalized = normalize_whitespace(&strip_callout_sentinels(&block.text));
+                let mut ranges = recorded.clone();
+                ranges.sort_unstable();
+                let mut cursor = 0usize;
+                for (start, end) in ranges {
+                    if start > cursor {
+                        let gap = normalized[cursor..start].trim();
+                        if gap.chars().any(char::is_alphanumeric) {
+                            unlinked.push(escape_footnote_text(gap));
+                        }
+                    }
+                    cursor = cursor.max(end);
+                }
+                if cursor < normalized.len() {
+                    let tail = normalized[cursor..].trim();
+                    if tail.chars().any(char::is_alphanumeric) {
+                        unlinked.push(escape_footnote_text(tail));
+                    }
                 }
             }
             let target = definitions
@@ -1116,21 +1150,29 @@ fn append_endnotes(writer: &mut MarkdownWriter, notes: &[String]) {
     }
 }
 
-/// The part of a note block that precedes its first *linked* note head.
+/// The byte range of `text` that [`note_text_for_marker`] turns into a
+/// definition, in the coordinates of the normalized text.
 ///
-/// [`numbered_note_heads`] only recognises markers that link into this block,
-/// so a block holding notes 15-20 where only 20 is linked yields a single head
-/// near its end. The definition then starts there and the text of notes 15-19 —
-/// most of the block — is written nowhere. Recovering it as an unlinked note
-/// keeps a linking failure from becoming a deletion.
-fn note_text_before_first_head(text: &str, block_markers: &[u16]) -> String {
-    let normalized = normalize_whitespace(&strip_callout_sentinels(text));
-    let heads = numbered_note_heads(&normalized, block_markers);
-    let Some((_, content_start)) = heads.first() else {
-        return String::new();
-    };
-    let head_start = note_head_start(&normalized, *content_start);
-    normalized[..head_start].trim().to_owned()
+/// Definitions are cut per marker, and the cuts are not guaranteed to tile the
+/// block: a marker already emitted from an earlier block is skipped, and text
+/// belonging to notes that never linked sits between the cuts. Reporting the
+/// consumed ranges lets the caller emit whatever is left instead of discarding
+/// it.
+fn note_range_for_marker(
+    normalized: &str,
+    marker: u16,
+    block_markers: &[u16],
+) -> Option<(usize, usize)> {
+    let heads = numbered_note_heads(normalized, block_markers);
+    let (head_index, (_, content_start)) = heads
+        .iter()
+        .enumerate()
+        .find(|(_, (found, _))| *found == marker)?;
+    let content_end = heads
+        .get(head_index + 1)
+        .map(|(_, start)| note_head_start(normalized, *start))
+        .unwrap_or(normalized.len());
+    Some((note_head_start(normalized, *content_start), content_end))
 }
 
 fn note_text_for_marker(text: &str, marker: u16, block_markers: &[u16]) -> String {
