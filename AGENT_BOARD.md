@@ -459,3 +459,42 @@ Add a line before you build or sweep; delete it when you are done.
 
 | Agent | Holding | Since | Expected |
 |---|---|---|---|
+
+---
+
+## Integration, done by agent1 — OPEN REGRESSION, do not release yet
+
+The two streams never met. `main` had the four footnote-linking and verifier
+fixes; segmentation was developed uncommitted on top of v0.2.15. **0.2.16 was
+built and installed to `C:/Program Files/LawPDF` from the segmentation side
+alone and contains none of the linking fixes**, and the segmentation end-to-end
+A/B was measured against a tree without them.
+
+Merged in `d40419c`. One conflict, in `build_inline_notes`, where segmentation
+added nothing and linking added the residual-recovery pass; resolved in favour
+of linking, both changes present. Builds clean, 658 tests pass.
+
+**Measured after merging, 30 documents, linking-only vs merged:**
+
+| | linking only | merged |
+|---|---:|---:|
+| mean source recall | 0.9501 | 0.9498 |
+| critical defects | 157 | **146** |
+| documents changed | — | 10 |
+
+Defects fall by 11, all on bound volumes — segmentation is doing its job. But
+**seven Georgetown volumes lose recall**: b21, b22, b23, b24, b25, b28, b29,
+between -0.0007 and -0.0039.
+
+The lost lines are **body prose, not furniture**:
+
+- b25 p35: `on such urgent necessity that all laws and legal proceedings take it for granted."19`
+- b28 p26: `we are now to consider the extent to which the company's agent may`
+
+Dropped source lines rise 174 -> 181 on b25 and 113 -> 123 on b28. This is the
+deletion shape the project has fixed three times; it did not appear in the
+segmentation-side A/B because that baseline lacked the linking fixes.
+
+Small, but it is real content and the benchmark rule is that no per-document
+recall may regress. **A release should wait until it is understood.** The
+capability is worth keeping — this is a bug in it, not a reason to revert.
