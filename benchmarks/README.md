@@ -56,6 +56,45 @@ unlinked notes section because too few body markers are detected.
 Top defects: 48 suspected fused paragraphs, 46 source-loss flags, 27 footnote
 definitions rendered as body text, 24 footnote sequence gaps.
 
+## Comparing two sweeps
+
+Use `tools/bench_compare.py`, not the raw defect totals:
+
+```
+python tools/bench_compare.py --before before.json --after after.json
+```
+
+It separates three things a single number conflates — coverage (how many
+documents got footnotes), fidelity (whether those footnotes are referenced from
+the body rather than orphaned), and **like-for-like defects**, restricted to
+documents that emit footnotes in *both* runs. That last subset is the only one
+where the footnote checks are active on both sides, so a rise there is a real
+regression rather than newly-visible damage. It exits non-zero on regression.
+
+## The footnote landing floor, measured
+
+The floor decides whether a document gets linked footnotes at all: below it,
+every pairing is discarded and the notes are dumped into an unlinked section.
+It was set at 0.75 on intuition. Measured on the 100-article sweep:
+
+| Floor | Documents with footnotes | Definitions | Like-for-like defects | Mean recall |
+|---|---:|---:|---:|---:|
+| 0.75 (original) | 54 | 6,402 | — | 83.9% |
+| 0.50 | 76 (+22) | 7,201 | **+0** | 83.6% |
+| **0.20 (current)** | **90 (+14)** | **7,374** | **+0** | 83.4% |
+
+**Both reductions are free.** Like-for-like defects are unchanged at each step
+— 218 → 218, then 377 → 377 — every newly emitted definition is referenced from
+the body, no document lost footnotes it previously had, and recall moves 0.5
+points across the whole range, which is noise.
+
+The reason it is free: an unmatched marker becomes *no* link, not a wrong one.
+What can attach a citation to the wrong sentence is an ambiguous match, and
+across all 14 documents recovered by the 0.20 floor there are **zero** ambiguous
+matches. That risk is gated separately and was never what the floor controlled.
+
+Eight documents still land below 0.20 and are correctly rejected.
+
 ## The 100-article sweep, and a warning about the defect count
 
 A 100-article sweep (10 per journal, same selection rules) is the larger
