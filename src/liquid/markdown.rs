@@ -1018,6 +1018,16 @@ fn build_inline_notes(
     let mut continuation_target: Option<(usize, usize)> = None;
     for index in note_indices {
         if emitted_note_blocks.contains(index) || author_notes.note_blocks.contains(index) {
+            // The definition for this block began at its first linked note
+            // head; anything printed before that head belongs to earlier notes
+            // that never linked, and would otherwise be dropped.
+            if let Some(block) = document.blocks.get(*index) {
+                let markers = markers_by_note.get(index).map(Vec::as_slice).unwrap_or(&[]);
+                let prefix = note_text_before_first_head(&block.text, markers);
+                if prefix.chars().any(char::is_alphanumeric) {
+                    unlinked.push(escape_footnote_text(&prefix));
+                }
+            }
             let target = definitions
                 .iter()
                 .enumerate()
@@ -1104,6 +1114,23 @@ fn append_endnotes(writer: &mut MarkdownWriter, notes: &[String]) {
     for note in notes {
         writer.push(note.clone(), BlockJoin::Loose);
     }
+}
+
+/// The part of a note block that precedes its first *linked* note head.
+///
+/// [`numbered_note_heads`] only recognises markers that link into this block,
+/// so a block holding notes 15-20 where only 20 is linked yields a single head
+/// near its end. The definition then starts there and the text of notes 15-19 —
+/// most of the block — is written nowhere. Recovering it as an unlinked note
+/// keeps a linking failure from becoming a deletion.
+fn note_text_before_first_head(text: &str, block_markers: &[u16]) -> String {
+    let normalized = normalize_whitespace(&strip_callout_sentinels(text));
+    let heads = numbered_note_heads(&normalized, block_markers);
+    let Some((_, content_start)) = heads.first() else {
+        return String::new();
+    };
+    let head_start = note_head_start(&normalized, *content_start);
+    normalized[..head_start].trim().to_owned()
 }
 
 fn note_text_for_marker(text: &str, marker: u16, block_markers: &[u16]) -> String {
