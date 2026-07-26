@@ -162,3 +162,41 @@ is roughly 95%, and the defect budget worth targeting is the 86% attributable to
 missing structure. Track both with `tools/bench_compare.py`, which judges
 content-recovering changes on defect *rate* and fails on any per-document recall
 regression.
+
+
+## Outcome, measured
+
+**C shipped in v0.2.15.** Classification no longer deletes: rejected lines
+become `Noise` blocks that reach the generator, which drops only what an
+explicit furniture test recognises — repeated running heads, bare folios,
+contents leaders, printed rules — and rescues anything else of 20 words or
+more.
+
+| | Mean recall | Worst | Words dropped | Defects / 10k words |
+|---|---:|---:|---:|---:|
+| v0.2.14 | 90.9% | 42.0% | 174,076 | 5.83 |
+| **v0.2.15** | **94.5%** | **82.2%** | **93,177** | **5.62** |
+
+68 documents improved, one regressed by 0.016. Defect *rate* fell while 80,899
+words were recovered.
+
+The length floor is the whole story of the tuning. Rescuing everything the
+classifier rejected reached 96.9% recall but drove the defect rate from 5.83 to
+9.63, because furniture is short and prose is long, and no pattern separated
+them as cleanly as length did. That is the honest limit of a hand-written
+discriminator, and it is the argument for A: deciding what to delete is a
+modelling problem, not a rule.
+
+**B was implemented and removed.** A longest-ascending-subsequence constraint
+over candidate note numbers, re-segmenting definitions so the sequence ascends
+globally rather than line by line. It fired on zero of 100 documents, because
+the local guards it was meant to replace already filter the same candidates
+upstream. The structural win is available but requires deleting those guards in
+the same change and re-measuring; it was not attempted here. The code is in the
+history at the commit that adds this section.
+
+**A was scoped, not built.** Its blocking question — whether boundary labels can
+be derived without human annotation — is answered yes: `indent_vs_body` is
+already computed and populated (nonzero on 40% of body lines, 60% of headings),
+and `doc_note_marker` gives footnote starts. Labels can be bootstrapped from
+geometry and checked against the invariants offline before any training.

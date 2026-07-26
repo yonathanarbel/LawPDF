@@ -8379,10 +8379,20 @@ fn build_lm2_blocks_with_grouping(
                 }
                 current_last_line = None;
                 current_group_index = None;
+                continue;
             }
-            continue;
+            // Otherwise fall through as Noise rather than dropping the line.
+            // Classification used to delete here, with nothing downstream able
+            // to reach the text again; on a 1926 volume that removed 1,088
+            // lines, a fifth of the article. Deletion is now an explicit
+            // decision the generator makes about furniture, where it can be
+            // seen and measured.
         }
-        let role = role_for_decoded_line(line, *action, blocks.is_empty());
+        let role = if *action == Lm2Action::HideNoise {
+            LiquidBlockRole::Noise
+        } else {
+            role_for_decoded_line(line, *action, blocks.is_empty())
+        };
         if lm2_should_attach_standalone_marker_to_current_block(
             current_role,
             role,
@@ -15577,8 +15587,11 @@ mod tests {
 
         let (_title, blocks, sources) = build_lm2_blocks("Fallback", &decoded);
 
-        assert!(blocks.is_empty());
-        assert!(sources.is_empty());
+        // Furniture is routed to Noise, not deleted: the generator decides
+        // what to drop, where the decision can be seen and measured.
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Noise);
+        assert_eq!(sources.len(), 1);
     }
 
     #[test]

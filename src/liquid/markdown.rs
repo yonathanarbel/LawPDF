@@ -11,6 +11,15 @@ const MARKDOWN_MARKER_START: char = '\u{E100}';
 const MARKDOWN_MARKER_END: char = '\u{E101}';
 /// Consecutive dash-like glyphs that mark a printed footnote separator rule.
 const FOOTNOTE_SEPARATOR_MIN_RUN: usize = 24;
+/// A rejected line repeating at least this often, and no longer than
+/// [`FURNITURE_MAX_WORDS`], is a running head or folio rather than prose.
+const FURNITURE_MIN_REPEATS: usize = 3;
+const FURNITURE_MAX_WORDS: usize = 14;
+/// Words a rejected block needs before it is rescued as prose rather than
+/// left out as furniture.
+const RESCUED_NOISE_MIN_WORDS: usize = 20;
+/// Longest all-digit line still treated as a folio or accession stamp.
+const MAX_BARE_NUMBER_LEN: usize = 12;
 /// Below this share of markers matched to a note, the document is probably
 /// being misread rather than merely under-linked, so fall back to endnotes.
 ///
@@ -187,6 +196,10 @@ pub fn liquid_document_markdown(
     let mut last_special_section = None;
     let mut omitted_footnote_separator_fragments = 0usize;
     let mut omitted_footnote_separator_rules = 0usize;
+    let mut discarded_furniture = 0usize;
+    // Running heads and folios repeat on every page; body text does not. This
+    // is what separates furniture from content the classifier merely disliked.
+    let repeated_noise = repeated_noise_texts(document);
     for (index, block) in document.blocks.iter().enumerate() {
         if matches!(
             block.role,
@@ -347,12 +360,38 @@ pub fn liquid_document_markdown(
                 last_special_section = None;
                 true
             }
+            // Text the classifier rejected. Furniture is dropped, deliberately
+            // and by an explicit test; anything else is kept, because a role
+            // decision should not silently destroy content.
+            LiquidBlockRole::Noise => {
+                let text = normalize_whitespace(&strip_callout_sentinels(raw_text));
+                // Only substantial prose is worth rescuing. Furniture is
+                // short by nature -- folios, running heads, contents lines --
+                // and a length floor separates the two far more reliably than
+                // any pattern, at the cost of leaving short stray lines out.
+                let words = text.split_whitespace().count();
+                if text.is_empty()
+                    || words < RESCUED_NOISE_MIN_WORDS
+                    || is_discardable_furniture(&text, &repeated_noise)
+                {
+                    discarded_furniture += 1;
+                    false
+                } else {
+                    let body = normalize_and_escape_body(raw_text);
+                    if body.is_empty() {
+                        false
+                    } else {
+                        writer.push(body, BlockJoin::Loose);
+                        last_special_section = None;
+                        true
+                    }
+                }
+            }
             LiquidBlockRole::Footnote
             | LiquidBlockRole::Marginalia
             | LiquidBlockRole::Header
             | LiquidBlockRole::Footer
             | LiquidBlockRole::Contents
-            | LiquidBlockRole::Noise
             | LiquidBlockRole::Table
             | LiquidBlockRole::Metadata
             | LiquidBlockRole::Title
@@ -365,6 +404,11 @@ pub fn liquid_document_markdown(
     if omitted_footnote_separator_fragments > 0 {
         warnings.push(format!(
             "omitted {omitted_footnote_separator_fragments} standalone footnote-separator rule(s) from the article body"
+        ));
+    }
+    if discarded_furniture > 0 {
+        warnings.push(format!(
+            "dropped {discarded_furniture} block(s) of page furniture such as running heads and folios"
         ));
     }
     if omitted_footnote_separator_rules > 0 {
@@ -1163,10 +1207,14 @@ fn leading_symbol_note(text: &str) -> Option<(String, String)> {
 /// for text whose role is uncertain: visible to the reader, out of the body
 /// flow, and not silently destroyed.
 fn is_note_candidate(role: LiquidBlockRole, _text: &str, _linked: bool) -> bool {
-    matches!(
-        role,
-        LiquidBlockRole::Footnote | LiquidBlockRole::Marginalia
-    )
+    match role {
+        LiquidBlockRole::Footnote | LiquidBlockRole::Marginalia => true,
+        // Rejected text that opens with a note number is footnote material the
+        // classifier mislabelled. It belongs with the notes, not loose in the
+        // body where it reads as a numbered fragment interrupting the prose.
+        LiquidBlockRole::Noise => false,
+        _ => false,
+    }
 }
 
 fn resolved_title(document: &LiquidDocument) -> Option<String> {
@@ -1252,6 +1300,61 @@ fn reads_like_heading(text: &str) -> bool {
         return false;
     }
     true
+}
+
+/// Normalised texts that appear on enough pages to be page furniture.
+fn repeated_noise_texts(document: &LiquidDocument) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for block in &document.blocks {
+        if block.role != LiquidBlockRole::Noise {
+            continue;
+        }
+        let key = normalize_whitespace(&strip_callout_sentinels(&block.text)).to_lowercase();
+        if !key.is_empty() {
+            *counts.entry(key).or_insert(0usize) += 1;
+        }
+    }
+    counts
+}
+
+/// Whether a rejected line is page furniture rather than content.
+///
+/// Deliberately narrow. Everything it does not recognise is kept, because the
+/// cost of keeping a stray running head is one noisy line, while the cost of
+/// dropping a paragraph is a hole nothing downstream can repair.
+fn is_discardable_furniture(text: &str, repeated: &BTreeMap<String, usize>) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    // A bare folio, optionally bracketed.
+    // A bare number on its own line: a folio, a volume year, or a scanner's
+    // accession stamp. Prose does not consist solely of digits.
+    let folio = trimmed.trim_matches(|ch: char| matches!(ch, '[' | ']' | '(' | ')' | '.'));
+    if !folio.is_empty()
+        && folio.len() <= MAX_BARE_NUMBER_LEN
+        && folio.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return true;
+    }
+    // Repeats across pages and is short enough to be a running head.
+    let words = trimmed.split_whitespace().count();
+    if words <= FURNITURE_MAX_WORDS
+        && repeated
+            .get(&trimmed.to_lowercase())
+            .is_some_and(|count| *count >= FURNITURE_MIN_REPEATS)
+    {
+        return true;
+    }
+    // A table-of-contents entry: title, a run of dot leaders, a page number.
+    if trimmed.contains("..") && trimmed.ends_with(|ch: char| ch.is_ascii_digit()) {
+        return true;
+    }
+    // A printed rule.
+    trimmed.chars().count() >= 6
+        && trimmed
+            .chars()
+            .all(|ch| matches!(ch, '-' | '_' | ' ') || ('\u{2010}'..='\u{2015}').contains(&ch))
 }
 
 fn normalize_heading_text(text: &str) -> String {
