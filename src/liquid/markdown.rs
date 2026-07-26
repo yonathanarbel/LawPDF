@@ -1148,12 +1148,25 @@ fn leading_symbol_note(text: &str) -> Option<(String, String)> {
     (!rest.is_empty()).then(|| (marker.to_string(), escape_footnote_text(rest)))
 }
 
-fn is_note_candidate(role: LiquidBlockRole, text: &str, linked: bool) -> bool {
-    role == LiquidBlockRole::Footnote
-        || (role == LiquidBlockRole::Marginalia
-            && (linked
-                || leading_numeric_note_marker(text).is_some()
-                || leading_symbol_note(text).is_some()))
+/// Whether a block's text belongs in the notes apparatus.
+///
+/// Every marginalia block qualifies, because the alternative is deletion.
+/// Marginalia is skipped by the body loop, so a block that is not a note
+/// candidate appears nowhere at all — and the requirement used to be a link or
+/// a recognisable leading note number. On one 1941 volume that discarded 157
+/// of 171 marginalia blocks, 27,297 words, including plainly readable body
+/// prose that the classifier had merely mislabelled.
+///
+/// A footnote's continuation lines do not repeat its number, so they never met
+/// the old test either. `build_inline_notes` reattaches those to the
+/// definition above them and lists whatever is left, which is the right place
+/// for text whose role is uncertain: visible to the reader, out of the body
+/// flow, and not silently destroyed.
+fn is_note_candidate(role: LiquidBlockRole, _text: &str, _linked: bool) -> bool {
+    matches!(
+        role,
+        LiquidBlockRole::Footnote | LiquidBlockRole::Marginalia
+    )
 }
 
 fn resolved_title(document: &LiquidDocument) -> Option<String> {

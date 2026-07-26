@@ -29,6 +29,11 @@ from collections import Counter
 from pathlib import Path
 
 
+# Defects per 10k words may drift slightly without meaning anything; this is
+# how much drift counts as noise rather than regression.
+DENSITY_TOLERANCE = 0.5
+
+
 def load(path: Path) -> dict[str, dict]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     return {
@@ -101,6 +106,21 @@ def main(argv: list[str]) -> int:
         if delta:
             print(f"    {kind:<38} {b_common[kind]:>5} -> {a_common[kind]:<5} {delta:+d}")
 
+    # Even like-for-like, the raw count assumes the two runs emit the same
+    # amount of text. A change that recovers content brings that content's
+    # defects with it, so compare defects per unit of text actually emitted.
+    def words(runs: dict[str, dict]) -> int:
+        return sum(runs[k]["stats"].get("body_words") or 0 for k in common)
+
+    b_words, a_words = words(before), words(after)
+    b_density = 10_000 * b_total / max(1, b_words)
+    a_density = 10_000 * a_total / max(1, a_words)
+    print(f"\n  body words in those documents  {b_words:>8} -> {a_words:<8} ({a_words - b_words:+d})")
+    print(
+        f"  defects per 10k words          {b_density:>8.2f} -> {a_density:<8.2f} "
+        f"({a_density - b_density:+.2f})"
+    )
+
     newly = [k for k in shared if not emits(before[k]) and emits(after[k])]
     if newly:
         defs = sum(after[k]["stats"].get("footnote_definitions") or 0 for k in newly)
@@ -114,8 +134,32 @@ def main(argv: list[str]) -> int:
         for key in lost:
             print(f"    {key}")
 
-    ok = (a_total - b_total) <= args.max_regression and not lost
-    print(f"\nverdict: {'quality preserved' if ok else 'REGRESSION'}")
+    regressed_recall = [
+        k
+        for k in shared
+        if "source_recall" in before[k]["stats"]
+        and "source_recall" in after[k]["stats"]
+        and after[k]["stats"]["source_recall"]
+        < before[k]["stats"]["source_recall"] - 0.005
+    ]
+    if regressed_recall:
+        print(f"\nRECALL REGRESSED on {len(regressed_recall)} documents:")
+        for key in regressed_recall[:10]:
+            print(f"    {key}")
+
+    # A change that recovers text raises the absolute defect count by bringing
+    # that text's defects with it — deleting the text scored better, which is
+    # exactly backwards. So when more content is emitted and nothing regressed,
+    # judge on the defect *rate* instead of the count.
+    recovered = a_words > b_words and a_recall >= b_recall - 0.002
+    ok = not lost and not regressed_recall
+    if recovered:
+        ok = ok and a_density <= b_density + DENSITY_TOLERANCE
+        basis = "content recovered; judged on defect rate"
+    else:
+        ok = ok and (a_total - b_total) <= args.max_regression
+        basis = "content flat; judged on defect count"
+    print(f"\nverdict: {'quality preserved' if ok else 'REGRESSION'}  ({basis})")
     return 0 if ok else 1
 
 

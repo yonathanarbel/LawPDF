@@ -71,6 +71,32 @@ documents that emit footnotes in *both* runs. That last subset is the only one
 where the footnote checks are active on both sides, so a rise there is a real
 regression rather than newly-visible damage. It exits non-zero on regression.
 
+## Marginalia was being deleted
+
+The largest single loss found so far, and the reason old volumes scored so
+badly. Marginalia blocks are skipped by the generator's body loop, so a block
+that did not qualify as a note candidate appeared nowhere at all. Qualifying
+required a footnote link or a recognisable leading note number, which a
+footnote's continuation lines never have.
+
+On one 1941 Georgetown volume that discarded **157 of 171 marginalia blocks,
+27,297 words** — including plain body prose the classifier had merely
+mislabelled, such as "Martial Law is the law of necessity in national
+emergency". Routing all marginalia into the notes apparatus instead:
+
+| | Mean source recall | Worst | Tokens dropped | Clean documents |
+|---|---:|---:|---:|---:|
+| Before | 83.4% | 25.3% | 404,332 | 0 |
+| **After** | **90.9%** | **42.0%** | **174,076** | **1** |
+
+**230,256 words recovered, 57% of all the missing text.** 79 documents
+improved, none regressed, and no duplication. Defect *rate* fell from 6.48 to
+6.04 per 10k words even as the absolute count rose, because recovered text
+brings its own defects with it.
+
+Two documents show what changed: Georgetown 1941 went from 0.42 to 0.87 recall,
+the Oregon catalog from 0.25 to 0.43.
+
 ## The footnote landing floor, measured
 
 The floor decides whether a document gets linked footnotes at all: below it,
@@ -83,10 +109,20 @@ It was set at 0.75 on intuition. Measured on the 100-article sweep:
 | 0.50 | 76 (+22) | 7,201 | **+0** | 83.6% |
 | **0.20 (current)** | **90 (+14)** | **7,374** | **+0** | 83.4% |
 
-**Both reductions are free.** Like-for-like defects are unchanged at each step
-— 218 → 218, then 377 → 377 — every newly emitted definition is referenced from
-the body, no document lost footnotes it previously had, and recall moves 0.5
-points across the whole range, which is noise.
+Like-for-like defects are unchanged at each step — 218 → 218, then 377 → 377 —
+and every newly emitted definition is referenced from the body.
+
+**The 0.20 step was not free, and the first measurement missed it.** Checking
+only footnote emission showed no regression; checking per-document *recall*
+showed six documents losing text, worst −0.114. The cause was the marginalia
+deletion above: switching a document from the unlinked fallback into linked
+mode meant its unmatched notes were dropped rather than listed. With that bug
+fixed, five of the six recover and one remains, St. John's vol. 14, trading
+0.02 recall for eleven working footnotes.
+
+The lesson is in `tools/bench_compare.py`, which now fails on any per-document
+recall regression. Measuring the dimension a change was *aimed at* is not the
+same as measuring whether it did harm.
 
 The reason it is free: an unmatched marker becomes *no* link, not a wrong one.
 What can attach a citation to the wrong sentence is an ambiguous match, and
