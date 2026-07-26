@@ -55,6 +55,8 @@ pub use markdown::{FootnoteMode, MarkdownOptions, liquid_document_markdown};
 use model::LlmProvider;
 #[allow(unused_imports)]
 pub use model::{
+    ArticleBoundaryEvidence,
+    ArticleSpan,
     DeepLiquidConfig,
     DeepLiquidSourceLine,
     // Public API (stable surface for app.rs + callers)
@@ -296,6 +298,7 @@ pub fn prepare_liquid_document(request: LiquidRequest) -> Result<LiquidDocument,
     let mut document = LiquidDocument {
         title: display_title,
         blocks,
+        article_spans: Vec::new(),
         block_source_lines,
         footnote_links: Vec::new(),
         footnote_link_integrity: None,
@@ -394,6 +397,7 @@ fn title_only_document(
             text: title.clone(),
             label: None,
         }],
+        article_spans: Vec::new(),
         block_source_lines: Vec::new(),
         footnote_links: Vec::new(),
         footnote_link_integrity: None,

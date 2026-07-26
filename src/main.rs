@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod article_segments;
 #[cfg(feature = "devtools")]
 mod benchmark;
 mod chat;
@@ -161,6 +162,10 @@ const DEV_COMMANDS: &[DevCommand] = &[
         handler: dev_smoke_liquid,
     },
     DevCommand {
+        flags: &["--segment-smoke-report"],
+        handler: dev_segment_smoke_report,
+    },
+    DevCommand {
         flags: &["--lm2-assemble-markdown"],
         handler: dev_lm2_assemble_markdown,
     },
@@ -247,6 +252,11 @@ fn dev_bench_scroll(args: Vec<OsString>) -> Result<(), String> {
 #[cfg(feature = "devtools")]
 fn dev_smoke_liquid(args: Vec<OsString>) -> Result<(), String> {
     liquid_smoke::run_liquid_smoke(args.into_iter()).map_err(|error| format!("{error:#}"))
+}
+
+#[cfg(feature = "devtools")]
+fn dev_segment_smoke_report(args: Vec<OsString>) -> Result<(), String> {
+    liquid_smoke::run_article_segment_report(args.into_iter()).map_err(|error| format!("{error:#}"))
 }
 
 #[cfg(feature = "devtools")]

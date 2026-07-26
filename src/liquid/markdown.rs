@@ -121,13 +121,14 @@ pub fn liquid_document_markdown(
             // below already catches. Gating on landing alone discarded 416
             // correct links in one held-out article because 51 of its 468
             // markers had no matching note.
-            let integrity_is_usable = document
-                .footnote_link_integrity
-                .as_ref()
-                .is_some_and(|integrity| {
-                    integrity.landing_rate >= MIN_FOOTNOTE_LANDING_RATE
-                        && integrity.ambiguous_rate <= MAX_FOOTNOTE_AMBIGUOUS_RATE
-                });
+            let integrity_is_usable =
+                document
+                    .footnote_link_integrity
+                    .as_ref()
+                    .is_some_and(|integrity| {
+                        integrity.landing_rate >= MIN_FOOTNOTE_LANDING_RATE
+                            && integrity.ambiguous_rate <= MAX_FOOTNOTE_AMBIGUOUS_RATE
+                    });
             if !integrity_is_usable {
                 warnings.push(LOW_LINK_CONFIDENCE_WARNING.to_owned());
                 false
@@ -419,13 +420,7 @@ pub fn liquid_document_markdown(
 
     let footnote_count = match options.footnotes {
         FootnoteMode::Inline if footnotes_inlined => {
-            let notes = build_inline_notes(
-                document,
-                &note_indices,
-                &linked_note_indices,
-                author_notes,
-                &mut warnings,
-            );
+            let notes = build_inline_notes(document, &note_indices, author_notes, &mut warnings);
             append_inline_notes(&mut writer, &notes);
             notes.definitions.len() + notes.unlinked.len()
         }
@@ -936,7 +931,6 @@ struct FootnoteDefinition {
 fn build_inline_notes(
     document: &LiquidDocument,
     note_indices: &[usize],
-    linked_note_indices: &BTreeSet<usize>,
     author_notes: AuthorNotes,
     warnings: &mut Vec<String>,
 ) -> InlineNotes {
@@ -962,8 +956,22 @@ fn build_inline_notes(
         markers.dedup();
     }
 
+    // Diagnostic only. A repeated marker is normally a second body reference to
+    // the same note, which the dedup below is meant to collapse. It is a
+    // deletion only when the repeat points at a *different* note block, which is
+    // what a bound volume produces when each article restarts numbering at 1.
+    let mut block_for_label = BTreeMap::<String, usize>::new();
+    let mut dropped_distinct_notes = 0usize;
+
     for link in links {
         let label = link.marker.to_string();
+        match block_for_label.get(&label) {
+            Some(seen) if *seen != link.note_block_index => dropped_distinct_notes += 1,
+            None => {
+                block_for_label.insert(label.clone(), link.note_block_index);
+            }
+            _ => {}
+        }
         if !seen_labels.insert(label.clone()) {
             continue;
         }
@@ -997,10 +1005,19 @@ fn build_inline_notes(
     }
     definitions.sort_by_key(|definition| definition.note_index);
 
+    // A block that was linked but never emitted a definition — because another
+    // block claimed its marker first — must still reach the reader. Skipping on
+    // `linked_note_indices` below would drop it from the unlinked pass too, and
+    // its text would be written nowhere at all.
+    let emitted_note_blocks = definitions
+        .iter()
+        .map(|definition| definition.note_index)
+        .collect::<BTreeSet<_>>();
+
     let mut unlinked = Vec::new();
     let mut continuation_target: Option<(usize, usize)> = None;
     for index in note_indices {
-        if linked_note_indices.contains(index) || author_notes.note_blocks.contains(index) {
+        if emitted_note_blocks.contains(index) || author_notes.note_blocks.contains(index) {
             let target = definitions
                 .iter()
                 .enumerate()
@@ -1034,6 +1051,12 @@ fn build_inline_notes(
         }
         unlinked.push(escape_footnote_text(&text));
         continuation_target = None;
+    }
+
+    if dropped_distinct_notes > 0 {
+        warnings.push(format!(
+            "{dropped_distinct_notes} note(s) shared a marker number with a different note; they are listed without links rather than dropped"
+        ));
     }
 
     InlineNotes {
@@ -1494,6 +1517,7 @@ mod tests {
     fn document(blocks: Vec<LiquidBlock>) -> LiquidDocument {
         LiquidDocument {
             title: "Test Article".to_owned(),
+            article_spans: Vec::new(),
             blocks,
             block_source_lines: Vec::new(),
             footnote_links: Vec::new(),
@@ -1881,10 +1905,9 @@ mod tests {
         assert!(!export.text.contains(&separator));
         assert!(export.text.contains("Following paragraph."));
         assert!(
-            export
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("stripped a leading footnote-separator rule from 1"))
+            export.warnings.iter().any(
+                |warning| warning.contains("stripped a leading footnote-separator rule from 1")
+            )
         );
     }
 

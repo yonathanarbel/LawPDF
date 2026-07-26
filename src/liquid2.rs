@@ -14,12 +14,16 @@ use crossbeam_channel::Sender;
 use libloading::Library;
 use serde::{Deserialize, Serialize};
 
+use crate::article_segments::{
+    ArticleBoundaryCandidateTrace, ArticleSegmentationLine, detect_article_spans,
+    detect_article_spans_with_trace,
+};
 use crate::hashing::sha256_hex_of_file;
 use crate::layout_roles::{CALLOUT_END, CALLOUT_START};
 use crate::liquid::{
-    DeepLiquidSourceLine, DocumentProfileKind, DocumentProfileScore, LiquidBlock, LiquidBlockRole,
-    LiquidBlockSourceLines, LiquidDocument, LiquidSourceLineRef, attach_footnote_links,
-    should_preserve_terminal_hyphen,
+    ArticleSpan, DeepLiquidSourceLine, DocumentProfileKind, DocumentProfileScore, LiquidBlock,
+    LiquidBlockRole, LiquidBlockSourceLines, LiquidDocument, LiquidSourceLineRef,
+    attach_footnote_links, should_preserve_terminal_hyphen,
 };
 use crate::liquidvision::{fill_document_features, liquidvision_enabled};
 use crate::pdf_backend::PdfEngine;
@@ -31,8 +35,7 @@ pub use fast_cache::load_fast_cached_liquid_mode2_document;
 pub(crate) use fast_cache::save_fast_cached_lm2_document;
 pub use runtime_status::run_lm2_runtime_status;
 
-const LM2_SCHEMA_VERSION: &str =
-    "liquidmode2-native-catboost-default-v6-runtime-lv-fill-multimarker-note-links-no-stack";
+const LM2_SCHEMA_VERSION: &str = "liquidmode2-native-catboost-default-v8-line-article-segmentation";
 const LM2_D1_RUNTIME_ZEROSPEND_OVERLAY_VERSION: &str = "d1-zerospend-v3-no-ibid";
 const LM2_D1_RUNTIME_POSTCUE_CITATION_NEXT1_OVERLAY_VERSION: &str =
     "d1-postcue-citation-next1-v2-narrow-cue";
@@ -173,9 +176,8 @@ const LM2_NATIVE_CATBOOST_FLOAT_FEATURES: [&str; 116] = [
     "liquidvision_routes_marginalia",
     "liquidvision_keep_veto",
 ];
-/// How far a note number may step backwards before the line is read as
-/// something other than a new note head.
-const NOTE_NUMBER_BACKWARD_TOLERANCE: u16 = 10;
+/// Fewer candidate note heads than this and the sequence says nothing.
+const NOTE_SEQUENCE_MIN_CANDIDATES: usize = 8;
 const LM2_NATIVE_CATBOOST_CAT_FEATURES: [&str; 14] = [
     "page_zone_y",
     "page_zone_x",
@@ -2276,6 +2278,7 @@ pub fn prepare_liquid_mode2_document_with_timing(
         let document = LiquidDocument {
             title: request.title,
             blocks: Vec::new(),
+            article_spans: Vec::new(),
             block_source_lines: Vec::new(),
             footnote_links: Vec::new(),
             footnote_link_integrity: None,
@@ -2380,6 +2383,7 @@ pub fn prepare_liquid_mode2_document_with_timing(
     if !native_catboost_no_stack {
         apply_page_label_furniture_guard(&mut decoded);
     }
+    let article_spans = detect_lm2_article_spans(&decoded, request.pages.len());
     timing.overlay_decode_ms = overlay_started.elapsed().as_secs_f64() * 1000.0;
 
     let assembly_started = Instant::now();
@@ -2400,7 +2404,7 @@ pub fn prepare_liquid_mode2_document_with_timing(
         None
     };
     let (title, mut blocks, mut block_source_lines) =
-        build_lm2_blocks_with_grouping(&request.title, &decoded, grouping.as_ref());
+        build_lm2_blocks_with_grouping(&request.title, &decoded, grouping.as_ref(), &article_spans);
     if runtime.action_neutral_blocksplit {
         apply_action_neutral_blocksplit(&mut blocks, &mut block_source_lines, &decoded);
     }
@@ -2538,6 +2542,12 @@ pub fn prepare_liquid_mode2_document_with_timing(
     if runtime.pp_footnote_region_membership {
         warnings.push("EXP-075 PP footnote-region membership override is enabled.".to_owned());
     }
+    if article_spans.len() > 1 {
+        warnings.push(format!(
+            "Detected {} article spans in this PDF.",
+            article_spans.len()
+        ));
+    }
     warnings.extend(pp_runtime_warnings);
     warnings.extend(liquidvision_runtime_warnings);
     if let Some(grouping) = &grouping {
@@ -2555,6 +2565,7 @@ pub fn prepare_liquid_mode2_document_with_timing(
     let mut document = LiquidDocument {
         title,
         blocks,
+        article_spans,
         block_source_lines,
         footnote_links: Vec::new(),
         footnote_link_integrity: None,
@@ -2574,6 +2585,71 @@ pub fn prepare_liquid_mode2_document_with_timing(
     timing.assembly_ms = assembly_started.elapsed().as_secs_f64() * 1000.0;
     timing.total_ms = total_started.elapsed().as_secs_f64() * 1000.0;
     Ok((document, timing))
+}
+
+fn detect_lm2_article_spans(
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+    page_count: usize,
+) -> Vec<crate::liquid::ArticleSpan> {
+    let lines = decoded
+        .iter()
+        .map(|(line, action)| ArticleSegmentationLine {
+            page_index: line.page_index,
+            line_index: line.line_index,
+            text: line.text.clone(),
+            font_ratio_page: line.font_ratio_page,
+            font_ratio_doc: line.font_ratio_doc,
+            margin_centered: line.margin_centered,
+            line_width_ratio: line.line_width_ratio,
+            top: line.top,
+            page_height: line.page_height,
+            repeated_edge_text: line.doc_repeated_edge_text,
+            toc_like: line.segment_block_toc_like,
+            note_marker: note_head_marker(&line.text)
+                .or((line.doc_note_marker > 0).then_some(line.doc_note_marker)),
+            // Boundary evidence must not depend solely on the final emission
+            // action. The old scans that most need article scoping are also
+            // the documents where note lines are commonly misclassified.
+            marginalia: *action == Lm2Action::Marginalia
+                || line.doc_footnote_state
+                || line.in_footnote_zone
+                || line.below_footnote_divider
+                || line.segment_block_footnote_like,
+        })
+        .collect::<Vec<_>>();
+    detect_article_spans(&lines, page_count)
+}
+
+pub(crate) fn trace_article_spans_from_source_lines(
+    source_lines: &[DeepLiquidSourceLine],
+    page_count: usize,
+) -> (
+    Vec<crate::liquid::ArticleSpan>,
+    Vec<ArticleBoundaryCandidateTrace>,
+) {
+    let lines = source_lines
+        .iter()
+        .map(|line| ArticleSegmentationLine {
+            page_index: line.page_index,
+            line_index: line.line_index,
+            text: line.text.clone(),
+            font_ratio_page: line.font_ratio_page,
+            font_ratio_doc: line.font_ratio_doc,
+            margin_centered: line.margin_centered,
+            line_width_ratio: line.line_width_ratio,
+            top: line.top,
+            page_height: line.page_height,
+            repeated_edge_text: line.doc_repeated_edge_text,
+            toc_like: line.segment_block_toc_like,
+            note_marker: note_head_marker(&line.text)
+                .or((line.doc_note_marker > 0).then_some(line.doc_note_marker)),
+            marginalia: line.doc_footnote_state
+                || line.in_footnote_zone
+                || line.below_footnote_divider
+                || line.segment_block_footnote_like,
+        })
+        .collect::<Vec<_>>();
+    detect_article_spans_with_trace(&lines, page_count)
 }
 
 impl Lm2Runtime {
@@ -2919,7 +2995,14 @@ fn lm2_context_onehot(features: &mut Vec<f64>, action: Option<Lm2Action>) {
 fn lm2_context_block_meta(
     decoded: &[(DeepLiquidSourceLine, Lm2Action)],
 ) -> HashMap<String, Lm2ContextBlockMeta> {
-    let (_, _, block_source_lines) = build_lm2_blocks_with_grouping("", decoded, None);
+    let page_count = decoded
+        .iter()
+        .map(|(line, _)| line.page_index)
+        .max()
+        .map_or(0, |page| page + 1);
+    let article_spans = detect_lm2_article_spans(decoded, page_count);
+    let (_, _, block_source_lines) =
+        build_lm2_blocks_with_grouping("", decoded, None, &article_spans);
     let lines_by_id = decoded
         .iter()
         .map(|(line, _)| (line.id.clone(), line))
@@ -8286,13 +8369,14 @@ fn build_lm2_blocks(
     fallback_title: &str,
     decoded: &[(DeepLiquidSourceLine, Lm2Action)],
 ) -> (String, Vec<LiquidBlock>, Vec<LiquidBlockSourceLines>) {
-    build_lm2_blocks_with_grouping(fallback_title, decoded, None)
+    build_lm2_blocks_with_grouping(fallback_title, decoded, None, &[])
 }
 
 fn build_lm2_blocks_with_grouping(
     fallback_title: &str,
     decoded: &[(DeepLiquidSourceLine, Lm2Action)],
     grouping: Option<&Lm2PymupdfGroupingResponse>,
+    article_spans: &[ArticleSpan],
 ) -> (String, Vec<LiquidBlock>, Vec<LiquidBlockSourceLines>) {
     let mut blocks = Vec::new();
     let mut sources = Vec::new();
@@ -8312,11 +8396,9 @@ fn build_lm2_blocks_with_grouping(
     let mut current_refs = Vec::new();
     let mut current_role = LiquidBlockRole::Paragraph;
     let mut current_last_line: Option<DeepLiquidSourceLine> = None;
+    let note_start_ids = note_start_line_ids(decoded, article_spans);
     let line_group_index = grouping_line_group_index(grouping);
     let mut current_group_index: Option<usize> = None;
-    // Note numbers run upward through an article. Tracking the current one
-    // lets a numbered list inside a footnote be told from a real note head.
-    let mut current_note_number: Option<u16> = None;
 
     if let Some(recovered) = &recovered_title {
         for (index, line) in recovered.lines.iter().enumerate() {
@@ -8407,13 +8489,10 @@ fn build_lm2_blocks_with_grouping(
             role,
             LiquidBlockRole::Title | LiquidBlockRole::Heading | LiquidBlockRole::Subheading
         );
-        let candidate_note_number = note_head_marker(&line.text);
         let starts_new_note = current_role == LiquidBlockRole::Marginalia
             && role == LiquidBlockRole::Marginalia
             && !current_text.is_empty()
-            && looks_like_marginalia_note_block_start(&line.text)
-            && !looks_like_citation_continuation(&line.text)
-            && !breaks_note_monotonicity(current_note_number, candidate_note_number);
+            && note_start_ids.contains(&line.id);
         let starts_new_paragraph = current_role == LiquidBlockRole::Paragraph
             && role == LiquidBlockRole::Paragraph
             && current_last_line.as_ref().is_some_and(|previous| {
@@ -8444,12 +8523,6 @@ fn build_lm2_blocks_with_grouping(
             );
             current_role = role;
             current_group_index = line_group_index.get(&line.id).copied();
-        }
-        if starts_new_note || current_role != LiquidBlockRole::Marginalia {
-            current_note_number = candidate_note_number;
-        } else if let Some(number) = candidate_note_number.filter(|_| current_note_number.is_none())
-        {
-            current_note_number = Some(number);
         }
         append_line(&mut current_text, &line.text);
         current_refs.push(line_ref(line, role));
@@ -8490,6 +8563,125 @@ fn build_lm2_blocks_with_grouping(
         title = "Untitled document".to_owned();
     }
     (title, blocks, sources)
+}
+
+/// Line ids that genuinely open a footnote, decided within each article.
+///
+/// Whether a line opens a note or continues one is not decidable on that line.
+/// A citation volume (`106 VA. L. REV. 611`) and a numbered list inside a note
+/// both look like note heads locally. A law-review article numbers its notes
+/// consecutively, so the true heads form the longest ascending subsequence.
+///
+/// The article scope is essential: a bound volume restarts at 1 for every
+/// article. Running this optimization across the whole PDF suppresses the note
+/// heads in all but one article.
+fn note_start_line_ids(
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+    article_spans: &[ArticleSpan],
+) -> HashSet<String> {
+    let mut starts = note_start_line_ids_for_scope(decoded, article_spans);
+    if !article_spans.is_empty() {
+        // Article scope may recover heads hidden by a later article's restart,
+        // but must never revoke a head the document-global constraint accepted.
+        // Revocation merges note blocks and can make downstream linked assembly
+        // discard the merged text wholesale.
+        starts.extend(note_start_line_ids_for_scope(decoded, &[]));
+    }
+    starts
+}
+
+fn note_start_line_ids_for_scope(
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+    article_spans: &[ArticleSpan],
+) -> HashSet<String> {
+    let mut by_article: BTreeMap<usize, Vec<(&String, u16)>> = BTreeMap::new();
+    for (line, action) in decoded {
+        if *action != Lm2Action::Marginalia {
+            continue;
+        }
+        let Some(number) = note_head_marker(&line.text) else {
+            continue;
+        };
+        let article_index =
+            article_index_at(article_spans, line.page_index, line.line_index).unwrap_or(usize::MAX);
+        by_article
+            .entry(article_index)
+            .or_default()
+            .push((&line.id, number));
+    }
+
+    let mut starts = HashSet::new();
+    for candidates in by_article.into_values() {
+        if candidates.len() < NOTE_SEQUENCE_MIN_CANDIDATES {
+            starts.extend(candidates.into_iter().map(|(id, _)| id.clone()));
+            continue;
+        }
+        let numbers = candidates
+            .iter()
+            .map(|(_, number)| *number)
+            .collect::<Vec<_>>();
+        let keep = longest_ascending_run(&numbers);
+        // A run explaining less than half the candidates is not strong enough
+        // evidence to reinterpret local note heads.
+        if keep.len() * 2 < candidates.len() {
+            starts.extend(candidates.into_iter().map(|(id, _)| id.clone()));
+            continue;
+        }
+        starts.extend(
+            candidates
+                .into_iter()
+                .enumerate()
+                .filter(|(position, _)| keep.contains(position))
+                .map(|(_, (id, _))| id.clone()),
+        );
+    }
+    starts
+}
+
+fn article_index_at(
+    article_spans: &[ArticleSpan],
+    page_index: usize,
+    line_index: usize,
+) -> Option<usize> {
+    if article_spans.is_empty() {
+        return Some(0);
+    }
+    let coordinate = (page_index, line_index);
+    article_spans
+        .iter()
+        .find(|span| {
+            coordinate >= (span.start_page_index, span.start_line_index)
+                && coordinate < (span.end_page_index, span.end_line_index)
+        })
+        .map(|span| span.article_index)
+}
+
+/// Positions of the longest strictly ascending subsequence of `numbers`.
+fn longest_ascending_run(numbers: &[u16]) -> HashSet<usize> {
+    if numbers.is_empty() {
+        return HashSet::new();
+    }
+    let mut best = vec![1usize; numbers.len()];
+    let mut previous = vec![usize::MAX; numbers.len()];
+    let mut end = 0usize;
+    for i in 0..numbers.len() {
+        for j in 0..i {
+            if numbers[j] < numbers[i] && best[j] + 1 > best[i] {
+                best[i] = best[j] + 1;
+                previous[i] = j;
+            }
+        }
+        if best[i] > best[end] {
+            end = i;
+        }
+    }
+    let mut run = HashSet::new();
+    let mut cursor = end;
+    while cursor != usize::MAX {
+        run.insert(cursor);
+        cursor = previous[cursor];
+    }
+    run
 }
 
 fn apply_action_neutral_blocksplit(
@@ -9912,71 +10104,6 @@ fn looks_like_marginalia_note_block_start(text: &str) -> bool {
         .skip_while(|ch| ch.is_whitespace())
         .next()
         .is_some_and(|ch| ch.is_ascii_uppercase())
-}
-
-/// True when a line opens like the middle of a legal citation rather than a
-/// new footnote: a volume number, an all-caps reporter or journal name, then a
-/// page number — `106 VA. L. REV. 611 (2020)`.
-///
-/// Such a line satisfies [`looks_like_marginalia_note_block_start`] (digits,
-/// space, capital), so without this guard a footnote that wraps onto a line
-/// beginning with a citation is split in two. The tail then fails to link and
-/// surfaces as stray body text. Note text that merely starts with a capital —
-/// `245 See infra ...`, `167 Id. at 2366.` — is not all-caps and is unaffected.
-fn looks_like_citation_continuation(text: &str) -> bool {
-    let mut tokens = text.trim_start().split_whitespace();
-    let Some(volume) = tokens.next() else {
-        return false;
-    };
-    if volume.is_empty() || volume.len() > 4 || !volume.chars().all(|ch| ch.is_ascii_digit()) {
-        return false;
-    }
-    for _ in 0..8 {
-        let Some(token) = tokens.next() else {
-            return false;
-        };
-        if token.starts_with(|ch: char| ch.is_ascii_digit()) {
-            // Reached the page number, so at least one reporter token was seen.
-            return true;
-        }
-        if !is_reporter_token(token) {
-            return false;
-        }
-    }
-    false
-}
-
-/// A token that can appear in the reporter or code name of a citation:
-/// `VA.`, `L.`, `REV.`, `Ind.`, `Tex.`, `S.W.2d`, `U.S.C.`, `&`, `§`.
-///
-/// Ordinary prose words also start with a capital, so this is deliberately
-/// permissive; [`looks_like_citation_continuation`] only accepts a run of
-/// these when it is followed by a page number, and prose reaches a lowercase
-/// word first.
-fn is_reporter_token(token: &str) -> bool {
-    if token == "&" || token == "\u{00A7}" {
-        return true;
-    }
-    token.starts_with(|ch: char| ch.is_ascii_uppercase())
-        && token
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '\'' | '&'))
-}
-
-/// True when treating `candidate` as the next note head would break the
-/// upward run of note numbers by more than a stray digit could explain.
-///
-/// Footnotes are numbered consecutively through an article, so a line reading
-/// "1. If X is clearly illegal" arriving while note 194 is open is a numbered
-/// list inside that note, not note 1. Small backward steps are tolerated
-/// because a genuine restart or a misread digit should not merge two notes.
-fn breaks_note_monotonicity(current: Option<u16>, candidate: Option<u16>) -> bool {
-    match (current, candidate) {
-        (Some(current), Some(candidate)) => {
-            current > candidate && current - candidate > NOTE_NUMBER_BACKWARD_TOLERANCE
-        }
-        _ => false,
-    }
 }
 
 fn has_legal_note_cue(lower: &str) -> bool {
@@ -11782,55 +11909,159 @@ mod tests {
         ));
     }
 
-    /// A numbered list inside a footnote must not restart the note sequence.
     #[test]
-    fn numbered_lists_inside_a_note_do_not_start_a_new_note() {
-        // "1." arriving while note 194 is open is pseudocode, not note 1.
-        assert!(breaks_note_monotonicity(Some(194), Some(1)));
-        assert!(breaks_note_monotonicity(Some(500), Some(137)));
-        // Genuine forward progress and small steps back are left alone.
-        assert!(!breaks_note_monotonicity(Some(194), Some(195)));
-        assert!(!breaks_note_monotonicity(Some(12), Some(8)));
-        assert!(!breaks_note_monotonicity(None, Some(1)));
-        assert!(!breaks_note_monotonicity(Some(3), None));
+    fn longest_ascending_run_rejects_impostor_note_heads() {
+        // Pseudocode "1." and "2." inside note 24.
+        assert_eq!(
+            longest_ascending_run(&[22, 23, 24, 1, 2, 25]),
+            HashSet::from([0, 1, 2, 5])
+        );
+        // Citation volume 106 sitting inside note 11.
+        assert_eq!(
+            longest_ascending_run(&[10, 11, 106, 12, 13]),
+            HashSet::from([0, 1, 3, 4])
+        );
+        assert_eq!(longest_ascending_run(&[1, 2, 3, 4]).len(), 4);
     }
 
-    /// A wrapped footnote continuing onto a citation must not be read as a new
-    /// note, while genuine note text that opens with a capital still is.
     #[test]
-    fn citation_continuations_are_not_note_starts() {
-        for citation in [
-            "106 VA. L. REV. 611 (2020) (arguing that any right must be based on limits).",
-            "69 U. MIAMI L. REV. 499, 513 (2015).",
-            "24 INT'L REV. L. & ECON. 209, 209-10 (2004).",
-            "13 CARDOZO L. REV. 1891, 1892 (1992).",
-            "12 U.S.C. 5491 (2012).",
-            "12 U.S.C. \u{00A7} 5491 (2012).",
-            "38 Ind. 89, 95-96 (1871); Brisbin v. Cleary, 1 N.W. 825 (Minn. 1879).",
-            "299 S.W.2d 933, 938 (Tex. 1957).",
-            "373 S.E.2d 9, 10 (Ga. 1988).",
-        ] {
-            assert!(
-                looks_like_citation_continuation(citation),
-                "expected a citation continuation: {citation}"
-            );
-        }
+    fn article_coordinate_lookup_handles_midpage_boundaries() {
+        let spans = vec![
+            ArticleSpan {
+                article_index: 0,
+                start_page_index: 0,
+                start_line_index: 0,
+                end_page_index: 5,
+                end_line_index: 11,
+                confidence: 1.0,
+                title_hint: None,
+                evidence: Vec::new(),
+            },
+            ArticleSpan {
+                article_index: 1,
+                start_page_index: 5,
+                start_line_index: 11,
+                end_page_index: 9,
+                end_line_index: 0,
+                confidence: 1.0,
+                title_hint: None,
+                evidence: Vec::new(),
+            },
+        ];
+        assert_eq!(article_index_at(&spans, 5, 10), Some(0));
+        assert_eq!(article_index_at(&spans, 5, 11), Some(1));
+        assert_eq!(article_index_at(&spans, 8, 99), Some(1));
+        assert_eq!(article_index_at(&spans, 9, 0), None);
+    }
 
-        for note in [
-            "245 See infra text accompanying notes 287-289.",
-            "167 Id. at 2366.",
-            "126 Today, many believe that robust discovery increased litigation.",
-            "88 See Symposium, The Vanishing Trial, 1 J. EMPIRICAL LEGAL STUD. at v.",
-            "1 Some have criticized focusing on AI alignment.",
-            "45 Brown v. Board of Educ., 347 U.S. 483 (1954).",
-            "166 Id.",
-            "128 I will further explore this topic in future work.",
-        ] {
-            assert!(
-                !looks_like_citation_continuation(note),
-                "expected a note start: {note}"
-            );
+    #[test]
+    fn note_sequence_restarts_independently_in_each_article() {
+        let mut decoded = Vec::new();
+        for article in 0..2 {
+            for marker in 1..=8 {
+                let id = format!("a{article}:n{marker}");
+                let mut line = lm2_test_source_line(
+                    &id,
+                    marker,
+                    &format!("{marker} Note text"),
+                    0.8,
+                    false,
+                    None,
+                );
+                line.page_index = article;
+                decoded.push((line, Lm2Action::Marginalia));
+            }
         }
+        let spans = vec![
+            ArticleSpan {
+                article_index: 0,
+                start_page_index: 0,
+                start_line_index: 0,
+                end_page_index: 1,
+                end_line_index: 0,
+                confidence: 1.0,
+                title_hint: None,
+                evidence: Vec::new(),
+            },
+            ArticleSpan {
+                article_index: 1,
+                start_page_index: 1,
+                start_line_index: 0,
+                end_page_index: 2,
+                end_line_index: 0,
+                confidence: 1.0,
+                title_hint: None,
+                evidence: Vec::new(),
+            },
+        ];
+
+        let starts = note_start_line_ids(&decoded, &spans);
+        assert_eq!(starts.len(), 16);
+        assert!(starts.contains("a0:n1"));
+        assert!(starts.contains("a1:n1"));
+    }
+
+    #[test]
+    fn article_scope_never_revokes_a_global_note_start() {
+        let mut decoded = Vec::new();
+        for (page, markers) in [
+            (0, vec![1, 1, 1, 1, 1, 1, 1, 1]),
+            (1, vec![1, 1, 1, 1, 1, 2, 3, 4]),
+        ] {
+            for (line_index, marker) in markers.into_iter().enumerate() {
+                let id = format!("p{page}:l{line_index}:n{marker}");
+                let mut line = lm2_test_source_line(
+                    &id,
+                    line_index,
+                    &format!("{marker} Note text"),
+                    0.8,
+                    false,
+                    None,
+                );
+                line.page_index = page;
+                decoded.push((line, Lm2Action::Marginalia));
+            }
+        }
+        let spans = vec![
+            ArticleSpan {
+                article_index: 0,
+                start_page_index: 0,
+                start_line_index: 0,
+                end_page_index: 1,
+                end_line_index: 0,
+                confidence: 1.0,
+                title_hint: None,
+                evidence: Vec::new(),
+            },
+            ArticleSpan {
+                article_index: 1,
+                start_page_index: 1,
+                start_line_index: 0,
+                end_page_index: 2,
+                end_line_index: 0,
+                confidence: 1.0,
+                title_hint: None,
+                evidence: Vec::new(),
+            },
+        ];
+
+        let global = note_start_line_ids_for_scope(&decoded, &[]);
+        let scoped_only = note_start_line_ids_for_scope(&decoded, &spans);
+        let monotonic_scoped = note_start_line_ids(&decoded, &spans);
+        let one_span = vec![ArticleSpan {
+            article_index: 0,
+            start_page_index: 0,
+            start_line_index: 0,
+            end_page_index: 2,
+            end_line_index: 0,
+            confidence: 1.0,
+            title_hint: None,
+            evidence: Vec::new(),
+        }];
+        assert!(global.contains("p1:l1:n1"));
+        assert!(!scoped_only.contains("p1:l1:n1"));
+        assert!(global.is_subset(&monotonic_scoped));
+        assert_eq!(global, note_start_line_ids(&decoded, &one_span));
     }
 
     #[test]
@@ -14817,7 +15048,8 @@ mod tests {
             ],
         };
 
-        let (_, blocks, sources) = build_lm2_blocks_with_grouping("", &decoded, Some(&grouping));
+        let (_, blocks, sources) =
+            build_lm2_blocks_with_grouping("", &decoded, Some(&grouping), &[]);
         assert_eq!(blocks.len(), 2);
         assert_eq!(
             blocks[0].text,
@@ -16729,6 +16961,7 @@ mod tests {
                 text: "Cached body".to_owned(),
                 label: None,
             }],
+            article_spans: Vec::new(),
             block_source_lines: vec![LiquidBlockSourceLines {
                 block_index: 0,
                 lines: vec![LiquidSourceLineRef {

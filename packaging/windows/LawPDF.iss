@@ -5,6 +5,9 @@
 #ifndef AppVersion
 #define AppVersion "0.1.0"
 #endif
+#ifndef PackageRoot
+#define PackageRoot "..\..\dist"
+#endif
 
 [Setup]
 AppId={{B76759BB-B39A-4F51-8A3D-EC9A6BB4E5D4}
@@ -16,7 +19,7 @@ DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 LicenseFile=..\..\LICENSE
 SetupIconFile=..\..\assets\lawpdf.ico
-OutputDir=..\..\dist
+OutputDir={#PackageRoot}
 OutputBaseFilename=LawPDFSetup-x64
 Compression=lzma2
 SolidCompression=yes
@@ -33,7 +36,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
 
 [Files]
-Source: "..\..\dist\LawPDF-portable\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PackageRoot}\LawPDF-portable\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Registry]
 Root: HKLM; Subkey: "Software\Classes\.pdf\OpenWithProgids"; ValueType: string; ValueName: "LawPDF.PDF"; ValueData: "{#MyAppName}"; Flags: uninsdeletevalue

@@ -4,15 +4,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::layout_roles;
 use crate::liquid::{
-    DeepLiquidSourceLine, DocumentProfile, LiquidBlock, LiquidBlockRole, LiquidBlockSourceLines,
-    LiquidDocument, LiquidFootnoteLinkIntegrity, LiquidRequest, MarkdownOptions,
-    liquid_document_markdown, prepare_liquid_document, should_prefer_ocr_page_text,
-    should_try_ocr_page_text,
+    ArticleSpan, DeepLiquidSourceLine, DocumentProfile, LiquidBlock, LiquidBlockRole,
+    LiquidBlockSourceLines, LiquidDocument, LiquidFootnoteLinkIntegrity, LiquidRequest,
+    MarkdownOptions, liquid_document_markdown, prepare_liquid_document,
+    should_prefer_ocr_page_text, should_try_ocr_page_text,
 };
 use crate::liquid2::{
     LiquidMode2Request, LiquidMode2Timing, lm2_progressive_preview_request,
@@ -74,6 +74,8 @@ struct LiquidSmokeDocument {
     layout_hint_samples: BTreeMap<String, Vec<String>>,
     title: Option<String>,
     profile: Option<DocumentProfile>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    article_spans: Vec<ArticleSpan>,
     block_count: usize,
     footnote_link_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -101,6 +103,78 @@ struct LiquidSmokeBlock {
     label: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     source_line_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArticleSegmentSourceReport {
+    documents: Vec<ArticleSegmentSourceDocument>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArticleSegmentSourceDocument {
+    path: String,
+    page_count: usize,
+    #[serde(default)]
+    source_lines: Vec<DeepLiquidSourceLine>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArticleSegmentTraceReport {
+    schema_version: u32,
+    detector_version: &'static str,
+    app_version: &'static str,
+    documents: Vec<ArticleSegmentTraceDocument>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArticleSegmentTraceDocument {
+    path: String,
+    page_count: usize,
+    article_spans: Vec<ArticleSpan>,
+    candidates: Vec<crate::article_segments::ArticleBoundaryCandidateTrace>,
+}
+
+pub(crate) fn run_article_segment_report(args: impl IntoIterator<Item = OsString>) -> Result<()> {
+    let paths = args
+        .into_iter()
+        .filter(|arg| arg != OsStr::new("--segment-smoke-report"))
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    if paths.len() != 2 {
+        bail!("usage: --segment-smoke-report SOURCE_REPORT.json OUTPUT_REPORT.json");
+    }
+    let source: ArticleSegmentSourceReport = serde_json::from_slice(
+        &std::fs::read(&paths[0])
+            .with_context(|| format!("failed to read {}", paths[0].display()))?,
+    )
+    .with_context(|| format!("failed to parse {}", paths[0].display()))?;
+    let documents = source
+        .documents
+        .into_iter()
+        .map(|document| {
+            let (article_spans, candidates) = crate::liquid2::trace_article_spans_from_source_lines(
+                &document.source_lines,
+                document.page_count,
+            );
+            ArticleSegmentTraceDocument {
+                path: document.path,
+                page_count: document.page_count,
+                article_spans,
+                candidates,
+            }
+        })
+        .collect();
+    std::fs::write(
+        &paths[1],
+        serde_json::to_vec_pretty(&ArticleSegmentTraceReport {
+            schema_version: 1,
+            detector_version: crate::article_segments::ARTICLE_SEGMENTATION_VERSION,
+            app_version: env!("CARGO_PKG_VERSION"),
+            documents,
+        })?,
+    )
+    .with_context(|| format!("failed to write {}", paths[1].display()))?;
+    Ok(())
 }
 
 pub fn run_liquid_smoke(args: impl IntoIterator<Item = OsString>) -> Result<()> {
@@ -404,7 +478,10 @@ pub fn run_char_metrics_dump(args: impl IntoIterator<Item = OsString>) -> Result
         );
         let letter_median = alpha[alpha.len() / 2];
         let shrunk = digits.iter().filter(|h| **h < letter_median * 0.80).count();
-        println!("  digits under 0.80x letter height: {shrunk}/{}", digits.len());
+        println!(
+            "  digits under 0.80x letter height: {shrunk}/{}",
+            digits.len()
+        );
     }
     for c in chars.iter().filter(|c| c.ch.is_ascii_digit()).take(20) {
         println!(
@@ -1299,6 +1376,7 @@ fn smoke_document(
                 layout_hint_samples: BTreeMap::new(),
                 title: None,
                 profile: None,
+                article_spans: Vec::new(),
                 block_count: 0,
                 footnote_link_count: 0,
                 footnote_link_integrity: None,
@@ -1405,6 +1483,7 @@ fn smoke_document(
             layout_hint_samples: BTreeMap::new(),
             title: Some(document.title),
             profile: None,
+            article_spans: Vec::new(),
             block_count: 0,
             footnote_link_count: 0,
             footnote_link_integrity: None,
@@ -1496,6 +1575,7 @@ fn smoke_document(
                 .map(|block| compact_sample(&block.text))
                 .collect::<Vec<_>>();
             let profile = liquid.profile.clone();
+            let article_spans = liquid.article_spans.clone();
             let liquid_document = liquid.clone();
             let blocks = include_blocks.then(|| {
                 smoke_blocks_with_source_line_ids(&liquid.blocks, &liquid.block_source_lines)
@@ -1521,6 +1601,7 @@ fn smoke_document(
                 layout_hint_samples,
                 title: Some(liquid.title),
                 profile,
+                article_spans,
                 block_count: liquid.blocks.len(),
                 footnote_link_count: liquid.footnote_links.len(),
                 footnote_link_integrity: liquid.footnote_link_integrity,
@@ -1554,6 +1635,7 @@ fn smoke_document(
             layout_hint_samples,
             title: Some(document.title),
             profile: None,
+            article_spans: Vec::new(),
             block_count: 0,
             footnote_link_count: 0,
             footnote_link_integrity: None,

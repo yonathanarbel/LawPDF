@@ -43,6 +43,8 @@ pub struct LiquidDocument {
     pub title: String,
     pub blocks: Vec<LiquidBlock>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub article_spans: Vec<ArticleSpan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub block_source_lines: Vec<LiquidBlockSourceLines>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub footnote_links: Vec<LiquidFootnoteLink>,
@@ -63,6 +65,32 @@ pub struct LiquidDocument {
     pub deep_liquid_model: Option<String>,
     pub warnings: Vec<String>,
     pub source_signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ArticleSpan {
+    pub article_index: usize,
+    /// Inclusive start coordinate in extracted-line order.
+    pub start_page_index: usize,
+    #[serde(default)]
+    pub start_line_index: usize,
+    /// Exclusive end coordinate. `(page_count, 0)` is the document-end sentinel.
+    /// Two adjacent spans may share a page when an article begins mid-page.
+    pub end_page_index: usize,
+    #[serde(default)]
+    pub end_line_index: usize,
+    pub confidence: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<ArticleBoundaryEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ArticleBoundaryEvidence {
+    pub kind: String,
+    pub score: f32,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

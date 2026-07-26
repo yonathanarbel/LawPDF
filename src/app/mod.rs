@@ -13672,6 +13672,7 @@ mod app_tests {
         LiquidDocument {
             title: "Test Document".to_owned(),
             blocks: Vec::new(),
+            article_spans: Vec::new(),
             block_source_lines: Vec::new(),
             footnote_links: Vec::new(),
             footnote_link_integrity: None,
