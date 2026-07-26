@@ -167,6 +167,9 @@ def is_footnote_def(block: Block) -> bool:
     return bool(FOOTNOTE_DEF.match(block.first))
 
 
+NOTES_HEADING = re.compile(r"^#{1,6}\s+Notes\s*$", re.IGNORECASE)
+
+
 def is_heading(block: Block) -> bool:
     return bool(HEADING.match(block.first))
 
@@ -302,8 +305,18 @@ def check_body(blocks: Sequence[Block], report: DocumentReport) -> None:
         for block in blocks
         if len(block.lines) == 1 and not is_footnote_def(block)
     )
+    # Everything after the "## Notes" heading is the notes apparatus, not body.
+    # Unlinked notes are emitted there deliberately: a note the linker could not
+    # attach is listed rather than deleted. Counting those as body paragraphs
+    # made recovering text score worse than discarding it, which is the exact
+    # bias this tool exists to prevent.
+    in_notes_section = False
+
     for block in blocks:
-        if is_heading(block) or is_footnote_def(block) or is_table_or_code(block):
+        if is_heading(block):
+            in_notes_section = NOTES_HEADING.match(block.first.strip()) is not None
+            continue
+        if is_footnote_def(block) or is_table_or_code(block):
             continue
 
         text = block.text
@@ -361,8 +374,10 @@ def check_body(blocks: Sequence[Block], report: DocumentReport) -> None:
 
         # Only meaningful once the document is known to use numbered notes;
         # otherwise a numbered list would trip it.
-        if report.stats.get("footnote_numeric_definitions") and BARE_NOTE_OPENER.match(
-            stripped
+        if (
+            not in_notes_section
+            and report.stats.get("footnote_numeric_definitions")
+            and BARE_NOTE_OPENER.match(stripped)
         ):
             report.add(
                 "footnote.definition_in_body",
