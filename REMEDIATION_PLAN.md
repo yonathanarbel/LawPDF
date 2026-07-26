@@ -187,13 +187,43 @@ them as cleanly as length did. That is the honest limit of a hand-written
 discriminator, and it is the argument for A: deciding what to delete is a
 modelling problem, not a rule.
 
-**B was implemented and removed.** A longest-ascending-subsequence constraint
-over candidate note numbers, re-segmenting definitions so the sequence ascends
-globally rather than line by line. It fired on zero of 100 documents, because
-the local guards it was meant to replace already filter the same candidates
-upstream. The structural win is available but requires deleting those guards in
-the same change and re-measuring; it was not attempted here. The code is in the
-history at the commit that adds this section.
+**B was implemented, measured, and rejected.** Twice.
+
+The first attempt post-processed assembled blocks, merging any block whose note
+number broke the ascending sequence into the note above it. It fired on zero of
+100 documents: the block splitter does not emit one block per note, so almost no
+block carries a leading note number for the constraint to read. Wrong
+granularity — it could only merge blocks, never decide how they were cut.
+
+The second attempt moved the decision to the source lines, where the cut is
+actually made, and deleted the three local rules it replaced
+(`looks_like_marginalia_note_block_start` plus the citation-continuation and
+monotonicity guards): 117 lines out, 80 in. Measured on the 100-article
+benchmark against v0.2.15:
+
+| | v0.2.15 | global constraint |
+|---|---:|---:|
+| Mean source recall | 0.945 | 0.947 |
+| Documents with linked footnotes | 90 | 92 |
+| Defects per 10k words | 5.66 | **7.14** |
+| `footnote.definition_in_body` | 293 | **462** |
+
+Rejected. The damage is concentrated exclusively in bound volumes — Georgetown
+1915–1943, St. John's — while every modern single-article PDF is unaffected
+(−1 to 0 defects).
+
+**The invariant is wrong.** Footnote numbers ascend *per article*, not per
+document. A bound volume restarts at 1 for each article it contains, so a single
+longest-ascending run selects one article's chain and demotes every other
+article's note heads to continuations; their text merges into the preceding note
+and surfaces as `definition_in_body`.
+
+This is worth stating plainly because it is not a tuning failure. The document
+scope was the wrong scope. Applying the constraint correctly requires segmenting
+a volume into its constituent articles first — which is a real capability these
+volumes need for other reasons, and which is a larger piece of work than the
+constraint itself. The patch is preserved outside the repository; the invariant
+is sound, the unit it was applied to was not.
 
 **A was scoped, not built.** Its blocking question — whether boundary labels can
 be derived without human annotation — is answered yes: `indent_vs_body` is
