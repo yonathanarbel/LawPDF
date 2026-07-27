@@ -6317,6 +6317,9 @@ impl PdfEditorApp {
                                     );
                                     block_index = next_index;
                                 }
+                                if !self.liquid_mode2_complete {
+                                    self.draw_liquid_deciphering(ui, ctx);
+                                }
                                 self.draw_liquid_notes(ui, &notes);
                                 ui.add_space(40.0);
                             }
@@ -6507,6 +6510,79 @@ impl PdfEditorApp {
                     });
                 });
             });
+    }
+
+    /// Placeholder for the part of the article still being prepared.
+    ///
+    /// Review Mode paints the opening pages as soon as they are ready and keeps
+    /// working on the remainder in the background. Without a marker the article
+    /// simply appears to stop, and a reader cannot tell a short paper from an
+    /// unfinished one. These lines are deliberately unreadable and visibly
+    /// moving: text that has not been deciphered yet, rather than text that is
+    /// missing.
+    fn draw_liquid_deciphering(&self, ui: &mut egui::Ui, ctx: &Context) {
+        const GLYPHS: &[char] = &[
+            '#', '%', '&', '@', '$', '*', '?', '\u{00A7}', '\u{2261}', '\u{2206}', '\u{03BB}',
+            '\u{03BE}', '\u{03C8}', '\u{03C9}', '\u{25CA}', '\u{00B6}', '\u{221E}', '\u{2248}',
+        ];
+        // Ragged widths so the block reads as prose rather than a progress bar.
+        const LINE_FILL: [f32; 4] = [1.0, 0.96, 0.99, 0.58];
+        const GLYPH_HZ: f64 = 9.0;
+        const WAVE_HZ: f64 = 0.55;
+
+        let time = ui.input(|input| input.time);
+        let bucket = (time * GLYPH_HZ) as u64;
+        let muted = self.liquid_muted_color();
+        let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+        let char_width = ui
+            .painter()
+            .layout_no_wrap("\u{2261}".to_owned(), font_id, Color32::PLACEHOLDER)
+            .rect
+            .width();
+        let available = ui.available_width();
+
+        ui.add_space(22.0);
+        for (row, fill) in LINE_FILL.iter().enumerate() {
+            let columns = if char_width > 0.0 {
+                ((available * fill) / char_width).floor().max(1.0) as usize
+            } else {
+                24
+            };
+            let line: String = (0..columns)
+                .map(|column| {
+                    // Cheap deterministic scramble: no rng dependency, and every
+                    // column advances independently so the row does not pulse as
+                    // one piece.
+                    let mut hash = bucket
+                        .wrapping_add(row as u64 * 0x9E37_79B9)
+                        .wrapping_add(column as u64 * 0x85EB_CA6B);
+                    hash ^= hash >> 33;
+                    hash = hash.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+                    hash ^= hash >> 29;
+                    GLYPHS[(hash % GLYPHS.len() as u64) as usize]
+                })
+                .collect();
+            // A slow wave down the rows, so the block breathes instead of flickering.
+            let phase = time * WAVE_HZ * std::f64::consts::TAU - row as f64 * 0.9;
+            let alpha = (0.34 + 0.3 * (0.5 + 0.5 * phase.sin())) as f32;
+            ui.label(
+                RichText::new(line)
+                    .color(muted.gamma_multiply(alpha))
+                    .monospace(),
+            );
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(
+                RichText::new("Deciphering the rest of the article\u{2026}")
+                    .color(muted)
+                    .italics(),
+            );
+        });
+        ui.add_space(10.0);
+        // Drive the animation without pinning the UI at full frame rate.
+        ctx.request_repaint_after(std::time::Duration::from_millis(70));
     }
 
     fn draw_liquid_header(&self, ui: &mut egui::Ui, document: &LiquidDocument) {
