@@ -294,6 +294,9 @@ pub struct PdfEditorApp {
     liquid_state: LiquidState,
     liquid_mode2_state: LiquidState,
     liquid_mode2_complete: bool,
+    /// When the reflow first became readable while the reader was still on the
+    /// original PDF. Drives the reveal, and is cleared once it has played.
+    liquid_mode2_reveal_at: Option<f64>,
     pending_markdown_copy: bool,
     pending_markdown_request: Option<PendingMarkdownRequest>,
     liquid_notice_dismissed: bool,
@@ -1006,6 +1009,7 @@ impl PdfEditorApp {
             liquid_state: LiquidState::Idle,
             liquid_mode2_state: LiquidState::Idle,
             liquid_mode2_complete: false,
+            liquid_mode2_reveal_at: None,
             pending_markdown_copy: false,
             pending_markdown_request: None,
             liquid_notice_dismissed: false,
@@ -1489,6 +1493,7 @@ impl PdfEditorApp {
         self.liquid_state = LiquidState::Idle;
         self.liquid_mode2_state = LiquidState::Idle;
         self.liquid_mode2_complete = false;
+        self.liquid_mode2_reveal_at = None;
         self.pending_markdown_copy = false;
         self.pending_markdown_request = None;
         self.liquid_notice_dismissed = false;
@@ -6204,6 +6209,16 @@ impl PdfEditorApp {
                                 }
                             }
                             LiquidState::Ready(document) => {
+                                // Fade and settle in, so arriving from the
+                                // original page reads as a transition rather
+                                // than a jump cut.
+                                let reveal = self
+                                    .liquid_mode2_reveal_progress(ui.input(|input| input.time));
+                                if reveal < 1.0 {
+                                    ui.set_opacity(reveal);
+                                    ui.add_space(20.0 * (1.0 - reveal));
+                                    ctx.request_repaint();
+                                }
                                 self.draw_liquid_controls(ui);
                                 self.draw_liquid_tts_controls(ui, &document);
                                 self.liquid_footnote_index =
@@ -6512,65 +6527,36 @@ impl PdfEditorApp {
             });
     }
 
+    /// Eased 0..1 progress of the reveal that plays when the reflow replaces the
+    /// original page. Returns 1.0 when there is nothing to animate.
+    fn liquid_mode2_reveal_progress(&self, now: f64) -> f32 {
+        const REVEAL_SECONDS: f64 = 0.55;
+        match self.liquid_mode2_reveal_at {
+            Some(started) => {
+                let linear = ((now - started) / REVEAL_SECONDS).clamp(0.0, 1.0);
+                // Ease-out cubic: quick to become legible, gentle as it settles.
+                (1.0 - (1.0 - linear).powi(3)) as f32
+            }
+            None => 1.0,
+        }
+    }
+
     /// Placeholder for the part of the article still being prepared.
     ///
     /// Review Mode paints the opening pages as soon as they are ready and keeps
-    /// working on the remainder in the background. Without a marker the article
+    /// working on the rest in the background. Without a marker the article
     /// simply appears to stop, and a reader cannot tell a short paper from an
-    /// unfinished one. These lines are deliberately unreadable and visibly
-    /// moving: text that has not been deciphered yet, rather than text that is
-    /// missing.
+    /// unfinished one.
     fn draw_liquid_deciphering(&self, ui: &mut egui::Ui, ctx: &Context) {
-        const GLYPHS: &[char] = &[
-            '#', '%', '&', '@', '$', '*', '?', '\u{00A7}', '\u{2261}', '\u{2206}', '\u{03BB}',
-            '\u{03BE}', '\u{03C8}', '\u{03C9}', '\u{25CA}', '\u{00B6}', '\u{221E}', '\u{2248}',
-        ];
         // Ragged widths so the block reads as prose rather than a progress bar.
         const LINE_FILL: [f32; 4] = [1.0, 0.96, 0.99, 0.58];
-        const GLYPH_HZ: f64 = 9.0;
-        const WAVE_HZ: f64 = 0.55;
 
         let time = ui.input(|input| input.time);
-        let bucket = (time * GLYPH_HZ) as u64;
         let muted = self.liquid_muted_color();
-        let font_id = egui::TextStyle::Monospace.resolve(ui.style());
-        let char_width = ui
-            .painter()
-            .layout_no_wrap("\u{2261}".to_owned(), font_id, Color32::PLACEHOLDER)
-            .rect
-            .width();
-        let available = ui.available_width();
+        let size = egui::TextStyle::Monospace.resolve(ui.style()).size;
 
         ui.add_space(22.0);
-        for (row, fill) in LINE_FILL.iter().enumerate() {
-            let columns = if char_width > 0.0 {
-                ((available * fill) / char_width).floor().max(1.0) as usize
-            } else {
-                24
-            };
-            let line: String = (0..columns)
-                .map(|column| {
-                    // Cheap deterministic scramble: no rng dependency, and every
-                    // column advances independently so the row does not pulse as
-                    // one piece.
-                    let mut hash = bucket
-                        .wrapping_add(row as u64 * 0x9E37_79B9)
-                        .wrapping_add(column as u64 * 0x85EB_CA6B);
-                    hash ^= hash >> 33;
-                    hash = hash.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-                    hash ^= hash >> 29;
-                    GLYPHS[(hash % GLYPHS.len() as u64) as usize]
-                })
-                .collect();
-            // A slow wave down the rows, so the block breathes instead of flickering.
-            let phase = time * WAVE_HZ * std::f64::consts::TAU - row as f64 * 0.9;
-            let alpha = (0.34 + 0.3 * (0.5 + 0.5 * phase.sin())) as f32;
-            ui.label(
-                RichText::new(line)
-                    .color(muted.gamma_multiply(alpha))
-                    .monospace(),
-            );
-        }
+        Self::draw_scrambled_rows(ui, time, &LINE_FILL, muted, size);
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.spinner();
@@ -6583,6 +6569,124 @@ impl PdfEditorApp {
         ui.add_space(10.0);
         // Drive the animation without pinning the UI at full frame rate.
         ctx.request_repaint_after(std::time::Duration::from_millis(70));
+    }
+
+    /// Small card floated over the original page while the reflow is prepared.
+    ///
+    /// The reader keeps the real document and can scroll it; this only says that
+    /// work is happening and that the switch will be automatic. It is
+    /// non-interactive on purpose so it cannot swallow clicks meant for the page.
+    fn draw_liquid_pending_overlay(&self, ctx: &Context) {
+        let time = ctx.input(|input| input.time);
+        let dark = matches!(self.liquid_theme, LiquidTheme::Dark);
+        let (fill, stroke, ink, muted) = if dark {
+            (
+                Color32::from_rgba_unmultiplied(28, 30, 36, 238),
+                Color32::from_rgb(78, 84, 96),
+                Color32::from_rgb(226, 230, 238),
+                Color32::from_rgb(150, 158, 172),
+            )
+        } else {
+            (
+                Color32::from_rgba_unmultiplied(252, 252, 250, 242),
+                Color32::from_rgb(206, 202, 192),
+                Color32::from_rgb(38, 40, 46),
+                Color32::from_rgb(122, 122, 128),
+            )
+        };
+
+        egui::Area::new(egui::Id::new("liquid_mode2_pending_overlay"))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-22.0, -22.0))
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(fill)
+                    .stroke(Stroke::new(1.0, stroke))
+                    .corner_radius(10)
+                    .inner_margin(Margin::symmetric(14, 12))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 6],
+                        blur: 18,
+                        spread: 0,
+                        color: Color32::from_black_alpha(if dark { 120 } else { 38 }),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_max_width(268.0);
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.add_space(2.0);
+                            ui.label(
+                                RichText::new("Review Mode engaged")
+                                    .size(13.0)
+                                    .strong()
+                                    .color(ink),
+                            );
+                        });
+                        ui.add_space(7.0);
+                        // Two short scrambled rows: the same "not yet deciphered"
+                        // language as the placeholder at the end of the article.
+                        Self::draw_scrambled_rows(ui, time, &[0.92, 0.55], muted, 11.0);
+                        ui.add_space(7.0);
+                        ui.label(
+                            RichText::new("Deciphering this paper. Keep reading \u{2014} it switches over on its own.")
+                                .size(11.0)
+                                .color(muted),
+                        );
+                    });
+            });
+        ctx.request_repaint_after(std::time::Duration::from_millis(70));
+    }
+
+    /// Rows of glyphs that reshuffle in place, used by both the overlay and the
+    /// placeholder at the end of a partially prepared article.
+    fn draw_scrambled_rows(
+        ui: &mut egui::Ui,
+        time: f64,
+        fills: &[f32],
+        color: Color32,
+        size: f32,
+    ) {
+        const GLYPHS: &[char] = &[
+            '#', '%', '&', '@', '$', '*', '?', '\u{00A7}', '\u{2261}', '\u{2206}', '\u{03BB}',
+            '\u{03BE}', '\u{03C8}', '\u{03C9}', '\u{25CA}', '\u{00B6}', '\u{221E}', '\u{2248}',
+        ];
+        const GLYPH_HZ: f64 = 9.0;
+        const WAVE_HZ: f64 = 0.55;
+
+        let bucket = (time * GLYPH_HZ) as u64;
+        let font_id = egui::FontId::monospace(size);
+        let char_width = ui
+            .painter()
+            .layout_no_wrap("\u{2261}".to_owned(), font_id.clone(), Color32::PLACEHOLDER)
+            .rect
+            .width()
+            .max(1.0);
+        let available = ui.available_width();
+
+        for (row, fill) in fills.iter().enumerate() {
+            let columns = ((available * fill) / char_width).floor().max(1.0) as usize;
+            let line: String = (0..columns)
+                .map(|column| {
+                    // Deterministic scramble: no rng dependency, and each column
+                    // advances on its own so a row does not pulse as one piece.
+                    let mut hash = bucket
+                        .wrapping_add(row as u64 * 0x9E37_79B9)
+                        .wrapping_add(column as u64 * 0x85EB_CA6B);
+                    hash ^= hash >> 33;
+                    hash = hash.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+                    hash ^= hash >> 29;
+                    GLYPHS[(hash % GLYPHS.len() as u64) as usize]
+                })
+                .collect();
+            let phase = time * WAVE_HZ * std::f64::consts::TAU - row as f64 * 0.9;
+            let alpha = (0.34 + 0.3 * (0.5 + 0.5 * phase.sin())) as f32;
+            ui.label(
+                RichText::new(line)
+                    .font(font_id.clone())
+                    .color(color.gamma_multiply(alpha)),
+            );
+        }
     }
 
     fn draw_liquid_header(&self, ui: &mut egui::Ui, document: &LiquidDocument) {
@@ -8270,8 +8374,25 @@ impl PdfEditorApp {
                 }
                 if self.view_mode == DocumentViewMode::LiquidMode2 {
                     self.ensure_liquid_mode2_started(ctx);
-                    self.draw_liquid_mode2_document(ui, ctx);
-                    return;
+                    // Preparing the reflow used to replace the document with a
+                    // spinner, which stops the reader dead for as long as it
+                    // takes. Keep the original page up and float a small card
+                    // over it instead; the switch happens by itself below.
+                    if matches!(
+                        self.liquid_mode2_state,
+                        LiquidState::PreparingText | LiquidState::Preparing
+                    ) {
+                        self.liquid_mode2_reveal_at = None;
+                        self.draw_liquid_pending_overlay(ctx);
+                    } else {
+                        if self.liquid_mode2_reveal_at.is_none()
+                            && matches!(self.liquid_mode2_state, LiquidState::Ready(_))
+                        {
+                            self.liquid_mode2_reveal_at = Some(ctx.input(|input| input.time));
+                        }
+                        self.draw_liquid_mode2_document(ui, ctx);
+                        return;
+                    }
                 }
 
                 let Some(document_layout) = self.cached_document_layout() else {
