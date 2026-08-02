@@ -14,7 +14,9 @@ use crate::settings::app_data_dir;
 
 const OCR_CACHE_SCHEMA_VERSION: u32 = 1;
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
-const OPENROUTER_OCR_MODEL: &str = "baidu/qianfan-ocr-fast:free";
+// Let OpenRouter select a currently available free vision model. Individual
+// free model IDs can disappear when their provider endpoint is retired.
+const OPENROUTER_OCR_MODEL: &str = "openrouter/free";
 const OCR_RENDER_SCALE: f32 = 2.2;
 const LOCAL_TESSERACT_PSM: &str = "4";
 const OPENROUTER_OCR_BATCH_PAGES: usize = 3;
@@ -315,17 +317,23 @@ fn ocr_page(
 }
 
 fn run_tesseract_image(image_path: &Path) -> Result<String, String> {
-    let mut child = Command::new("tesseract")
-        .arg(&image_path)
+    let mut command = Command::new("tesseract");
+    command
+        .arg(image_path)
         .arg("stdout")
         .arg("-l")
         .arg("eng")
         .arg("--psm")
         .arg(LOCAL_TESSERACT_PSM)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command.spawn().map_err(|error| {
         format!(
             "failed to run tesseract; install Tesseract OCR and make sure it is on PATH: {error}"
         )
@@ -452,16 +460,7 @@ fn openrouter_ocr_pages(
         }));
     }
 
-    let body = json!({
-        "model": OPENROUTER_OCR_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": content
-            }
-        ],
-        "temperature": 0
-    });
+    let body = openrouter_ocr_request_body(content);
 
     let response_text =
         post_openrouter_ocr(client, api_key, &body, last_request_at, Some(status_target))?;
@@ -508,25 +507,16 @@ fn openrouter_ocr_single_page(
         status_target.pdf_path,
         format!("OpenRouter OCR page {}...", page_index + 1),
     );
-    let body = json!({
-        "model": OPENROUTER_OCR_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "Extract every readable word from this PDF page. Preserve natural line breaks and reading order. Return only the OCR text, with no commentary."
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": { "url": page_data_url(render_tx, pdf_path, page_index)? }
-                    }
-                ]
-            }
-        ],
-        "temperature": 0
-    });
+    let body = openrouter_ocr_request_body(vec![
+        json!({
+            "type": "text",
+            "text": "Extract every readable word from this PDF page. Preserve natural line breaks and reading order. Return only the OCR text, with no commentary."
+        }),
+        json!({
+            "type": "image_url",
+            "image_url": { "url": page_data_url(render_tx, pdf_path, page_index)? }
+        }),
+    ]);
 
     let response_text =
         post_openrouter_ocr(client, api_key, &body, last_request_at, Some(status_target))?;
@@ -543,6 +533,19 @@ fn openrouter_ocr_single_page(
         .ok_or_else(|| "OpenRouter OCR response did not include message content.".to_owned())?;
 
     Ok(strip_text_fence(content).trim().to_owned())
+}
+
+fn openrouter_ocr_request_body(content: Vec<serde_json::Value>) -> serde_json::Value {
+    json!({
+        "model": OPENROUTER_OCR_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": content
+            }
+        ],
+        "temperature": 0
+    })
 }
 
 fn page_data_url(
@@ -794,4 +797,41 @@ fn stable_hash(value: &str) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openrouter_ocr_request_uses_dynamic_free_vision_router() {
+        let body = openrouter_ocr_request_body(vec![json!({
+            "type": "image_url",
+            "image_url": { "url": "data:image/png;base64,AAAA" }
+        })]);
+
+        assert_eq!(body["model"], "openrouter/free");
+        assert_eq!(
+            body.pointer("/messages/0/content/0/type")
+                .and_then(serde_json::Value::as_str),
+            Some("image_url")
+        );
+    }
+
+    #[test]
+    fn batch_response_parser_preserves_requested_page_order() {
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "content": "{\"pages\":[{\"page\":3,\"text\":\"third\"},{\"page\":1,\"text\":\"first\"}]}"
+                }
+            }]
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_ocr_batch_response(&response, &[0, 2]).unwrap(),
+            vec!["first", "third"]
+        );
+    }
 }

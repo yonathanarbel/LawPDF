@@ -1,6 +1,8 @@
 use std::fs::File;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use lopdf::{
@@ -19,6 +21,15 @@ const MARGIN_BOTTOM: f32 = 54.0;
 const BODY_FONT_SIZE: f32 = 11.0;
 const LINE_HEIGHT: f32 = 14.0;
 const MAX_COLLISION_ATTEMPTS: usize = 1000;
+const CALIBRE_TIMEOUT: Duration = Duration::from_secs(120);
+const CALIBRE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const CALIBRE_DOCX_OPTIONS: &[&str] = &[
+    "--docx-no-pagebreaks-between-notes",
+    "--pdf-use-document-margins",
+    "--disable-font-rescaling",
+    "--paper-size",
+    "letter",
+];
 
 const CONVERTIBLE_EXTENSIONS: &[&str] = &[
     "docx", "md", "markdown", "txt", "text", "log", "csv", "json",
@@ -41,10 +52,117 @@ pub fn is_convertible_source(path: &Path) -> bool {
 
 pub fn convert_source_to_pdf(source: &Path) -> Result<PathBuf> {
     let source = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
-    let text = extract_source_text(&source)?;
     let destination = next_pdf_path(&source)?;
+    if source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("docx"))
+        && try_convert_docx_with_calibre(&source, &destination)
+    {
+        return Ok(destination);
+    }
+
+    let text = extract_source_text(&source)?;
     write_text_pdf(&text, &source, &destination)?;
     Ok(destination)
+}
+
+fn try_convert_docx_with_calibre(source: &Path, destination: &Path) -> bool {
+    if cfg!(test) {
+        return false;
+    }
+
+    for executable in calibre_command_candidates() {
+        if run_calibre_conversion(&executable, source, destination) {
+            return true;
+        }
+        cleanup_incomplete_conversion(destination);
+    }
+    false
+}
+
+fn calibre_command_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(override_path) = std::env::var_os("LAWPDF_EBOOK_CONVERT") {
+        candidates.push(PathBuf::from(override_path));
+    }
+
+    for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(root) = std::env::var_os(variable) {
+            candidates.push(
+                PathBuf::from(root)
+                    .join("Calibre2")
+                    .join("ebook-convert.exe"),
+            );
+        }
+    }
+    if let Some(root) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(
+            PathBuf::from(root)
+                .join("Programs")
+                .join("calibre")
+                .join("ebook-convert.exe"),
+        );
+    }
+
+    candidates.push(PathBuf::from("ebook-convert.exe"));
+    candidates.dedup();
+    candidates
+}
+
+fn run_calibre_conversion(executable: &Path, source: &Path, destination: &Path) -> bool {
+    let mut command = Command::new(executable);
+    command
+        .arg(source)
+        .arg(destination)
+        .args(CALIBRE_DOCX_OPTIONS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return status.success() && converted_pdf_is_valid(destination);
+            }
+            Ok(None) if started.elapsed() < CALIBRE_TIMEOUT => {
+                std::thread::sleep(CALIBRE_POLL_INTERVAL);
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+fn converted_pdf_is_valid(destination: &Path) -> bool {
+    destination
+        .metadata()
+        .is_ok_and(|metadata| metadata.len() > 0)
+        && Document::load(destination).is_ok_and(|document| !document.get_pages().is_empty())
+}
+
+fn cleanup_incomplete_conversion(destination: &Path) {
+    if destination.exists() {
+        let _ = std::fs::remove_file(destination);
+    }
 }
 
 pub fn convert_sources_to_pdf(paths: &[PathBuf]) -> Result<Vec<ConversionOutput>> {

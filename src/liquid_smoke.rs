@@ -1450,9 +1450,11 @@ fn smoke_document(
     let extracted_chars = pages.iter().map(|page| page.chars().count()).sum();
 
     let (mut deep_source_lines, extraction_report) =
-        layout_roles::deep_source_lines_for_pages_with_extraction_report(
+        layout_roles::deep_source_lines_for_pages_with_extraction_report_and_text_overrides(
             &document.pages,
             &text_chars,
+            &pages,
+            &page_uses_ocr,
         );
     if lmv_enabled() && (source_lines_only || !use_lm2) {
         apply_liquidvision_features(engine, path, document.page_count, &mut deep_source_lines);

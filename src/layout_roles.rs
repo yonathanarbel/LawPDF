@@ -182,9 +182,43 @@ pub fn deep_source_lines_for_pages(
     deep_source_lines_for_pages_with_extraction_report(pages, text_chars).0
 }
 
+/// Build LM2 source lines from the same per-page text selected for reading.
+///
+/// Native pages retain their real character geometry. Pages whose selected
+/// text came from OCR receive conservative synthetic geometry so recovered OCR
+/// is not silently discarded in favor of a sparse or corrupt PDF text layer.
+pub fn deep_source_lines_for_pages_with_text_overrides(
+    pages: &[PageInfo],
+    text_chars: &[Option<Vec<PageTextChar>>],
+    selected_pages: &[String],
+    use_selected_text: &[bool],
+) -> Vec<DeepLiquidSourceLine> {
+    deep_source_lines_for_pages_with_extraction_report_and_text_overrides(
+        pages,
+        text_chars,
+        selected_pages,
+        use_selected_text,
+    )
+    .0
+}
+
 pub fn deep_source_lines_for_pages_with_extraction_report(
     pages: &[PageInfo],
     text_chars: &[Option<Vec<PageTextChar>>],
+) -> (Vec<DeepLiquidSourceLine>, ExtractionReport) {
+    deep_source_lines_for_pages_with_extraction_report_and_text_overrides(
+        pages,
+        text_chars,
+        &[],
+        &[],
+    )
+}
+
+pub fn deep_source_lines_for_pages_with_extraction_report_and_text_overrides(
+    pages: &[PageInfo],
+    text_chars: &[Option<Vec<PageTextChar>>],
+    selected_pages: &[String],
+    use_selected_text: &[bool],
 ) -> (Vec<DeepLiquidSourceLine>, ExtractionReport) {
     let mut all_lines = Vec::new();
     let mut page_ranges = Vec::new();
@@ -193,7 +227,18 @@ pub fn deep_source_lines_for_pages_with_extraction_report(
 
     for (page_index, page) in pages.iter().enumerate() {
         let start = all_lines.len();
-        if let Some(chars) = text_chars.get(page_index).and_then(Option::as_deref) {
+        let selected_override = use_selected_text
+            .get(page_index)
+            .copied()
+            .unwrap_or(false)
+            .then(|| selected_pages.get(page_index))
+            .flatten()
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| synthetic_page_text_chars(page, text));
+        let chars = selected_override
+            .as_deref()
+            .or_else(|| text_chars.get(page_index).and_then(Option::as_deref));
+        if let Some(chars) = chars {
             let (mut lines, page_trace) = extract_lines_with_trace(page_index, page, chars);
             trace.merge(page_trace);
             normalize_lines_to_page_coordinates(page, &mut lines);
@@ -219,6 +264,10 @@ pub fn deep_source_lines_for_pages_with_extraction_report(
                 page_height: line.page_height,
                 line_index: line.line_index,
                 text: line.text.clone(),
+                synthetic_text_geometry: use_selected_text
+                    .get(line.page_index)
+                    .copied()
+                    .unwrap_or(false),
                 left: line.left,
                 bottom: line.bottom,
                 right: line.right,
@@ -316,6 +365,88 @@ pub fn deep_source_lines_for_pages_with_extraction_report(
             events: trace.events,
         },
     )
+}
+
+fn synthetic_page_text_chars(page: &PageInfo, text: &str) -> Vec<PageTextChar> {
+    let horizontal_margin = 72.0_f32.min((page.width * 0.12).max(18.0));
+    let vertical_margin = 54.0_f32.min((page.height * 0.08).max(18.0));
+    let usable_width = (page.width - horizontal_margin * 2.0).max(120.0);
+    let wrap_columns = ((usable_width / 5.25).floor() as usize).clamp(40, 120);
+    let mut visual_lines = Vec::new();
+
+    for raw_line in text.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            visual_lines.push(None);
+            continue;
+        }
+        let mut current = String::new();
+        for word in trimmed.split_whitespace() {
+            let separator = usize::from(!current.is_empty());
+            if !current.is_empty()
+                && current.chars().count() + separator + word.chars().count() > wrap_columns
+            {
+                visual_lines.push(Some(std::mem::take(&mut current)));
+            }
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+        if !current.is_empty() {
+            visual_lines.push(Some(current));
+        }
+    }
+
+    while visual_lines.first().is_some_and(Option::is_none) {
+        visual_lines.remove(0);
+    }
+    while visual_lines.last().is_some_and(Option::is_none) {
+        visual_lines.pop();
+    }
+    if visual_lines.is_empty() {
+        return Vec::new();
+    }
+
+    let usable_height = (page.height - vertical_margin * 2.0).max(72.0);
+    let line_step = (usable_height / visual_lines.len().max(1) as f32).clamp(7.5, 15.0);
+    let font_height = (line_step * 0.78).clamp(7.0, 11.0);
+    let mut chars = Vec::new();
+
+    for (slot, line) in visual_lines.into_iter().enumerate() {
+        let Some(line) = line else {
+            continue;
+        };
+        let y_from_top = vertical_margin + slot as f32 * line_step;
+        let top = (page.height - y_from_top).clamp(font_height, page.height);
+        let bottom = (top - font_height).max(0.0);
+        let char_count = line.chars().count().max(1) as f32;
+        let char_width = (usable_width / char_count).min(5.25);
+        let mut left = horizontal_margin;
+        for ch in line.chars() {
+            let width = if ch.is_whitespace() {
+                char_width * 0.65
+            } else {
+                char_width
+            };
+            chars.push(PageTextChar {
+                ch,
+                rect: Some(PdfRect::new(left, bottom, left + width, top)),
+                font_size: Some(font_height),
+                bold: false,
+                italic: false,
+            });
+            left += width;
+        }
+        chars.push(PageTextChar {
+            ch: '\n',
+            rect: None,
+            font_size: None,
+            bold: false,
+            italic: false,
+        });
+    }
+    chars
 }
 
 fn deep_source_line_id(page_index: usize, line_index: usize) -> String {
@@ -8134,6 +8265,65 @@ fn percentile_sorted(values: &[f32], percentile: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ocr_text_override_replaces_sparse_native_deep_lines() {
+        let page = PageInfo::new(612.0, 792.0);
+        let mut native = Vec::new();
+        push_line(&mut native, &page, 120.0, 11.0, "broken native header 1/1");
+        let selected = vec![
+            "Recovered OCR Title\n\nThis recovered OCR body must reach Review Mode.".to_owned(),
+        ];
+
+        let lines = deep_source_lines_for_pages_with_text_overrides(
+            &[page],
+            &[Some(native)],
+            &selected,
+            &[true],
+        );
+        let text = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(text.contains("Recovered OCR Title"));
+        assert!(text.contains("recovered OCR body"));
+        assert!(!text.contains("broken native header"));
+        assert!(lines.iter().all(|line| line.id.starts_with("p0:l")));
+    }
+
+    #[test]
+    fn native_deep_lines_are_unchanged_without_override() {
+        let page = PageInfo::new(612.0, 792.0);
+        let mut native = Vec::new();
+        push_line(
+            &mut native,
+            &page,
+            120.0,
+            11.0,
+            "Native body text remains authoritative.",
+        );
+
+        let baseline = deep_source_lines_for_pages(&[page.clone()], &[Some(native.clone())]);
+        let mixed = deep_source_lines_for_pages_with_text_overrides(
+            &[page],
+            &[Some(native)],
+            &["Ignored OCR text".to_owned()],
+            &[false],
+        );
+
+        assert_eq!(
+            baseline
+                .iter()
+                .map(|line| (&line.id, &line.text))
+                .collect::<Vec<_>>(),
+            mixed
+                .iter()
+                .map(|line| (&line.id, &line.text))
+                .collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn detects_small_law_review_footnote_zone() {

@@ -73,6 +73,8 @@ const RENDER_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const ZOOM_RENDER_DEBOUNCE: Duration = Duration::from_millis(180);
 const ZOOM_ANIMATION_EPSILON: f32 = 0.001;
 const ZOOM_ANIMATION_SPEED: f32 = 18.0;
+const TOOLBAR_CONTROL_HEIGHT: f32 = 30.0;
+const TOOLBAR_ICON_SIZE: f32 = 30.0;
 const MAX_LIQUID_OUTLINE_ITEMS: usize = 80;
 const THUMBNAIL_SCROLL_SECONDS: f32 = 0.28;
 const DOCUMENT_PAGE_GAP: f32 = 24.0;
@@ -300,6 +302,12 @@ pub struct PdfEditorApp {
     pending_markdown_copy: bool,
     pending_markdown_request: Option<PendingMarkdownRequest>,
     liquid_notice_dismissed: bool,
+    review_feedback_prompt_visible: bool,
+    review_feedback_dialog_open: bool,
+    review_feedback_sending: bool,
+    review_feedback_comment: String,
+    review_feedback_tx: Sender<ReviewFeedbackEvent>,
+    review_feedback_rx: Receiver<ReviewFeedbackEvent>,
     liquid_text_scale: f32,
     liquid_max_width: f32,
     liquid_theme: LiquidTheme,
@@ -879,6 +887,22 @@ struct LiquidRetrainQueue {
     entries: Vec<LiquidFeedback>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ReviewFeedbackSubmission {
+    schema_version: u8,
+    submitted_at: String,
+    app_version: String,
+    review_engine: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    user_feedback: String,
+    review: LiquidDocument,
+}
+
+#[derive(Debug)]
+struct ReviewFeedbackEvent {
+    result: Result<(), String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct VisiblePageRange {
     page_index: usize,
@@ -968,6 +992,7 @@ impl PdfEditorApp {
         let (document_links_tx, document_links_rx) = unbounded();
         let (liquid_tx, liquid_rx) = unbounded();
         let (liquid_mode2_tx, liquid_mode2_rx) = unbounded();
+        let (review_feedback_tx, review_feedback_rx) = unbounded();
         let chat_ui = ChatUi::new();
         let (update_tx, update_rx) = unbounded();
         let tts_controller = TtsController::new();
@@ -1013,6 +1038,12 @@ impl PdfEditorApp {
             pending_markdown_copy: false,
             pending_markdown_request: None,
             liquid_notice_dismissed: false,
+            review_feedback_prompt_visible: false,
+            review_feedback_dialog_open: false,
+            review_feedback_sending: false,
+            review_feedback_comment: String::new(),
+            review_feedback_tx,
+            review_feedback_rx,
             liquid_text_scale: 1.0,
             liquid_max_width: 920.0,
             liquid_theme: LiquidTheme::Paper,
@@ -3217,6 +3248,25 @@ impl PdfEditorApp {
             .collect()
     }
 
+    fn liquid_selected_text_override_pages(&self, document: &LoadedDocument) -> Vec<bool> {
+        (0..document.page_count)
+            .map(|page_index| {
+                let native = document
+                    .native_text
+                    .get(page_index)
+                    .map(|text| text.trim())
+                    .unwrap_or_default();
+                let ocr = self
+                    .ocr_states
+                    .get(page_index)
+                    .and_then(OcrPageState::text)
+                    .map(str::trim)
+                    .unwrap_or_default();
+                !ocr.is_empty() && (native.is_empty() || should_prefer_ocr_page_text(native, ocr))
+            })
+            .collect()
+    }
+
     fn set_view_mode(&mut self, mode: DocumentViewMode, ctx: &Context) {
         // #29: returning to a reading view clears any stale source-provenance highlight.
         if mode != DocumentViewMode::Pdf {
@@ -3232,6 +3282,15 @@ impl PdfEditorApp {
         }
         self.clear_text_selection();
         self.view_mode = mode;
+        if matches!(
+            mode,
+            DocumentViewMode::Liquid | DocumentViewMode::LiquidMode2
+        ) {
+            self.review_feedback_prompt_visible = true;
+        } else {
+            self.review_feedback_prompt_visible = false;
+            self.review_feedback_dialog_open = false;
+        }
         match mode {
             DocumentViewMode::Pdf => {
                 self.status = "PDF view".to_owned();
@@ -3322,13 +3381,18 @@ impl PdfEditorApp {
             return;
         };
         let pages = self.collect_liquid_source_pages_with_layout_text(document);
+        let selected_text_overrides = self.liquid_selected_text_override_pages(document);
         let (layout_hints, source_line_hints) =
             layout_roles::layout_hints_and_source_lines_for_pages(
                 &document.pages,
                 &document.text_chars,
             );
-        let deep_source_lines =
-            layout_roles::deep_source_lines_for_pages(&document.pages, &document.text_chars);
+        let deep_source_lines = layout_roles::deep_source_lines_for_pages_with_text_overrides(
+            &document.pages,
+            &document.text_chars,
+            &pages,
+            &selected_text_overrides,
+        );
         let request = LiquidRequest {
             document_epoch: self.document_epoch,
             path: document.path.clone(),
@@ -3451,8 +3515,13 @@ impl PdfEditorApp {
             return;
         };
         let pages = self.collect_liquid_source_pages_with_layout_text(document);
-        let deep_source_lines =
-            layout_roles::deep_source_lines_for_pages(&document.pages, &document.text_chars);
+        let selected_text_overrides = self.liquid_selected_text_override_pages(document);
+        let deep_source_lines = layout_roles::deep_source_lines_for_pages_with_text_overrides(
+            &document.pages,
+            &document.text_chars,
+            &pages,
+            &selected_text_overrides,
+        );
         let request = LiquidMode2Request {
             document_epoch: self.document_epoch,
             path: document.path.clone(),
@@ -4182,6 +4251,20 @@ impl PdfEditorApp {
         }
     }
 
+    /// Pointer-anchored wheel zoom must update geometry atomically. Animating
+    /// between a current zoom and a newer target makes the anchor calculation
+    /// stale on the next wheel event and produces lateral drift.
+    fn set_pointer_zoom(&mut self, zoom: f32) {
+        let zoom = normalized_pdf_zoom(zoom);
+        if (self.zoom - zoom).abs() > f32::EPSILON || (self.target_zoom - zoom).abs() > f32::EPSILON
+        {
+            self.zoom = zoom;
+            self.target_zoom = zoom;
+            self.remember_pdf_zoom(zoom);
+            self.last_zoom_change = Some(Instant::now());
+        }
+    }
+
     fn advance_zoom_animation(&mut self, ctx: &Context) {
         if !self.zoom_is_animating() {
             self.zoom = self.target_zoom;
@@ -4560,6 +4643,8 @@ impl PdfEditorApp {
                     .stroke(Stroke::new(1.0, Color32::from_rgb(222, 218, 208))),
             )
             .show(ctx, |ui| {
+                // Keep text and painted-icon actions on one predictable row.
+                ui.spacing_mut().interact_size.y = TOOLBAR_CONTROL_HEIGHT;
                 self.draw_tab_strip(ui, ctx);
                 ui.add_space(6.0);
 
@@ -4572,20 +4657,36 @@ impl PdfEditorApp {
 
                 ui.horizontal_wrapped(|ui| {
                     toolbar_group(ui, |ui| {
-                        if ui.button("Open").on_hover_text("Open PDF").clicked() {
+                        if toolbar_icon_button(
+                            ui,
+                            ToolbarIcon::Open,
+                            false,
+                            true,
+                            "Open PDF",
+                        )
+                        .clicked()
+                        {
                             self.open_dialog(ctx);
                         }
-                        if ui
-                            .add_enabled(has_document, egui::Button::new("Save"))
-                            .on_hover_text("Save highlights and comments into this PDF")
-                            .clicked()
+                        if toolbar_icon_button(
+                            ui,
+                            ToolbarIcon::Save,
+                            false,
+                            has_document,
+                            "Save highlights and comments into this PDF",
+                        )
+                        .clicked()
                         {
                             if let Err(error) = self.save_current_annotations() {
                                 self.push_error_notice(error);
                             }
                         }
-                        ui.add_enabled_ui(has_document, |ui| {
-                            ui.menu_button("Export", |ui| {
+                        toolbar_icon_menu_button(
+                            ui,
+                            ToolbarIcon::Export,
+                            has_document,
+                            "Export this PDF as another document or image format",
+                            |ui| {
                                 if ui.button("Save PDF copy").clicked() {
                                     self.save_as_dialog();
                                     ui.close();
@@ -4602,8 +4703,8 @@ impl PdfEditorApp {
                                     self.export_png_dialog();
                                     ui.close();
                                 }
-                            });
-                        });
+                            },
+                        );
                         let markdown_busy = self.pending_markdown_request.is_some();
                         if markdown_busy {
                             ui.spinner();
@@ -4611,24 +4712,23 @@ impl PdfEditorApp {
                         let mut markdown_settings_changed = false;
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
-                            if ui
-                                .add_enabled(
-                                    has_document && !markdown_busy,
-                                    egui::Button::new(if self.pending_markdown_copy {
-                                        "Preparing…"
-                                    } else {
-                                        "Copy MD"
-                                    }),
-                                )
-                                .on_hover_text(
-                                    "Copy the whole article as Markdown for pasting into an AI chat\nCtrl/Cmd+Shift+C",
-                                )
-                                .clicked()
+                            if toolbar_icon_button(
+                                ui,
+                                ToolbarIcon::Markdown,
+                                false,
+                                has_document && !markdown_busy,
+                                "Copy the whole article as Markdown for pasting into an AI chat\nCtrl/Cmd+Shift+C",
+                            )
+                            .clicked()
                             {
                                 self.request_markdown_copy(ctx);
                             }
-                            ui.add_enabled_ui(has_document && !markdown_busy, |ui| {
-                                ui.menu_button("v", |ui| {
+                            toolbar_icon_menu_button(
+                                ui,
+                                ToolbarIcon::More,
+                                has_document && !markdown_busy,
+                                "Markdown options",
+                                |ui| {
                                     ui.label(RichText::new("Markdown copy").strong());
                                     ui.separator();
                                     ui.label("Footnotes");
@@ -4666,21 +4766,21 @@ impl PdfEditorApp {
                                             "Include metadata",
                                         )
                                         .changed();
-                                })
-                                .response
-                                .on_hover_text("Markdown options");
-                            });
+                                },
+                            );
                         });
                         if markdown_settings_changed {
                             self.save_markdown_settings();
                         }
                         #[cfg(target_os = "windows")]
-                        if ui
-                            .button("Set as default")
-                            .on_hover_text(
-                                "Open Windows Settings to choose LawPDF as the default PDF reader",
-                            )
-                            .clicked()
+                        if toolbar_icon_button(
+                            ui,
+                            ToolbarIcon::DefaultApp,
+                            false,
+                            true,
+                            "Open Windows Settings to choose LawPDF as the default PDF reader",
+                        )
+                        .clicked()
                         {
                             match open_windows_default_pdf_settings() {
                                 Ok(()) => {
@@ -4696,10 +4796,14 @@ impl PdfEditorApp {
                             }
                         }
                         #[cfg(target_os = "macos")]
-                        if ui
-                            .button("Set as default")
-                            .on_hover_text("Make LawPDF the default macOS PDF reader")
-                            .clicked()
+                        if toolbar_icon_button(
+                            ui,
+                            ToolbarIcon::DefaultApp,
+                            false,
+                            true,
+                            "Make LawPDF the default macOS PDF reader",
+                        )
+                        .clicked()
                         {
                             match set_macos_default_pdf_reader() {
                                 Ok(()) => {
@@ -4718,10 +4822,14 @@ impl PdfEditorApp {
                     ui.add_space(6.0);
 
                     toolbar_group(ui, |ui| {
-                        if ui
-                            .add_enabled(has_document, egui::Button::new("OCR PDF"))
-                            .on_hover_text("Use OpenRouter OCR and save a searchable PDF copy")
-                            .clicked()
+                        if toolbar_icon_button(
+                            ui,
+                            ToolbarIcon::Ocr,
+                            false,
+                            has_document,
+                            "Use OpenRouter OCR and save a searchable PDF copy",
+                        )
+                        .clicked()
                         {
                             self.sidebar_tab = SidebarTab::Search;
                             self.start_openrouter_ocr_save();
@@ -4733,13 +4841,14 @@ impl PdfEditorApp {
                     toolbar_group(ui, |ui| {
                         let sbs_active = self.sbs_mode.is_some();
                         let pdf_active = !sbs_active && self.view_mode == DocumentViewMode::Pdf;
-                        if ui
-                            .add_enabled(
-                                has_document,
-                                egui::Button::new("PDF").selected(pdf_active),
-                            )
-                            .on_hover_text("Original PDF view")
-                            .clicked()
+                        if toolbar_icon_button(
+                            ui,
+                            ToolbarIcon::Pdf,
+                            pdf_active,
+                            has_document,
+                            "Original PDF view",
+                        )
+                        .clicked()
                         {
                             // #30: leaving a reflow view for the fixed layout is a doc-level
                             // "reflow rejected" signal.
@@ -4756,37 +4865,39 @@ impl PdfEditorApp {
                         }
                         let liquid_active =
                             !sbs_active && self.view_mode == DocumentViewMode::LiquidMode2;
-                        if ui
-                            .add_enabled(
-                                has_document,
-                                egui::Button::new("Review Mode").selected(liquid_active),
-                            )
-                            .on_hover_text(
-                                "Converts law review articles to a smooth reading experience.",
-                            )
-                            .clicked()
+                        if toolbar_icon_button(
+                            ui,
+                            ToolbarIcon::Review,
+                            liquid_active,
+                            has_document,
+                            "Converts law review articles to a smooth reading experience.",
+                        )
+                        .clicked()
                         {
                             if sbs_active {
                                 self.exit_sbs_mode(ctx);
                             }
                             self.set_view_mode(DocumentViewMode::LiquidMode2, ctx);
                         }
-                        if ui
-                            .add_enabled(
-                                has_document,
-                                egui::Button::new("SbS").selected(sbs_active),
-                            )
-                            .on_hover_text(
-                                "Open two PDFs side by side with independent scrolling",
-                            )
-                            .clicked()
+                        if toolbar_icon_button(
+                            ui,
+                            ToolbarIcon::SideBySide,
+                            sbs_active,
+                            has_document,
+                            "Open two PDFs side by side with independent scrolling",
+                        )
+                        .clicked()
                         {
                             self.toggle_sbs_mode(ctx);
                         }
                         if let Some(mut mode) = self.sbs_mode
-                            && ui
-                                .small_button("Swap")
-                                .on_hover_text("Swap the left and right PDFs")
+                            && toolbar_icon_button(
+                                ui,
+                                ToolbarIcon::Swap,
+                                false,
+                                true,
+                                "Swap the left and right PDFs",
+                            )
                                 .clicked()
                         {
                             std::mem::swap(&mut mode.left_epoch, &mut mode.right_epoch);
@@ -4832,7 +4943,8 @@ impl PdfEditorApp {
                                 ui.add_enabled_ui(rotation_enabled, |ui| {
                                     let (rotate_response, _) =
                                         egui::containers::menu::MenuButton::from_button(
-                                            egui::Button::new("").min_size(Vec2::splat(28.0)),
+                                            egui::Button::new("")
+                                                .min_size(Vec2::splat(TOOLBAR_ICON_SIZE)),
                                         )
                                         .ui(ui, |ui| {
                                             if ui
@@ -4862,7 +4974,8 @@ impl PdfEditorApp {
                                         ToolbarIcon::Rotate,
                                         toolbar_icon_color(ui, &rotate_response, rotation_enabled),
                                     );
-                                    rotate_response.on_disabled_hover_text(
+                                    toolbar_tooltip(
+                                        rotate_response,
                                         "Rotate the current page by 90° (saved in this PDF)",
                                     );
                                 });
@@ -4882,18 +4995,26 @@ impl PdfEditorApp {
                     ui.add_space(6.0);
 
                     toolbar_group(ui, |ui| {
-                        if ui
-                            .add_enabled(has_document, egui::Button::new("-"))
-                            .on_hover_text("Zoom out")
-                            .clicked()
+                        if toolbar_icon_button(
+                            ui,
+                            ToolbarIcon::ZoomOut,
+                            false,
+                            has_document,
+                            "Zoom out",
+                        )
+                        .clicked()
                         {
                             self.set_zoom(self.target_zoom / 1.15);
                         }
                         ui.label(format!("{:.0}%", self.zoom * 100.0));
-                        if ui
-                            .add_enabled(has_document, egui::Button::new("+"))
-                            .on_hover_text("Zoom in")
-                            .clicked()
+                        if toolbar_icon_button(
+                            ui,
+                            ToolbarIcon::ZoomIn,
+                            false,
+                            has_document,
+                            "Zoom in",
+                        )
+                        .clicked()
                         {
                             self.set_zoom(self.target_zoom * 1.15);
                         }
@@ -4902,13 +5023,14 @@ impl PdfEditorApp {
                     ui.add_space(6.0);
 
                     toolbar_group(ui, |ui| {
-                        if ui
-                            .add_enabled(
-                                has_document && self.page_index > 0,
-                                egui::Button::new("<"),
-                            )
-                            .on_disabled_hover_text("Previous page")
-                            .clicked()
+                        if toolbar_icon_button(
+                            ui,
+                            ToolbarIcon::Previous,
+                            false,
+                            has_document && self.page_index > 0,
+                            "Previous page",
+                        )
+                        .clicked()
                         {
                             self.go_to_page(self.page_index.saturating_sub(1));
                         }
@@ -4968,13 +5090,14 @@ impl PdfEditorApp {
                         });
                         ui.label(format!("/ {page_count}"))
                             .on_hover_text("Total pages in this PDF");
-                        if ui
-                            .add_enabled(
-                                has_document && self.page_index + 1 < page_count,
-                                egui::Button::new(">"),
-                            )
-                            .on_disabled_hover_text("Next page")
-                            .clicked()
+                        if toolbar_icon_button(
+                            ui,
+                            ToolbarIcon::Next,
+                            false,
+                            has_document && self.page_index + 1 < page_count,
+                            "Next page",
+                        )
+                        .clicked()
                         {
                             self.go_to_page(self.page_index + 1);
                         }
@@ -5005,10 +5128,18 @@ impl PdfEditorApp {
                         }
                         let pressed_enter = search_response.lost_focus()
                             && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                        if ui
-                            .add_enabled(search_enabled, egui::Button::new("Find"))
-                            .on_disabled_hover_text("Open the active pane solo to search within it")
-                            .clicked()
+                        if toolbar_icon_button(
+                            ui,
+                            ToolbarIcon::Search,
+                            false,
+                            search_enabled,
+                            if search_enabled {
+                                "Search this PDF"
+                            } else {
+                                "Open the active pane solo to search within it"
+                            },
+                        )
+                        .clicked()
                             || pressed_enter
                         {
                             self.start_search(ctx);
@@ -6212,20 +6343,19 @@ impl PdfEditorApp {
                                 // Fade and settle in, so arriving from the
                                 // original page reads as a transition rather
                                 // than a jump cut.
-                                let reveal = self
-                                    .liquid_mode2_reveal_progress(ui.input(|input| input.time));
+                                let reveal =
+                                    self.liquid_mode2_reveal_progress(ui.input(|input| input.time));
                                 if reveal < 1.0 {
                                     ui.set_opacity(reveal);
                                     ui.add_space(20.0 * (1.0 - reveal));
                                     ctx.request_repaint();
                                 }
-                                self.draw_liquid_controls(ui);
+                                self.draw_liquid_controls(ui, &document);
                                 self.draw_liquid_tts_controls(ui, &document);
                                 self.liquid_footnote_index =
                                     build_liquid_footnote_index(&document.blocks);
-                                self.draw_liquid_header(ui, &document);
                                 if liquid_document_needs_ocr(&document) {
-                                    self.draw_liquid_ocr_actions(ui, ctx);
+                                    self.draw_liquid_ocr_actions(ui, ctx, false);
                                 } else if let Some(hint) = liquid_reflow_low_confidence(&document) {
                                     // #23: confidence-gated fallback affordance.
                                     self.draw_liquid_reflow_gate(ui, ctx, hint);
@@ -6405,13 +6535,12 @@ impl PdfEditorApp {
                                 }
                             }
                             LiquidState::Ready(document) => {
-                                self.draw_liquid_controls(ui);
+                                self.draw_liquid_controls(ui, &document);
                                 self.draw_liquid_tts_controls(ui, &document);
                                 self.liquid_footnote_index =
                                     build_liquid_footnote_index(&document.blocks);
-                                self.draw_liquid_header(ui, &document);
                                 if liquid_document_needs_ocr(&document) {
-                                    self.draw_liquid_ocr_actions(ui, ctx);
+                                    self.draw_liquid_ocr_actions(ui, ctx, true);
                                 } else if let Some(hint) = liquid_reflow_low_confidence(&document) {
                                     // #23: confidence-gated fallback affordance.
                                     self.draw_liquid_reflow_gate(ui, ctx, hint);
@@ -6640,13 +6769,7 @@ impl PdfEditorApp {
 
     /// Rows of glyphs that reshuffle in place, used by both the overlay and the
     /// placeholder at the end of a partially prepared article.
-    fn draw_scrambled_rows(
-        ui: &mut egui::Ui,
-        time: f64,
-        fills: &[f32],
-        color: Color32,
-        size: f32,
-    ) {
+    fn draw_scrambled_rows(ui: &mut egui::Ui, time: f64, fills: &[f32], color: Color32, size: f32) {
         const GLYPHS: &[char] = &[
             '#', '%', '&', '@', '$', '*', '?', '\u{00A7}', '\u{2261}', '\u{2206}', '\u{03BB}',
             '\u{03BE}', '\u{03C8}', '\u{03C9}', '\u{25CA}', '\u{00B6}', '\u{221E}', '\u{2248}',
@@ -6689,7 +6812,9 @@ impl PdfEditorApp {
         }
     }
 
-    fn draw_liquid_header(&self, ui: &mut egui::Ui, document: &LiquidDocument) {
+    fn draw_liquid_review_details(&self, ui: &mut egui::Ui, document: &LiquidDocument) {
+        ui.label(RichText::new("Review details").strong());
+        ui.separator();
         ui.horizontal_wrapped(|ui| {
             let engine = document
                 .llm_provider
@@ -6738,7 +6863,6 @@ impl PdfEditorApp {
         for warning in &document.warnings {
             ui.label(RichText::new(warning).color(Color32::from_rgb(134, 92, 34)));
         }
-        ui.add_space(12.0);
     }
 
     fn draw_liquid_feedback_block(
@@ -7144,9 +7268,9 @@ impl PdfEditorApp {
         }
     }
 
-    /// #33: read the reflowed text aloud with native macOS speech (`say`), reading order
-    /// preserved, page furniture skipped, footnotes as a separate pass. Replaces any current
-    /// playback. No-op with a note on non-macOS.
+    /// Read the reflowed text with an operating-system speech process. The
+    /// process starts only after the user clicks, so Review Mode rendering and
+    /// application startup do not pay for speech initialization.
     fn start_liquid_tts(&mut self, document: &LiquidDocument) {
         self.stop_liquid_tts();
         let text = liquid_tts_text(document, self.tts_controller.include_notes);
@@ -7168,6 +7292,7 @@ impl PdfEditorApp {
             {
                 Ok(child) => {
                     self.tts_controller.child = Some(child);
+                    self.tts_controller.native_text_path = Some(tmp);
                     self.status = "Reading aloud…".to_owned();
                 }
                 Err(error) => {
@@ -7175,10 +7300,76 @@ impl PdfEditorApp {
                 }
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            const WINDOWS_SPEECH_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+try {
+    Add-Type -AssemblyName System.Speech
+    $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+    try {
+        $text = [System.IO.File]::ReadAllText($env:LAWPDF_TTS_TEXT_PATH)
+        $synth.Speak($text)
+    } finally {
+        $synth.Dispose()
+    }
+} catch {
+    [System.IO.File]::WriteAllText(
+        $env:LAWPDF_TTS_ERROR_PATH,
+        $_.Exception.Message
+    )
+    exit 1
+}
+"#;
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_millis())
+                .unwrap_or_default();
+            let tmp =
+                std::env::temp_dir().join(format!("lawpdf-tts-{}-{stamp}.txt", std::process::id()));
+            let error_path = tmp.with_extension("error.txt");
+            if let Err(error) = std::fs::write(&tmp, &text) {
+                self.push_error_notice(format!("Could not prepare speech: {error}"));
+                return;
+            }
+            let _ = std::fs::remove_file(&error_path);
+            let mut command = std::process::Command::new("powershell.exe");
+            command
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    WINDOWS_SPEECH_SCRIPT,
+                ])
+                .env("LAWPDF_TTS_TEXT_PATH", &tmp)
+                .env("LAWPDF_TTS_ERROR_PATH", &error_path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW);
+            match command.spawn() {
+                Ok(child) => {
+                    self.tts_controller.child = Some(child);
+                    self.tts_controller.native_text_path = Some(tmp);
+                    self.tts_controller.native_error_path = Some(error_path);
+                    self.status = "Reading aloud…".to_owned();
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    self.push_error_notice(format!("Windows text-to-speech unavailable: {error}"));
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             let _ = text;
-            self.status = "Read aloud is available on macOS.".to_owned();
+            self.status = "Read aloud is unavailable on this platform.".to_owned();
         }
     }
 
@@ -7188,6 +7379,16 @@ impl PdfEditorApp {
             // Best-effort process cleanup: playback is already detached from app state.
             let _ = child.kill();
             let _ = child.wait();
+        }
+        self.cleanup_native_tts_files();
+    }
+
+    fn cleanup_native_tts_files(&mut self) {
+        if let Some(path) = self.tts_controller.native_text_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(path) = self.tts_controller.native_error_path.take() {
+            let _ = std::fs::remove_file(path);
         }
     }
 
@@ -7267,10 +7468,23 @@ impl PdfEditorApp {
             .tts_controller
             .child
             .as_mut()
-            .map(|child| matches!(child.try_wait(), Ok(Some(_))))
-            .unwrap_or(false);
-        if finished {
+            .and_then(|child| child.try_wait().ok().flatten());
+        if let Some(status) = finished {
             self.tts_controller.child = None;
+            let error = (!status.success()).then(|| {
+                self.tts_controller
+                    .native_error_path
+                    .as_ref()
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+                    .filter(|message| !message.trim().is_empty())
+                    .unwrap_or_else(|| format!("Native text-to-speech exited with {status}."))
+            });
+            self.cleanup_native_tts_files();
+            if let Some(error) = error {
+                self.push_error_notice(format!("Text-to-speech unavailable: {error}"));
+            } else {
+                self.status = "Finished reading aloud.".to_owned();
+            }
         }
         ui.horizontal_wrapped(|ui| {
             if ui
@@ -7289,7 +7503,13 @@ impl PdfEditorApp {
                 }
             } else if ui
                 .button(RichText::new("▶ Read aloud").size(11.0))
-                .on_hover_text("Read the reflowed text aloud (macOS speech)")
+                .on_hover_text(if cfg!(target_os = "windows") {
+                    "Read the reflowed text aloud with Windows speech"
+                } else if cfg!(target_os = "macos") {
+                    "Read the reflowed text aloud with macOS speech"
+                } else {
+                    "Read the reflowed text aloud"
+                })
                 .clicked()
             {
                 self.start_liquid_tts(document);
@@ -7349,6 +7569,170 @@ impl PdfEditorApp {
             }
         });
         ui.add_space(6.0);
+    }
+
+    fn current_review_feedback_submission(&self) -> Option<ReviewFeedbackSubmission> {
+        let (review_engine, review) = match self.view_mode {
+            DocumentViewMode::Liquid => (
+                "legacy_liquid",
+                match &self.liquid_state {
+                    LiquidState::Ready(document) => document.clone(),
+                    _ => return None,
+                },
+            ),
+            DocumentViewMode::LiquidMode2 => (
+                "liquid_mode2",
+                match &self.liquid_mode2_state {
+                    LiquidState::Ready(document) => document.clone(),
+                    _ => return None,
+                },
+            ),
+            DocumentViewMode::Pdf => return None,
+        };
+        Some(ReviewFeedbackSubmission {
+            schema_version: 1,
+            submitted_at: comment_timestamp(),
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            review_engine: review_engine.to_owned(),
+            user_feedback: self.review_feedback_comment.trim().to_owned(),
+            review,
+        })
+    }
+
+    fn submit_current_review_feedback(&mut self, ctx: &Context) {
+        let Some(submission) = self.current_review_feedback_submission() else {
+            self.push_error_notice(
+                "Review Mode is not ready yet. Try again once the review is visible.".to_owned(),
+            );
+            return;
+        };
+        let tx = self.review_feedback_tx.clone();
+        self.review_feedback_sending = true;
+        std::thread::spawn(move || {
+            let result = send_review_feedback(&submission);
+            let _ = tx.send(ReviewFeedbackEvent { result });
+        });
+        ctx.request_repaint_after(RENDER_POLL_INTERVAL);
+    }
+
+    fn poll_review_feedback(&mut self, ctx: &Context) {
+        while let Ok(event) = self.review_feedback_rx.try_recv() {
+            self.review_feedback_sending = false;
+            match event.result {
+                Ok(()) => {
+                    self.review_feedback_dialog_open = false;
+                    self.review_feedback_comment.clear();
+                    self.status = "Review sent. Thank you for helping improve LawPDF.".to_owned();
+                    self.push_info_notice(
+                        "Review sent. Thank you for helping improve LawPDF.".to_owned(),
+                    );
+                }
+                Err(error) => self.push_error_notice(error),
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    fn draw_review_feedback_ui(&mut self, ctx: &Context) {
+        if !matches!(
+            self.view_mode,
+            DocumentViewMode::Liquid | DocumentViewMode::LiquidMode2
+        ) {
+            return;
+        }
+
+        if self.review_feedback_prompt_visible {
+            let mut dismiss = false;
+            let mut open_dialog = false;
+            egui::Area::new(egui::Id::new("review_feedback_prompt"))
+                .order(egui::Order::Foreground)
+                .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -24.0))
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Unhappy with the review?");
+                            if ui
+                                .link("Send it to our servers for future updates")
+                                .clicked()
+                            {
+                                open_dialog = true;
+                            }
+                            if ui.small_button("x").on_hover_text("Dismiss").clicked() {
+                                dismiss = true;
+                            }
+                        });
+                    });
+                });
+            if dismiss {
+                self.review_feedback_prompt_visible = false;
+            }
+            if open_dialog {
+                self.review_feedback_prompt_visible = false;
+                self.review_feedback_dialog_open = true;
+            }
+        }
+
+        if self.review_feedback_dialog_open {
+            let mut open = true;
+            let mut send = false;
+            let mut cancel = false;
+            egui::Window::new("Send Review Mode feedback")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.set_max_width(440.0);
+                    ui.label(
+                        "If you aren't happy with the review reading quality, send it to us for future improvement. Do not send any private information.",
+                    );
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(
+                            "Sending includes the generated review text and its layout metadata.",
+                        )
+                        .color(self.liquid_muted_color()),
+                    );
+                    ui.add_space(12.0);
+                    ui.label("What didn't you like? (optional)");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.review_feedback_comment)
+                            .hint_text("For example: headings were wrong, footnotes were mixed into the text, or paragraphs were out of order.")
+                            .desired_rows(4)
+                            .desired_width(420.0)
+                            .char_limit(4_000),
+                    );
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !self.review_feedback_sending,
+                                egui::Button::new(if self.review_feedback_sending {
+                                    "Sending..."
+                                } else {
+                                    "Send review"
+                                }),
+                            )
+                            .clicked()
+                        {
+                            send = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.review_feedback_sending,
+                                egui::Button::new("Cancel"),
+                            )
+                            .clicked()
+                        {
+                            cancel = true;
+                        }
+                    });
+                });
+            self.review_feedback_dialog_open = open && !cancel;
+            if send {
+                self.submit_current_review_feedback(ctx);
+            }
+        }
     }
 
     /// #32: while the (non-blocking, background) reflow finishes, give the reader instant
@@ -7420,7 +7804,7 @@ impl PdfEditorApp {
         }
     }
 
-    fn draw_liquid_ocr_actions(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+    fn draw_liquid_ocr_actions(&mut self, ui: &mut egui::Ui, ctx: &Context, mode2: bool) {
         ui.horizontal_wrapped(|ui| {
             let ocr_active = self.ocr_is_active();
             if ui
@@ -7438,10 +7822,16 @@ impl PdfEditorApp {
                 self.start_openrouter_ocr_save();
                 ctx.request_repaint_after(RENDER_POLL_INTERVAL);
             }
-            if has_usable_ocr_text(&self.ocr_states) && ui.button("Rebuild Liquid").clicked() {
-                self.liquid_state = LiquidState::Idle;
+            if has_usable_ocr_text(&self.ocr_states) && ui.button("Rebuild Review").clicked() {
+                if mode2 {
+                    self.liquid_mode2_state = LiquidState::Idle;
+                    self.liquid_mode2_complete = false;
+                    self.ensure_liquid_mode2_started(ctx);
+                } else {
+                    self.liquid_state = LiquidState::Idle;
+                    self.ensure_liquid_started(ctx);
+                }
                 self.liquid_notice_dismissed = false;
-                self.ensure_liquid_started(ctx);
             }
             if ocr_active {
                 ui.spinner();
@@ -8109,7 +8499,7 @@ impl PdfEditorApp {
         }
     }
 
-    fn draw_liquid_controls(&mut self, ui: &mut egui::Ui) {
+    fn draw_liquid_controls(&mut self, ui: &mut egui::Ui, document: &LiquidDocument) {
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new("Text size")
@@ -8173,6 +8563,30 @@ impl PdfEditorApp {
                 self.liquid_text_scale = 1.0;
                 self.liquid_max_width = 920.0;
                 self.liquid_theme = LiquidTheme::Paper;
+            }
+            let details = ui.menu_button(
+                RichText::new(if document.warnings.is_empty() {
+                    "ⓘ"
+                } else {
+                    "ⓘ!"
+                })
+                .size(14.0),
+                |ui| {
+                    ui.set_max_width(520.0);
+                    self.draw_liquid_review_details(ui, document);
+                },
+            );
+            details
+                .response
+                .on_hover_text("Review engine, cleanup, linking, and warning details");
+            ui.add_space(12.0);
+            if ui
+                .button(RichText::new("☹").size(17.0))
+                .on_hover_text("Unhappy with the review? Send it to our server to help improve future updates.")
+                .clicked()
+            {
+                self.review_feedback_dialog_open = true;
+                self.review_feedback_prompt_visible = false;
             }
             ui.add_space(12.0);
             // #29: reveal normally-hidden furniture (headers/footers/TOC/noise/tables).
@@ -8521,18 +8935,14 @@ impl PdfEditorApp {
                                         (new_content_width - clip_rect.width()).max(0.0),
                                         (new_content_height - clip_rect.height()).max(0.0),
                                     );
-                                    let viewport_center = Vec2::new(
-                                        clip_rect.width() * 0.5,
-                                        clip_rect.height() * 0.5,
-                                    );
-                                    self.pending_document_scroll_offset = Some(Vec2::new(
-                                        (desired_anchor.x - viewport_center.x)
-                                            .clamp(0.0, max_offset.x),
-                                        (desired_anchor.y - viewport_center.y)
-                                            .clamp(0.0, max_offset.y),
-                                    ));
+                                    self.pending_document_scroll_offset =
+                                        Some(cursor_anchored_scroll_offset(
+                                            desired_anchor,
+                                            pointer_in_viewport,
+                                            max_offset,
+                                        ));
                                     self.scroll_target_page = None;
-                                    self.set_zoom(new_zoom);
+                                    self.set_pointer_zoom(new_zoom);
                                     self.status = format!("{:.0}% zoom", self.target_zoom * 100.0);
                                     ctx.request_repaint_after(RENDER_POLL_INTERVAL);
                                 }
@@ -11040,6 +11450,7 @@ impl eframe::App for PdfEditorApp {
         self.poll_chat_results(ctx);
         self.poll_liquid_results(ctx);
         self.poll_liquid_mode2_results(ctx);
+        self.poll_review_feedback(ctx);
         self.poll_paid_tts(ctx);
         self.poll_update_events(ctx);
         self.handle_dropped_files(ctx);
@@ -11177,6 +11588,7 @@ impl eframe::App for PdfEditorApp {
         }
         self.draw_status_bar(ctx);
         self.draw_document(ctx);
+        self.draw_review_feedback_ui(ctx);
         self.draw_settings_window(ctx);
         self.draw_unsaved_close_prompt(ctx);
         self.draw_default_reader_prompt(ctx);
@@ -11198,6 +11610,7 @@ impl eframe::App for PdfEditorApp {
             || self.update_ui.state.is_busy()
             || self.chat_ui.state.in_flight
             || self.ocr_is_active()
+            || self.review_feedback_sending
             || matches!(
                 self.liquid_state,
                 LiquidState::PreparingText | LiquidState::Preparing
@@ -11480,13 +11893,35 @@ fn toolbar_group(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
         });
 }
 
+fn toolbar_tooltip(response: egui::Response, tooltip: &str) -> egui::Response {
+    response
+        .on_hover_text(tooltip)
+        .on_disabled_hover_text(tooltip)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolbarIcon {
+    Open,
+    Save,
+    Export,
+    Markdown,
+    More,
+    DefaultApp,
+    Ocr,
+    Pdf,
+    Review,
+    SideBySide,
+    Swap,
     Select,
     Marker,
     TextBox,
     Signature,
     Rotate,
+    ZoomOut,
+    ZoomIn,
+    Previous,
+    Next,
+    Search,
 }
 
 impl ToolbarIcon {
@@ -11511,15 +11946,41 @@ fn toolbar_icon_button(
         enabled,
         egui::Button::new("")
             .selected(selected)
-            .min_size(Vec2::splat(28.0)),
+            .min_size(Vec2::splat(TOOLBAR_ICON_SIZE)),
     );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tooltip));
     paint_toolbar_icon(
         ui.painter(),
         response.rect,
         icon,
         toolbar_icon_color(ui, &response, enabled),
     );
-    response.on_disabled_hover_text(tooltip)
+    toolbar_tooltip(response, tooltip)
+}
+
+fn toolbar_icon_menu_button(
+    ui: &mut egui::Ui,
+    icon: ToolbarIcon,
+    enabled: bool,
+    tooltip: &str,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) -> egui::Response {
+    let (response, _) = ui
+        .add_enabled_ui(enabled, |ui| {
+            egui::containers::menu::MenuButton::from_button(
+                egui::Button::new("").min_size(Vec2::splat(TOOLBAR_ICON_SIZE)),
+            )
+            .ui(ui, add_contents)
+        })
+        .inner;
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tooltip));
+    paint_toolbar_icon(
+        ui.painter(),
+        response.rect,
+        icon,
+        toolbar_icon_color(ui, &response, enabled),
+    );
+    toolbar_tooltip(response, tooltip)
 }
 
 fn toolbar_icon_color(ui: &egui::Ui, response: &egui::Response, enabled: bool) -> Color32 {
@@ -11541,6 +12002,106 @@ fn paint_toolbar_icon(
     let stroke = Stroke::new(1.65, color);
 
     match icon {
+        ToolbarIcon::Open => {
+            let folder = Rect::from_min_max(point(-7.0, -3.0), point(7.0, 6.0));
+            painter.rect_stroke(folder, 1.5, stroke, egui::StrokeKind::Inside);
+            painter.line_segment([point(-6.0, -3.0), point(-3.0, -6.0)], stroke);
+            painter.line_segment([point(-3.0, -6.0), point(1.0, -6.0)], stroke);
+            painter.line_segment([point(1.0, -6.0), point(3.0, -3.0)], stroke);
+        }
+        ToolbarIcon::Save => {
+            painter.rect_stroke(
+                Rect::from_min_max(point(-7.0, -7.0), point(7.0, 7.0)),
+                1.5,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.rect_stroke(
+                Rect::from_min_max(point(-4.0, -6.0), point(3.5, -1.5)),
+                0.5,
+                Stroke::new(1.2, color),
+                egui::StrokeKind::Inside,
+            );
+            painter.circle_stroke(point(0.0, 3.5), 2.6, Stroke::new(1.2, color));
+        }
+        ToolbarIcon::Export => {
+            painter.rect_stroke(
+                Rect::from_min_max(point(-7.0, -1.0), point(5.0, 7.0)),
+                1.5,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.line_segment([point(-1.0, 2.0), point(7.0, -6.0)], stroke);
+            painter.line_segment([point(2.0, -6.0), point(7.0, -6.0)], stroke);
+            painter.line_segment([point(7.0, -6.0), point(7.0, -1.0)], stroke);
+        }
+        ToolbarIcon::Markdown => {
+            painter.text(
+                center,
+                Align2::CENTER_CENTER,
+                "MD",
+                FontId::proportional(10.5),
+                color,
+            );
+        }
+        ToolbarIcon::More => {
+            painter.line_segment([point(-5.0, -2.0), point(0.0, 3.0)], stroke);
+            painter.line_segment([point(0.0, 3.0), point(5.0, -2.0)], stroke);
+        }
+        ToolbarIcon::DefaultApp => {
+            painter.circle_stroke(center, 7.0, stroke);
+            painter.line_segment([point(-3.5, 0.0), point(-0.8, 3.0)], stroke);
+            painter.line_segment([point(-0.8, 3.0), point(4.5, -3.5)], stroke);
+        }
+        ToolbarIcon::Ocr => {
+            painter.text(
+                center,
+                Align2::CENTER_CENTER,
+                "OCR",
+                FontId::proportional(9.5),
+                color,
+            );
+        }
+        ToolbarIcon::Pdf => {
+            painter.text(
+                center,
+                Align2::CENTER_CENTER,
+                "PDF",
+                FontId::proportional(9.5),
+                color,
+            );
+        }
+        ToolbarIcon::Review => {
+            painter.line_segment([point(0.0, -6.5), point(0.0, 6.5)], stroke);
+            painter.line_segment([point(-7.0, -5.0), point(-1.0, -6.5)], stroke);
+            painter.line_segment([point(-7.0, -5.0), point(-7.0, 5.0)], stroke);
+            painter.line_segment([point(-7.0, 5.0), point(-1.0, 6.5)], stroke);
+            painter.line_segment([point(7.0, -5.0), point(1.0, -6.5)], stroke);
+            painter.line_segment([point(7.0, -5.0), point(7.0, 5.0)], stroke);
+            painter.line_segment([point(7.0, 5.0), point(1.0, 6.5)], stroke);
+        }
+        ToolbarIcon::SideBySide => {
+            painter.rect_stroke(
+                Rect::from_min_max(point(-7.0, -6.0), point(-1.0, 6.0)),
+                1.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.rect_stroke(
+                Rect::from_min_max(point(1.0, -6.0), point(7.0, 6.0)),
+                1.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        ToolbarIcon::Swap => {
+            painter.line_segment([point(-6.0, -3.0), point(5.0, -3.0)], stroke);
+            painter.line_segment([point(2.0, -6.0), point(5.0, -3.0)], stroke);
+            painter.line_segment([point(5.0, -3.0), point(2.0, 0.0)], stroke);
+            painter.line_segment([point(6.0, 3.0), point(-5.0, 3.0)], stroke);
+            painter.line_segment([point(-2.0, 0.0), point(-5.0, 3.0)], stroke);
+            painter.line_segment([point(-5.0, 3.0), point(-2.0, 6.0)], stroke);
+        }
         ToolbarIcon::Select => {
             let outline = vec![
                 point(-6.0, -8.0),
@@ -11610,6 +12171,26 @@ fn paint_toolbar_icon(
                 color,
                 Stroke::NONE,
             ));
+        }
+        ToolbarIcon::ZoomOut | ToolbarIcon::ZoomIn => {
+            painter.circle_stroke(point(-1.5, -1.5), 5.5, stroke);
+            painter.line_segment([point(2.5, 2.5), point(7.0, 7.0)], stroke);
+            painter.line_segment([point(-4.8, -1.5), point(1.8, -1.5)], stroke);
+            if icon == ToolbarIcon::ZoomIn {
+                painter.line_segment([point(-1.5, -4.8), point(-1.5, 1.8)], stroke);
+            }
+        }
+        ToolbarIcon::Previous => {
+            painter.line_segment([point(3.0, -6.0), point(-3.0, 0.0)], stroke);
+            painter.line_segment([point(-3.0, 0.0), point(3.0, 6.0)], stroke);
+        }
+        ToolbarIcon::Next => {
+            painter.line_segment([point(-3.0, -6.0), point(3.0, 0.0)], stroke);
+            painter.line_segment([point(3.0, 0.0), point(-3.0, 6.0)], stroke);
+        }
+        ToolbarIcon::Search => {
+            painter.circle_stroke(point(-1.5, -1.5), 5.0, stroke);
+            painter.line_segment([point(2.0, 2.0), point(7.0, 7.0)], stroke);
         }
     }
 }
@@ -12102,6 +12683,63 @@ fn save_liquid_retrain_queue(
     std::fs::write(&path, bytes)
         .map_err(|error| format!("Could not save Liquid retrain queue: {error}"))?;
     Ok(path)
+}
+
+fn review_feedback_url() -> Option<String> {
+    std::env::var("LAWPDF_REVIEW_FEEDBACK_URL")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            option_env!("LAWPDF_REVIEW_FEEDBACK_URL")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| Some("https://lawpdf.battleoftheforms.com/api/review-feedback".to_owned()))
+}
+
+fn send_review_feedback(submission: &ReviewFeedbackSubmission) -> Result<(), String> {
+    let url = review_feedback_url().ok_or_else(|| {
+        "Review upload is not configured. Set LAWPDF_REVIEW_FEEDBACK_URL to the server's HTTPS feedback endpoint when building LawPDF."
+            .to_owned()
+    })?;
+    if !url.starts_with("https://") && !url.starts_with("http://127.0.0.1") {
+        return Err("Review feedback must use HTTPS (or localhost for testing).".to_owned());
+    }
+
+    let response = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("Could not prepare review upload: {error}"))?
+        .post(url)
+        .header(
+            reqwest::header::USER_AGENT,
+            concat!("LawPDF/", env!("CARGO_PKG_VERSION")),
+        )
+        .json(submission)
+        .send()
+        .map_err(|error| format!("Could not send the review: {error}"))?;
+
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let detail = response.text().unwrap_or_default();
+    let detail = detail.trim();
+    let detail = if detail.chars().count() > 240 {
+        format!("{}...", detail.chars().take(240).collect::<String>())
+    } else {
+        detail.to_owned()
+    };
+    if detail.is_empty() {
+        Err(format!("The review server returned HTTP {status}."))
+    } else {
+        Err(format!(
+            "The review server returned HTTP {status}: {detail}"
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -13213,6 +13851,17 @@ fn document_canvas_width(viewport_width: f32, max_page_width: f32) -> f32 {
         .max(1.0)
 }
 
+fn cursor_anchored_scroll_offset(
+    zoomed_document_anchor: Pos2,
+    pointer_in_viewport: Vec2,
+    max_offset: Vec2,
+) -> Vec2 {
+    Vec2::new(
+        (zoomed_document_anchor.x - pointer_in_viewport.x).clamp(0.0, max_offset.x),
+        (zoomed_document_anchor.y - pointer_in_viewport.y).clamp(0.0, max_offset.y),
+    )
+}
+
 fn page_marker_rect(page_rect: Rect, width: f32) -> Rect {
     Rect::from_min_size(
         Pos2::new(
@@ -13580,6 +14229,36 @@ mod app_tests {
         assert_eq!(
             document_canvas_width(700.0, 600.0),
             600.0 + PAGE_MARKER_GUTTER * 2.0
+        );
+    }
+
+    #[test]
+    fn pointer_zoom_keeps_the_document_anchor_under_the_pointer() {
+        let pointer = Vec2::new(120.0, 200.0);
+        let anchor = Pos2::new(620.0, 700.0);
+        let offset = cursor_anchored_scroll_offset(anchor, pointer, Vec2::new(2_000.0, 2_000.0));
+
+        assert_eq!(offset, Vec2::new(500.0, 500.0));
+        assert_eq!(offset + pointer, anchor.to_vec2());
+    }
+
+    #[test]
+    fn pointer_zoom_clamps_only_at_document_edges() {
+        assert_eq!(
+            cursor_anchored_scroll_offset(
+                Pos2::new(40.0, 50.0),
+                Vec2::new(160.0, 220.0),
+                Vec2::new(800.0, 900.0),
+            ),
+            Vec2::ZERO
+        );
+        assert_eq!(
+            cursor_anchored_scroll_offset(
+                Pos2::new(1_500.0, 1_700.0),
+                Vec2::new(100.0, 100.0),
+                Vec2::new(800.0, 900.0),
+            ),
+            Vec2::new(800.0, 900.0)
         );
     }
 

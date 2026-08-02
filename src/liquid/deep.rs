@@ -329,6 +329,7 @@ mod tests {
             page_height: 1.0,
             line_index,
             text: text.to_owned(),
+            synthetic_text_geometry: false,
             left: 0.0,
             bottom: 0.0,
             right: 1.0,

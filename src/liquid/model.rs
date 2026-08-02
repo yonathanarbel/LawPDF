@@ -226,6 +226,10 @@ pub struct DeepLiquidSourceLine {
     pub page_height: f32,
     pub line_index: usize,
     pub text: String,
+    /// True when OCR text has conservative synthetic geometry rather than
+    /// character boxes from the PDF text layer.
+    #[serde(default)]
+    pub synthetic_text_geometry: bool,
     pub left: f32,
     pub bottom: f32,
     pub right: f32,
