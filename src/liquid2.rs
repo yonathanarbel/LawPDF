@@ -48,7 +48,7 @@ const LM2_D1_RUNTIME_FOOTER_ARTIFACT_OVERLAY_VERSION: &str =
     "d1-footer-artifact-v1-guarded-no-contact";
 const LM2_FOOTNOTE_MONOTONE_OVERLAY_VERSION: &str = "footnote-monotone-v1-marker-context";
 const LM2_FOOTNOTE_CARRYOVER_OVERLAY_VERSION: &str = "footnote-carryover-v1-open-prev-smallfont";
-const LM2_ASSEMBLY_CACHE_VERSION: &str = "lm2-assembly-v31-callout-footer-context-bridge-line-order-inline-fragment-and-note-head-recovery";
+const LM2_ASSEMBLY_CACHE_VERSION: &str = "lm2-assembly-v35-canonical-heading-boundaries";
 const LM2_TABLE_FIGURE_ROUTER_OVERLAY_VERSION: &str = "table-figure-router-v4-default-on";
 const LM2_PAGE_OBJECT_OVERLAY_VERSION: &str = "page-object-overlay-v1-guarded-ruled-path";
 const LM2_PAGE_OBJECT_TUNED_OVERLAY_VERSION: &str =
@@ -2413,6 +2413,8 @@ pub fn prepare_liquid_mode2_document_with_timing(
     if runtime.action_neutral_blocksplit {
         apply_action_neutral_blocksplit(&mut blocks, &mut block_source_lines, &decoded);
     }
+    apply_heading_outline_splits(&mut blocks, &mut block_source_lines);
+    apply_heading_continuation_reflow(&mut blocks, &mut block_source_lines, &decoded);
     apply_deferred_marginalia_reflow(&mut blocks, &mut block_source_lines);
     apply_attached_terminal_callout_recovery(&mut blocks, &block_source_lines);
     apply_in_block_standalone_callout_recovery(&mut blocks, &block_source_lines, &decoded);
@@ -9378,6 +9380,281 @@ fn flush_action_neutral_blocksplit(
     });
 }
 
+/// Undo any broad block grouping that swallowed a later numbered/lettered
+/// outline item into the preceding heading. Provenance lines are authoritative
+/// here: a fresh marker after the first source line starts a fresh block.
+fn apply_heading_outline_splits(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+) -> usize {
+    if blocks.is_empty() || sources.is_empty() {
+        return 0;
+    }
+    let mut source_by_block = sources
+        .iter()
+        .map(|source| (source.block_index, source.lines.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let old_blocks = std::mem::take(blocks);
+    let mut rebuilt_blocks = Vec::with_capacity(old_blocks.len());
+    let mut rebuilt_sources = Vec::with_capacity(sources.len());
+    let mut split_count = 0usize;
+
+    for (old_index, block) in old_blocks.into_iter().enumerate() {
+        let refs = source_by_block.remove(&old_index).unwrap_or_default();
+        if !matches!(
+            block.role,
+            LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+        ) || refs.len() < 2
+        {
+            let block_index = rebuilt_blocks.len();
+            rebuilt_blocks.push(block);
+            if !refs.is_empty() {
+                rebuilt_sources.push(LiquidBlockSourceLines {
+                    block_index,
+                    lines: refs,
+                });
+            }
+            continue;
+        }
+
+        let mut groups: Vec<Vec<LiquidSourceLineRef>> = Vec::new();
+        for line in refs {
+            if !groups.is_empty() && lm2_heading_starts_new_outline_item(&line.text) {
+                groups.push(Vec::new());
+                split_count += 1;
+            } else if groups.is_empty() {
+                groups.push(Vec::new());
+            }
+            groups.last_mut().expect("heading group exists").push(line);
+        }
+        for group in groups {
+            let mut text = String::new();
+            for line in &group {
+                let cleaned = clean_lm2_line_text(&line.text);
+                if !cleaned.is_empty() {
+                    append_line(&mut text, &cleaned);
+                }
+            }
+            if text.trim().is_empty() {
+                continue;
+            }
+            let block_index = rebuilt_blocks.len();
+            rebuilt_blocks.push(LiquidBlock {
+                role: block.role,
+                text,
+                label: block.label.clone(),
+            });
+            rebuilt_sources.push(LiquidBlockSourceLines {
+                block_index,
+                lines: group,
+            });
+        }
+    }
+
+    *blocks = rebuilt_blocks;
+    *sources = rebuilt_sources;
+    split_count
+}
+
+/// Recombine physical lines that form one logical heading. Native model
+/// emissions intentionally keep heading lines separate, so this pass uses the
+/// source geometry and the document's outline grammar instead of relying on a
+/// particular classifier runtime.
+fn apply_heading_continuation_reflow(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    if blocks.len() < 2 || sources.is_empty() {
+        return 0;
+    }
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let mut source_by_block = sources
+        .iter()
+        .map(|source| (source.block_index, source.lines.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let old_blocks = std::mem::take(blocks);
+    let mut rebuilt_blocks = Vec::with_capacity(old_blocks.len());
+    let mut rebuilt_sources = Vec::with_capacity(sources.len());
+    let mut merged_count = 0usize;
+    let mut index = 0usize;
+
+    while index < old_blocks.len() {
+        let mut merged = old_blocks[index].clone();
+        let mut merged_refs = source_by_block.remove(&index).unwrap_or_default();
+        let mut next = index + 1;
+        while next < old_blocks.len() {
+            let next_refs = source_by_block.get(&next).cloned().unwrap_or_default();
+            if !lm2_should_merge_heading_continuation(
+                &merged,
+                &old_blocks[next],
+                &merged_refs,
+                &next_refs,
+                &line_by_id,
+            ) {
+                break;
+            }
+            append_line(&mut merged.text, &old_blocks[next].text);
+            merged_refs.extend(source_by_block.remove(&next).unwrap_or_default());
+            merged_count += 1;
+            next += 1;
+        }
+
+        let block_index = rebuilt_blocks.len();
+        rebuilt_blocks.push(merged);
+        if !merged_refs.is_empty() {
+            rebuilt_sources.push(LiquidBlockSourceLines {
+                block_index,
+                lines: merged_refs,
+            });
+        }
+        index = next;
+    }
+
+    *blocks = rebuilt_blocks;
+    *sources = rebuilt_sources;
+    merged_count
+}
+
+fn lm2_should_merge_heading_continuation(
+    current: &LiquidBlock,
+    next: &LiquidBlock,
+    current_refs: &[LiquidSourceLineRef],
+    next_refs: &[LiquidSourceLineRef],
+    line_by_id: &HashMap<&str, &DeepLiquidSourceLine>,
+) -> bool {
+    if current.role != next.role
+        || !matches!(
+            current.role,
+            LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+        )
+        || current.text.chars().count() + next.text.chars().count() > 200
+        || word_count(&current.text) + word_count(&next.text) > 30
+        || lm2_heading_starts_new_outline_item(&next.text)
+    {
+        return false;
+    }
+    let Some(previous_ref) = current_refs.last() else {
+        return false;
+    };
+    let Some(next_ref) = next_refs.first() else {
+        return false;
+    };
+    if previous_ref.page_index != next_ref.page_index
+        || next_ref.line_index <= previous_ref.line_index
+        || next_ref.line_index - previous_ref.line_index > 2
+    {
+        return false;
+    }
+    let previous_line = previous_ref
+        .id
+        .as_deref()
+        .and_then(|id| line_by_id.get(id).copied());
+    let next_line = next_ref
+        .id
+        .as_deref()
+        .and_then(|id| line_by_id.get(id).copied());
+    let (Some(previous_line), Some(next_line)) = (previous_line, next_line) else {
+        return false;
+    };
+
+    let page_width = previous_line.page_width.max(next_line.page_width).max(1.0);
+    let previous_center = (previous_line.left + previous_line.right) * 0.5;
+    let next_center = (next_line.left + next_line.right) * 0.5;
+    let both_centered = (previous_line.centered || previous_line.margin_centered)
+        && (next_line.centered || next_line.margin_centered);
+    let aligned = if both_centered {
+        (previous_center - next_center).abs() <= page_width * 0.06
+    } else {
+        (previous_line.left - next_line.left).abs() <= page_width * 0.06
+    };
+    if !aligned {
+        return false;
+    }
+
+    let previous_height = (previous_line.top - previous_line.bottom).abs().max(0.1);
+    let next_height = (next_line.top - next_line.bottom).abs().max(0.1);
+    let max_height = previous_height.max(next_height);
+    if (previous_line.font_height - next_line.font_height).abs() > max_height * 0.22
+        || (previous_line.font_ratio_doc - next_line.font_ratio_doc).abs() > 0.20
+        || lm2_vertical_interval_gap(previous_line, next_line) > max_height * 0.90 + 2.0
+    {
+        return false;
+    }
+
+    let first_has_marker = lm2_heading_starts_new_outline_item(&current.text);
+    let current_trimmed = current.text.trim_end();
+    let first_opens_continuation = current_trimmed.ends_with(':') || current_trimmed.ends_with('-');
+    let both_all_caps =
+        uppercase_ratio(&current.text) >= 0.85 && uppercase_ratio(&next.text) >= 0.85;
+    first_has_marker || first_opens_continuation || both_all_caps
+}
+
+fn lm2_vertical_interval_gap(first: &DeepLiquidSourceLine, second: &DeepLiquidSourceLine) -> f32 {
+    let first_low = first.bottom.min(first.top);
+    let first_high = first.bottom.max(first.top);
+    let second_low = second.bottom.min(second.top);
+    let second_high = second.bottom.max(second.top);
+    if first_high < second_low {
+        second_low - first_high
+    } else if second_high < first_low {
+        first_low - second_high
+    } else {
+        0.0
+    }
+}
+
+fn lm2_heading_starts_new_outline_item(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    let canonical = lower
+        .trim_matches(|ch: char| !ch.is_alphanumeric() && !ch.is_whitespace())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if matches!(
+        canonical.as_str(),
+        "abstract"
+            | "acknowledgments"
+            | "appendix"
+            | "background"
+            | "conclusion"
+            | "discussion"
+            | "executive summary"
+            | "findings"
+            | "introduction"
+            | "limitations"
+            | "literature review"
+            | "methodology"
+            | "methods"
+            | "recommendations"
+            | "references"
+            | "related work"
+            | "results"
+    ) {
+        return true;
+    }
+    if trimmed.starts_with('§') || lower.starts_with("part ") || lower.starts_with("chapter ") {
+        return true;
+    }
+    let Some(token) = trimmed.split_whitespace().next() else {
+        return false;
+    };
+    let unwrapped = token.trim_start_matches('(');
+    let marker = unwrapped.trim_end_matches(['.', ')', ':']);
+    if marker.is_empty() || marker.len() == unwrapped.len() {
+        return false;
+    }
+    marker.chars().all(|ch| ch.is_ascii_digit())
+        || marker
+            .chars()
+            .all(|ch| matches!(ch, 'I' | 'V' | 'X' | 'L' | 'C'))
+        || (marker.len() == 1 && marker.chars().all(|ch| ch.is_ascii_alphabetic()))
+}
+
 fn apply_deferred_marginalia_reflow(
     blocks: &mut Vec<LiquidBlock>,
     sources: &mut Vec<LiquidBlockSourceLines>,
@@ -10210,7 +10487,11 @@ fn role_for_decoded_line(
                     LiquidBlockRole::Heading
                         if word_count(&line.text) <= 14
                             && heading_text_like(&line.text)
-                            && ((line.centered && uppercase_ratio(&line.text) >= 0.72)
+                            && ((lm2_heading_starts_new_outline_item(&line.text)
+                                && line.font_ratio_doc >= 0.84
+                                && !line.in_footnote_zone
+                                && !line.below_footnote_divider)
+                                || (line.centered && uppercase_ratio(&line.text) >= 0.72)
                                 || (line.font_ratio_page >= 0.98
                                     && (line.bold
                                         || line.centered
@@ -12774,6 +13055,171 @@ mod tests {
             role_hint,
             lv: Default::default(),
         }
+    }
+
+    fn heading_reflow_fixture(
+        first_text: &str,
+        second_text: &str,
+    ) -> (
+        Vec<LiquidBlock>,
+        Vec<LiquidBlockSourceLines>,
+        Vec<(DeepLiquidSourceLine, Lm2Action)>,
+    ) {
+        let first = lm2_test_source_line(
+            "p17:l9",
+            9,
+            first_text,
+            1.0,
+            true,
+            Some(LiquidBlockRole::Heading),
+        );
+        let second = lm2_test_source_line(
+            "p17:l10",
+            10,
+            second_text,
+            1.0,
+            true,
+            Some(LiquidBlockRole::Heading),
+        );
+        let blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Heading,
+                text: first_text.to_owned(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Heading,
+                text: second_text.to_owned(),
+                label: None,
+            },
+        ];
+        let sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&first, LiquidBlockRole::Heading)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&second, LiquidBlockRole::Heading)],
+            },
+        ];
+        let decoded = vec![(first, Lm2Action::Keep), (second, Lm2Action::Keep)];
+        (blocks, sources, decoded)
+    }
+
+    #[test]
+    fn heading_continuation_reflow_unites_wrapped_numbered_heading() {
+        let (mut blocks, mut sources, decoded) = heading_reflow_fixture(
+            "B. The Pigeonhole Perspective:",
+            "Torts as Remedial Moral Liability Rules",
+        );
+
+        assert_eq!(
+            apply_heading_continuation_reflow(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].text,
+            "B. The Pigeonhole Perspective: Torts as Remedial Moral Liability Rules"
+        );
+        assert_eq!(sources[0].lines.len(), 2);
+    }
+
+    #[test]
+    fn decoded_role_trusts_normal_size_structured_heading_hint() {
+        let mut line = lm2_test_source_line(
+            "p17:l18",
+            18,
+            "A. Ground Truth and Interpretation",
+            0.97,
+            false,
+            Some(LiquidBlockRole::Heading),
+        );
+        line.font_ratio_doc = 0.97;
+
+        assert_eq!(
+            role_for_decoded_line(&line, Lm2Action::Keep, false),
+            LiquidBlockRole::Heading
+        );
+        line.in_footnote_zone = true;
+        assert_eq!(
+            role_for_decoded_line(&line, Lm2Action::Keep, false),
+            LiquidBlockRole::Paragraph
+        );
+    }
+
+    #[test]
+    fn heading_outline_split_separates_nested_markers_grouped_together() {
+        let (mut blocks, mut sources, _) = heading_reflow_fixture(
+            "I. WRESTLING A SQUARE PEG",
+            "A. Increasingly Artificial Governance",
+        );
+        blocks[0].text = format!("{} {}", blocks[0].text, blocks[1].text);
+        blocks.truncate(1);
+        let second_refs = sources.pop().unwrap().lines;
+        sources[0].lines.extend(second_refs);
+
+        assert_eq!(apply_heading_outline_splits(&mut blocks, &mut sources), 1);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].text, "I. WRESTLING A SQUARE PEG");
+        assert_eq!(blocks[1].text, "A. Increasingly Artificial Governance");
+        assert_eq!(sources[0].block_index, 0);
+        assert_eq!(sources[1].block_index, 1);
+    }
+
+    #[test]
+    fn heading_outline_split_separates_canonical_intro_from_front_matter() {
+        let (mut blocks, mut sources, _) =
+            heading_reflow_fixture("WHAT IS A TORT? Ketan Ramakrishnan", "INTRODUCTION");
+        blocks[0].text = format!("{} {}", blocks[0].text, blocks[1].text);
+        blocks.truncate(1);
+        let second_refs = sources.pop().unwrap().lines;
+        sources[0].lines.extend(second_refs);
+
+        assert_eq!(apply_heading_outline_splits(&mut blocks, &mut sources), 1);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].text, "WHAT IS A TORT? Ketan Ramakrishnan");
+        assert_eq!(blocks[1].text, "INTRODUCTION");
+    }
+
+    #[test]
+    fn heading_continuation_reflow_unites_centered_all_caps_wrap() {
+        let (mut blocks, mut sources, decoded) =
+            heading_reflow_fixture("RESTRAINT", "ON ALIENATION");
+
+        assert_eq!(
+            apply_heading_continuation_reflow(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[0].text, "RESTRAINT ON ALIENATION");
+    }
+
+    #[test]
+    fn heading_continuation_reflow_preserves_distinct_outline_items() {
+        let (mut blocks, mut sources, decoded) =
+            heading_reflow_fixture("A. First Topic", "B. Second Topic");
+
+        assert_eq!(
+            apply_heading_continuation_reflow(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(sources.len(), 2);
+    }
+
+    #[test]
+    fn heading_continuation_reflow_never_crosses_pages() {
+        let (mut blocks, mut sources, mut decoded) =
+            heading_reflow_fixture("III. A Heading That Wraps", "Across a Page Boundary");
+        decoded[1].0.page_index = 1;
+        sources[1].lines[0].page_index = 1;
+
+        assert_eq!(
+            apply_heading_continuation_reflow(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(blocks.len(), 2);
     }
 
     #[test]

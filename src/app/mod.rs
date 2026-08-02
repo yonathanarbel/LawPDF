@@ -346,13 +346,11 @@ pub struct PdfEditorApp {
     annotations: Vec<EditorAnnotation>,
     annotations_dirty: bool,
     liquid_feedback: Vec<LiquidFeedback>,
-    editing_liquid_feedback: Option<String>,
     /// #27 footnote popovers: body superscript marker number -> footnote text,
     /// rebuilt each frame from the rendered document's Footnote/Marginalia blocks.
     liquid_footnote_index: HashMap<u16, String>,
-    /// #31 outline navigation: pending scroll target (heading level, compacted text)
-    /// set when an outline entry is clicked; consumed by the matching heading block.
-    liquid_scroll_to_heading: Option<(usize, String)>,
+    /// Pending exact Review Mode block selected from the left-hand outline.
+    liquid_scroll_to_block: Option<usize>,
     /// #29 provenance dual-view: source bboxes (per page) to highlight in the
     /// fixed-layout view after the reader ⌘-clicks a reflowed block. Empty = none.
     liquid_provenance_highlight: Vec<(usize, PdfRect)>,
@@ -628,6 +626,7 @@ enum MarkdownPreparationOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiquidOutlineItem {
+    block_index: usize,
     level: usize,
     text: String,
 }
@@ -936,7 +935,6 @@ struct DocumentTab {
     annotations: Vec<EditorAnnotation>,
     annotations_dirty: bool,
     liquid_feedback: Vec<LiquidFeedback>,
-    editing_liquid_feedback: Option<String>,
     text_selection: Option<TextSelection>,
     liquid_all_selected: bool,
     selection_anchor: Option<(usize, usize)>,
@@ -1082,9 +1080,8 @@ impl PdfEditorApp {
             annotations: Vec::new(),
             annotations_dirty: false,
             liquid_feedback: Vec::new(),
-            editing_liquid_feedback: None,
             liquid_footnote_index: HashMap::new(),
-            liquid_scroll_to_heading: None,
+            liquid_scroll_to_block: None,
             liquid_provenance_highlight: Vec::new(),
             liquid_show_hidden_furniture: false,
             tts_controller,
@@ -1206,7 +1203,6 @@ impl PdfEditorApp {
             annotations: self.annotations.clone(),
             annotations_dirty: self.annotations_dirty,
             liquid_feedback: self.liquid_feedback.clone(),
-            editing_liquid_feedback: self.editing_liquid_feedback.clone(),
             text_selection: self.selection_state.text,
             liquid_all_selected: self.selection_state.liquid_all,
             selection_anchor: self.selection_state.anchor,
@@ -1280,7 +1276,6 @@ impl PdfEditorApp {
         self.annotations = tab.annotations;
         self.annotations_dirty = tab.annotations_dirty;
         self.liquid_feedback = tab.liquid_feedback;
-        self.editing_liquid_feedback = tab.editing_liquid_feedback;
         self.selection_state.text = tab.text_selection;
         self.selection_state.liquid_all = tab.liquid_all_selected;
         self.selection_state.anchor = tab.selection_anchor;
@@ -1545,7 +1540,6 @@ impl PdfEditorApp {
         self.annotations.clear();
         self.annotations_dirty = false;
         self.liquid_feedback.clear();
-        self.editing_liquid_feedback = None;
         self.selection_state.text = None;
         self.selection_state.liquid_all = false;
         self.selection_state.anchor = None;
@@ -1941,7 +1935,6 @@ impl PdfEditorApp {
             annotations,
             annotations_dirty: false,
             liquid_feedback,
-            editing_liquid_feedback: None,
             text_selection: None,
             liquid_all_selected: false,
             selection_anchor: None,
@@ -3274,14 +3267,26 @@ impl PdfEditorApp {
         }
         if self.view_mode == mode {
             if mode == DocumentViewMode::Liquid {
+                self.sidebar_tab = SidebarTab::Outline;
                 self.ensure_liquid_started(ctx);
             } else if mode == DocumentViewMode::LiquidMode2 {
+                self.sidebar_tab = SidebarTab::Outline;
                 self.ensure_liquid_mode2_started(ctx);
             }
             return;
         }
         self.clear_text_selection();
         self.view_mode = mode;
+        self.liquid_scroll_to_block = None;
+        if matches!(
+            mode,
+            DocumentViewMode::Liquid | DocumentViewMode::LiquidMode2
+        ) {
+            self.sidebar_tab = SidebarTab::Outline;
+        } else if self.sidebar_tab == SidebarTab::Outline {
+            self.sidebar_tab = SidebarTab::Pages;
+            self.thumbnail_scroll_target = Some(self.page_index);
+        }
         if matches!(
             mode,
             DocumentViewMode::Liquid | DocumentViewMode::LiquidMode2
@@ -5395,13 +5400,77 @@ impl PdfEditorApp {
     }
 
     fn draw_outline_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Outline");
-        ui.add_space(6.0);
-        ui.label(RichText::new("No outline detected.").color(MUTED_INK));
-        if let Some(document) = self.document.as_ref() {
-            ui.add_space(10.0);
-            ui.label(RichText::new(&document.title).strong());
-            ui.label(RichText::new(format!("{} pages", document.page_count)).color(MUTED_INK));
+        ui.heading("Contents");
+        ui.add_space(4.0);
+
+        let ready = match self.view_mode {
+            DocumentViewMode::Liquid => match &self.liquid_state {
+                LiquidState::Ready(document) => Some((
+                    document.title.clone(),
+                    liquid_outline_items(&document.blocks),
+                )),
+                _ => None,
+            },
+            DocumentViewMode::LiquidMode2 => match &self.liquid_mode2_state {
+                LiquidState::Ready(document) => Some((
+                    document.title.clone(),
+                    liquid_outline_items(&document.blocks),
+                )),
+                _ => None,
+            },
+            DocumentViewMode::Pdf => None,
+        };
+
+        let Some((title, outline)) = ready else {
+            if matches!(
+                self.view_mode,
+                DocumentViewMode::Liquid | DocumentViewMode::LiquidMode2
+            ) {
+                ui.spinner();
+                ui.label(RichText::new("Finding sections...").color(MUTED_INK));
+            } else {
+                ui.label(
+                    RichText::new("Open Review Mode to build a clickable contents list.")
+                        .color(MUTED_INK),
+                );
+            }
+            return;
+        };
+
+        ui.label(RichText::new(title).strong());
+        ui.add_space(7.0);
+        if outline.is_empty() {
+            ui.label(RichText::new("No section headings detected.").color(MUTED_INK));
+            return;
+        }
+
+        let mut clicked_target = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for item in &outline {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(14.0 * item.level.saturating_sub(1) as f32);
+                    let response = ui
+                        .add(
+                            egui::Label::new(
+                                RichText::new(&item.text)
+                                    .size(if item.level == 1 { 13.0 } else { 12.0 })
+                                    .strong()
+                                    .color(if item.level == 1 { INK } else { MUTED_INK }),
+                            )
+                            .wrap()
+                            .sense(Sense::click()),
+                        )
+                        .on_hover_text("Jump to this section")
+                        .on_hover_cursor(CursorIcon::PointingHand);
+                    if response.clicked() {
+                        clicked_target = Some(item.block_index);
+                    }
+                });
+                ui.add_space(3.0);
+            }
+        });
+        if let Some(block_index) = clicked_target {
+            self.liquid_scroll_to_block = Some(block_index);
         }
     }
 
@@ -6360,8 +6429,6 @@ impl PdfEditorApp {
                                     // #23: confidence-gated fallback affordance.
                                     self.draw_liquid_reflow_gate(ui, ctx, hint);
                                 }
-                                let outline = liquid_outline_items(&document.blocks);
-                                self.draw_liquid_outline(ui, &outline);
                                 let notes = liquid_note_blocks(&document.blocks);
                                 let hidden_contents =
                                     hidden_contents_mask_for_display(&document.blocks);
@@ -6545,8 +6612,6 @@ impl PdfEditorApp {
                                     // #23: confidence-gated fallback affordance.
                                     self.draw_liquid_reflow_gate(ui, ctx, hint);
                                 }
-                                let outline = liquid_outline_items(&document.blocks);
-                                self.draw_liquid_outline(ui, &outline);
                                 let notes = liquid_note_blocks(&document.blocks);
                                 let hidden_contents =
                                     hidden_contents_mask_for_display(&document.blocks);
@@ -6873,10 +6938,6 @@ impl PdfEditorApp {
         block: &LiquidBlock,
     ) {
         let feedback_id = liquid_feedback_id(&document.source_signature, block_index, block);
-        let has_feedback = self
-            .liquid_feedback
-            .iter()
-            .any(|entry| entry.id == feedback_id && entry.submitted_at.is_none());
         let inner = egui::Frame::NONE.show(ui, |ui| self.draw_liquid_block(ui, block));
         let response = inner.response;
         // #27: footnote marker rects (in screen space) collected while drawing the body text.
@@ -6905,57 +6966,52 @@ impl PdfEditorApp {
         if let Some((role, gold_role, action)) = pending_correction {
             self.apply_reader_correction(document, block_index, block, role, gold_role, action);
         }
-        // #31: if this heading is the pending outline scroll target, bring it into view.
-        if let Some((target_level, target_text)) = self.liquid_scroll_to_heading.clone() {
-            let level = match block.role {
-                LiquidBlockRole::Heading => 1,
-                LiquidBlockRole::Subheading => 2,
-                _ => 0,
-            };
-            if level == target_level && compact_liquid_outline_text(&block.text) == target_text {
-                response.scroll_to_me(Some(Align::TOP));
-                self.liquid_scroll_to_heading = None;
-            }
+        // Exact block identity makes repeated headings navigate deterministically.
+        if self.liquid_scroll_to_block == Some(block_index) {
+            response.scroll_to_me(Some(Align::TOP));
+            self.liquid_scroll_to_block = None;
         }
-        // Click a block to open/close its correction toolbar. (It used to appear on hover, which made
-        // reading jumpy — touching any line popped the toolbar — and the buttons were effectively
-        // unreachable, since moving the pointer toward them left the hover area and dismissed it.)
-        // The block-wide overlay fully contains the inline markers, so egui's hit-test always
-        // routes the click here (a fully-occluded smaller widget can't win). We therefore resolve
-        // marker taps ourselves against `marker_hits` before falling back to the feedback toggle.
-        let toggle = ui
-            .interact(
-                response.rect,
-                ui.id().with(("liquid-fb-toggle", feedback_id.as_str())),
-                Sense::click(),
-            )
-            .on_hover_cursor(CursorIcon::PointingHand);
-        let mut marker_clicked = false;
-        let mut provenance_clicked = false;
+        // Keep ordinary Review Mode text inert. The block-wide overlay only becomes clickable for
+        // an explicit provenance gesture or while the pointer is over a footnote marker. Because
+        // that overlay contains the inline markers, resolve marker taps here against `marker_hits`.
+        let command_active = ui.input(|input| input.modifiers.command);
+        let hovered_marker = ui
+            .input(|input| input.pointer.hover_pos())
+            .and_then(|position| {
+                marker_hits
+                    .iter()
+                    .find(|(rect, _)| rect.contains(position))
+                    .map(|(_, number)| *number)
+            });
+        let click_enabled = liquid_block_click_enabled(command_active, hovered_marker);
+        let sense = if click_enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        };
+        let toggle = ui.interact(
+            response.rect,
+            ui.id().with(("liquid-block-action", feedback_id.as_str())),
+            sense,
+        );
+        let toggle = if click_enabled {
+            toggle.on_hover_cursor(CursorIcon::PointingHand)
+        } else {
+            toggle
+        };
         if toggle.clicked() {
             // #29: ⌘/Ctrl-click a reflowed block jumps to the fixed-layout page view and
             // highlights the source bboxes this block was assembled from.
-            if ui.input(|i| i.modifiers.command) {
+            if command_active {
                 let rects = self.liquid_block_provenance_rects(document, block_index);
                 if let Some((page, _)) = rects.first().copied() {
                     self.liquid_provenance_highlight = rects;
                     self.scroll_target_page = Some(page);
                     self.set_view_mode(DocumentViewMode::Pdf, ui.ctx());
                 }
-                provenance_clicked = true;
-            } else if let Some(pos) = toggle.interact_pointer_pos() {
-                if let Some((_, number)) = marker_hits.iter().find(|(rect, _)| rect.contains(pos)) {
-                    let popup_id = liquid_footnote_popup_id(&feedback_id, *number);
-                    egui::Popup::toggle_id(ui.ctx(), popup_id);
-                    marker_clicked = true;
-                }
-            }
-        }
-        if toggle.clicked() && !marker_clicked && !provenance_clicked {
-            if self.editing_liquid_feedback.as_deref() == Some(feedback_id.as_str()) {
-                self.editing_liquid_feedback = None;
-            } else {
-                self.editing_liquid_feedback = Some(feedback_id.clone());
+            } else if let Some(number) = hovered_marker {
+                let popup_id = liquid_footnote_popup_id(&feedback_id, number);
+                egui::Popup::toggle_id(ui.ctx(), popup_id);
             }
         }
         // Render any open footnote popovers, anchored at their markers.
@@ -6967,10 +7023,6 @@ impl PdfEditorApp {
             if let Some(body) = self.liquid_footnote_index.get(number) {
                 self.draw_liquid_footnote_popover(ui, popup_id, *rect, *number, body);
             }
-        }
-        let editing = self.editing_liquid_feedback.as_deref() == Some(feedback_id.as_str());
-        if has_feedback || editing {
-            self.draw_liquid_feedback_toolbar(ui, document, block_index, block, &feedback_id);
         }
     }
 
@@ -7191,81 +7243,6 @@ impl PdfEditorApp {
                     );
                 });
         });
-    }
-
-    fn draw_liquid_feedback_toolbar(
-        &mut self,
-        ui: &mut egui::Ui,
-        document: &LiquidDocument,
-        block_index: usize,
-        block: &LiquidBlock,
-        feedback_id: &str,
-    ) {
-        let mut save_after_edit = false;
-        ui.horizontal_wrapped(|ui| {
-            ui.add_space(18.0);
-            ui.label(
-                RichText::new("Mark as")
-                    .size(10.0)
-                    .color(self.liquid_muted_color()),
-            );
-            for (label, role) in [
-                ("Body", LiquidBlockRole::Paragraph),
-                ("Footnote", LiquidBlockRole::Footnote),
-                ("Title", LiquidBlockRole::Title),
-                ("Heading", LiquidBlockRole::Heading),
-                ("Noise", LiquidBlockRole::Noise),
-            ] {
-                if ui
-                    .small_button(label)
-                    .on_hover_text(format!("Record this block as {label} training feedback"))
-                    .clicked()
-                {
-                    self.upsert_liquid_feedback(document, block_index, block, Some(role));
-                    self.editing_liquid_feedback = Some(feedback_id.to_owned());
-                }
-            }
-            if ui
-                .small_button("Note")
-                .on_hover_text("Add a freeform Review Mode training note")
-                .clicked()
-            {
-                self.upsert_liquid_feedback(document, block_index, block, None);
-                self.editing_liquid_feedback = Some(feedback_id.to_owned());
-            }
-        });
-
-        if let Some(index) = self
-            .liquid_feedback
-            .iter()
-            .position(|entry| entry.id == feedback_id)
-            && self.editing_liquid_feedback.as_deref() == Some(feedback_id)
-        {
-            ui.horizontal(|ui| {
-                ui.add_space(18.0);
-                ui.label(
-                    RichText::new("Annotation")
-                        .size(10.0)
-                        .color(self.liquid_muted_color()),
-                );
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.liquid_feedback[index].note)
-                        .desired_width(360.0)
-                        .hint_text("what looked wrong?"),
-                );
-                if response.changed() {
-                    self.liquid_feedback[index].updated_at = comment_timestamp();
-                    save_after_edit = true;
-                }
-                if ui.small_button("Done").clicked() {
-                    self.editing_liquid_feedback = None;
-                    save_after_edit = true;
-                }
-            });
-        }
-        if save_after_edit {
-            self.save_current_liquid_feedback();
-        }
     }
 
     /// Read the reflowed text with an operating-system speech process. The
@@ -7839,53 +7816,6 @@ try {
             }
         });
         ui.add_space(12.0);
-    }
-
-    fn draw_liquid_outline(&mut self, ui: &mut egui::Ui, outline: &[LiquidOutlineItem]) {
-        if outline.is_empty() {
-            return;
-        }
-
-        let ink = self.liquid_ink_color();
-        let muted = self.liquid_muted_color();
-        let scale = self.liquid_text_scale;
-        let mut clicked_target: Option<(usize, String)> = None;
-        egui::CollapsingHeader::new(format!("Sections ({})", outline.len()))
-            .default_open(outline.len() <= 6)
-            .show(ui, |ui| {
-                ui.add_space(2.0);
-                for item in outline {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.add_space(match item.level {
-                            0 | 1 => 0.0,
-                            _ => 18.0,
-                        });
-                        // #31: clicking an entry scrolls the reading view to its heading.
-                        let response = ui
-                            .add(
-                                egui::Label::new(
-                                    RichText::new(&item.text)
-                                        .size(if item.level <= 1 {
-                                            14.0 * scale
-                                        } else {
-                                            13.0 * scale
-                                        })
-                                        .strong()
-                                        .color(if item.level <= 1 { ink } else { muted }),
-                                )
-                                .sense(Sense::click()),
-                            )
-                            .on_hover_cursor(CursorIcon::PointingHand);
-                        if response.clicked() {
-                            clicked_target = Some((item.level, item.text.clone()));
-                        }
-                    });
-                }
-            });
-        if let Some(target) = clicked_target {
-            self.liquid_scroll_to_heading = Some(target);
-        }
-        ui.add_space(10.0);
     }
 
     /// Draws a body paragraph. Inline footnote markers (wrapped in CALLOUT sentinels
@@ -13401,31 +13331,275 @@ fn push_liquid_copy_part(parts: &mut Vec<String>, text: &str) {
 fn liquid_outline_items(blocks: &[LiquidBlock]) -> Vec<LiquidOutlineItem> {
     let mut outline = Vec::new();
     let hidden_contents = hidden_contents_mask_for_display(blocks);
+    let has_explicit_abstract = blocks
+        .iter()
+        .any(|block| block.role == LiquidBlockRole::Abstract);
+    let inferred_abstract_index = (!has_explicit_abstract)
+        .then(|| {
+            blocks.iter().position(|block| {
+                matches!(
+                    block.role,
+                    LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+                ) && liquid_outline_canonical_name(&block.text) == "introduction"
+            })
+        })
+        .flatten()
+        .and_then(|intro_index| {
+            blocks[..intro_index]
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, block)| {
+                    matches!(
+                        block.role,
+                        LiquidBlockRole::Paragraph | LiquidBlockRole::Lead
+                    ) && block.text.split_whitespace().count() >= 80
+                })
+                .map(|(index, _)| index)
+        });
+    let visible_headings = blocks.iter().enumerate().filter(|(index, block)| {
+        !hidden_contents.get(*index).copied().unwrap_or(false)
+            && !should_hide_contents_block_for_display(block)
+            && matches!(
+                block.role,
+                LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+            )
+    });
+    let marker_kinds = visible_headings
+        .filter_map(|(_, block)| liquid_outline_marker_kind(&block.text))
+        .collect::<HashSet<_>>();
+    let upper_markers = blocks
+        .iter()
+        .enumerate()
+        .filter(|(index, block)| {
+            !hidden_contents.get(*index).copied().unwrap_or(false)
+                && !should_hide_contents_block_for_display(block)
+                && matches!(
+                    block.role,
+                    LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+                )
+        })
+        .filter_map(|(_, block)| liquid_outline_upper_alpha_value(&block.text))
+        .collect::<HashSet<_>>();
+    let contiguous_upper_prefix = (1..=26)
+        .take_while(|value| upper_markers.contains(value))
+        .count();
+    let numeric_markers = blocks
+        .iter()
+        .enumerate()
+        .filter(|(index, block)| {
+            !hidden_contents.get(*index).copied().unwrap_or(false)
+                && !should_hide_contents_block_for_display(block)
+                && matches!(
+                    block.role,
+                    LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+                )
+        })
+        .filter_map(|(_, block)| liquid_outline_numeric_value(&block.text))
+        .collect::<HashSet<_>>();
+    let contiguous_numeric_prefix = (1..=99)
+        .take_while(|value| numeric_markers.contains(value))
+        .count();
+    let structured_marker_count = blocks
+        .iter()
+        .enumerate()
+        .filter(|(index, block)| {
+            !hidden_contents.get(*index).copied().unwrap_or(false)
+                && matches!(
+                    block.role,
+                    LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+                )
+                && liquid_outline_marker_kind(&block.text).is_some()
+        })
+        .count();
+    let marker_rich_document = structured_marker_count >= 3;
     for (index, block) in blocks.iter().enumerate() {
         if hidden_contents.get(index).copied().unwrap_or(false)
             || should_hide_contents_block_for_display(block)
         {
             continue;
         }
-        let level = match block.role {
-            LiquidBlockRole::Heading => 1,
-            LiquidBlockRole::Subheading => 2,
-            _ => continue,
-        };
-        let text = compact_liquid_outline_text(&block.text);
-        if text.is_empty()
-            || outline
-                .last()
-                .is_some_and(|item: &LiquidOutlineItem| item.level == level && item.text == text)
+        if block.role == LiquidBlockRole::Abstract {
+            outline.push(LiquidOutlineItem {
+                block_index: index,
+                level: 1,
+                text: "Abstract".to_owned(),
+            });
+            if outline.len() >= MAX_LIQUID_OUTLINE_ITEMS {
+                break;
+            }
+            continue;
+        }
+        if inferred_abstract_index == Some(index) {
+            outline.push(LiquidOutlineItem {
+                block_index: index,
+                level: 1,
+                text: "Abstract".to_owned(),
+            });
+            continue;
+        }
+        if !matches!(
+            block.role,
+            LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+        ) {
+            continue;
+        }
+        if marker_rich_document
+            && liquid_outline_marker_kind(&block.text).is_none()
+            && !liquid_outline_canonical_unnumbered_heading(&block.text)
         {
             continue;
         }
-        outline.push(LiquidOutlineItem { level, text });
+        if contiguous_upper_prefix >= 2
+            && liquid_outline_upper_alpha_value(&block.text)
+                .is_some_and(|value| value > contiguous_upper_prefix + 1)
+        {
+            continue;
+        }
+        if liquid_outline_marker_kind(&block.text) == Some(LiquidOutlineMarkerKind::Numeric)
+            && contiguous_numeric_prefix < 2
+        {
+            continue;
+        }
+        let level = liquid_outline_level(block, &marker_kinds);
+        let text = compact_liquid_outline_text(&block.text);
+        if text.is_empty() {
+            continue;
+        }
+        outline.push(LiquidOutlineItem {
+            block_index: index,
+            level,
+            text,
+        });
         if outline.len() >= MAX_LIQUID_OUTLINE_ITEMS {
             break;
         }
     }
     outline
+}
+
+fn liquid_outline_numeric_value(text: &str) -> Option<usize> {
+    if liquid_outline_marker_kind(text) != Some(LiquidOutlineMarkerKind::Numeric) {
+        return None;
+    }
+    let token = text.trim_start().split_whitespace().next()?;
+    token
+        .trim_start_matches('(')
+        .trim_end_matches(['.', ')', ':'])
+        .parse()
+        .ok()
+}
+
+fn liquid_outline_upper_alpha_value(text: &str) -> Option<usize> {
+    if liquid_outline_marker_kind(text) != Some(LiquidOutlineMarkerKind::UpperAlpha) {
+        return None;
+    }
+    let token = text.trim_start().split_whitespace().next()?;
+    let marker = token
+        .trim_start_matches('(')
+        .trim_end_matches(['.', ')', ':']);
+    let letter = marker.chars().next()?;
+    Some((letter as u8 - b'A' + 1) as usize)
+}
+
+fn liquid_outline_canonical_unnumbered_heading(text: &str) -> bool {
+    matches!(
+        liquid_outline_canonical_name(text).as_str(),
+        "abstract"
+            | "acknowledgments"
+            | "appendix"
+            | "background"
+            | "bibliography"
+            | "conclusion"
+            | "discussion"
+            | "executive summary"
+            | "findings"
+            | "introduction"
+            | "limitations"
+            | "literature review"
+            | "methodology"
+            | "methods"
+            | "recommendations"
+            | "references"
+            | "related work"
+            | "results"
+    )
+}
+
+fn liquid_outline_canonical_name(text: &str) -> String {
+    text.trim()
+        .trim_matches(|ch: char| !ch.is_alphanumeric() && !ch.is_whitespace())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum LiquidOutlineMarkerKind {
+    Roman,
+    UpperAlpha,
+    Numeric,
+    LowerAlpha,
+    Section,
+}
+
+fn liquid_outline_marker_kind(text: &str) -> Option<LiquidOutlineMarkerKind> {
+    let trimmed = text.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed.starts_with('§') || lower.starts_with("part ") || lower.starts_with("chapter ") {
+        return Some(LiquidOutlineMarkerKind::Section);
+    }
+    let token = trimmed.split_whitespace().next()?;
+    let unwrapped = token.trim_start_matches('(');
+    let marker = unwrapped.trim_end_matches(['.', ')', ':']);
+    if marker.len() == unwrapped.len() || marker.is_empty() {
+        return None;
+    }
+    if marker.chars().all(|ch| ch.is_ascii_digit()) {
+        return Some(LiquidOutlineMarkerKind::Numeric);
+    }
+    if (marker.len() > 1 || matches!(marker, "I" | "V" | "X"))
+        && marker
+            .chars()
+            .all(|ch| matches!(ch, 'I' | 'V' | 'X' | 'L' | 'C'))
+    {
+        return Some(LiquidOutlineMarkerKind::Roman);
+    }
+    if marker.len() == 1 && marker.chars().all(|ch| ch.is_ascii_uppercase()) {
+        return Some(LiquidOutlineMarkerKind::UpperAlpha);
+    }
+    if marker.len() == 1 && marker.chars().all(|ch| ch.is_ascii_lowercase()) {
+        return Some(LiquidOutlineMarkerKind::LowerAlpha);
+    }
+    None
+}
+
+fn liquid_outline_level(
+    block: &LiquidBlock,
+    marker_kinds: &HashSet<LiquidOutlineMarkerKind>,
+) -> usize {
+    let role_floor = if block.role == LiquidBlockRole::Subheading {
+        2
+    } else {
+        1
+    };
+    let has_roman = marker_kinds.contains(&LiquidOutlineMarkerKind::Roman)
+        || marker_kinds.contains(&LiquidOutlineMarkerKind::Section);
+    let has_upper = marker_kinds.contains(&LiquidOutlineMarkerKind::UpperAlpha);
+    let has_numeric = marker_kinds.contains(&LiquidOutlineMarkerKind::Numeric);
+    let inferred = match liquid_outline_marker_kind(&block.text) {
+        Some(LiquidOutlineMarkerKind::Roman | LiquidOutlineMarkerKind::Section) => 1,
+        Some(LiquidOutlineMarkerKind::UpperAlpha) => 1 + usize::from(has_roman),
+        Some(LiquidOutlineMarkerKind::Numeric) => {
+            1 + usize::from(has_roman) + usize::from(has_upper)
+        }
+        Some(LiquidOutlineMarkerKind::LowerAlpha) => {
+            1 + usize::from(has_roman) + usize::from(has_upper) + usize::from(has_numeric)
+        }
+        None => role_floor,
+    };
+    inferred.max(role_floor).clamp(1, 4)
 }
 
 fn compact_liquid_outline_text(text: &str) -> String {
@@ -14022,6 +14196,10 @@ fn build_liquid_footnote_index(blocks: &[LiquidBlock]) -> HashMap<u16, String> {
 /// Stable egui id for a body marker's footnote popover, unique per block+number.
 fn liquid_footnote_popup_id(feedback_id: &str, number: u16) -> egui::Id {
     egui::Id::new(("liquid-fn-popover", feedback_id, number))
+}
+
+fn liquid_block_click_enabled(command_active: bool, hovered_marker: Option<u16>) -> bool {
+    command_active || hovered_marker.is_some()
 }
 
 fn split_liquid_note_marker(text: &str) -> (Option<&str>, &str) {
@@ -14730,18 +14908,155 @@ mod app_tests {
             liquid_outline_items(&blocks),
             vec![
                 LiquidOutlineItem {
+                    block_index: 1,
                     level: 1,
                     text: "I. Introduction".to_owned()
                 },
                 LiquidOutlineItem {
+                    block_index: 2,
                     level: 2,
                     text: "A. Agency Reliance Interests".to_owned()
                 },
                 LiquidOutlineItem {
+                    block_index: 4,
+                    level: 2,
+                    text: "A. Agency Reliance Interests".to_owned()
+                },
+                LiquidOutlineItem {
+                    block_index: 5,
                     level: 1,
                     text: "II. Conclusion".to_owned()
                 }
             ]
+        );
+    }
+
+    #[test]
+    fn liquid_outline_items_learns_available_marker_hierarchy() {
+        let numeric_only = vec![
+            test_liquid_block(LiquidBlockRole::Heading, "1. Background"),
+            test_liquid_block(LiquidBlockRole::Heading, "2. Results"),
+        ];
+        assert_eq!(
+            liquid_outline_items(&numeric_only)
+                .iter()
+                .map(|item| item.level)
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+
+        let legal = vec![
+            test_liquid_block(LiquidBlockRole::Heading, "I. Background"),
+            test_liquid_block(LiquidBlockRole::Heading, "A. Doctrine"),
+            test_liquid_block(LiquidBlockRole::Heading, "C. Remedies"),
+            test_liquid_block(LiquidBlockRole::Heading, "1. Origins"),
+            test_liquid_block(LiquidBlockRole::Heading, "2. Development"),
+            test_liquid_block(LiquidBlockRole::Heading, "a. Early cases"),
+        ];
+        assert_eq!(
+            liquid_outline_items(&legal)
+                .iter()
+                .map(|item| item.level)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 2, 3, 3, 4]
+        );
+    }
+
+    #[test]
+    fn liquid_outline_items_filters_unstructured_clutter_in_marker_rich_document() {
+        let blocks = vec![
+            test_liquid_block(LiquidBlockRole::Heading, "Professor Jane Example"),
+            test_liquid_block(LiquidBlockRole::Heading, "I. Background"),
+            test_liquid_block(LiquidBlockRole::Heading, "A. Doctrine"),
+            test_liquid_block(LiquidBlockRole::Heading, "H. An Isolated Citation Artifact"),
+            test_liquid_block(LiquidBlockRole::Heading, "B. Application"),
+            test_liquid_block(LiquidBlockRole::Paragraph, "C. Prose that is not a heading"),
+            test_liquid_block(LiquidBlockRole::Paragraph, "D. Prose that is not a heading"),
+            test_liquid_block(LiquidBlockRole::Paragraph, "E. Prose that is not a heading"),
+            test_liquid_block(LiquidBlockRole::Paragraph, "F. Prose that is not a heading"),
+            test_liquid_block(LiquidBlockRole::Paragraph, "G. Prose that is not a heading"),
+            test_liquid_block(LiquidBlockRole::Heading, "CONCLUSION"),
+            test_liquid_block(LiquidBlockRole::Heading, "Downloaded from Repository"),
+        ];
+
+        assert_eq!(
+            liquid_outline_items(&blocks)
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "I. Background",
+                "A. Doctrine",
+                "B. Application",
+                "CONCLUSION"
+            ]
+        );
+    }
+
+    #[test]
+    fn liquid_outline_items_labels_abstract_body_as_section() {
+        let blocks = vec![
+            test_liquid_block(
+                LiquidBlockRole::Abstract,
+                "This study examines a long question that should not become the sidebar label.",
+            ),
+            test_liquid_block(LiquidBlockRole::Heading, "I. Introduction"),
+        ];
+
+        assert_eq!(
+            liquid_outline_items(&blocks),
+            vec![
+                LiquidOutlineItem {
+                    block_index: 0,
+                    level: 1,
+                    text: "Abstract".to_owned(),
+                },
+                LiquidOutlineItem {
+                    block_index: 1,
+                    level: 1,
+                    text: "I. Introduction".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn liquid_outline_items_infers_unlabeled_front_matter_abstract() {
+        let blocks = vec![
+            test_liquid_block(LiquidBlockRole::Title, "A Study of Reliable Outlines"),
+            test_liquid_block(
+                LiquidBlockRole::Paragraph,
+                &std::iter::repeat("substantive")
+                    .take(90)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            test_liquid_block(LiquidBlockRole::Heading, "INTRODUCTION"),
+            test_liquid_block(LiquidBlockRole::Heading, "I. Background"),
+            test_liquid_block(LiquidBlockRole::Heading, "A. Doctrine"),
+        ];
+
+        let outline = liquid_outline_items(&blocks);
+        assert_eq!(outline[0].text, "Abstract");
+        assert_eq!(outline[0].block_index, 1);
+        assert_eq!(outline[1].text, "INTRODUCTION");
+    }
+
+    #[test]
+    fn liquid_outline_items_hides_orphan_numeric_heading() {
+        let blocks = vec![
+            test_liquid_block(LiquidBlockRole::Heading, "I. Background"),
+            test_liquid_block(LiquidBlockRole::Heading, "A. Rule"),
+            test_liquid_block(LiquidBlockRole::Heading, "B. Application"),
+            test_liquid_block(LiquidBlockRole::Heading, "2. Citation artifact"),
+        ];
+
+        assert_eq!(
+            liquid_outline_items(&blocks)
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["I. Background", "A. Rule", "B. Application"]
         );
     }
 
@@ -14779,6 +15094,7 @@ mod app_tests {
         assert_eq!(
             liquid_outline_items(&blocks),
             vec![LiquidOutlineItem {
+                block_index: 4,
                 level: 1,
                 text: "I. Introduction".to_owned()
             }]
@@ -14815,6 +15131,7 @@ mod app_tests {
         assert_eq!(
             liquid_outline_items(&blocks),
             vec![LiquidOutlineItem {
+                block_index: 34,
                 level: 1,
                 text: "I. Introduction".to_owned()
             }]
@@ -14850,6 +15167,7 @@ mod app_tests {
         assert_eq!(
             liquid_outline_items(&blocks),
             vec![LiquidOutlineItem {
+                block_index: 3,
                 level: 1,
                 text: "I. Introduction".to_owned()
             }]
@@ -14900,6 +15218,7 @@ mod app_tests {
         assert_eq!(
             liquid_outline_items(&blocks),
             vec![LiquidOutlineItem {
+                block_index: 5,
                 level: 1,
                 text: "Introduction".to_owned()
             }]
@@ -14945,6 +15264,7 @@ mod app_tests {
         assert_eq!(
             liquid_outline_items(&blocks),
             vec![LiquidOutlineItem {
+                block_index: 4,
                 level: 1,
                 text: "Introduction".to_owned()
             }]
@@ -15472,6 +15792,13 @@ mod app_tests {
             split_liquid_note_marker("No marker here."),
             (None, "No marker here.")
         );
+    }
+
+    #[test]
+    fn ordinary_review_text_click_is_not_an_action_target() {
+        assert!(!liquid_block_click_enabled(false, None));
+        assert!(liquid_block_click_enabled(true, None));
+        assert!(liquid_block_click_enabled(false, Some(12)));
     }
 
     #[test]
