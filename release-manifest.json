@@ -2,12 +2,12 @@
   "schema_version": "lawpdf-public-release-manifest-v1",
   "product": {
     "name": "LawPDF",
-    "version": "0.2.20"
+    "version": "0.2.21"
   },
   "runtime_assets": {
     "native_model": {
       "path": "profile-models/lm2-native-catboost-runtime/lm2-catboost-augmented-epoch51lv-relabels-tc.cbm",
-      "sha256": "e9537a1f934c015674e3274af4ceaa5b095a54266a7abb456da025ebba32aa05"
+      "sha256": "a5fe13c4559ab8abf6d8042ce5804af5c6663fb9cd8858bca7e1c6db03917b99"
     },
     "context_model": {
       "path": "profile-models/lm2-context-twopass-runtime/lm2-context-twopass-hgb-v1.json",
