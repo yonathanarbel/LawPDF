@@ -26,11 +26,14 @@ New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $portableDir "fonts") | Out-Null
 
 $nativeRuntimeSource = Join-Path $repoRoot "profile-models\lm2-native-catboost-runtime"
+$fastTabRuntimeSource = Join-Path $repoRoot "profile-models\lm2-fasttab-runtime"
 $contextRuntimeSource = Join-Path $repoRoot "profile-models\lm2-context-twopass-runtime"
+$fastTabModelName = "fasttab-v1.onnx"
 $nativeModelName = "lm2-catboost-augmented-epoch51lv-relabels-tc.cbm"
 $nativeLibraryName = "catboostmodel.dll"
 $contextModelName = "lm2-context-twopass-hgb-v1.json"
 $requiredRuntimeAssets = @(
+    (Join-Path $fastTabRuntimeSource $fastTabModelName),
     (Join-Path $nativeRuntimeSource $nativeModelName),
     (Join-Path $nativeRuntimeSource $nativeLibraryName),
     (Join-Path $contextRuntimeSource $contextModelName)
@@ -52,9 +55,12 @@ Copy-Item -LiteralPath (Join-Path $repoRoot "release-manifest.json") -Destinatio
 Copy-Item -LiteralPath (Join-Path $repoRoot "third_party") -Destination (Join-Path $portableDir "third_party") -Recurse -Force
 
 $nativeRuntimeDest = Join-Path $portableDir "profile-models\lm2-native-catboost-runtime"
+$fastTabRuntimeDest = Join-Path $portableDir "profile-models\lm2-fasttab-runtime"
 $contextRuntimeDest = Join-Path $portableDir "profile-models\lm2-context-twopass-runtime"
 New-Item -ItemType Directory -Force -Path $nativeRuntimeDest | Out-Null
+New-Item -ItemType Directory -Force -Path $fastTabRuntimeDest | Out-Null
 New-Item -ItemType Directory -Force -Path $contextRuntimeDest | Out-Null
+Copy-Item -LiteralPath (Join-Path $fastTabRuntimeSource $fastTabModelName) -Destination (Join-Path $fastTabRuntimeDest $fastTabModelName) -Force
 Copy-Item -LiteralPath (Join-Path $nativeRuntimeSource $nativeModelName) -Destination (Join-Path $nativeRuntimeDest $nativeModelName) -Force
 Copy-Item -LiteralPath (Join-Path $nativeRuntimeSource $nativeLibraryName) -Destination (Join-Path $nativeRuntimeDest $nativeLibraryName) -Force
 Copy-Item -LiteralPath (Join-Path $contextRuntimeSource $contextModelName) -Destination (Join-Path $contextRuntimeDest $contextModelName) -Force
@@ -70,7 +76,28 @@ try {
         -PassThru `
         -Wait
     if ($runtimeStatus.ExitCode -ne 0) {
-        throw "Packaged LawPDF did not load the promoted native CatBoost + context runtime."
+        throw "Packaged LawPDF did not load the max-data CatBoost + context runtime."
+    }
+    $previousFastTab = $env:LAWPDF_LM2_FASTTAB
+    $env:LAWPDF_LM2_FASTTAB = "1"
+    try {
+        $fastTabStatus = Start-Process `
+            -FilePath (Join-Path $portableDir $exeName) `
+            -ArgumentList @("--lm2-runtime-status", "--require-native", "--require-context") `
+            -NoNewWindow `
+            -PassThru `
+            -Wait
+        if ($fastTabStatus.ExitCode -ne 0) {
+            throw "Packaged LawPDF did not load the optional FastTab runtime."
+        }
+    }
+    finally {
+        if ($null -eq $previousFastTab) {
+            Remove-Item Env:LAWPDF_LM2_FASTTAB -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:LAWPDF_LM2_FASTTAB = $previousFastTab
+        }
     }
 }
 finally {

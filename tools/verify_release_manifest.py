@@ -63,7 +63,7 @@ def main() -> int:
         )
 
     runtime_assets = manifest["runtime_assets"]
-    for name in ("native_model", "context_model"):
+    for name in ("fasttab_model", "native_model", "context_model"):
         asset = runtime_assets[name]
         path = root / asset["path"]
         if not path.is_file():

@@ -30,12 +30,14 @@ use crate::pdf_backend::PdfEngine;
 use crate::settings::app_data_dir;
 
 mod fast_cache;
+mod fasttab;
 mod runtime_status;
 pub use fast_cache::load_fast_cached_liquid_mode2_document;
 pub(crate) use fast_cache::save_fast_cached_lm2_document;
+use fasttab::{Lm2FastTabModel, fasttab_enabled};
 pub use runtime_status::run_lm2_runtime_status;
 
-const LM2_SCHEMA_VERSION: &str = "liquidmode2-native-catboost-default-v8-line-article-segmentation";
+const LM2_SCHEMA_VERSION: &str = "liquidmode2-catboost-v4-max-default-v1-line-article-segmentation";
 const LM2_D1_RUNTIME_ZEROSPEND_OVERLAY_VERSION: &str = "d1-zerospend-v3-no-ibid";
 const LM2_D1_RUNTIME_POSTCUE_CITATION_NEXT1_OVERLAY_VERSION: &str =
     "d1-postcue-citation-next1-v2-narrow-cue";
@@ -55,6 +57,8 @@ const LM2_PAGE_OBJECT_TUNED_OVERLAY_VERSION: &str =
     "page-object-tuned-overlay-v2-ruled-body-rescue-keep-preserve";
 const LM2_NATIVE_CATBOOST_RUNTIME_DIR: &str = "profile-models/lm2-native-catboost-runtime";
 const LM2_NATIVE_CATBOOST_MODEL_FILE: &str = "lm2-catboost-augmented-epoch51lv-relabels-tc.cbm";
+const LM2_FASTTAB_RUNTIME_DIR: &str = "profile-models/lm2-fasttab-runtime";
+const LM2_FASTTAB_MODEL_FILE: &str = "fasttab-v1.onnx";
 const LM2_CONTEXT_TWOPASS_RUNTIME_DIR: &str = "profile-models/lm2-context-twopass-runtime";
 const LM2_CONTEXT_TWOPASS_MODEL_FILE: &str = "lm2-context-twopass-hgb-v1.json";
 const LM2_CONTEXT_TWOPASS_VERSION: &str = "context-twopass-hgb-v1-agent2-task30-foldnorm";
@@ -355,6 +359,7 @@ struct Lm2DecoderConstants {
 #[derive(Debug)]
 struct Lm2Runtime {
     model: Option<Lm2Model>,
+    fasttab_model: Option<Lm2FastTabModel>,
     native_catboost_model: Option<Lm2NativeCatboostModel>,
     context_twopass_model: Option<Lm2ContextTwopassModel>,
     numeric_catboost_model: Option<Lm2NumericCatboostModel>,
@@ -575,7 +580,7 @@ fn lm2_runtime_preset_is_page_object_tuned(value: &str) -> bool {
 }
 
 fn lm2_v25_d1_page_object_tuned_default_enabled() -> bool {
-    !lm2_native_catboost_default_asset_available() && !falsey_env(LM2_PAGE_OBJECT_TUNED_DEFAULT_ENV)
+    !lm2_native_line_default_asset_available() && !falsey_env(LM2_PAGE_OBJECT_TUNED_DEFAULT_ENV)
 }
 
 fn lm2_v25_d1_page_object_tuned_runtime_preset_enabled() -> bool {
@@ -2129,41 +2134,41 @@ pub fn prepare_liquid_mode2_document_with_timing(
         runtime_load_ms: runtime_started.elapsed().as_secs_f64() * 1000.0,
         ..Default::default()
     };
-    let native_catboost_no_stack = runtime.native_catboost_model.is_some();
+    let native_line_model_no_stack = runtime.native_line_model_active();
     let d1_runtime_zerospend_overlay =
-        !native_catboost_no_stack && lm2_d1_runtime_zerospend_overlay_enabled();
+        !native_line_model_no_stack && lm2_d1_runtime_zerospend_overlay_enabled();
     let d1_runtime_continuation_overlay =
-        !native_catboost_no_stack && lm2_d1_runtime_continuation_overlay_enabled();
+        !native_line_model_no_stack && lm2_d1_runtime_continuation_overlay_enabled();
     let d1_runtime_immediate_continuation_overlay =
-        !native_catboost_no_stack && lm2_d1_runtime_immediate_continuation_overlay_enabled();
+        !native_line_model_no_stack && lm2_d1_runtime_immediate_continuation_overlay_enabled();
     let d1_runtime_sandwiched_continuation_overlay =
-        !native_catboost_no_stack && lm2_d1_runtime_sandwiched_continuation_overlay_enabled();
+        !native_line_model_no_stack && lm2_d1_runtime_sandwiched_continuation_overlay_enabled();
     let d1_runtime_wide_sandwich_overlay =
-        !native_catboost_no_stack && lm2_d1_runtime_wide_sandwich_overlay_enabled();
+        !native_line_model_no_stack && lm2_d1_runtime_wide_sandwich_overlay_enabled();
     let d1_runtime_safe_numeric_note_overlay =
-        !native_catboost_no_stack && lm2_d1_runtime_safe_numeric_note_overlay_enabled();
+        !native_line_model_no_stack && lm2_d1_runtime_safe_numeric_note_overlay_enabled();
     let d1_runtime_post_wide_cue_overlay =
-        !native_catboost_no_stack && lm2_d1_runtime_post_wide_cue_overlay_enabled();
+        !native_line_model_no_stack && lm2_d1_runtime_post_wide_cue_overlay_enabled();
     let d1_runtime_postcue_citation_next1_overlay =
-        !native_catboost_no_stack && lm2_d1_runtime_postcue_citation_next1_overlay_enabled();
+        !native_line_model_no_stack && lm2_d1_runtime_postcue_citation_next1_overlay_enabled();
     let d1_runtime_near8_cue_overlay =
-        !native_catboost_no_stack && lm2_d1_runtime_near8_cue_overlay_enabled();
+        !native_line_model_no_stack && lm2_d1_runtime_near8_cue_overlay_enabled();
     let d1_runtime_wide_divider_guard_overlay =
-        !native_catboost_no_stack && lm2_d1_runtime_wide_divider_guard_overlay_enabled();
+        !native_line_model_no_stack && lm2_d1_runtime_wide_divider_guard_overlay_enabled();
     let d1_runtime_geometric_zone_overlay =
-        !native_catboost_no_stack && lm2_d1_runtime_geometric_zone_overlay_enabled();
+        !native_line_model_no_stack && lm2_d1_runtime_geometric_zone_overlay_enabled();
     let d1_runtime_footer_artifact_overlay =
-        !native_catboost_no_stack && lm2_d1_runtime_footer_artifact_overlay_enabled();
+        !native_line_model_no_stack && lm2_d1_runtime_footer_artifact_overlay_enabled();
     let footnote_monotone_overlay =
-        !native_catboost_no_stack && lm2_footnote_monotone_overlay_enabled();
+        !native_line_model_no_stack && lm2_footnote_monotone_overlay_enabled();
     let footnote_carryover_overlay =
-        !native_catboost_no_stack && lm2_footnote_carryover_overlay_enabled();
+        !native_line_model_no_stack && lm2_footnote_carryover_overlay_enabled();
     let open_footnote_carryover_overlay = lm2_open_footnote_carryover_overlay_enabled();
     let table_figure_router_overlay =
-        !native_catboost_no_stack && lm2_table_figure_router_overlay_enabled();
-    let page_object_overlay = !native_catboost_no_stack && lm2_page_object_overlay_enabled();
+        !native_line_model_no_stack && lm2_table_figure_router_overlay_enabled();
+    let page_object_overlay = !native_line_model_no_stack && lm2_page_object_overlay_enabled();
     let page_object_tuned_overlay =
-        !native_catboost_no_stack && lm2_page_object_tuned_overlay_enabled();
+        !native_line_model_no_stack && lm2_page_object_tuned_overlay_enabled();
     let d1_runtime_zerospend_overlay_version =
         d1_runtime_zerospend_overlay.then_some(LM2_D1_RUNTIME_ZEROSPEND_OVERLAY_VERSION);
     let context_twopass_label = if request.external_emissions_path.is_none() {
@@ -2239,7 +2244,7 @@ pub fn prepare_liquid_mode2_document_with_timing(
         .filter(|line| !line.text.trim().is_empty())
         .cloned()
         .collect::<Vec<_>>();
-    if native_catboost_no_stack
+    if native_line_model_no_stack
         && liquidvision_enabled(true)
         && !lines.iter().all(|line| line.lv.has_region)
     {
@@ -2265,7 +2270,7 @@ pub fn prepare_liquid_mode2_document_with_timing(
                 "LiquidVision runtime feature fill failed; native model received zero vision features: {error}"
             )),
         }
-    } else if native_catboost_no_stack && !liquidvision_enabled(true) {
+    } else if native_line_model_no_stack && !liquidvision_enabled(true) {
         liquidvision_runtime_warnings.push(
             "LiquidVision was disabled; native model received zero vision features.".to_owned(),
         );
@@ -2380,7 +2385,7 @@ pub fn prepare_liquid_mode2_document_with_timing(
     if open_footnote_carryover_overlay {
         apply_open_footnote_carryover_overlay(&mut decoded);
     }
-    if !native_catboost_no_stack {
+    if !native_line_model_no_stack {
         apply_page_label_furniture_guard(&mut decoded);
     }
     apply_synthetic_ocr_body_preservation(&mut decoded);
@@ -2420,7 +2425,7 @@ pub fn prepare_liquid_mode2_document_with_timing(
     apply_in_block_standalone_callout_recovery(&mut blocks, &block_source_lines, &decoded);
     apply_numeric_footer_furniture_suppression(&mut blocks, &block_source_lines, &decoded);
     apply_leading_callout_backfill(&mut blocks, &block_source_lines);
-    let mut warnings = if runtime.native_catboost_model.is_some() {
+    let mut warnings = if runtime.native_line_model_active() {
         vec![format!(
             "Review Mode uses {} raw no-stack emissions.",
             runtime.model_label
@@ -2451,7 +2456,7 @@ pub fn prepare_liquid_mode2_document_with_timing(
             "Review Mode context two-pass model is active: {label}."
         ));
     }
-    if runtime.native_catboost_model.is_none()
+    if !runtime.native_line_model_active()
         && runtime.numeric_catboost_model.is_none()
         && runtime.model.is_none()
     {
@@ -2667,6 +2672,24 @@ impl Lm2Runtime {
     fn load() -> Self {
         let mut load_warnings = Vec::new();
         let pp_priors = load_lm2_pp_priors().ok().flatten();
+        let fasttab_model = match Lm2FastTabModel::load() {
+            Ok(Some(model)) => Some(model),
+            Ok(None) => {
+                if fasttab_enabled() {
+                    load_warnings.push(
+                        "Requested FastTab runtime asset was not found; retaining CatBoost default."
+                            .to_owned(),
+                    );
+                }
+                None
+            }
+            Err(error) => {
+                load_warnings.push(format!(
+                    "Requested FastTab runtime failed to load; retaining CatBoost default: {error}"
+                ));
+                None
+            }
+        };
         let native_catboost_model = match load_lm2_native_catboost_model() {
             Ok(Some(model)) => Some(model),
             Ok(None) => {
@@ -2683,8 +2706,8 @@ impl Lm2Runtime {
                 None
             }
         };
-        let native_catboost_active = native_catboost_model.is_some();
-        let context_twopass_model = if native_catboost_active && lm2_context_twopass_enabled() {
+        let native_line_model_active = fasttab_model.is_some() || native_catboost_model.is_some();
+        let context_twopass_model = if native_line_model_active && lm2_context_twopass_enabled() {
             match load_lm2_context_twopass_model() {
                 Ok(Some(model)) => Some(model),
                 Ok(None) => {
@@ -2704,26 +2727,29 @@ impl Lm2Runtime {
         } else {
             None
         };
-        let numeric_catboost_model = if native_catboost_active {
+        let numeric_catboost_model = if native_line_model_active {
             None
         } else {
             load_lm2_numeric_catboost_model().ok().flatten()
         };
-        let static_front_overlay = if native_catboost_active {
+        let static_front_overlay = if native_line_model_active {
             None
         } else {
             load_lm2_static_front_overlay().ok().flatten()
         };
-        let runtime_label = native_catboost_model
+        let runtime_label = fasttab_model
             .as_ref()
-            .map(|model| {
-                format!(
-                    "lm2-native-catboost-text-runtime:f{}c{}t{}d{}",
-                    model.float_feature_count,
-                    model.cat_feature_count,
-                    model.text_feature_count,
-                    model.dimensions_count
-                )
+            .map(|_| "lm2-fasttab-onnx:f116c14b256d3".to_owned())
+            .or_else(|| {
+                native_catboost_model.as_ref().map(|model| {
+                    format!(
+                        "lm2-native-catboost-text-runtime:f{}c{}t{}d{}",
+                        model.float_feature_count,
+                        model.cat_feature_count,
+                        model.text_feature_count,
+                        model.dimensions_count
+                    )
+                })
             })
             .or_else(|| {
                 numeric_catboost_model.as_ref().map(|_| {
@@ -2737,34 +2763,36 @@ impl Lm2Runtime {
                 model_label: runtime_label.unwrap_or_else(|| model.model_id.clone()),
                 load_warnings,
                 model: Some(model),
+                fasttab_model,
                 native_catboost_model,
                 context_twopass_model,
                 numeric_catboost_model,
                 static_front_overlay,
                 pp_priors,
-                pp_footnote_region_membership: !native_catboost_active
+                pp_footnote_region_membership: !native_line_model_active
                     && lm2_pp_footnote_region_membership_enabled(),
-                marker_decoder_prior: !native_catboost_active && lm2_marker_decoder_prior_enabled(),
-                small_font_decoder_prior: !native_catboost_active
+                marker_decoder_prior: !native_line_model_active
+                    && lm2_marker_decoder_prior_enabled(),
+                small_font_decoder_prior: !native_line_model_active
                     && lm2_small_font_decoder_prior_enabled(),
-                small_font_sequence_prior: !native_catboost_active
+                small_font_sequence_prior: !native_line_model_active
                     && lm2_small_font_sequence_prior_enabled(),
-                anchored_marginalia_flow_guard: !native_catboost_active
+                anchored_marginalia_flow_guard: !native_line_model_active
                     && lm2_anchored_marginalia_flow_guard_enabled(),
-                body_preservation_guard: !native_catboost_active
+                body_preservation_guard: !native_line_model_active
                     && lm2_body_preservation_guard_enabled(),
-                action_neutral_blocksplit: !native_catboost_active
+                action_neutral_blocksplit: !native_line_model_active
                     && lm2_action_neutral_blocksplit_enabled(),
-                toc_overlay: !native_catboost_active && lm2_toc_overlay_enabled(),
-                front_matter_guard: !native_catboost_active && lm2_front_matter_guard_enabled(),
-                marginalia_preservation_guard: !native_catboost_active
+                toc_overlay: !native_line_model_active && lm2_toc_overlay_enabled(),
+                front_matter_guard: !native_line_model_active && lm2_front_matter_guard_enabled(),
+                marginalia_preservation_guard: !native_line_model_active
                     && lm2_marginalia_preservation_guard_enabled(),
-                start_score_scale: if native_catboost_active {
+                start_score_scale: if native_line_model_active {
                     1.0
                 } else {
                     lm2_start_score_scale()
                 },
-                transition_score_scale: if native_catboost_active {
+                transition_score_scale: if native_line_model_active {
                     1.0
                 } else {
                     lm2_transition_score_scale()
@@ -2772,6 +2800,7 @@ impl Lm2Runtime {
             },
             _ => Self {
                 model: None,
+                fasttab_model,
                 model_label: runtime_label.unwrap_or_else(|| "lm2-heuristic-fallback".to_owned()),
                 load_warnings,
                 native_catboost_model,
@@ -2779,29 +2808,30 @@ impl Lm2Runtime {
                 numeric_catboost_model,
                 static_front_overlay,
                 pp_priors,
-                pp_footnote_region_membership: !native_catboost_active
+                pp_footnote_region_membership: !native_line_model_active
                     && lm2_pp_footnote_region_membership_enabled(),
-                marker_decoder_prior: !native_catboost_active && lm2_marker_decoder_prior_enabled(),
-                small_font_decoder_prior: !native_catboost_active
+                marker_decoder_prior: !native_line_model_active
+                    && lm2_marker_decoder_prior_enabled(),
+                small_font_decoder_prior: !native_line_model_active
                     && lm2_small_font_decoder_prior_enabled(),
-                small_font_sequence_prior: !native_catboost_active
+                small_font_sequence_prior: !native_line_model_active
                     && lm2_small_font_sequence_prior_enabled(),
-                anchored_marginalia_flow_guard: !native_catboost_active
+                anchored_marginalia_flow_guard: !native_line_model_active
                     && lm2_anchored_marginalia_flow_guard_enabled(),
-                body_preservation_guard: !native_catboost_active
+                body_preservation_guard: !native_line_model_active
                     && lm2_body_preservation_guard_enabled(),
-                action_neutral_blocksplit: !native_catboost_active
+                action_neutral_blocksplit: !native_line_model_active
                     && lm2_action_neutral_blocksplit_enabled(),
-                toc_overlay: !native_catboost_active && lm2_toc_overlay_enabled(),
-                front_matter_guard: !native_catboost_active && lm2_front_matter_guard_enabled(),
-                marginalia_preservation_guard: !native_catboost_active
+                toc_overlay: !native_line_model_active && lm2_toc_overlay_enabled(),
+                front_matter_guard: !native_line_model_active && lm2_front_matter_guard_enabled(),
+                marginalia_preservation_guard: !native_line_model_active
                     && lm2_marginalia_preservation_guard_enabled(),
-                start_score_scale: if native_catboost_active {
+                start_score_scale: if native_line_model_active {
                     1.0
                 } else {
                     lm2_start_score_scale()
                 },
-                transition_score_scale: if native_catboost_active {
+                transition_score_scale: if native_line_model_active {
                     1.0
                 } else {
                     lm2_transition_score_scale()
@@ -2811,6 +2841,12 @@ impl Lm2Runtime {
     }
 
     fn emission_scores(&self, line: &DeepLiquidSourceLine) -> [f64; 3] {
+        if let Some(model) = self.fasttab_model.as_ref()
+            && let Ok(scores) = model.emission_scores(std::slice::from_ref(line))
+            && let Some(scores) = scores.first()
+        {
+            return *scores;
+        }
         if let Some(model) = self.native_catboost_model.as_ref() {
             return model.emission_scores(line).unwrap_or([0.0, 0.0, 0.0]);
         }
@@ -2846,6 +2882,10 @@ impl Lm2Runtime {
         apply_layout_priors(line, &mut scores);
         apply_pp_priors(self, line, &mut scores);
         scores
+    }
+
+    fn native_line_model_active(&self) -> bool {
+        self.fasttab_model.is_some() || self.native_catboost_model.is_some()
     }
 
     fn decoder_weights(&self) -> Option<&HashMap<String, f64>> {
@@ -3925,6 +3965,17 @@ pub(crate) fn lm2_native_catboost_default_asset_available() -> bool {
             .any(|path| path.is_file())
 }
 
+pub(crate) fn lm2_fasttab_default_asset_available() -> bool {
+    lm2_fasttab_runtime_asset_candidates(LM2_FASTTAB_MODEL_FILE)
+        .into_iter()
+        .any(|path| path.is_file())
+}
+
+pub(crate) fn lm2_native_line_default_asset_available() -> bool {
+    lm2_native_catboost_default_asset_available()
+        || (fasttab_enabled() && lm2_fasttab_default_asset_available())
+}
+
 fn lm2_context_twopass_enabled() -> bool {
     !falsey_env("LAWPDF_LM2_CONTEXT_TWOPASS")
 }
@@ -3980,6 +4031,10 @@ fn lm2_native_catboost_runtime_asset_candidates(file_name: &str) -> Vec<PathBuf>
     lm2_runtime_asset_candidates(LM2_NATIVE_CATBOOST_RUNTIME_DIR, file_name)
 }
 
+fn lm2_fasttab_runtime_asset_candidates(file_name: &str) -> Vec<PathBuf> {
+    lm2_runtime_asset_candidates(LM2_FASTTAB_RUNTIME_DIR, file_name)
+}
+
 fn lm2_runtime_asset_candidates(runtime_dir: &str, file_name: &str) -> Vec<PathBuf> {
     let model_dir = std::env::var_os("LAWPDF_MODEL_DIR").map(PathBuf::from);
     let exe_path = std::env::current_exe().ok();
@@ -4033,6 +4088,7 @@ struct Lm2ReleaseManifest {
 
 #[derive(Debug, Deserialize)]
 struct Lm2ReleaseRuntimeAssets {
+    fasttab_model: Lm2ReleaseAsset,
     native_model: Lm2ReleaseAsset,
     context_model: Lm2ReleaseAsset,
 }
@@ -4066,6 +4122,7 @@ fn verify_model_asset_hash(path: &Path, asset_name: &str) -> Result<(), String> 
         )
     })?;
     let expected = match asset_name {
+        "fasttab_model" => &manifest.runtime_assets.fasttab_model.sha256,
         "native_model" => &manifest.runtime_assets.native_model.sha256,
         "context_model" => &manifest.runtime_assets.context_model.sha256,
         _ => return Err(format!("Unknown LM2 release-manifest asset: {asset_name}")),
@@ -4084,6 +4141,25 @@ fn decode_pages(
     runtime: &Lm2Runtime,
     lines: &[DeepLiquidSourceLine],
 ) -> Vec<(DeepLiquidSourceLine, Lm2Action)> {
+    if let Some(model) = runtime.fasttab_model.as_ref() {
+        match model.emission_scores(lines) {
+            Ok(scores) if scores.len() == lines.len() => {
+                return lines
+                    .iter()
+                    .cloned()
+                    .zip(scores.into_iter().map(argmax_lm2_action))
+                    .collect();
+            }
+            Ok(scores) => eprintln!(
+                "FastTab returned {} score rows for {} source lines; using CatBoost fallback.",
+                scores.len(),
+                lines.len()
+            ),
+            Err(error) => {
+                eprintln!("FastTab inference failed; using CatBoost fallback: {error}")
+            }
+        }
+    }
     if runtime.native_catboost_model.is_some() {
         return lines
             .iter()
@@ -13977,6 +14053,7 @@ mod tests {
             marginalia_preservation_guard: false,
             start_score_scale: 1.0,
             transition_score_scale: 1.0,
+            fasttab_model: None,
             native_catboost_model: None,
             context_twopass_model: None,
             numeric_catboost_model: None,
@@ -16141,6 +16218,7 @@ mod tests {
             marginalia_preservation_guard: false,
             start_score_scale: 1.0,
             transition_score_scale: 1.0,
+            fasttab_model: None,
             native_catboost_model: None,
             context_twopass_model: None,
             numeric_catboost_model: None,
@@ -16179,6 +16257,7 @@ mod tests {
             marginalia_preservation_guard: false,
             start_score_scale: 1.0,
             transition_score_scale: 1.0,
+            fasttab_model: None,
             native_catboost_model: None,
             context_twopass_model: None,
             numeric_catboost_model: None,
@@ -16515,6 +16594,7 @@ mod tests {
             marginalia_preservation_guard: false,
             start_score_scale: 1.0,
             transition_score_scale: 1.0,
+            fasttab_model: None,
             native_catboost_model: None,
             context_twopass_model: None,
             numeric_catboost_model: None,
@@ -16618,6 +16698,7 @@ mod tests {
             marginalia_preservation_guard: false,
             start_score_scale: 1.0,
             transition_score_scale: 1.0,
+            fasttab_model: None,
             native_catboost_model: None,
             context_twopass_model: None,
             numeric_catboost_model: None,
@@ -16666,6 +16747,7 @@ mod tests {
             marginalia_preservation_guard: false,
             start_score_scale: 1.0,
             transition_score_scale: 1.0,
+            fasttab_model: None,
             native_catboost_model: None,
             context_twopass_model: None,
             numeric_catboost_model: None,

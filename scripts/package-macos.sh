@@ -73,11 +73,14 @@ if [[ -d "$ROOT/profile-models/lm2-v20-runtime" ]]; then
 fi
 
 NATIVE_RUNTIME_SOURCE="$ROOT/profile-models/lm2-native-catboost-runtime"
+FASTTAB_RUNTIME_SOURCE="$ROOT/profile-models/lm2-fasttab-runtime"
 CONTEXT_RUNTIME_SOURCE="$ROOT/profile-models/lm2-context-twopass-runtime"
+FASTTAB_MODEL="fasttab-v1.onnx"
 NATIVE_MODEL="lm2-catboost-augmented-epoch51lv-relabels-tc.cbm"
 NATIVE_LIBRARY="libcatboostmodel-darwin-universal2-1.2.10.dylib"
 CONTEXT_MODEL="lm2-context-twopass-hgb-v1.json"
 for asset in \
+  "$FASTTAB_RUNTIME_SOURCE/$FASTTAB_MODEL" \
   "$NATIVE_RUNTIME_SOURCE/$NATIVE_MODEL" \
   "$NATIVE_RUNTIME_SOURCE/$NATIVE_LIBRARY" \
   "$CONTEXT_RUNTIME_SOURCE/$CONTEXT_MODEL"; do
@@ -88,8 +91,10 @@ for asset in \
 done
 
 NATIVE_RUNTIME_DEST="$RESOURCES/profile-models/lm2-native-catboost-runtime"
+FASTTAB_RUNTIME_DEST="$RESOURCES/profile-models/lm2-fasttab-runtime"
 CONTEXT_RUNTIME_DEST="$RESOURCES/profile-models/lm2-context-twopass-runtime"
-mkdir -p "$NATIVE_RUNTIME_DEST" "$CONTEXT_RUNTIME_DEST"
+mkdir -p "$FASTTAB_RUNTIME_DEST" "$NATIVE_RUNTIME_DEST" "$CONTEXT_RUNTIME_DEST"
+cp "$FASTTAB_RUNTIME_SOURCE/$FASTTAB_MODEL" "$FASTTAB_RUNTIME_DEST/$FASTTAB_MODEL"
 cp "$NATIVE_RUNTIME_SOURCE/$NATIVE_MODEL" "$NATIVE_RUNTIME_DEST/$NATIVE_MODEL"
 cp "$NATIVE_RUNTIME_SOURCE/$NATIVE_LIBRARY" "$NATIVE_RUNTIME_DEST/$NATIVE_LIBRARY"
 cp "$CONTEXT_RUNTIME_SOURCE/$CONTEXT_MODEL" "$CONTEXT_RUNTIME_DEST/$CONTEXT_MODEL"
