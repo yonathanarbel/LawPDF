@@ -2225,7 +2225,7 @@ dependencies = [
 
 [[package]]
 name = "lawpdf"
-version = "0.2.22"
+version = "0.2.23"
 dependencies = [
  "anyhow",
  "blake2b_simd",

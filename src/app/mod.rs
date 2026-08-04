@@ -37,7 +37,7 @@ use crate::liquid::{
     should_hide_contents_block_for_display, should_prefer_ocr_page_text, spawn_liquid_job,
 };
 use crate::liquid2::{
-    LiquidMode2Event, LiquidMode2Request, load_fast_cached_liquid_mode2_document,
+    LiquidMode2Event, LiquidMode2Request, Lm2RuntimeChoice, load_fast_cached_liquid_mode2_document,
     spawn_liquid_mode2_job,
 };
 use crate::model::{
@@ -65,6 +65,7 @@ use crate::updater::{self, UpdateEvent};
 const CANVAS_FILL: Color32 = Color32::from_rgb(232, 230, 224);
 const PANEL_FILL: Color32 = Color32::from_rgb(246, 244, 239);
 const BAR_FILL: Color32 = Color32::from_rgb(250, 249, 245);
+const APP_VERSION_LABEL: &str = concat!("LawPDF v", env!("CARGO_PKG_VERSION"));
 const PAPER_FILL: Color32 = Color32::from_rgb(255, 254, 250);
 const PAPER_STROKE: Color32 = Color32::from_rgb(205, 201, 192);
 const INK: Color32 = Color32::from_rgb(42, 38, 32);
@@ -296,6 +297,7 @@ pub struct PdfEditorApp {
     liquid_state: LiquidState,
     liquid_mode2_state: LiquidState,
     liquid_mode2_complete: bool,
+    liquid_mode2_runtime_choice: Lm2RuntimeChoice,
     /// When the reflow first became readable while the reader was still on the
     /// original PDF. Drives the reveal, and is cleared once it has played.
     liquid_mode2_reveal_at: Option<f64>,
@@ -925,6 +927,7 @@ struct DocumentTab {
     liquid_state: LiquidState,
     liquid_mode2_state: LiquidState,
     liquid_mode2_complete: bool,
+    liquid_mode2_runtime_choice: Lm2RuntimeChoice,
     liquid_notice_dismissed: bool,
     zoom: f32,
     target_zoom: f32,
@@ -1032,6 +1035,7 @@ impl PdfEditorApp {
             liquid_state: LiquidState::Idle,
             liquid_mode2_state: LiquidState::Idle,
             liquid_mode2_complete: false,
+            liquid_mode2_runtime_choice: Lm2RuntimeChoice::CatBoost,
             liquid_mode2_reveal_at: None,
             pending_markdown_copy: false,
             pending_markdown_request: None,
@@ -1193,6 +1197,7 @@ impl PdfEditorApp {
             liquid_state: self.liquid_state.clone(),
             liquid_mode2_state: self.liquid_mode2_state.clone(),
             liquid_mode2_complete: self.liquid_mode2_complete,
+            liquid_mode2_runtime_choice: self.liquid_mode2_runtime_choice,
             liquid_notice_dismissed: self.liquid_notice_dismissed,
             zoom: self.zoom,
             target_zoom: self.target_zoom,
@@ -1261,6 +1266,7 @@ impl PdfEditorApp {
         self.liquid_state = tab.liquid_state;
         self.liquid_mode2_state = tab.liquid_mode2_state;
         self.liquid_mode2_complete = tab.liquid_mode2_complete;
+        self.liquid_mode2_runtime_choice = tab.liquid_mode2_runtime_choice;
         self.liquid_notice_dismissed = tab.liquid_notice_dismissed;
         self.zoom = tab_zoom;
         self.target_zoom = tab_target_zoom;
@@ -1519,6 +1525,7 @@ impl PdfEditorApp {
         self.liquid_state = LiquidState::Idle;
         self.liquid_mode2_state = LiquidState::Idle;
         self.liquid_mode2_complete = false;
+        self.liquid_mode2_runtime_choice = Lm2RuntimeChoice::CatBoost;
         self.liquid_mode2_reveal_at = None;
         self.pending_markdown_copy = false;
         self.pending_markdown_request = None;
@@ -1925,6 +1932,7 @@ impl PdfEditorApp {
             liquid_state: LiquidState::Idle,
             liquid_mode2_state: LiquidState::Idle,
             liquid_mode2_complete: false,
+            liquid_mode2_runtime_choice: Lm2RuntimeChoice::CatBoost,
             liquid_notice_dismissed: false,
             zoom,
             target_zoom: zoom,
@@ -3310,6 +3318,24 @@ impl PdfEditorApp {
         ctx.request_repaint();
     }
 
+    fn set_review_runtime_choice(&mut self, choice: Lm2RuntimeChoice, ctx: &Context) {
+        if self.liquid_mode2_runtime_choice != choice {
+            self.stop_liquid_tts();
+            self.liquid_mode2_runtime_choice = choice;
+            self.liquid_mode2_state = LiquidState::Idle;
+            self.liquid_mode2_complete = false;
+            self.liquid_mode2_reveal_at = None;
+            self.liquid_scroll_to_block = None;
+            self.status = match choice {
+                Lm2RuntimeChoice::CatBoost => "Switching Review Mode to CatBoost...",
+                Lm2RuntimeChoice::FastTab => "Switching Review Mode to FastTab neural...",
+                Lm2RuntimeChoice::Automatic => "Switching Review Mode runtime...",
+            }
+            .to_owned();
+        }
+        self.set_view_mode(DocumentViewMode::LiquidMode2, ctx);
+    }
+
     fn apply_startup_view_mode(&mut self, ctx: &Context) {
         let Ok(value) = std::env::var("LAWPDF_START_VIEW") else {
             return;
@@ -3490,12 +3516,18 @@ impl PdfEditorApp {
                     &source.path,
                     self.settings.liquid_mode2_use_pymupdf_blocks,
                     self.settings.liquid_mode2_use_pp_footnote_regions,
+                    self.liquid_mode2_runtime_choice,
                 )
             })
         {
             self.liquid_mode2_state = LiquidState::Ready(document);
             self.liquid_mode2_complete = true;
-            self.status = "LM2 ready from cache.".to_owned();
+            self.status = match self.liquid_mode2_runtime_choice {
+                Lm2RuntimeChoice::CatBoost => "Review Fast ready from CatBoost cache.",
+                Lm2RuntimeChoice::FastTab => "Review Full ready from neural cache.",
+                Lm2RuntimeChoice::Automatic => "Review Mode ready from cache.",
+            }
+            .to_owned();
             ctx.request_repaint();
             return;
         }
@@ -3536,18 +3568,44 @@ impl PdfEditorApp {
             use_pymupdf_blocks: self.settings.liquid_mode2_use_pymupdf_blocks,
             use_pp_footnote_regions: self.settings.liquid_mode2_use_pp_footnote_regions,
             external_emissions_path: None,
+            runtime_choice: self.liquid_mode2_runtime_choice,
         };
         self.liquid_mode2_state = LiquidState::Preparing;
         self.liquid_mode2_complete = false;
-        self.status = "Preparing Review Mode...".to_owned();
+        self.status = match self.liquid_mode2_runtime_choice {
+            Lm2RuntimeChoice::CatBoost => "Preparing Review Fast with CatBoost...",
+            Lm2RuntimeChoice::FastTab => "Preparing Review Full with FastTab neural...",
+            Lm2RuntimeChoice::Automatic => "Preparing Review Mode...",
+        }
+        .to_owned();
         spawn_liquid_mode2_job(request, self.liquid_mode2_tx.clone());
         ctx.request_repaint_after(RENDER_POLL_INTERVAL);
     }
 
     fn poll_liquid_mode2_results(&mut self, ctx: &Context) {
         while let Ok(event) = self.liquid_mode2_rx.try_recv() {
+            let event_targets_current_document =
+                self.is_current_document(event.document_epoch, &event.path);
+            let event_is_current = event_targets_current_document
+                && event.runtime_choice == self.liquid_mode2_runtime_choice;
+            let event_tab_index = (!event_targets_current_document).then(|| {
+                self.tabs.iter().position(|tab| {
+                    tab.document_epoch == event.document_epoch
+                        && tab.document.path == event.path
+                        && tab.liquid_mode2_runtime_choice == event.runtime_choice
+                })
+            });
+            let event_tab_index = event_tab_index.flatten();
+            if !event_is_current && event_tab_index.is_none() {
+                continue;
+            }
             let complete = event.complete;
             let preview_page_count = event.preview_page_count;
+            let review_name = match event.runtime_choice {
+                Lm2RuntimeChoice::CatBoost => "Review Fast",
+                Lm2RuntimeChoice::FastTab => "Review Full",
+                Lm2RuntimeChoice::Automatic => "Review Mode",
+            };
             let mut error_notice = None;
             let mut completed_document = None;
             let next_state = match event.result {
@@ -3563,13 +3621,13 @@ impl PdfEditorApp {
                             .cloned()
                             .unwrap_or_else(|| {
                                 format!(
-                                    "Review Mode ready; {} noise line(s) removed.",
+                                    "{review_name} ready; {} noise line(s) removed.",
                                     document.noise_lines_removed
                                 )
                             })
                     } else {
                         format!(
-                            "First {} page(s) ready; finishing the full Liquid document in the background...",
+                            "{review_name}: first {} page(s) ready; finishing the document in the background...",
                             preview_page_count.unwrap_or(0)
                         )
                     };
@@ -3579,19 +3637,17 @@ impl PdfEditorApp {
                     (LiquidState::Ready(document), status)
                 }
                 Err(error) => {
-                    error_notice = Some(format!("Review Mode failed: {error}"));
+                    error_notice = Some(format!("{review_name} failed: {error}"));
                     (LiquidState::Failed(error.clone()), error)
                 }
             };
 
-            if self.is_current_document(event.document_epoch, &event.path) {
+            if event_is_current {
                 self.liquid_mode2_state = next_state.0;
                 self.liquid_mode2_complete = complete && completed_document.is_some();
                 self.status = next_state.1;
                 ctx.request_repaint();
-            } else if let Some(tab) = self.tabs.iter_mut().find(|tab| {
-                tab.document_epoch == event.document_epoch && tab.document.path == event.path
-            }) {
+            } else if let Some(tab) = event_tab_index.and_then(|index| self.tabs.get_mut(index)) {
                 tab.liquid_mode2_state = next_state.0;
                 tab.liquid_mode2_complete = complete && completed_document.is_some();
                 tab.status = next_state.1;
@@ -4533,7 +4589,7 @@ impl PdfEditorApp {
         let mut close_tab = None;
 
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("LawPDF").strong().color(INK));
+            ui.label(RichText::new(APP_VERSION_LABEL).strong().color(INK));
             ui.add_space(4.0);
 
             for (index, tab) in self.tabs.iter().enumerate() {
@@ -4868,21 +4924,43 @@ impl PdfEditorApp {
                             }
                             self.set_view_mode(DocumentViewMode::Pdf, ctx);
                         }
-                        let liquid_active =
+                        let review_active =
                             !sbs_active && self.view_mode == DocumentViewMode::LiquidMode2;
-                        if toolbar_icon_button(
-                            ui,
-                            ToolbarIcon::Review,
-                            liquid_active,
-                            has_document,
-                            "Converts law review articles to a smooth reading experience.",
-                        )
-                        .clicked()
-                        {
+                        let review_fast = ui
+                            .add_enabled(
+                                has_document,
+                                egui::Button::new("Review Fast").selected(
+                                    review_active
+                                        && self.liquid_mode2_runtime_choice
+                                            == Lm2RuntimeChoice::CatBoost,
+                                ),
+                            )
+                            .on_hover_text(
+                                "Use the faster maximum-data CatBoost Review Mode runtime.",
+                            );
+                        if review_fast.clicked() {
                             if sbs_active {
                                 self.exit_sbs_mode(ctx);
                             }
-                            self.set_view_mode(DocumentViewMode::LiquidMode2, ctx);
+                            self.set_review_runtime_choice(Lm2RuntimeChoice::CatBoost, ctx);
+                        }
+                        let review_full = ui
+                            .add_enabled(
+                                has_document,
+                                egui::Button::new("Review Full").selected(
+                                    review_active
+                                        && self.liquid_mode2_runtime_choice
+                                            == Lm2RuntimeChoice::FastTab,
+                                ),
+                            )
+                            .on_hover_text(
+                                "Use the FastTab neural Review Mode runtime for comparison.",
+                            );
+                        if review_full.clicked() {
+                            if sbs_active {
+                                self.exit_sbs_mode(ctx);
+                            }
+                            self.set_review_runtime_choice(Lm2RuntimeChoice::FastTab, ctx);
                         }
                         if toolbar_icon_button(
                             ui,
@@ -11839,7 +11917,6 @@ enum ToolbarIcon {
     DefaultApp,
     Ocr,
     Pdf,
-    Review,
     SideBySide,
     Swap,
     Select,
@@ -12000,15 +12077,6 @@ fn paint_toolbar_icon(
                 FontId::proportional(9.5),
                 color,
             );
-        }
-        ToolbarIcon::Review => {
-            painter.line_segment([point(0.0, -6.5), point(0.0, 6.5)], stroke);
-            painter.line_segment([point(-7.0, -5.0), point(-1.0, -6.5)], stroke);
-            painter.line_segment([point(-7.0, -5.0), point(-7.0, 5.0)], stroke);
-            painter.line_segment([point(-7.0, 5.0), point(-1.0, 6.5)], stroke);
-            painter.line_segment([point(7.0, -5.0), point(1.0, -6.5)], stroke);
-            painter.line_segment([point(7.0, -5.0), point(7.0, 5.0)], stroke);
-            painter.line_segment([point(7.0, 5.0), point(1.0, 6.5)], stroke);
         }
         ToolbarIcon::SideBySide => {
             painter.rect_stroke(
@@ -14300,6 +14368,14 @@ fn tab_title(document: &LoadedDocument) -> String {
 mod app_tests {
     use super::*;
     use crate::model::PageInfo;
+
+    #[test]
+    fn toolbar_version_label_matches_the_build_version() {
+        assert_eq!(
+            APP_VERSION_LABEL,
+            format!("LawPDF v{}", env!("CARGO_PKG_VERSION"))
+        );
+    }
 
     fn loaded_document_for_enrichment(path: &Path, optimized: bool) -> LoadedDocument {
         LoadedDocument {

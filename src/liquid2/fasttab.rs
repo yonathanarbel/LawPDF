@@ -30,7 +30,11 @@ impl fmt::Debug for Lm2FastTabModel {
 
 impl Lm2FastTabModel {
     pub(super) fn load() -> Result<Option<Self>, String> {
-        if !fasttab_enabled() {
+        Self::load_requested(fasttab_enabled())
+    }
+
+    pub(super) fn load_requested(requested: bool) -> Result<Option<Self>, String> {
+        if !requested {
             return Ok(None);
         }
         let mut candidates = Vec::new();

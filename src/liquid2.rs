@@ -202,6 +202,24 @@ const LM2_V25_D1_PAGE_OBJECT_TUNED_PRESET: &str = "v25-d1-sandwiched-note-start-
 const LM2_PAGE_OBJECT_TUNED_DEFAULT_ENV: &str = "LAWPDF_LM2_PAGE_OBJECT_TUNED_DEFAULT";
 const ACTIONS: [Lm2Action; 3] = [Lm2Action::Keep, Lm2Action::Marginalia, Lm2Action::HideNoise];
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Lm2RuntimeChoice {
+    #[default]
+    Automatic,
+    CatBoost,
+    FastTab,
+}
+
+impl Lm2RuntimeChoice {
+    fn fasttab_requested(self) -> bool {
+        match self {
+            Self::Automatic => fasttab_enabled(),
+            Self::CatBoost => false,
+            Self::FastTab => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LiquidMode2Request {
     pub document_epoch: u64,
@@ -212,6 +230,7 @@ pub struct LiquidMode2Request {
     pub use_pymupdf_blocks: bool,
     pub use_pp_footnote_regions: bool,
     pub external_emissions_path: Option<PathBuf>,
+    pub runtime_choice: Lm2RuntimeChoice,
 }
 
 #[derive(Debug, Clone)]
@@ -220,6 +239,7 @@ pub struct LiquidMode2Event {
     pub path: PathBuf,
     pub complete: bool,
     pub preview_page_count: Option<usize>,
+    pub runtime_choice: Lm2RuntimeChoice,
     pub result: Result<LiquidDocument, String>,
 }
 
@@ -710,6 +730,7 @@ pub fn spawn_liquid_mode2_job(request: LiquidMode2Request, tx: Sender<LiquidMode
         let path = request.path.clone();
         let use_pymupdf_blocks = request.use_pymupdf_blocks;
         let use_pp_footnote_regions = request.use_pp_footnote_regions;
+        let runtime_choice = request.runtime_choice;
         if lm2_progressive_preview_enabled()
             && let Some((preview_request, preview_page_count)) =
                 lm2_progressive_preview_request(&request)
@@ -720,6 +741,7 @@ pub fn spawn_liquid_mode2_job(request: LiquidMode2Request, tx: Sender<LiquidMode
                 path: path.clone(),
                 complete: false,
                 preview_page_count: Some(preview_page_count),
+                runtime_choice,
                 result: Ok(document),
             });
         }
@@ -729,6 +751,7 @@ pub fn spawn_liquid_mode2_job(request: LiquidMode2Request, tx: Sender<LiquidMode
                 &path,
                 use_pymupdf_blocks,
                 use_pp_footnote_regions,
+                runtime_choice,
                 document,
             );
         }
@@ -737,6 +760,7 @@ pub fn spawn_liquid_mode2_job(request: LiquidMode2Request, tx: Sender<LiquidMode
             path,
             complete: true,
             preview_page_count: None,
+            runtime_choice,
             result,
         });
     });
@@ -1356,7 +1380,7 @@ pub fn run_lm2_eval(args: impl IntoIterator<Item = OsString>) -> Result<(), Stri
         }
     }
 
-    let runtime = Lm2Runtime::load();
+    let runtime = Lm2Runtime::load(Lm2RuntimeChoice::Automatic);
     let external_emissions = external_emissions_path
         .as_deref()
         .map(Lm2ExternalEmissions::load)
@@ -1776,7 +1800,7 @@ pub fn run_lm2_decoder_lattice_dump(
         }
     }
 
-    let runtime = Lm2Runtime::load();
+    let runtime = Lm2Runtime::load(Lm2RuntimeChoice::Automatic);
     let examples: Lm2EvalExamplesFile = read_json_file(&examples_input)?;
     let labels: Lm2EvalLabelsFile = read_json_file(&labels_input)?;
     let mut label_by_key = HashMap::new();
@@ -1911,7 +1935,7 @@ pub fn run_lm2_draft(args: impl IntoIterator<Item = OsString>) -> Result<(), Str
     }
 
     reject_label_like_path(&input_path)?;
-    let runtime = Lm2Runtime::load();
+    let runtime = Lm2Runtime::load(Lm2RuntimeChoice::Automatic);
     let input: Lm2DraftInput = read_json_file(&input_path)?;
     let mut rows = Vec::new();
     for document in input.documents {
@@ -2039,6 +2063,7 @@ pub fn run_lm2_source_smoke(args: impl IntoIterator<Item = OsString>) -> Result<
             use_pymupdf_blocks: false,
             use_pp_footnote_regions: false,
             external_emissions_path: external_emissions_path.clone(),
+            runtime_choice: Lm2RuntimeChoice::Automatic,
         };
         match prepare_liquid_mode2_document(request) {
             Ok(liquid) => documents.push(Lm2SourceSmokeDocument {
@@ -2092,7 +2117,7 @@ pub fn prepare_liquid_mode2_document_with_timing(
 ) -> Result<(LiquidDocument, LiquidMode2Timing), String> {
     let total_started = Instant::now();
     let runtime_started = Instant::now();
-    let mut runtime = Lm2Runtime::load();
+    let mut runtime = Lm2Runtime::load(request.runtime_choice);
     let mut pp_runtime_warnings = Vec::new();
     let mut liquidvision_runtime_warnings = Vec::new();
     if request.use_pp_footnote_regions {
@@ -2669,13 +2694,14 @@ pub(crate) fn trace_article_spans_from_source_lines(
 }
 
 impl Lm2Runtime {
-    fn load() -> Self {
+    fn load(runtime_choice: Lm2RuntimeChoice) -> Self {
         let mut load_warnings = Vec::new();
         let pp_priors = load_lm2_pp_priors().ok().flatten();
-        let fasttab_model = match Lm2FastTabModel::load() {
+        let fasttab_requested = runtime_choice.fasttab_requested();
+        let fasttab_model = match Lm2FastTabModel::load_requested(fasttab_requested) {
             Ok(Some(model)) => Some(model),
             Ok(None) => {
-                if fasttab_enabled() {
+                if fasttab_requested {
                     load_warnings.push(
                         "Requested FastTab runtime asset was not found; retaining CatBoost default."
                             .to_owned(),
@@ -14095,10 +14121,12 @@ mod tests {
             use_pymupdf_blocks: false,
             use_pp_footnote_regions: false,
             external_emissions_path: None,
+            runtime_choice: Lm2RuntimeChoice::CatBoost,
         };
 
         let (preview, page_count) = lm2_progressive_preview_request(&request).unwrap();
         assert_eq!(page_count, LM2_PROGRESSIVE_PREVIEW_PAGES);
+        assert_eq!(preview.runtime_choice, request.runtime_choice);
         assert_eq!(preview.pages.len(), LM2_PROGRESSIVE_PREVIEW_PAGES);
         assert_eq!(
             preview.deep_source_lines.len(),
@@ -14110,6 +14138,12 @@ mod tests {
                 .iter()
                 .all(|line| line.page_index < LM2_PROGRESSIVE_PREVIEW_PAGES)
         );
+    }
+
+    #[test]
+    fn explicit_runtime_choices_override_the_process_default() {
+        assert!(!Lm2RuntimeChoice::CatBoost.fasttab_requested());
+        assert!(Lm2RuntimeChoice::FastTab.fasttab_requested());
     }
 
     fn mark_pp_footnote(line: &mut DeepLiquidSourceLine) {
@@ -19752,16 +19786,39 @@ mod tests {
             source_signature: source_signature.clone(),
         };
         save_cached_lm2_document(&document).unwrap();
-        save_fast_cached_lm2_document(&source_path, false, false, &document).unwrap();
+        save_fast_cached_lm2_document(
+            &source_path,
+            false,
+            false,
+            Lm2RuntimeChoice::CatBoost,
+            &document,
+        )
+        .unwrap();
 
-        let loaded = load_fast_cached_liquid_mode2_document(&source_path, false, false).unwrap();
+        let loaded = load_fast_cached_liquid_mode2_document(
+            &source_path,
+            false,
+            false,
+            Lm2RuntimeChoice::CatBoost,
+        )
+        .unwrap();
         assert_eq!(loaded.title, "Cached");
         assert_eq!(loaded.source_signature, source_signature);
+
+        let catboost_pointer =
+            fast_cache::lm2_fast_cache_path(&source_path, false, false, Lm2RuntimeChoice::CatBoost)
+                .unwrap();
+        let fasttab_pointer =
+            fast_cache::lm2_fast_cache_path(&source_path, false, false, Lm2RuntimeChoice::FastTab)
+                .unwrap();
+        assert_ne!(catboost_pointer, fasttab_pointer);
 
         if let Some(path) = lm2_cache_path(&source_signature) {
             let _ = std::fs::remove_file(path);
         }
-        if let Some(path) = fast_cache::lm2_fast_cache_path(&source_path, false, false) {
+        if let Some(path) =
+            fast_cache::lm2_fast_cache_path(&source_path, false, false, Lm2RuntimeChoice::CatBoost)
+        {
             let _ = std::fs::remove_file(path);
         }
         let _ = std::fs::remove_file(source_path);

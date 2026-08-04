@@ -32,7 +32,11 @@ use std::path::PathBuf;
 
 use app::PdfEditorApp;
 
-const APP_TITLE: &str = "LawPDF - Y. Arbel design (2026)";
+const APP_TITLE: &str = concat!(
+    "LawPDF v",
+    env!("CARGO_PKG_VERSION"),
+    " - Y. Arbel design (2026)"
+);
 
 fn main() -> eframe::Result<()> {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();

@@ -846,6 +846,7 @@ fn measure_lm2_timing_document(
         use_pymupdf_blocks,
         use_pp_footnote_regions: false,
         external_emissions_path: None,
+        runtime_choice: crate::liquid2::Lm2RuntimeChoice::Automatic,
     };
     let (preview_page_count, preview_lm2) = lm2_progressive_preview_request(&request)
         .and_then(|(preview_request, page_count)| {
@@ -886,10 +887,21 @@ fn measure_lm2_timing_document(
     let markdown_render_ms = markdown_started.elapsed().as_secs_f64() * 1000.0;
     let liquify_total_ms =
         text_extraction_ms + line_geometry_ms + lm2.total_ms + markdown_render_ms;
-    let _ = save_fast_cached_lm2_document(path, use_pymupdf_blocks, false, &liquid);
+    let _ = save_fast_cached_lm2_document(
+        path,
+        use_pymupdf_blocks,
+        false,
+        crate::liquid2::Lm2RuntimeChoice::Automatic,
+        &liquid,
+    );
     let fast_reopen_started = Instant::now();
-    let fast_reopen_hit =
-        load_fast_cached_liquid_mode2_document(path, use_pymupdf_blocks, false).is_some();
+    let fast_reopen_hit = load_fast_cached_liquid_mode2_document(
+        path,
+        use_pymupdf_blocks,
+        false,
+        crate::liquid2::Lm2RuntimeChoice::Automatic,
+    )
+    .is_some();
     let fast_reopen_ms = fast_reopen_started.elapsed().as_secs_f64() * 1000.0;
 
     Lm2TimingDocument {
@@ -1529,6 +1541,7 @@ fn smoke_document(
             use_pymupdf_blocks,
             use_pp_footnote_regions,
             external_emissions_path: lm2_external_emissions_path.map(Path::to_path_buf),
+            runtime_choice: crate::liquid2::Lm2RuntimeChoice::Automatic,
         })
     } else {
         prepare_liquid_document(LiquidRequest {

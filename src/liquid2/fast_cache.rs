@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use super::{
-    LM2_SCHEMA_VERSION, LiquidDocument, app_data_dir, attach_footnote_links,
+    LM2_SCHEMA_VERSION, LiquidDocument, Lm2RuntimeChoice, app_data_dir, attach_footnote_links,
     load_cached_lm2_document,
 };
 
@@ -11,8 +11,14 @@ pub fn load_fast_cached_liquid_mode2_document(
     path: &Path,
     use_pymupdf_blocks: bool,
     use_pp_footnote_regions: bool,
+    runtime_choice: Lm2RuntimeChoice,
 ) -> Option<LiquidDocument> {
-    let pointer_path = lm2_fast_cache_path(path, use_pymupdf_blocks, use_pp_footnote_regions)?;
+    let pointer_path = lm2_fast_cache_path(
+        path,
+        use_pymupdf_blocks,
+        use_pp_footnote_regions,
+        runtime_choice,
+    )?;
     let source_signature = std::fs::read_to_string(pointer_path).ok()?;
     let mut document = load_cached_lm2_document(source_signature.trim())?;
     if document.blocks.is_empty() || document.block_source_lines.is_empty() {
@@ -26,10 +32,16 @@ pub fn save_fast_cached_lm2_document(
     source_path: &Path,
     use_pymupdf_blocks: bool,
     use_pp_footnote_regions: bool,
+    runtime_choice: Lm2RuntimeChoice,
     document: &LiquidDocument,
 ) -> Result<(), String> {
-    let path = lm2_fast_cache_path(source_path, use_pymupdf_blocks, use_pp_footnote_regions)
-        .ok_or_else(|| "Could not find LiquidMode2 fast-cache directory.".to_owned())?;
+    let path = lm2_fast_cache_path(
+        source_path,
+        use_pymupdf_blocks,
+        use_pp_footnote_regions,
+        runtime_choice,
+    )
+    .ok_or_else(|| "Could not find LiquidMode2 fast-cache directory.".to_owned())?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Could not create LiquidMode2 fast cache: {error}"))?;
@@ -42,6 +54,7 @@ pub(super) fn lm2_fast_cache_path(
     source_path: &Path,
     use_pymupdf_blocks: bool,
     use_pp_footnote_regions: bool,
+    runtime_choice: Lm2RuntimeChoice,
 ) -> Option<PathBuf> {
     let metadata = std::fs::metadata(source_path).ok()?;
     let modified = metadata
@@ -59,6 +72,7 @@ pub(super) fn lm2_fast_cache_path(
     modified.hash(&mut hasher);
     use_pymupdf_blocks.hash(&mut hasher);
     use_pp_footnote_regions.hash(&mut hasher);
+    runtime_choice.hash(&mut hasher);
     let mut runtime_env = std::env::vars_os()
         .filter_map(|(name, value)| {
             let name = name.to_string_lossy();
