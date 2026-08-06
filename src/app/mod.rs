@@ -91,6 +91,11 @@ const SBS_TEXTURE_CACHE_CAP: usize = PAGE_TEXTURE_CACHE_CAP * 2;
 const PAGE_PREFETCH_RADIUS: usize = 3;
 const PAGE_TEXTURE_CACHE_CAP: usize = 32;
 const SMALL_DOCUMENT_PREFETCH_LIMIT: usize = 6;
+const REVIEW_PRECOMPUTE_PAGE_LIMIT_EXCLUSIVE: usize = 120;
+
+fn should_precompute_review_on_open(page_count: usize) -> bool {
+    (1..REVIEW_PRECOMPUTE_PAGE_LIMIT_EXCLUSIVE).contains(&page_count)
+}
 const NOTCHED_WHEEL_IMMEDIATE_SHARE: f32 = 0.60;
 const NOTCHED_WHEEL_POINT_CHUNK: f32 = 6.0;
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -1888,6 +1893,7 @@ impl PdfEditorApp {
                     if prefetch_pages {
                         self.prefetch_small_document_pages(ctx);
                     }
+                    self.start_review_precompute_if_eligible(ctx);
                 } else {
                     self.status = format!("Added {title} to tabs");
                 }
@@ -2607,6 +2613,13 @@ impl PdfEditorApp {
                                             DocumentViewMode::LiquidMode2 => {
                                                 self.ensure_liquid_mode2_started(ctx)
                                             }
+                                        }
+                                        if matches!(
+                                            self.liquid_mode2_state,
+                                            LiquidState::PreparingText
+                                        ) && self.view_mode != DocumentViewMode::LiquidMode2
+                                        {
+                                            self.ensure_liquid_mode2_started(ctx);
                                         }
                                         let pending_markdown = self
                                             .pending_markdown_request
@@ -3582,6 +3595,23 @@ impl PdfEditorApp {
         ctx.request_repaint_after(RENDER_POLL_INTERVAL);
     }
 
+    fn start_review_precompute_if_eligible(&mut self, ctx: &Context) {
+        let Some(page_count) = self.document.as_ref().map(|document| document.page_count) else {
+            return;
+        };
+        if !should_precompute_review_on_open(page_count)
+            || !matches!(self.liquid_mode2_state, LiquidState::Idle)
+        {
+            return;
+        }
+
+        // Mark this as a background preparation before asking for detailed layout so an
+        // optimized PDF resumes automatically when the enrichment worker finishes.
+        self.liquid_mode2_state = LiquidState::PreparingText;
+        self.liquid_mode2_complete = false;
+        self.ensure_liquid_mode2_started(ctx);
+    }
+
     fn poll_liquid_mode2_results(&mut self, ctx: &Context) {
         while let Ok(event) = self.liquid_mode2_rx.try_recv() {
             let event_targets_current_document =
@@ -3617,6 +3647,8 @@ impl PdfEditorApp {
                             .find(|warning| {
                                 warning.contains("Promoted native CatBoost runtime failed")
                                     || warning.contains("Promoted context two-pass model failed")
+                                    || warning.contains("learned note-head scorer failed")
+                                    || warning.contains("footnote link ranker failed")
                             })
                             .cloned()
                             .unwrap_or_else(|| {
@@ -14375,6 +14407,15 @@ mod app_tests {
             APP_VERSION_LABEL,
             format!("LawPDF v{}", env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    #[test]
+    fn review_precompute_is_bounded_to_nonempty_documents_under_120_pages() {
+        assert!(!should_precompute_review_on_open(0));
+        assert!(should_precompute_review_on_open(1));
+        assert!(should_precompute_review_on_open(119));
+        assert!(!should_precompute_review_on_open(120));
+        assert!(!should_precompute_review_on_open(500));
     }
 
     fn loaded_document_for_enrichment(path: &Path, optimized: bool) -> LoadedDocument {

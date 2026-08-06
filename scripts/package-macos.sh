@@ -75,15 +75,21 @@ fi
 NATIVE_RUNTIME_SOURCE="$ROOT/profile-models/lm2-native-catboost-runtime"
 FASTTAB_RUNTIME_SOURCE="$ROOT/profile-models/lm2-fasttab-runtime"
 CONTEXT_RUNTIME_SOURCE="$ROOT/profile-models/lm2-context-twopass-runtime"
+NOTE_HEAD_RUNTIME_SOURCE="$ROOT/profile-models/lm2-note-head-runtime"
+LINK_RANKER_RUNTIME_SOURCE="$ROOT/profile-models/lm2-link-ranker-runtime"
 FASTTAB_MODEL="fasttab-v1.onnx"
 NATIVE_MODEL="lm2-catboost-augmented-epoch51lv-relabels-tc.cbm"
 NATIVE_LIBRARY="libcatboostmodel-darwin-universal2-1.2.10.dylib"
 CONTEXT_MODEL="lm2-context-twopass-hgb-v1.json"
+NOTE_HEAD_MODEL="lm2-note-head-hgb-v1.json"
+LINK_RANKER_MODEL="lm2-footnote-link-ranker-hgb-v1.json"
 for asset in \
   "$FASTTAB_RUNTIME_SOURCE/$FASTTAB_MODEL" \
   "$NATIVE_RUNTIME_SOURCE/$NATIVE_MODEL" \
   "$NATIVE_RUNTIME_SOURCE/$NATIVE_LIBRARY" \
-  "$CONTEXT_RUNTIME_SOURCE/$CONTEXT_MODEL"; do
+  "$CONTEXT_RUNTIME_SOURCE/$CONTEXT_MODEL" \
+  "$NOTE_HEAD_RUNTIME_SOURCE/$NOTE_HEAD_MODEL" \
+  "$LINK_RANKER_RUNTIME_SOURCE/$LINK_RANKER_MODEL"; do
   if [[ ! -f "$asset" ]]; then
     echo "missing promoted LM2 runtime asset: $asset" >&2
     exit 1
@@ -93,11 +99,15 @@ done
 NATIVE_RUNTIME_DEST="$RESOURCES/profile-models/lm2-native-catboost-runtime"
 FASTTAB_RUNTIME_DEST="$RESOURCES/profile-models/lm2-fasttab-runtime"
 CONTEXT_RUNTIME_DEST="$RESOURCES/profile-models/lm2-context-twopass-runtime"
-mkdir -p "$FASTTAB_RUNTIME_DEST" "$NATIVE_RUNTIME_DEST" "$CONTEXT_RUNTIME_DEST"
+NOTE_HEAD_RUNTIME_DEST="$RESOURCES/profile-models/lm2-note-head-runtime"
+LINK_RANKER_RUNTIME_DEST="$RESOURCES/profile-models/lm2-link-ranker-runtime"
+mkdir -p "$FASTTAB_RUNTIME_DEST" "$NATIVE_RUNTIME_DEST" "$CONTEXT_RUNTIME_DEST" "$NOTE_HEAD_RUNTIME_DEST" "$LINK_RANKER_RUNTIME_DEST"
 cp "$FASTTAB_RUNTIME_SOURCE/$FASTTAB_MODEL" "$FASTTAB_RUNTIME_DEST/$FASTTAB_MODEL"
 cp "$NATIVE_RUNTIME_SOURCE/$NATIVE_MODEL" "$NATIVE_RUNTIME_DEST/$NATIVE_MODEL"
 cp "$NATIVE_RUNTIME_SOURCE/$NATIVE_LIBRARY" "$NATIVE_RUNTIME_DEST/$NATIVE_LIBRARY"
 cp "$CONTEXT_RUNTIME_SOURCE/$CONTEXT_MODEL" "$CONTEXT_RUNTIME_DEST/$CONTEXT_MODEL"
+cp "$NOTE_HEAD_RUNTIME_SOURCE/$NOTE_HEAD_MODEL" "$NOTE_HEAD_RUNTIME_DEST/$NOTE_HEAD_MODEL"
+cp "$LINK_RANKER_RUNTIME_SOURCE/$LINK_RANKER_MODEL" "$LINK_RANKER_RUNTIME_DEST/$LINK_RANKER_MODEL"
 cp "$ROOT/release-manifest.json" "$RESOURCES/release-manifest.json"
 
 if command -v lipo >/dev/null 2>&1; then
@@ -179,7 +189,7 @@ VERIFY_WORKDIR="${TMPDIR:-/tmp}/lawpdf-package-runtime-verify"
 mkdir -p "$VERIFY_WORKDIR"
 (
   cd "$VERIFY_WORKDIR"
-  "$MACOS/$APP_NAME" --lm2-runtime-status --require-native --require-context >/dev/null
+  "$MACOS/$APP_NAME" --lm2-runtime-status --require-native --require-context --require-note-head --require-link-ranker >/dev/null
 )
 
 if command -v xattr >/dev/null 2>&1; then

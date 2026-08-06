@@ -18,21 +18,36 @@ struct Lm2RuntimeStatus {
     native_catboost_active: bool,
     native_line_model_active: bool,
     context_twopass_active: bool,
+    context_arbiter_active: bool,
+    note_head_active: bool,
+    link_ranker_active: bool,
     liquidvision_active: bool,
     legacy_model_available: bool,
     fasttab_model_path: Option<String>,
     native_model_path: Option<String>,
+    native_model_sha256: Option<String>,
     native_library_path: Option<String>,
     context_model_path: Option<String>,
+    context_arbiter_model_path: Option<String>,
+    note_head_model_path: Option<String>,
+    link_ranker_model_path: Option<String>,
+    require_fasttab: bool,
     require_native: bool,
     require_context: bool,
+    require_arbiter: bool,
+    require_note_head: bool,
+    require_link_ranker: bool,
     requirements_met: bool,
     errors: Vec<String>,
 }
 
 pub fn run_lm2_runtime_status(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
+    let mut require_fasttab = false;
     let mut require_native = false;
     let mut require_context = false;
+    let mut require_arbiter = false;
+    let mut require_note_head = false;
+    let mut require_link_ranker = false;
     let mut output_path: Option<PathBuf> = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -43,8 +58,24 @@ pub fn run_lm2_runtime_status(args: impl IntoIterator<Item = OsString>) -> Resul
             require_native = true;
             continue;
         }
+        if arg == OsStr::new("--require-fasttab") {
+            require_fasttab = true;
+            continue;
+        }
         if arg == OsStr::new("--require-context") {
             require_context = true;
+            continue;
+        }
+        if arg == OsStr::new("--require-arbiter") {
+            require_arbiter = true;
+            continue;
+        }
+        if arg == OsStr::new("--require-note-head") {
+            require_note_head = true;
+            continue;
+        }
+        if arg == OsStr::new("--require-link-ranker") {
+            require_link_ranker = true;
             continue;
         }
         if arg == OsStr::new("--output") {
@@ -61,7 +92,14 @@ pub fn run_lm2_runtime_status(args: impl IntoIterator<Item = OsString>) -> Resul
         ));
     }
 
-    let status = lm2_runtime_status(require_native, require_context);
+    let status = lm2_runtime_status(
+        require_fasttab,
+        require_native,
+        require_context,
+        require_arbiter,
+        require_note_head,
+        require_link_ranker,
+    );
     let json = serde_json::to_string_pretty(&status).map_err(|error| error.to_string())?;
     if let Some(path) = output_path {
         if let Some(parent) = path.parent() {
@@ -78,7 +116,14 @@ pub fn run_lm2_runtime_status(args: impl IntoIterator<Item = OsString>) -> Resul
     }
 }
 
-fn lm2_runtime_status(require_native: bool, require_context: bool) -> Lm2RuntimeStatus {
+fn lm2_runtime_status(
+    require_fasttab: bool,
+    require_native: bool,
+    require_context: bool,
+    require_arbiter: bool,
+    require_note_head: bool,
+    require_link_ranker: bool,
+) -> Lm2RuntimeStatus {
     let fasttab_requested = fasttab_enabled();
     let fasttab_model_path = std::env::var_os("LAWPDF_LM2_FASTTAB_MODEL")
         .map(PathBuf::from)
@@ -105,6 +150,17 @@ fn lm2_runtime_status(require_native: bool, require_context: bool) -> Lm2Runtime
         lm2_context_twopass_runtime_asset_candidates(LM2_CONTEXT_TWOPASS_MODEL_FILE)
             .into_iter()
             .find(|path| path.is_file());
+    let context_arbiter_model_path =
+        lm2_context_arbiter_runtime_asset_candidates(LM2_CONTEXT_ARBITER_MODEL_FILE)
+            .into_iter()
+            .find(|path| path.is_file());
+    let note_head_model_path = lm2_note_head_runtime_asset_candidates(LM2_NOTE_HEAD_MODEL_FILE)
+        .into_iter()
+        .find(|path| path.is_file());
+    let link_ranker_model_path =
+        lm2_link_ranker_runtime_asset_candidates(LM2_LINK_RANKER_MODEL_FILE)
+            .into_iter()
+            .find(|path| path.is_file());
 
     let mut errors = Vec::new();
     let fasttab_model = match Lm2FastTabModel::load() {
@@ -115,7 +171,7 @@ fn lm2_runtime_status(require_native: bool, require_context: bool) -> Lm2Runtime
         }
     };
     let fasttab_active = fasttab_model.is_some();
-    if fasttab_requested && !fasttab_active && errors.is_empty() {
+    if (fasttab_requested || require_fasttab) && !fasttab_active && errors.is_empty() {
         errors.push("requested FastTab ONNX model was not loaded".to_owned());
     }
     let native_model = match load_lm2_native_catboost_model() {
@@ -130,9 +186,16 @@ fn lm2_runtime_status(require_native: bool, require_context: bool) -> Lm2Runtime
         errors.push("required CatBoost default model/library assets were not found".to_owned());
     }
     let native_line_model_active = fasttab_active || native_catboost_active;
+    let context_primary_sha256 = if fasttab_active {
+        None
+    } else {
+        native_model
+            .as_ref()
+            .map(|model| model.model_sha256.as_str())
+    };
 
     let context_model = if native_line_model_active {
-        match load_lm2_context_twopass_model() {
+        match load_lm2_context_twopass_model(context_primary_sha256) {
             Ok(model) => model,
             Err(error) => {
                 errors.push(format!("context two-pass load failed: {error}"));
@@ -146,6 +209,51 @@ fn lm2_runtime_status(require_native: bool, require_context: bool) -> Lm2Runtime
     if require_context && !context_twopass_active {
         errors.push("required context two-pass model was not loaded".to_owned());
     }
+    let context_arbiter_model = if native_line_model_active {
+        match load_lm2_context_arbiter_model(context_primary_sha256) {
+            Ok(model) => model,
+            Err(error) => {
+                errors.push(format!("context arbiter load failed: {error}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let context_arbiter_active = context_arbiter_model.is_some();
+    if require_arbiter && !context_arbiter_active {
+        errors.push("required context arbiter model was not loaded".to_owned());
+    }
+    let note_head_model = if native_line_model_active && !fasttab_active {
+        match load_lm2_note_head_model(context_primary_sha256) {
+            Ok(model) => model,
+            Err(error) => {
+                errors.push(format!("note-head model load failed: {error}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let note_head_active = note_head_model.is_some();
+    if require_note_head && !note_head_active {
+        errors.push("required learned note-head model was not loaded".to_owned());
+    }
+    let link_ranker_model = if native_line_model_active && !fasttab_active {
+        match load_lm2_link_ranker_model(note_head_model.as_ref()) {
+            Ok(model) => model,
+            Err(error) => {
+                errors.push(format!("footnote link-ranker model load failed: {error}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let link_ranker_active = link_ranker_model.is_some();
+    if require_link_ranker && !link_ranker_active {
+        errors.push("required learned footnote link-ranker model was not loaded".to_owned());
+    }
     let liquidvision_active =
         native_line_model_active && liquidvision_enabled(true) && LiquidVision::global().is_some();
     if require_native && !liquidvision_active {
@@ -156,7 +264,19 @@ fn lm2_runtime_status(require_native: bool, require_context: bool) -> Lm2Runtime
     let legacy_model_available = legacy_model.is_some();
     let (runtime_tier, model_label) = if fasttab_active {
         (
-            if context_twopass_active {
+            if link_ranker_active && context_arbiter_active {
+                "fasttab_onnx_context_arbiter_footnote_linker"
+            } else if link_ranker_active && context_twopass_active {
+                "fasttab_onnx_context_footnote_linker"
+            } else if link_ranker_active {
+                "fasttab_onnx_footnote_linker"
+            } else if note_head_active && context_arbiter_active {
+                "fasttab_onnx_context_arbiter_note_head"
+            } else if note_head_active && context_twopass_active {
+                "fasttab_onnx_context_note_head"
+            } else if context_arbiter_active {
+                "fasttab_onnx_context_arbiter"
+            } else if context_twopass_active {
                 "fasttab_onnx_context"
             } else {
                 "fasttab_onnx"
@@ -165,17 +285,30 @@ fn lm2_runtime_status(require_native: bool, require_context: bool) -> Lm2Runtime
         )
     } else if let Some(model) = native_model.as_ref() {
         (
-            if context_twopass_active {
+            if link_ranker_active && context_arbiter_active {
+                "native_catboost_context_arbiter_footnote_linker"
+            } else if link_ranker_active && context_twopass_active {
+                "native_catboost_context_footnote_linker"
+            } else if link_ranker_active {
+                "native_catboost_footnote_linker"
+            } else if note_head_active && context_arbiter_active {
+                "native_catboost_context_arbiter_note_head"
+            } else if note_head_active && context_twopass_active {
+                "native_catboost_context_note_head"
+            } else if context_arbiter_active {
+                "native_catboost_context_arbiter"
+            } else if context_twopass_active {
                 "native_catboost_context"
             } else {
                 "native_catboost"
             },
             format!(
-                "lm2-native-catboost-text-runtime:f{}c{}t{}d{}",
+                "lm2-native-catboost-text-runtime:f{}c{}t{}d{}:sha{}",
                 model.float_feature_count,
                 model.cat_feature_count,
                 model.text_feature_count,
-                model.dimensions_count
+                model.dimensions_count,
+                &model.model_sha256[..16]
             ),
         )
     } else if let Some(model) = legacy_model.as_ref() {
@@ -183,13 +316,17 @@ fn lm2_runtime_status(require_native: bool, require_context: bool) -> Lm2Runtime
     } else {
         ("heuristic_fallback", "lm2-heuristic-fallback".to_owned())
     };
-    let requirements_met = (!require_native || native_catboost_active)
+    let requirements_met = (!require_fasttab || fasttab_active)
+        && (!require_native || native_catboost_active)
         && (!require_native || liquidvision_active)
         && (!require_context || context_twopass_active)
+        && (!require_arbiter || context_arbiter_active)
+        && (!require_note_head || note_head_active)
+        && (!require_link_ranker || link_ranker_active)
         && errors.is_empty();
 
     Lm2RuntimeStatus {
-        schema_version: "lm2-runtime-status-v2",
+        schema_version: "lm2-runtime-status-v5",
         app_version: env!("CARGO_PKG_VERSION"),
         platform: std::env::consts::OS,
         runtime_tier,
@@ -199,14 +336,28 @@ fn lm2_runtime_status(require_native: bool, require_context: bool) -> Lm2Runtime
         native_catboost_active,
         native_line_model_active,
         context_twopass_active,
+        context_arbiter_active,
+        note_head_active,
+        link_ranker_active,
         liquidvision_active,
         legacy_model_available,
         fasttab_model_path: fasttab_model_path.map(|path| path.display().to_string()),
         native_model_path: native_model_path.map(|path| path.display().to_string()),
+        native_model_sha256: native_model
+            .as_ref()
+            .map(|model| model.model_sha256.clone()),
         native_library_path: native_library_path.map(|path| path.display().to_string()),
         context_model_path: context_model_path.map(|path| path.display().to_string()),
+        context_arbiter_model_path: context_arbiter_model_path
+            .map(|path| path.display().to_string()),
+        note_head_model_path: note_head_model_path.map(|path| path.display().to_string()),
+        link_ranker_model_path: link_ranker_model_path.map(|path| path.display().to_string()),
+        require_fasttab,
         require_native,
         require_context,
+        require_arbiter,
+        require_note_head,
+        require_link_ranker,
         requirements_met,
         errors,
     }

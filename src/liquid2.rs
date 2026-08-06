@@ -61,7 +61,118 @@ const LM2_FASTTAB_RUNTIME_DIR: &str = "profile-models/lm2-fasttab-runtime";
 const LM2_FASTTAB_MODEL_FILE: &str = "fasttab-v1.onnx";
 const LM2_CONTEXT_TWOPASS_RUNTIME_DIR: &str = "profile-models/lm2-context-twopass-runtime";
 const LM2_CONTEXT_TWOPASS_MODEL_FILE: &str = "lm2-context-twopass-hgb-v1.json";
+const LM2_CONTEXT_ARBITER_MODEL_FILE: &str = "lm2-context-arbiter-hgb-v2.json";
+const LM2_NOTE_HEAD_RUNTIME_DIR: &str = "profile-models/lm2-note-head-runtime";
+const LM2_NOTE_HEAD_MODEL_FILE: &str = "lm2-note-head-hgb-v1.json";
+const LM2_NOTE_HEAD_SCHEMA_V1: &str = "lawpdf-footnote-head-hgb-v1";
+const LM2_NOTE_HEAD_SCHEMA_V2: &str = "lawpdf-footnote-head-stacked-hgb-v2";
+const LM2_NOTE_HEAD_SCHEMA_V3: &str = "lawpdf-footnote-head-sequence-hgb-v3";
+const LM2_NOTE_HEAD_RUNTIME_VERSION: &str = "note-head-runtime-v3.0-sequence-stacked";
+const LM2_NOTE_HEAD_FEATURE_COUNT_V1: usize = 131;
+const LM2_NOTE_HEAD_FEATURE_COUNT_V2: usize = 134;
+const LM2_NOTE_HEAD_FEATURE_COUNT_V3: usize = 150;
+const LM2_NOTE_HEAD_NEIGHBOR_OFFSETS_V3: [isize; 2] = [-1, 1];
+const LM2_LINK_RANKER_RUNTIME_DIR: &str = "profile-models/lm2-link-ranker-runtime";
+const LM2_LINK_RANKER_MODEL_FILE: &str = "lm2-footnote-link-ranker-hgb-v1.json";
+const LM2_LINK_RANKER_SCHEMA_V1: &str = "lawpdf-footnote-link-ranker-hgb-v1";
+const LM2_LINK_RANKER_RUNTIME_VERSION: &str = "footnote-link-ranker-runtime-v1";
+const LM2_LINK_RANKER_FEATURE_COUNT_V1: usize = 89;
+const LM2_LINK_RANKER_FEATURES_V1: [&str; LM2_LINK_RANKER_FEATURE_COUNT_V1] = [
+    "marker_norm",
+    "marker_log",
+    "marker_digits_norm",
+    "marker_le_5",
+    "marker_ge_100",
+    "page_delta_clip",
+    "same_page",
+    "next_page",
+    "body_page_norm",
+    "candidate_page_norm",
+    "reference_line_known",
+    "reference_starts_with_marker",
+    "reference_embeds_marker",
+    "reference_word_count_norm",
+    "reference_font_ratio_page",
+    "same_source_line_as_reference",
+    "candidate_after_reference",
+    "same_page_line_delta",
+    "line_index_norm",
+    "top_norm",
+    "bottom_norm",
+    "center_y_norm",
+    "width_norm",
+    "left_norm",
+    "right_margin_norm",
+    "font_ratio_page",
+    "font_ratio_page_ref",
+    "font_ratio_doc",
+    "font_height_norm",
+    "bold",
+    "italic",
+    "centered",
+    "margin_centered",
+    "below_footnote_divider",
+    "page_has_footnote_divider",
+    "in_footnote_zone",
+    "doc_footnote_state",
+    "doc_footnote_continuation",
+    "segment_footnote_like",
+    "segment_furniture_like",
+    "segment_table_like",
+    "segment_toc_like",
+    "segment_first",
+    "segment_last",
+    "segment_line_position",
+    "segment_count_norm",
+    "text_length_norm",
+    "word_count_norm",
+    "digit_ratio",
+    "alpha_ratio",
+    "uppercase_ratio",
+    "punctuation_ratio",
+    "space_ratio",
+    "suffix_space",
+    "suffix_dot",
+    "suffix_paren",
+    "suffix_bracket",
+    "remainder_upper",
+    "remainder_lower",
+    "remainder_digit",
+    "has_url",
+    "terminal_punctuation",
+    "mostly_upper",
+    "local_same_marker_count",
+    "document_same_marker_count",
+    "prev_numeric_present",
+    "prev_numeric_marker_delta",
+    "prev_numeric_page_delta",
+    "prev_numeric_line_gap",
+    "prev_numeric_same_page",
+    "prev_numeric_is_current_note",
+    "next_numeric_present",
+    "next_numeric_marker_delta",
+    "next_numeric_page_delta",
+    "next_numeric_line_gap",
+    "next_numeric_same_page",
+    "next_numeric_is_current_note",
+    "previous_note_present",
+    "previous_note_marker_delta",
+    "previous_note_page_delta",
+    "previous_note_line_gap",
+    "next_note_present",
+    "next_note_marker_delta",
+    "next_note_page_delta",
+    "next_note_line_gap",
+    "previous_note_is_marker_minus_one",
+    "next_note_is_marker_plus_one",
+    "bracketed_by_consecutive_notes",
+    "candidate_auth_probability",
+];
 const LM2_CONTEXT_TWOPASS_VERSION: &str = "context-twopass-hgb-v1-agent2-task30-foldnorm";
+const LM2_CONTEXT_ARBITER_SCHEMA_V2: &str = "lawpdf-lm2-context-arbiter-hgb-v2";
+const LM2_CONTEXT_ARBITER_RUNTIME_VERSION: &str = "context-arbiter-runtime-v2.1-gated-nonkeep";
+const LM2_CONTEXT_ARBITER_FEATURE_COUNT_V2: usize = 139;
+const LM2_CONTEXT_ARBITER_NEIGHBOR_OFFSETS: [isize; 4] = [-2, -1, 1, 2];
 const LM2_NATIVE_CATBOOST_FLOAT_FEATURES: [&str; 116] = [
     "page_width",
     "page_height",
@@ -250,6 +361,7 @@ pub struct LiquidMode2Timing {
     pub feature_enrichment_ms: f64,
     pub model_decode_ms: f64,
     pub overlay_decode_ms: f64,
+    pub footnote_linker_ms: f64,
     pub assembly_ms: f64,
     pub total_ms: f64,
     pub cache_hit: bool,
@@ -356,6 +468,7 @@ struct Lm2NativeCatboostModel {
     cat_feature_count: usize,
     text_feature_count: usize,
     dimensions_count: usize,
+    model_sha256: String,
 }
 
 unsafe impl Send for Lm2NativeCatboostModel {}
@@ -382,6 +495,9 @@ struct Lm2Runtime {
     fasttab_model: Option<Lm2FastTabModel>,
     native_catboost_model: Option<Lm2NativeCatboostModel>,
     context_twopass_model: Option<Lm2ContextTwopassModel>,
+    context_arbiter_model: Option<Lm2ContextTwopassModel>,
+    note_head_model: Option<Lm2NoteHeadModel>,
+    link_ranker_model: Option<Lm2LinkRankerModel>,
     numeric_catboost_model: Option<Lm2NumericCatboostModel>,
     static_front_overlay: Option<Lm2StaticFrontOverlay>,
     model_label: String,
@@ -407,6 +523,16 @@ struct Lm2ContextTwopassModelFile {
     actions: Vec<String>,
     feature_count: usize,
     #[serde(default)]
+    numeric_feature_count: Option<usize>,
+    #[serde(default)]
+    primary_probability_order: Vec<String>,
+    #[serde(default)]
+    primary_model_sha256: Option<String>,
+    #[serde(default)]
+    neighbor_offsets: Vec<isize>,
+    #[serde(default)]
+    calibration: Option<Lm2ContextArbiterCalibration>,
+    #[serde(default)]
     doc_to_fold: HashMap<String, usize>,
     #[serde(default)]
     unseen_doc_model: Option<String>,
@@ -420,14 +546,81 @@ struct Lm2ContextTwopassHgbModel {
     trees: Vec<Vec<Vec<[f64; 7]>>>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct Lm2ContextArbiterCalibration {
+    rescue_keep_threshold: f64,
+    demote_to_marginalia_threshold: f64,
+    demote_to_noise_threshold: f64,
+    #[serde(default = "lm2_context_default_closed_threshold")]
+    reclassify_nonkeep_threshold: f64,
+}
+
+fn lm2_context_default_closed_threshold() -> f64 {
+    1.0
+}
+
 #[derive(Debug)]
 struct Lm2ContextTwopassModel {
     schema_version: String,
     actions: Vec<String>,
     feature_count: usize,
+    calibration: Option<Lm2ContextArbiterCalibration>,
+    primary_model_sha256: Option<String>,
+    asset_sha256: String,
     doc_to_fold: HashMap<String, usize>,
     unseen_doc_model: String,
     models: Vec<Lm2ContextTwopassHgbModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Lm2NoteHeadModelFile {
+    schema_version: String,
+    feature_count: usize,
+    #[serde(default)]
+    numeric_feature_count: Option<usize>,
+    #[serde(default)]
+    primary_probability_order: Vec<String>,
+    #[serde(default)]
+    primary_model_sha256: Option<String>,
+    #[serde(default)]
+    candidate_neighbor_offsets: Vec<isize>,
+    baseline_prediction: Vec<f64>,
+    trees: Vec<Vec<[f64; 7]>>,
+    threshold: f64,
+}
+
+#[derive(Debug)]
+struct Lm2NoteHeadModel {
+    schema_version: String,
+    feature_count: usize,
+    primary_model_sha256: Option<String>,
+    baseline_prediction: f64,
+    trees: Vec<Vec<[f64; 7]>>,
+    threshold: f64,
+    asset_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Lm2LinkRankerModelFile {
+    schema_version: String,
+    feature_count: usize,
+    feature_names: Vec<String>,
+    baseline_prediction: Vec<f64>,
+    trees: Vec<Vec<[f64; 7]>>,
+    threshold: f64,
+    auth_threshold: f64,
+    auth_model_sha256: String,
+    candidate_page_offsets: Vec<i32>,
+}
+
+#[derive(Debug)]
+struct Lm2LinkRankerModel {
+    baseline_prediction: f64,
+    trees: Vec<Vec<[f64; 7]>>,
+    threshold: f64,
+    auth_threshold: f64,
+    auth_model_sha256: String,
+    asset_sha256: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2197,10 +2390,21 @@ pub fn prepare_liquid_mode2_document_with_timing(
     let d1_runtime_zerospend_overlay_version =
         d1_runtime_zerospend_overlay.then_some(LM2_D1_RUNTIME_ZEROSPEND_OVERLAY_VERSION);
     let context_twopass_label = if request.external_emissions_path.is_none() {
-        runtime
-            .context_twopass_model
-            .as_ref()
-            .map(|model| model.label())
+        let mut labels = [
+            runtime.context_twopass_model.as_ref(),
+            runtime.context_arbiter_model.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(Lm2ContextTwopassModel::label)
+        .collect::<Vec<_>>();
+        if let Some(model) = runtime.note_head_model.as_ref() {
+            labels.push(model.label());
+        }
+        if let Some(model) = runtime.link_ranker_model.as_ref() {
+            labels.push(model.label());
+        }
+        (!labels.is_empty()).then(|| labels.join(" -> "))
     } else {
         None
     };
@@ -2331,10 +2535,14 @@ pub fn prepare_liquid_mode2_document_with_timing(
     }
 
     let model_started = Instant::now();
-    let mut decoded = if let Some(external) = external_emissions.as_ref() {
-        decode_pages_with_external_emissions(&runtime, &request.path, &lines, external)?
+    let (mut decoded, primary_emissions) = if let Some(external) = external_emissions.as_ref() {
+        (
+            decode_pages_with_external_emissions(&runtime, &request.path, &lines, external)?,
+            None,
+        )
     } else {
-        decode_pages(&runtime, &lines)
+        let (decoded, emissions) = decode_pages_with_scores(&runtime, &lines);
+        (decoded, Some(emissions))
     };
     timing.model_decode_ms = model_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -2342,7 +2550,22 @@ pub fn prepare_liquid_mode2_document_with_timing(
     if external_emissions.is_none()
         && let Some(model) = runtime.context_twopass_model.as_ref()
     {
-        apply_context_twopass_model(model, &request.path, &mut decoded);
+        apply_context_twopass_model(
+            model,
+            &request.path,
+            primary_emissions.as_deref(),
+            &mut decoded,
+        );
+    }
+    if external_emissions.is_none()
+        && let Some(model) = runtime.context_arbiter_model.as_ref()
+    {
+        apply_context_twopass_model(
+            model,
+            &request.path,
+            primary_emissions.as_deref(),
+            &mut decoded,
+        );
     }
     if let Some(overlay) = runtime.static_front_overlay.as_ref() {
         apply_static_front_overlay(overlay, &request.path, &mut decoded);
@@ -2418,6 +2641,27 @@ pub fn prepare_liquid_mode2_document_with_timing(
     apply_drop_cap_recovery_overlay(&mut decoded);
     apply_same_row_body_fragment_overlay(&mut decoded);
     apply_same_page_body_callout_overlay(&mut decoded);
+    if let (Some(link_model), Some(auth_model)) = (
+        runtime.link_ranker_model.as_ref(),
+        runtime.note_head_model.as_ref(),
+    ) {
+        let linker_started = Instant::now();
+        apply_footnote_link_ranker(
+            link_model,
+            auth_model,
+            &request.path,
+            primary_emissions.as_deref(),
+            &mut decoded,
+        );
+        timing.footnote_linker_ms = linker_started.elapsed().as_secs_f64() * 1000.0;
+    } else if let Some(model) = runtime.note_head_model.as_ref() {
+        apply_note_head_model(
+            model,
+            &request.path,
+            primary_emissions.as_deref(),
+            &mut decoded,
+        );
+    }
     let article_spans = detect_lm2_article_spans(&decoded, request.pages.len());
     timing.overlay_decode_ms = overlay_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -2478,7 +2722,7 @@ pub fn prepare_liquid_mode2_document_with_timing(
     }
     if let Some(label) = context_twopass_label.as_deref() {
         warnings.push(format!(
-            "Review Mode context two-pass model is active: {label}."
+            "Review Mode learned postprocessor stack is active: {label}."
         ));
     }
     if !runtime.native_line_model_active()
@@ -2733,8 +2977,15 @@ impl Lm2Runtime {
             }
         };
         let native_line_model_active = fasttab_model.is_some() || native_catboost_model.is_some();
+        let context_primary_sha256 = if fasttab_model.is_none() {
+            native_catboost_model
+                .as_ref()
+                .map(|model| model.model_sha256.as_str())
+        } else {
+            None
+        };
         let context_twopass_model = if native_line_model_active && lm2_context_twopass_enabled() {
-            match load_lm2_context_twopass_model() {
+            match load_lm2_context_twopass_model(context_primary_sha256) {
                 Ok(Some(model)) => Some(model),
                 Ok(None) => {
                     load_warnings.push(
@@ -2746,6 +2997,45 @@ impl Lm2Runtime {
                 Err(error) => {
                     load_warnings.push(format!(
                         "Promoted context two-pass model failed to load; using native emissions only: {error}"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let context_arbiter_model = if native_line_model_active && lm2_context_twopass_enabled() {
+            match load_lm2_context_arbiter_model(context_primary_sha256) {
+                Ok(model) => model,
+                Err(error) => {
+                    load_warnings.push(format!(
+                        "Optional context arbiter failed to load; retaining the promoted context model only: {error}"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let note_head_model = if native_line_model_active {
+            match load_lm2_note_head_model(context_primary_sha256) {
+                Ok(model) => model,
+                Err(error) => {
+                    load_warnings.push(format!(
+                        "Optional learned note-head scorer failed to load: {error}"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let link_ranker_model = if native_line_model_active {
+            match load_lm2_link_ranker_model(note_head_model.as_ref()) {
+                Ok(model) => model,
+                Err(error) => {
+                    load_warnings.push(format!(
+                        "Optional learned footnote link ranker failed to load: {error}"
                     ));
                     None
                 }
@@ -2769,11 +3059,12 @@ impl Lm2Runtime {
             .or_else(|| {
                 native_catboost_model.as_ref().map(|model| {
                     format!(
-                        "lm2-native-catboost-text-runtime:f{}c{}t{}d{}",
+                        "lm2-native-catboost-text-runtime:f{}c{}t{}d{}:sha{}",
                         model.float_feature_count,
                         model.cat_feature_count,
                         model.text_feature_count,
-                        model.dimensions_count
+                        model.dimensions_count,
+                        &model.model_sha256[..16]
                     )
                 })
             })
@@ -2792,6 +3083,9 @@ impl Lm2Runtime {
                 fasttab_model,
                 native_catboost_model,
                 context_twopass_model,
+                context_arbiter_model,
+                note_head_model,
+                link_ranker_model,
                 numeric_catboost_model,
                 static_front_overlay,
                 pp_priors,
@@ -2831,6 +3125,9 @@ impl Lm2Runtime {
                 load_warnings,
                 native_catboost_model,
                 context_twopass_model,
+                context_arbiter_model,
+                note_head_model,
+                link_ranker_model,
                 numeric_catboost_model,
                 static_front_overlay,
                 pp_priors,
@@ -2950,6 +3247,26 @@ fn argmax_lm2_action(scores: [f64; 3]) -> Lm2Action {
 
 impl Lm2ContextTwopassModel {
     fn label(&self) -> String {
+        if self.schema_version == LM2_CONTEXT_ARBITER_SCHEMA_V2 {
+            let primary = self
+                .primary_model_sha256
+                .as_deref()
+                .unwrap_or("unknown")
+                .chars()
+                .take(12)
+                .collect::<String>();
+            let asset = self.asset_sha256.chars().take(12).collect::<String>();
+            return format!(
+                "{}:{}:a{}f{}m{}:primary{}:asset{}",
+                LM2_CONTEXT_ARBITER_RUNTIME_VERSION,
+                self.schema_version,
+                self.actions.len(),
+                self.feature_count,
+                self.models.len(),
+                primary,
+                asset
+            );
+        }
         format!(
             "{LM2_CONTEXT_TWOPASS_VERSION}:{}:a{}f{}m{}",
             self.schema_version,
@@ -2975,7 +3292,7 @@ impl Lm2ContextTwopassModel {
 }
 
 impl Lm2ContextTwopassHgbModel {
-    fn predict(&self, features: &[f64]) -> Lm2Action {
+    fn raw_prediction(&self, features: &[f64]) -> [f64; 3] {
         let mut raw = [0.0; 3];
         for (index, score) in raw.iter_mut().enumerate() {
             *score = *self.baseline_prediction.get(index).unwrap_or(&0.0);
@@ -2985,6 +3302,11 @@ impl Lm2ContextTwopassHgbModel {
                 raw[class_index] += lm2_context_tree_predict(tree, features);
             }
         }
+        raw
+    }
+
+    fn predict(&self, features: &[f64]) -> Lm2Action {
+        let raw = self.raw_prediction(features);
         let class_index = raw
             .iter()
             .enumerate()
@@ -2997,6 +3319,80 @@ impl Lm2ContextTwopassHgbModel {
             2 => Lm2Action::Marginalia,
             _ => Lm2Action::Keep,
         }
+    }
+
+    fn predict_probabilities(&self, features: &[f64]) -> [f64; 3] {
+        lm2_context_softmax(self.raw_prediction(features))
+    }
+}
+
+impl Lm2NoteHeadModel {
+    fn label(&self) -> String {
+        let asset = self.asset_sha256.chars().take(12).collect::<String>();
+        let primary = self
+            .primary_model_sha256
+            .as_deref()
+            .map(|sha| sha.chars().take(12).collect::<String>())
+            .unwrap_or_else(|| "none".to_owned());
+        format!(
+            "{LM2_NOTE_HEAD_RUNTIME_VERSION}:{}:f{}t{}:primary{primary}:asset{asset}",
+            self.schema_version,
+            self.feature_count,
+            self.trees.len(),
+        )
+    }
+
+    fn probability(&self, features: &[f64]) -> f64 {
+        let raw = self
+            .trees
+            .iter()
+            .fold(self.baseline_prediction, |score, tree| {
+                score + lm2_context_tree_predict(tree, features)
+            });
+        if raw >= 0.0 {
+            1.0 / (1.0 + (-raw).exp())
+        } else {
+            let exp = raw.exp();
+            exp / (1.0 + exp)
+        }
+    }
+}
+
+impl Lm2LinkRankerModel {
+    fn label(&self) -> String {
+        let asset = self.asset_sha256.chars().take(12).collect::<String>();
+        let auth = self.auth_model_sha256.chars().take(12).collect::<String>();
+        format!(
+            "{LM2_LINK_RANKER_RUNTIME_VERSION}:{LM2_LINK_RANKER_SCHEMA_V1}:f{}t{}:auth{auth}:asset{asset}",
+            LM2_LINK_RANKER_FEATURE_COUNT_V1,
+            self.trees.len(),
+        )
+    }
+
+    fn probability(&self, features: &[f64]) -> f64 {
+        let raw = self
+            .trees
+            .iter()
+            .fold(self.baseline_prediction, |score, tree| {
+                score + lm2_context_tree_predict(tree, features)
+            });
+        if raw >= 0.0 {
+            1.0 / (1.0 + (-raw).exp())
+        } else {
+            let exp = raw.exp();
+            exp / (1.0 + exp)
+        }
+    }
+}
+
+fn lm2_context_softmax(raw: [f64; 3]) -> [f64; 3] {
+    let max = raw.into_iter().fold(f64::NEG_INFINITY, f64::max);
+    let exp = raw.map(|value| (value - max).exp());
+    let total = exp.iter().sum::<f64>();
+    if total.is_finite() && total > 0.0 {
+        exp.map(|value| value / total)
+    } else {
+        [0.0, 1.0, 0.0]
     }
 }
 
@@ -3029,6 +3425,7 @@ fn lm2_context_tree_predict(nodes: &[[f64; 7]], features: &[f64]) -> f64 {
 fn apply_context_twopass_model(
     model: &Lm2ContextTwopassModel,
     document_path: &Path,
+    primary_emissions: Option<&[[f64; 3]]>,
     decoded: &mut [(DeepLiquidSourceLine, Lm2Action)],
 ) {
     if decoded.is_empty() {
@@ -3037,6 +3434,35 @@ fn apply_context_twopass_model(
     let Some(document_model) = model.model_for_document(document_path) else {
         return;
     };
+    if model.schema_version == LM2_CONTEXT_ARBITER_SCHEMA_V2 {
+        let Some(primary_emissions) = primary_emissions.filter(|rows| rows.len() == decoded.len())
+        else {
+            return;
+        };
+        let baseline_actions = decoded
+            .iter()
+            .map(|(_, action)| *action)
+            .collect::<Vec<_>>();
+        let primary_probabilities = primary_emissions
+            .iter()
+            .copied()
+            .map(lm2_context_primary_probabilities)
+            .collect::<Vec<_>>();
+        let Some(calibration) = model.calibration.as_ref() else {
+            return;
+        };
+        for index in 0..decoded.len() {
+            let features =
+                lm2_context_arbiter_feature_vector(decoded, &primary_probabilities, index);
+            if features.len() != model.feature_count {
+                continue;
+            }
+            let arbiter = document_model.predict_probabilities(&features);
+            decoded[index].1 =
+                lm2_context_arbiter_policy(baseline_actions[index], arbiter, calibration);
+        }
+        return;
+    }
     let baseline_actions = decoded
         .iter()
         .map(|(_, action)| *action)
@@ -3048,6 +3474,867 @@ fn apply_context_twopass_model(
             decoded[index].1 = document_model.predict(&features);
         }
     }
+}
+
+fn lm2_context_primary_probabilities(internal_scores: [f64; 3]) -> [f64; 3] {
+    // Native inference is [keep, marginalia, hide_noise], whereas the arbiter's
+    // training/export contract is [hide_noise, keep, marginalia].
+    lm2_context_softmax([
+        internal_scores[Lm2Action::HideNoise.index()],
+        internal_scores[Lm2Action::Keep.index()],
+        internal_scores[Lm2Action::Marginalia.index()],
+    ])
+}
+
+fn lm2_context_finite_feature(value: f64) -> f64 {
+    if value.is_nan() {
+        0.0
+    } else if value == f64::INFINITY {
+        1_000_000.0
+    } else if value == f64::NEG_INFINITY {
+        -1_000_000.0
+    } else {
+        value
+    }
+}
+
+fn lm2_context_arbiter_feature_vector(
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+    primary_probabilities: &[[f64; 3]],
+    index: usize,
+) -> Vec<f64> {
+    let mut features = Vec::with_capacity(LM2_CONTEXT_ARBITER_FEATURE_COUNT_V2);
+    let feature_map = lm2_numeric_catboost_features(&decoded[index].0);
+    features.extend(
+        LM2_NATIVE_CATBOOST_FLOAT_FEATURES
+            .iter()
+            .map(|name| lm2_context_finite_feature(feature_map.get(*name).copied().unwrap_or(0.0))),
+    );
+    features.extend(primary_probabilities[index]);
+
+    let mut neighbor_meta = Vec::with_capacity(LM2_CONTEXT_ARBITER_NEIGHBOR_OFFSETS.len());
+    for offset in LM2_CONTEXT_ARBITER_NEIGHBOR_OFFSETS {
+        let neighbor = index.checked_add_signed(offset).filter(|neighbor| {
+            decoded
+                .get(*neighbor)
+                .is_some_and(|(line, _)| line.page_index == decoded[index].0.page_index)
+        });
+        if let Some(neighbor) = neighbor {
+            features.extend(primary_probabilities[neighbor]);
+            let gap = decoded[index]
+                .0
+                .line_index
+                .abs_diff(decoded[neighbor].0.line_index)
+                .min(8) as f64
+                / 8.0;
+            neighbor_meta.push((1.0, gap));
+        } else {
+            features.extend([0.0; 3]);
+            neighbor_meta.push((0.0, 0.0));
+        }
+    }
+    features.extend(neighbor_meta.iter().map(|(same_page, _)| *same_page));
+    features.extend(neighbor_meta.iter().map(|(_, gap)| *gap));
+    features
+}
+
+fn lm2_note_head_feature_vector(
+    line: &DeepLiquidSourceLine,
+    primary_probabilities: Option<[f64; 3]>,
+) -> Option<(u16, Vec<f64>)> {
+    let (marker, normalized_text) = lm2_note_head_normalized_text(&line.text)?;
+    let trimmed = normalized_text.as_str();
+    let digit_count = trimmed
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .take(3)
+        .count();
+    let suffix = trimmed.chars().nth(digit_count)?;
+    let remainder = trimmed
+        .chars()
+        .skip(digit_count + 1)
+        .skip_while(|ch| ch.is_whitespace())
+        .collect::<String>();
+    let first = remainder.chars().next();
+    let text_chars = normalized_text.chars().count().max(1);
+    let text_digits = normalized_text
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .count();
+    let token_count = normalized_text.split_whitespace().count();
+    let mut features =
+        Vec::with_capacity(LM2_NOTE_HEAD_FEATURE_COUNT_V1 + primary_probabilities.map_or(0, |_| 3));
+    let feature_map = lm2_numeric_catboost_features(line);
+    features.extend(
+        LM2_NATIVE_CATBOOST_FLOAT_FEATURES
+            .iter()
+            .map(|name| lm2_context_finite_feature(feature_map.get(*name).copied().unwrap_or(0.0))),
+    );
+    if let Some(probabilities) = primary_probabilities {
+        features.extend(probabilities);
+    }
+    features.extend([
+        marker as f64 / 500.0,
+        (marker as f64).ln_1p() / 501.0f64.ln(),
+        digit_count as f64 / 3.0,
+        text_chars.min(500) as f64 / 500.0,
+        token_count.min(100) as f64 / 100.0,
+        text_digits as f64 / text_chars as f64,
+        bool_as_f64(suffix.is_whitespace()),
+        bool_as_f64(suffix == '.'),
+        bool_as_f64(suffix == ')'),
+        bool_as_f64(suffix == ']'),
+        bool_as_f64(first.is_some_and(char::is_uppercase)),
+        bool_as_f64(first.is_some_and(char::is_lowercase)),
+        bool_as_f64(first.is_some_and(|ch| ch.is_ascii_digit())),
+        bool_as_f64(marker <= 5),
+        bool_as_f64(marker >= 100),
+    ]);
+    Some((marker, features))
+}
+
+fn lm2_note_head_normalized_text(text: &str) -> Option<(u16, String)> {
+    let trimmed = text.trim_start();
+    if let Some(marker) = leading_numeric_token_marker(trimmed) {
+        return Some((marker, trimmed.to_owned()));
+    }
+    let mut chars = trimmed.char_indices();
+    if chars.next().map(|(_, ch)| ch) != Some(CALLOUT_START) {
+        return None;
+    }
+    let mut digits = String::new();
+    let mut end = None;
+    for (index, ch) in chars {
+        if ch == CALLOUT_END {
+            end = Some(index + ch.len_utf8());
+            break;
+        }
+        if !ch.is_ascii_digit() || digits.len() >= 3 {
+            return None;
+        }
+        digits.push(ch);
+    }
+    let marker = digits.parse::<u16>().ok()?;
+    if !(1..=500).contains(&marker) {
+        return None;
+    }
+    let remainder = trimmed.get(end?..)?.trim_start();
+    Some((marker, format!("{marker} {remainder}")))
+}
+
+fn lm2_note_head_sequence_features(
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+    primary_probabilities: &[[f64; 3]],
+) -> Vec<Option<[f64; 16]>> {
+    let mut candidates = decoded
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (line, _))| {
+            lm2_note_head_normalized_text(&line.text)
+                .map(|(marker, _)| (index, marker, line.page_index, line.line_index))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(index, _, page, line)| (*page, *line, *index));
+    let mut output = vec![None; decoded.len()];
+    for (position, (index, marker, page, line)) in candidates.iter().copied().enumerate() {
+        let mut features = [0.0; 16];
+        for (slot, offset) in LM2_NOTE_HEAD_NEIGHBOR_OFFSETS_V3.into_iter().enumerate() {
+            let Some(neighbor_position) = position.checked_add_signed(offset) else {
+                continue;
+            };
+            let Some((neighbor_index, neighbor_marker, neighbor_page, neighbor_line)) =
+                candidates.get(neighbor_position).copied()
+            else {
+                continue;
+            };
+            let cursor = slot * 8;
+            let same_page = neighbor_page == page;
+            features[cursor] = 1.0;
+            features[cursor + 1] =
+                (neighbor_marker as i32 - marker as i32).clamp(-20, 20) as f64 / 20.0;
+            features[cursor + 2] = (neighbor_page as i64 - page as i64).clamp(-4, 4) as f64 / 4.0;
+            features[cursor + 3] = if same_page {
+                neighbor_line.abs_diff(line).min(50) as f64 / 50.0
+            } else {
+                1.0
+            };
+            features[cursor + 4] = bool_as_f64(same_page);
+            if let Some(probabilities) = primary_probabilities.get(neighbor_index) {
+                features[cursor + 5..cursor + 8].copy_from_slice(probabilities);
+            }
+        }
+        output[index] = Some(features);
+    }
+    output
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Lm2LinkNumericCandidate {
+    decoded_index: usize,
+    marker: u16,
+}
+
+fn lm2_link_numeric_candidates(
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> Vec<Lm2LinkNumericCandidate> {
+    let mut candidates = decoded
+        .iter()
+        .enumerate()
+        .filter_map(|(decoded_index, (line, _))| {
+            lm2_note_head_normalized_text(&line.text).map(|(marker, _)| Lm2LinkNumericCandidate {
+                decoded_index,
+                marker,
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| {
+        let line = &decoded[candidate.decoded_index].0;
+        (line.page_index, line.line_index, candidate.decoded_index)
+    });
+    candidates
+}
+
+fn lm2_note_head_auth_probabilities(
+    model: &Lm2NoteHeadModel,
+    primary_emissions: &[[f64; 3]],
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> Vec<Option<(u16, f64)>> {
+    if model.schema_version != LM2_NOTE_HEAD_SCHEMA_V3 || primary_emissions.len() != decoded.len() {
+        return vec![None; decoded.len()];
+    }
+    let primary_probabilities = primary_emissions
+        .iter()
+        .copied()
+        .map(lm2_context_primary_probabilities)
+        .collect::<Vec<_>>();
+    let sequence_features = lm2_note_head_sequence_features(decoded, &primary_probabilities);
+    decoded
+        .iter()
+        .enumerate()
+        .map(|(index, (line, _))| {
+            let (marker, mut features) =
+                lm2_note_head_feature_vector(line, Some(primary_probabilities[index]))?;
+            if let Some(sequence) = sequence_features.get(index).copied().flatten() {
+                features.extend(sequence);
+            }
+            (features.len() == model.feature_count).then(|| (marker, model.probability(&features)))
+        })
+        .collect()
+}
+
+fn lm2_link_text_contains_marker(text: &str, marker: u16) -> bool {
+    if sentineled_note_markers(text).contains(&marker) {
+        return true;
+    }
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < chars.len() {
+        if !chars[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < chars.len() && chars[index].is_ascii_digit() && index - start < 3 {
+            index += 1;
+        }
+        let bounded_left = start == 0 || !chars[start - 1].is_ascii_digit();
+        let bounded_right = index == chars.len() || !chars[index].is_ascii_digit();
+        let value = chars[start..index]
+            .iter()
+            .collect::<String>()
+            .parse::<u16>()
+            .ok();
+        if bounded_left && bounded_right && value == Some(marker) {
+            return true;
+        }
+    }
+    false
+}
+
+fn lm2_link_neighbor_features(
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+    candidate: Lm2LinkNumericCandidate,
+    neighbor: Option<Lm2LinkNumericCandidate>,
+) -> [f64; 6] {
+    let Some(neighbor) = neighbor else {
+        return [0.0; 6];
+    };
+    let line = &decoded[candidate.decoded_index].0;
+    let other = &decoded[neighbor.decoded_index].0;
+    let same_page = line.page_index == other.page_index;
+    [
+        1.0,
+        (neighbor.marker as i32 - candidate.marker as i32).clamp(-20, 20) as f64 / 20.0,
+        (other.page_index as i64 - line.page_index as i64).clamp(-4, 4) as f64 / 4.0,
+        if same_page {
+            other.line_index.abs_diff(line.line_index).min(100) as f64 / 100.0
+        } else {
+            1.0
+        },
+        bool_as_f64(same_page),
+        bool_as_f64(decoded[neighbor.decoded_index].1 == Lm2Action::Marginalia),
+    ]
+}
+
+fn lm2_link_note_neighbor_features(
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+    candidate: Lm2LinkNumericCandidate,
+    neighbor: Option<Lm2LinkNumericCandidate>,
+) -> [f64; 4] {
+    let Some(neighbor) = neighbor else {
+        return [0.0; 4];
+    };
+    let line = &decoded[candidate.decoded_index].0;
+    let other = &decoded[neighbor.decoded_index].0;
+    let same_page = line.page_index == other.page_index;
+    [
+        1.0,
+        (neighbor.marker as i32 - candidate.marker as i32).clamp(-20, 20) as f64 / 20.0,
+        (other.page_index as i64 - line.page_index as i64).clamp(-8, 8) as f64 / 8.0,
+        if same_page {
+            other.line_index.abs_diff(line.line_index).min(100) as f64 / 100.0
+        } else {
+            1.0
+        },
+    ]
+}
+
+fn lm2_link_ranker_feature_vector(
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+    candidates: &[Lm2LinkNumericCandidate],
+    candidate_position: usize,
+    reference_index: usize,
+    local_same_marker_count: usize,
+    document_same_marker_count: usize,
+    auth_probability: f64,
+) -> Vec<f64> {
+    let candidate = candidates[candidate_position];
+    let line = &decoded[candidate.decoded_index].0;
+    let reference = &decoded[reference_index].0;
+    let page_count = decoded
+        .iter()
+        .map(|(line, _)| line.page_index)
+        .max()
+        .map_or(1, |page| page + 1);
+    let page_max_line = decoded
+        .iter()
+        .filter(|(other, _)| other.page_index == line.page_index)
+        .map(|(other, _)| other.line_index)
+        .max()
+        .unwrap_or(line.line_index)
+        .max(1);
+    let width = (line.page_width as f64).max(1.0);
+    let height = (line.page_height as f64).max(1.0);
+    let page_delta = line.page_index as i64 - reference.page_index as i64;
+    let (_, normalized_text) =
+        lm2_note_head_normalized_text(&line.text).unwrap_or((candidate.marker, line.text.clone()));
+    let digit_count = normalized_text
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .take(3)
+        .count();
+    let suffix = normalized_text.chars().nth(digit_count).unwrap_or(' ');
+    let remainder = normalized_text
+        .chars()
+        .skip(digit_count + 1)
+        .skip_while(|ch| ch.is_whitespace())
+        .collect::<String>();
+    let text_chars = normalized_text.chars().count().max(1);
+    let digit_chars = normalized_text
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .count();
+    let alpha_chars = normalized_text
+        .chars()
+        .filter(|ch| ch.is_alphabetic())
+        .collect::<Vec<_>>();
+    let uppercase_chars = alpha_chars.iter().filter(|ch| ch.is_uppercase()).count();
+    let punctuation_chars = normalized_text
+        .chars()
+        .filter(|ch| !ch.is_alphanumeric() && !ch.is_whitespace())
+        .count();
+    let whitespace_chars = normalized_text
+        .chars()
+        .filter(|ch| ch.is_whitespace())
+        .count();
+    let reference_starts = lm2_note_head_normalized_text(&reference.text)
+        .is_some_and(|(marker, _)| marker == candidate.marker);
+    let reference_has_marker = lm2_link_text_contains_marker(&reference.text, candidate.marker);
+    let reference_words = reference.text.split_whitespace().count();
+    let same_reference_page = line.page_index == reference.page_index;
+    let segment_count = line.segment_block_line_count.max(1);
+    let previous = candidate_position
+        .checked_sub(1)
+        .and_then(|position| candidates.get(position))
+        .copied();
+    let next = candidates.get(candidate_position + 1).copied();
+    let coordinate = (line.page_index, line.line_index, candidate.decoded_index);
+    let current_notes = candidates
+        .iter()
+        .copied()
+        .filter(|other| decoded[other.decoded_index].1 == Lm2Action::Marginalia)
+        .collect::<Vec<_>>();
+    let previous_note = current_notes.iter().copied().rev().find(|other| {
+        let other_line = &decoded[other.decoded_index].0;
+        (
+            other_line.page_index,
+            other_line.line_index,
+            other.decoded_index,
+        ) < coordinate
+    });
+    let next_note = current_notes.iter().copied().find(|other| {
+        let other_line = &decoded[other.decoded_index].0;
+        (
+            other_line.page_index,
+            other_line.line_index,
+            other.decoded_index,
+        ) > coordinate
+    });
+    let previous_consecutive =
+        previous_note.is_some_and(|other| other.marker + 1 == candidate.marker);
+    let next_consecutive = next_note.is_some_and(|other| candidate.marker + 1 == other.marker);
+    let first_remainder = remainder.chars().next();
+    let lower_remainder = remainder.to_lowercase();
+    let terminal_punctuation = remainder
+        .trim_end()
+        .chars()
+        .last()
+        .is_some_and(|ch| matches!(ch, '.' | '?' | '!' | ';' | ':'));
+
+    let mut features = vec![
+        candidate.marker as f64 / 500.0,
+        (candidate.marker as f64).ln_1p() / 501.0f64.ln(),
+        candidate.marker.to_string().len() as f64 / 3.0,
+        bool_as_f64(candidate.marker <= 5),
+        bool_as_f64(candidate.marker >= 100),
+        page_delta.clamp(-4, 4) as f64 / 4.0,
+        bool_as_f64(page_delta == 0),
+        bool_as_f64(page_delta == 1),
+        reference.page_index as f64 / page_count.saturating_sub(1).max(1) as f64,
+        line.page_index as f64 / page_count.saturating_sub(1).max(1) as f64,
+        1.0,
+        bool_as_f64(reference_starts),
+        bool_as_f64(reference_has_marker && !reference_starts),
+        reference_words.min(100) as f64 / 100.0,
+        reference.font_ratio_page as f64,
+        bool_as_f64(line.id == reference.id),
+        bool_as_f64(
+            (line.page_index, line.line_index) > (reference.page_index, reference.line_index),
+        ),
+        if same_reference_page {
+            (line.line_index as i64 - reference.line_index as i64).clamp(-100, 100) as f64 / 100.0
+        } else {
+            0.0
+        },
+        line.line_index as f64 / page_max_line as f64,
+        line.top as f64 / height,
+        line.bottom as f64 / height,
+        ((line.top + line.bottom) as f64 * 0.5) / height,
+        (line.right - line.left).max(0.0) as f64 / width,
+        line.left as f64 / width,
+        (line.page_width - line.right).max(0.0) as f64 / width,
+        line.font_ratio_page as f64,
+        line.font_ratio_page_ref as f64,
+        line.font_ratio_doc as f64,
+        line.font_height as f64 / height,
+        bool_as_f64(line.bold),
+        bool_as_f64(line.italic),
+        bool_as_f64(line.centered),
+        bool_as_f64(line.margin_centered),
+        bool_as_f64(line.below_footnote_divider),
+        bool_as_f64(line.page_has_footnote_divider),
+        bool_as_f64(line.in_footnote_zone),
+        bool_as_f64(line.doc_footnote_state),
+        bool_as_f64(line.doc_footnote_continuation),
+        bool_as_f64(line.segment_block_footnote_like),
+        bool_as_f64(line.segment_block_furniture_like),
+        bool_as_f64(line.segment_block_table_like),
+        bool_as_f64(line.segment_block_toc_like),
+        bool_as_f64(line.segment_block_first),
+        bool_as_f64(line.segment_block_last),
+        line.segment_block_line_index as f64 / segment_count.saturating_sub(1).max(1) as f64,
+        segment_count.min(50) as f64 / 50.0,
+        text_chars.min(500) as f64 / 500.0,
+        normalized_text.split_whitespace().count().min(100) as f64 / 100.0,
+        digit_chars as f64 / text_chars as f64,
+        alpha_chars.len() as f64 / text_chars as f64,
+        uppercase_chars as f64 / alpha_chars.len().max(1) as f64,
+        punctuation_chars as f64 / text_chars as f64,
+        whitespace_chars as f64 / text_chars as f64,
+        bool_as_f64(suffix.is_whitespace()),
+        bool_as_f64(suffix == '.'),
+        bool_as_f64(suffix == ')'),
+        bool_as_f64(suffix == ']'),
+        bool_as_f64(first_remainder.is_some_and(char::is_uppercase)),
+        bool_as_f64(first_remainder.is_some_and(char::is_lowercase)),
+        bool_as_f64(first_remainder.is_some_and(|ch| ch.is_ascii_digit())),
+        bool_as_f64(
+            lower_remainder.contains("http://")
+                || lower_remainder.contains("https://")
+                || lower_remainder.contains("www."),
+        ),
+        bool_as_f64(terminal_punctuation),
+        bool_as_f64(
+            uppercase_chars as f64 / alpha_chars.len().max(1) as f64 >= 0.72
+                && remainder.chars().count() >= 8,
+        ),
+        local_same_marker_count.min(8) as f64 / 8.0,
+        document_same_marker_count.min(20) as f64 / 20.0,
+    ];
+    features.extend(lm2_link_neighbor_features(decoded, candidate, previous));
+    features.extend(lm2_link_neighbor_features(decoded, candidate, next));
+    features.extend(lm2_link_note_neighbor_features(
+        decoded,
+        candidate,
+        previous_note,
+    ));
+    features.extend(lm2_link_note_neighbor_features(
+        decoded, candidate, next_note,
+    ));
+    features.extend([
+        bool_as_f64(previous_consecutive),
+        bool_as_f64(next_consecutive),
+        bool_as_f64(previous_consecutive && next_consecutive),
+        auth_probability,
+    ]);
+    features
+}
+
+fn apply_footnote_link_ranker(
+    link_model: &Lm2LinkRankerModel,
+    auth_model: &Lm2NoteHeadModel,
+    document_path: &Path,
+    primary_emissions: Option<&[[f64; 3]]>,
+    decoded: &mut [(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let Some(primary_emissions) = primary_emissions.filter(|rows| rows.len() == decoded.len())
+    else {
+        return 0;
+    };
+    let candidates = lm2_link_numeric_candidates(decoded);
+    if candidates.is_empty() {
+        return 0;
+    }
+    let auth_probabilities =
+        lm2_note_head_auth_probabilities(auth_model, primary_emissions, decoded);
+    let mut candidate_counts_by_marker = HashMap::<u16, usize>::new();
+    let mut candidate_positions_by_marker = HashMap::<u16, Vec<usize>>::new();
+    let mut current_note_pages_by_marker = HashMap::<u16, HashSet<usize>>::new();
+    for (position, candidate) in candidates.iter().copied().enumerate() {
+        *candidate_counts_by_marker
+            .entry(candidate.marker)
+            .or_default() += 1;
+        let line = &decoded[candidate.decoded_index].0;
+        if decoded[candidate.decoded_index].1 == Lm2Action::Marginalia {
+            current_note_pages_by_marker
+                .entry(candidate.marker)
+                .or_default()
+                .insert(line.page_index);
+            continue;
+        }
+        let auth_probability = auth_probabilities
+            .get(candidate.decoded_index)
+            .copied()
+            .flatten()
+            .map(|(_, probability)| probability)
+            .unwrap_or(0.0);
+        if auth_probability >= link_model.auth_threshold {
+            candidate_positions_by_marker
+                .entry(candidate.marker)
+                .or_default()
+                .push(position);
+        }
+    }
+    let candidate_markers = candidate_positions_by_marker
+        .keys()
+        .copied()
+        .collect::<HashSet<_>>();
+    if candidate_markers.is_empty() {
+        return 0;
+    }
+    let references = decoded
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, action))| *action == Lm2Action::Keep)
+        .flat_map(|(index, (line, _))| {
+            let leading_marker =
+                lm2_note_head_normalized_text(&line.text).map(|(marker, _)| marker);
+            let mut markers = sentineled_note_markers(&line.text)
+                .into_iter()
+                .filter(|marker| Some(*marker) != leading_marker)
+                .collect::<HashSet<_>>();
+            markers.extend(candidate_markers.iter().copied().filter(|marker| {
+                Some(*marker) != leading_marker
+                    && lm2_link_text_contains_marker(&line.text, *marker)
+            }));
+            markers.into_iter().map(move |marker| (index, marker))
+        })
+        .collect::<HashSet<_>>();
+    let trace_path = std::env::var_os("LAWPDF_LM2_TRACE_LINK_RANKER_FILE").map(PathBuf::from);
+    let mut trace_rows = Vec::new();
+    let mut selected = HashSet::new();
+    for (reference_index, marker) in references {
+        let reference_page = decoded[reference_index].0.page_index;
+        let already_resolved = current_note_pages_by_marker
+            .get(&marker)
+            .is_some_and(|pages| {
+                pages.contains(&reference_page) || pages.contains(&(reference_page + 1))
+            });
+        if already_resolved {
+            continue;
+        }
+        let local_positions = candidate_positions_by_marker
+            .get(&marker)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|position| {
+                let candidate = candidates[*position];
+                let page = decoded[candidate.decoded_index].0.page_index;
+                page == reference_page || page == reference_page + 1
+            })
+            .collect::<Vec<_>>();
+        if local_positions.is_empty() {
+            continue;
+        }
+        let document_same_marker_count = candidate_counts_by_marker
+            .get(&marker)
+            .copied()
+            .unwrap_or(0);
+        let mut scored = Vec::new();
+        for position in &local_positions {
+            let candidate = candidates[*position];
+            let Some((_, auth_probability)) = auth_probabilities
+                .get(candidate.decoded_index)
+                .copied()
+                .flatten()
+            else {
+                continue;
+            };
+            if auth_probability < link_model.auth_threshold {
+                continue;
+            }
+            let features = lm2_link_ranker_feature_vector(
+                decoded,
+                &candidates,
+                *position,
+                reference_index,
+                local_positions.len(),
+                document_same_marker_count,
+                auth_probability,
+            );
+            if features.len() != LM2_LINK_RANKER_FEATURE_COUNT_V1 {
+                continue;
+            }
+            let link_probability = link_model.probability(&features);
+            if trace_path.is_some() {
+                let candidate_line = &decoded[candidate.decoded_index].0;
+                let reference_line = &decoded[reference_index].0;
+                trace_rows.push(serde_json::json!({
+                    "document": document_path.display().to_string(),
+                    "marker": marker,
+                    "reference_id": reference_line.id.clone(),
+                    "reference_page_index": reference_line.page_index,
+                    "reference_line_index": reference_line.line_index,
+                    "reference_text": reference_line.text.clone(),
+                    "candidate_id": candidate_line.id.clone(),
+                    "candidate_page_index": candidate_line.page_index,
+                    "candidate_line_index": candidate_line.line_index,
+                    "candidate_text": candidate_line.text.clone(),
+                    "baseline_action": decoded[candidate.decoded_index].1.as_str(),
+                    "auth_probability": auth_probability,
+                    "auth_threshold": link_model.auth_threshold,
+                    "link_probability": link_probability,
+                    "link_threshold": link_model.threshold,
+                    "features": features,
+                }));
+            }
+            scored.push((candidate.decoded_index, auth_probability, link_probability));
+        }
+        scored.sort_by(|left, right| right.2.partial_cmp(&left.2).unwrap_or(Ordering::Equal));
+        if let Some((candidate_index, auth_probability, link_probability)) = scored.first().copied()
+            && auth_probability >= link_model.auth_threshold
+            && link_probability >= link_model.threshold
+        {
+            selected.insert((candidate_index, marker));
+        }
+    }
+    let changed = selected.len();
+    for (index, marker) in selected {
+        decoded[index].0.doc_note_marker = marker;
+        decoded[index].1 = Lm2Action::Marginalia;
+    }
+    if let Some(path) = trace_path
+        && !trace_rows.is_empty()
+        && let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    {
+        use std::io::Write as _;
+        let mut writer = std::io::BufWriter::new(file);
+        for row in trace_rows {
+            if let Ok(encoded) = serde_json::to_string(&row) {
+                let _ = writeln!(writer, "{encoded}");
+            }
+        }
+        let _ = writer.flush();
+    }
+    changed
+}
+
+fn apply_note_head_model(
+    model: &Lm2NoteHeadModel,
+    document_path: &Path,
+    primary_emissions: Option<&[[f64; 3]]>,
+    decoded: &mut [(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let primary_emissions = primary_emissions.filter(|rows| rows.len() == decoded.len());
+    let stacked = matches!(
+        model.schema_version.as_str(),
+        LM2_NOTE_HEAD_SCHEMA_V2 | LM2_NOTE_HEAD_SCHEMA_V3
+    );
+    if stacked && primary_emissions.is_none() {
+        return 0;
+    }
+    let all_primary_probabilities = primary_emissions.map(|rows| {
+        rows.iter()
+            .copied()
+            .map(lm2_context_primary_probabilities)
+            .collect::<Vec<_>>()
+    });
+    let sequence_features = if model.schema_version == LM2_NOTE_HEAD_SCHEMA_V3 {
+        all_primary_probabilities
+            .as_deref()
+            .map(|probabilities| lm2_note_head_sequence_features(decoded, probabilities))
+    } else {
+        None
+    };
+    let mut changed = 0usize;
+    let trace = truthy_env("LAWPDF_LM2_TRACE_NOTE_HEAD");
+    let trace_path = std::env::var_os("LAWPDF_LM2_TRACE_NOTE_HEAD_FILE").map(PathBuf::from);
+    let mut trace_rows = Vec::new();
+    for (index, (line, action)) in decoded.iter_mut().enumerate() {
+        let primary_probabilities = if stacked {
+            all_primary_probabilities
+                .as_deref()
+                .and_then(|rows| rows.get(index))
+                .copied()
+        } else {
+            None
+        };
+        let Some((marker, mut features)) =
+            lm2_note_head_feature_vector(line, primary_probabilities)
+        else {
+            if trace
+                && (line.text.trim_start().starts_with(CALLOUT_START) || line.doc_note_marker > 0)
+            {
+                eprintln!(
+                    "note-head skipped page={} line={} marker={} action={} text={:?}",
+                    line.page_index,
+                    line.line_index,
+                    line.doc_note_marker,
+                    action.as_str(),
+                    line.text
+                );
+            }
+            continue;
+        };
+        if let Some(sequence) = sequence_features
+            .as_ref()
+            .and_then(|rows| rows.get(index))
+            .copied()
+            .flatten()
+        {
+            features.extend(sequence);
+        }
+        if features.len() != model.feature_count {
+            continue;
+        }
+        let probability = model.probability(&features);
+        if trace_path.is_some() {
+            trace_rows.push(serde_json::json!({
+                "document": document_path.display().to_string(),
+                "id": line.id.clone(),
+                "page_index": line.page_index,
+                "line_index": line.line_index,
+                "marker": marker,
+                "probability": probability,
+                "threshold": model.threshold,
+                "primary_probabilities": primary_probabilities,
+                "features": features,
+                "baseline_action": action.as_str(),
+                "text": line.text.clone(),
+            }));
+        }
+        if trace {
+            eprintln!(
+                "note-head p={probability:.6} threshold={:.6} primary={primary_probabilities:?} page={} line={} action={} text={:?}",
+                model.threshold,
+                line.page_index,
+                line.line_index,
+                action.as_str(),
+                line.text
+            );
+        }
+        if probability < model.threshold {
+            continue;
+        }
+        line.doc_note_marker = marker;
+        if *action != Lm2Action::Marginalia {
+            *action = Lm2Action::Marginalia;
+            changed += 1;
+        }
+    }
+    if let Some(path) = trace_path
+        && !trace_rows.is_empty()
+        && let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    {
+        use std::io::Write as _;
+        let mut writer = std::io::BufWriter::new(file);
+        for row in trace_rows {
+            if let Ok(encoded) = serde_json::to_string(&row) {
+                let _ = writeln!(writer, "{encoded}");
+            }
+        }
+        let _ = writer.flush();
+    }
+    changed
+}
+
+fn lm2_context_arbiter_policy(
+    baseline: Lm2Action,
+    arbiter: [f64; 3],
+    calibration: &Lm2ContextArbiterCalibration,
+) -> Lm2Action {
+    if baseline != Lm2Action::Keep {
+        if arbiter[1] >= calibration.rescue_keep_threshold {
+            return Lm2Action::Keep;
+        }
+        return if arbiter[0] >= arbiter[2] {
+            if arbiter[0] >= calibration.reclassify_nonkeep_threshold {
+                Lm2Action::HideNoise
+            } else {
+                baseline
+            }
+        } else if arbiter[2] >= calibration.reclassify_nonkeep_threshold {
+            Lm2Action::Marginalia
+        } else {
+            baseline
+        };
+    }
+
+    let mut prediction = Lm2Action::Keep;
+    if arbiter[2] >= calibration.demote_to_marginalia_threshold {
+        prediction = Lm2Action::Marginalia;
+    }
+    if arbiter[0] >= calibration.demote_to_noise_threshold {
+        prediction = Lm2Action::HideNoise;
+    }
+    prediction
 }
 
 fn lm2_context_norm_path(value: &str) -> String {
@@ -3583,6 +4870,7 @@ fn load_lm2_native_catboost_model() -> Result<Option<Lm2NativeCatboostModel>, St
         .cloned()
         .ok_or_else(|| missing_model_error("LM2 native CatBoost model", &model_candidates))?;
     verify_model_asset_hash(&model_path, "native_model")?;
+    let model_sha256 = sha256_hex_of_file(&model_path)?;
 
     let mut library_candidates = Vec::new();
     if let Some(path) = std::env::var_os("LAWPDF_LM2_NATIVE_CATBOOST_LIB").map(PathBuf::from) {
@@ -3696,6 +4984,7 @@ fn load_lm2_native_catboost_model() -> Result<Option<Lm2NativeCatboostModel>, St
         cat_feature_count,
         text_feature_count,
         dimensions_count,
+        model_sha256,
     }))
 }
 
@@ -4006,31 +5295,134 @@ fn lm2_context_twopass_enabled() -> bool {
     !falsey_env("LAWPDF_LM2_CONTEXT_TWOPASS")
 }
 
-fn load_lm2_context_twopass_model() -> Result<Option<Lm2ContextTwopassModel>, String> {
+fn load_lm2_context_twopass_model(
+    active_primary_model_sha256: Option<&str>,
+) -> Result<Option<Lm2ContextTwopassModel>, String> {
     let candidates = lm2_context_twopass_runtime_asset_candidates(LM2_CONTEXT_TWOPASS_MODEL_FILE);
     let path = candidates
         .iter()
         .find(|path| path.is_file())
         .cloned()
         .ok_or_else(|| missing_model_error("LM2 context two-pass model", &candidates))?;
-    verify_model_asset_hash(&path, "context_model")?;
-    let input: Lm2ContextTwopassModelFile = read_json_file(&path)?;
-    if input.feature_count != 66 {
+    load_lm2_context_model_from_path(&path, "context_model", active_primary_model_sha256).map(Some)
+}
+
+fn load_lm2_context_arbiter_model(
+    active_primary_model_sha256: Option<&str>,
+) -> Result<Option<Lm2ContextTwopassModel>, String> {
+    let candidates = lm2_context_arbiter_runtime_asset_candidates(LM2_CONTEXT_ARBITER_MODEL_FILE);
+    let Some(path) = candidates.iter().find(|path| path.is_file()).cloned() else {
+        return Ok(None);
+    };
+    let model = load_lm2_context_model_from_path(
+        &path,
+        "context_arbiter_model",
+        active_primary_model_sha256,
+    )?;
+    if model.schema_version != LM2_CONTEXT_ARBITER_SCHEMA_V2 {
         return Err(format!(
-            "LM2 context two-pass model has unexpected feature count {}",
-            input.feature_count
+            "LM2 context arbiter must use schema {LM2_CONTEXT_ARBITER_SCHEMA_V2}, found {}",
+            model.schema_version
         ));
     }
+    Ok(Some(model))
+}
+
+fn load_lm2_context_model_from_path(
+    path: &Path,
+    release_asset_name: &str,
+    active_primary_model_sha256: Option<&str>,
+) -> Result<Lm2ContextTwopassModel, String> {
+    verify_model_asset_hash(path, release_asset_name)?;
+    let asset_sha256 = sha256_hex_of_file(&path)?;
+    let input: Lm2ContextTwopassModelFile = read_json_file(&path)?;
     if input.actions != ["hide_noise", "keep", "marginalia"] {
         return Err(format!(
             "LM2 context two-pass model has unexpected action order {:?}",
             input.actions
         ));
     }
-    Ok(Some(Lm2ContextTwopassModel {
+    match input.schema_version.as_str() {
+        "lawpdf-lm2-context-twopass-hgb-v1" => {
+            if input.feature_count != 66 {
+                return Err(format!(
+                    "LM2 context two-pass v1 model has unexpected feature count {}",
+                    input.feature_count
+                ));
+            }
+        }
+        LM2_CONTEXT_ARBITER_SCHEMA_V2 => {
+            if input.feature_count != LM2_CONTEXT_ARBITER_FEATURE_COUNT_V2
+                || input.numeric_feature_count != Some(LM2_NATIVE_CATBOOST_FLOAT_FEATURES.len())
+                || input.primary_probability_order != ["hide_noise", "keep", "marginalia"]
+                || input.neighbor_offsets != LM2_CONTEXT_ARBITER_NEIGHBOR_OFFSETS
+            {
+                return Err(format!(
+                    "LM2 context arbiter v2 feature contract mismatch: f{}/numeric{:?}/probability_order={:?}/offsets={:?}",
+                    input.feature_count,
+                    input.numeric_feature_count,
+                    input.primary_probability_order,
+                    input.neighbor_offsets
+                ));
+            }
+            let expected_primary = input.primary_model_sha256.as_deref().ok_or_else(|| {
+                "LM2 context arbiter v2 is missing primary_model_sha256".to_owned()
+            })?;
+            let active_primary = active_primary_model_sha256.ok_or_else(|| {
+                "LM2 context arbiter v2 requires its exact CatBoost primary; it cannot consume FastTab or fallback emissions"
+                    .to_owned()
+            })?;
+            if !expected_primary.eq_ignore_ascii_case(active_primary) {
+                return Err(format!(
+                    "LM2 context arbiter v2 primary-model mismatch: expected {expected_primary}, active {active_primary}"
+                ));
+            }
+            let calibration = input.calibration.as_ref().ok_or_else(|| {
+                "LM2 context arbiter v2 is missing calibrated policy thresholds".to_owned()
+            })?;
+            for (name, value) in [
+                ("rescue_keep_threshold", calibration.rescue_keep_threshold),
+                (
+                    "demote_to_marginalia_threshold",
+                    calibration.demote_to_marginalia_threshold,
+                ),
+                (
+                    "demote_to_noise_threshold",
+                    calibration.demote_to_noise_threshold,
+                ),
+                (
+                    "reclassify_nonkeep_threshold",
+                    calibration.reclassify_nonkeep_threshold,
+                ),
+            ] {
+                if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                    return Err(format!(
+                        "LM2 context arbiter v2 has invalid {name}: {value}"
+                    ));
+                }
+            }
+        }
+        schema => {
+            return Err(format!(
+                "LM2 context two-pass model has unsupported schema {schema}"
+            ));
+        }
+    }
+    if input.models.is_empty()
+        || input.models.iter().any(|model| {
+            model.baseline_prediction.len() != 3
+                || model.trees.iter().any(|iteration| iteration.len() != 3)
+        })
+    {
+        return Err("LM2 context model has an invalid three-class HGB structure".to_owned());
+    }
+    Ok(Lm2ContextTwopassModel {
         schema_version: input.schema_version,
         actions: input.actions,
         feature_count: input.feature_count,
+        calibration: input.calibration,
+        primary_model_sha256: input.primary_model_sha256,
+        asset_sha256,
         doc_to_fold: input
             .doc_to_fold
             .into_iter()
@@ -4038,6 +5430,130 @@ fn load_lm2_context_twopass_model() -> Result<Option<Lm2ContextTwopassModel>, St
             .collect(),
         unseen_doc_model: input.unseen_doc_model.unwrap_or_else(|| "full".to_owned()),
         models: input.models,
+    })
+}
+
+fn load_lm2_note_head_model(
+    active_primary_model_sha256: Option<&str>,
+) -> Result<Option<Lm2NoteHeadModel>, String> {
+    let candidates = lm2_note_head_runtime_asset_candidates(LM2_NOTE_HEAD_MODEL_FILE);
+    let Some(path) = candidates.iter().find(|path| path.is_file()).cloned() else {
+        return Ok(None);
+    };
+    verify_model_asset_hash(&path, "note_head_model")?;
+    let asset_sha256 = sha256_hex_of_file(&path)?;
+    let input: Lm2NoteHeadModelFile = read_json_file(&path)?;
+    match input.schema_version.as_str() {
+        LM2_NOTE_HEAD_SCHEMA_V1 if input.feature_count == LM2_NOTE_HEAD_FEATURE_COUNT_V1 => {}
+        LM2_NOTE_HEAD_SCHEMA_V2 | LM2_NOTE_HEAD_SCHEMA_V3 => {
+            let expected_feature_count = if input.schema_version == LM2_NOTE_HEAD_SCHEMA_V3 {
+                LM2_NOTE_HEAD_FEATURE_COUNT_V3
+            } else {
+                LM2_NOTE_HEAD_FEATURE_COUNT_V2
+            };
+            if input.feature_count != expected_feature_count
+                || input.numeric_feature_count != Some(LM2_NATIVE_CATBOOST_FLOAT_FEATURES.len())
+                || input.primary_probability_order != ["hide_noise", "keep", "marginalia"]
+                || (input.schema_version == LM2_NOTE_HEAD_SCHEMA_V3
+                    && input.candidate_neighbor_offsets != LM2_NOTE_HEAD_NEIGHBOR_OFFSETS_V3)
+            {
+                return Err(format!(
+                    "LM2 stacked note-head feature contract mismatch: f{}/numeric{:?}/probability_order={:?}/offsets={:?}",
+                    input.feature_count,
+                    input.numeric_feature_count,
+                    input.primary_probability_order,
+                    input.candidate_neighbor_offsets,
+                ));
+            }
+            let expected_primary = input.primary_model_sha256.as_deref().ok_or_else(|| {
+                "LM2 stacked note-head model is missing primary_model_sha256".to_owned()
+            })?;
+            let active_primary = active_primary_model_sha256.ok_or_else(|| {
+                "LM2 stacked note-head model requires its exact CatBoost primary".to_owned()
+            })?;
+            if !expected_primary.eq_ignore_ascii_case(active_primary) {
+                return Err(format!(
+                    "LM2 stacked note-head primary-model mismatch: expected {expected_primary}, active {active_primary}"
+                ));
+            }
+        }
+        _ => {
+            return Err(format!(
+                "LM2 note-head model contract mismatch: schema={} features={}",
+                input.schema_version, input.feature_count
+            ));
+        }
+    }
+    if input.baseline_prediction.len() != 1
+        || input.trees.is_empty()
+        || !input.threshold.is_finite()
+        || !(0.0..=1.0).contains(&input.threshold)
+        || input.trees.iter().any(|tree| tree.is_empty())
+    {
+        return Err("LM2 note-head model has an invalid binary HGB structure".to_owned());
+    }
+    Ok(Some(Lm2NoteHeadModel {
+        schema_version: input.schema_version,
+        feature_count: input.feature_count,
+        primary_model_sha256: input.primary_model_sha256,
+        baseline_prediction: input.baseline_prediction[0],
+        trees: input.trees,
+        threshold: input.threshold,
+        asset_sha256,
+    }))
+}
+
+fn load_lm2_link_ranker_model(
+    auth_model: Option<&Lm2NoteHeadModel>,
+) -> Result<Option<Lm2LinkRankerModel>, String> {
+    let candidates = lm2_link_ranker_runtime_asset_candidates(LM2_LINK_RANKER_MODEL_FILE);
+    let Some(path) = candidates.iter().find(|path| path.is_file()).cloned() else {
+        return Ok(None);
+    };
+    verify_model_asset_hash(&path, "link_ranker_model")?;
+    let asset_sha256 = sha256_hex_of_file(&path)?;
+    let input: Lm2LinkRankerModelFile = read_json_file(&path)?;
+    let expected_names = LM2_LINK_RANKER_FEATURES_V1.map(str::to_owned);
+    if input.schema_version != LM2_LINK_RANKER_SCHEMA_V1
+        || input.feature_count != LM2_LINK_RANKER_FEATURE_COUNT_V1
+        || input.feature_names != expected_names
+        || input.candidate_page_offsets != [0, 1]
+    {
+        return Err(format!(
+            "LM2 link-ranker feature contract mismatch: schema={} f{} offsets={:?}",
+            input.schema_version, input.feature_count, input.candidate_page_offsets
+        ));
+    }
+    let auth_model = auth_model.ok_or_else(|| {
+        "LM2 link ranker requires its exact learned note authenticator".to_owned()
+    })?;
+    if auth_model.schema_version != LM2_NOTE_HEAD_SCHEMA_V3
+        || !input
+            .auth_model_sha256
+            .eq_ignore_ascii_case(&auth_model.asset_sha256)
+    {
+        return Err(format!(
+            "LM2 link-ranker authenticator mismatch: expected {}, active {}",
+            input.auth_model_sha256, auth_model.asset_sha256
+        ));
+    }
+    if input.baseline_prediction.len() != 1
+        || input.trees.is_empty()
+        || input.trees.iter().any(|tree| tree.is_empty())
+        || !input.threshold.is_finite()
+        || !(0.0..=1.0).contains(&input.threshold)
+        || !input.auth_threshold.is_finite()
+        || !(0.0..=1.0).contains(&input.auth_threshold)
+    {
+        return Err("LM2 link ranker has an invalid binary HGB policy".to_owned());
+    }
+    Ok(Some(Lm2LinkRankerModel {
+        baseline_prediction: input.baseline_prediction[0],
+        trees: input.trees,
+        threshold: input.threshold,
+        auth_threshold: input.auth_threshold,
+        auth_model_sha256: input.auth_model_sha256,
+        asset_sha256,
     }))
 }
 
@@ -4048,6 +5564,42 @@ fn lm2_context_twopass_runtime_asset_candidates(file_name: &str) -> Vec<PathBuf>
     }
     candidates.extend(lm2_runtime_asset_candidates(
         LM2_CONTEXT_TWOPASS_RUNTIME_DIR,
+        file_name,
+    ));
+    candidates
+}
+
+fn lm2_context_arbiter_runtime_asset_candidates(file_name: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("LAWPDF_LM2_CONTEXT_ARBITER_MODEL").map(PathBuf::from) {
+        candidates.push(path);
+    }
+    candidates.extend(lm2_runtime_asset_candidates(
+        LM2_CONTEXT_TWOPASS_RUNTIME_DIR,
+        file_name,
+    ));
+    candidates
+}
+
+fn lm2_note_head_runtime_asset_candidates(file_name: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("LAWPDF_LM2_NOTE_HEAD_MODEL").map(PathBuf::from) {
+        candidates.push(path);
+    }
+    candidates.extend(lm2_runtime_asset_candidates(
+        LM2_NOTE_HEAD_RUNTIME_DIR,
+        file_name,
+    ));
+    candidates
+}
+
+fn lm2_link_ranker_runtime_asset_candidates(file_name: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("LAWPDF_LM2_LINK_RANKER_MODEL").map(PathBuf::from) {
+        candidates.push(path);
+    }
+    candidates.extend(lm2_runtime_asset_candidates(
+        LM2_LINK_RANKER_RUNTIME_DIR,
         file_name,
     ));
     candidates
@@ -4117,6 +5669,12 @@ struct Lm2ReleaseRuntimeAssets {
     fasttab_model: Lm2ReleaseAsset,
     native_model: Lm2ReleaseAsset,
     context_model: Lm2ReleaseAsset,
+    #[serde(default)]
+    context_arbiter_model: Option<Lm2ReleaseAsset>,
+    #[serde(default)]
+    note_head_model: Option<Lm2ReleaseAsset>,
+    #[serde(default)]
+    link_ranker_model: Option<Lm2ReleaseAsset>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4148,11 +5706,27 @@ fn verify_model_asset_hash(path: &Path, asset_name: &str) -> Result<(), String> 
         )
     })?;
     let expected = match asset_name {
-        "fasttab_model" => &manifest.runtime_assets.fasttab_model.sha256,
-        "native_model" => &manifest.runtime_assets.native_model.sha256,
-        "context_model" => &manifest.runtime_assets.context_model.sha256,
+        "fasttab_model" => Some(&manifest.runtime_assets.fasttab_model.sha256),
+        "native_model" => Some(&manifest.runtime_assets.native_model.sha256),
+        "context_model" => Some(&manifest.runtime_assets.context_model.sha256),
+        "context_arbiter_model" => manifest
+            .runtime_assets
+            .context_arbiter_model
+            .as_ref()
+            .map(|asset| &asset.sha256),
+        "note_head_model" => manifest
+            .runtime_assets
+            .note_head_model
+            .as_ref()
+            .map(|asset| &asset.sha256),
+        "link_ranker_model" => manifest
+            .runtime_assets
+            .link_ranker_model
+            .as_ref()
+            .map(|asset| &asset.sha256),
         _ => return Err(format!("Unknown LM2 release-manifest asset: {asset_name}")),
-    };
+    }
+    .ok_or_else(|| format!("LM2 release manifest is missing {asset_name}"))?;
     let actual = sha256_hex_of_file(path)?;
     if !actual.eq_ignore_ascii_case(expected) {
         return Err(format!(
@@ -4167,14 +5741,22 @@ fn decode_pages(
     runtime: &Lm2Runtime,
     lines: &[DeepLiquidSourceLine],
 ) -> Vec<(DeepLiquidSourceLine, Lm2Action)> {
+    decode_pages_with_scores(runtime, lines).0
+}
+
+fn decode_pages_with_scores(
+    runtime: &Lm2Runtime,
+    lines: &[DeepLiquidSourceLine],
+) -> (Vec<(DeepLiquidSourceLine, Lm2Action)>, Vec<[f64; 3]>) {
     if let Some(model) = runtime.fasttab_model.as_ref() {
         match model.emission_scores(lines) {
             Ok(scores) if scores.len() == lines.len() => {
-                return lines
+                let decoded = lines
                     .iter()
                     .cloned()
-                    .zip(scores.into_iter().map(argmax_lm2_action))
+                    .zip(scores.iter().copied().map(argmax_lm2_action))
                     .collect();
+                return (decoded, scores);
             }
             Ok(scores) => eprintln!(
                 "FastTab returned {} score rows for {} source lines; using CatBoost fallback.",
@@ -4187,16 +5769,19 @@ fn decode_pages(
         }
     }
     if runtime.native_catboost_model.is_some() {
-        return lines
+        let emissions = lines
+            .iter()
+            .map(|line| runtime.emission_scores(line))
+            .collect::<Vec<_>>();
+        let decoded = lines
             .iter()
             .cloned()
-            .map(|line| {
-                let action = argmax_lm2_action(runtime.emission_scores(&line));
-                (line, action)
-            })
+            .zip(emissions.iter().copied().map(argmax_lm2_action))
             .collect();
+        return (decoded, emissions);
     }
     let mut decoded = Vec::with_capacity(lines.len());
+    let mut emissions = Vec::with_capacity(lines.len());
     let mut start = 0usize;
     while start < lines.len() {
         let page = lines[start].page_index;
@@ -4204,10 +5789,19 @@ fn decode_pages(
         while end < lines.len() && lines[end].page_index == page {
             end += 1;
         }
-        decoded.extend(decode_page(runtime, &lines[start..end]));
+        let page_emissions = lines[start..end]
+            .iter()
+            .map(|line| runtime.emission_scores(line))
+            .collect::<Vec<_>>();
+        decoded.extend(decode_page_with_emissions(
+            runtime,
+            &lines[start..end],
+            Some(&page_emissions),
+        ));
+        emissions.extend(page_emissions);
         start = end;
     }
-    decoded
+    (decoded, emissions)
 }
 
 fn decode_pages_with_external_emissions(
@@ -9333,6 +10927,16 @@ fn leading_numeric_token_marker(text: &str) -> Option<u16> {
         return None;
     }
     let remainder = &trimmed[digits.len()..];
+    if remainder.starts_with('.')
+        && remainder
+            .chars()
+            .nth(1)
+            .is_some_and(|ch| ch.is_ascii_digit())
+    {
+        // `6.3 Heading` is a decimal section number, not integer note 6.
+        // A true `6. 3 U.S.C. ...` note head retains the separating space.
+        return None;
+    }
     if remainder
         .chars()
         .next()
@@ -13159,6 +14763,130 @@ mod tests {
         }
     }
 
+    #[test]
+    fn context_arbiter_reorders_native_scores_to_training_class_order() {
+        let probabilities = lm2_context_primary_probabilities([2.0, 1.0, 0.0]);
+        assert!(probabilities[1] > probabilities[2]);
+        assert!(probabilities[2] > probabilities[0]);
+        assert!((probabilities.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn context_arbiter_features_mask_neighbors_across_page_boundaries() {
+        let first = lm2_test_source_line("p0:l0", 0, "First line", 1.0, false, None);
+        let second = lm2_test_source_line("p0:l3", 3, "Second line", 1.0, false, None);
+        let mut next_page = lm2_test_source_line("p1:l0", 0, "Next page", 1.0, false, None);
+        next_page.page_index = 1;
+        let decoded = vec![
+            (first, Lm2Action::Keep),
+            (second, Lm2Action::Keep),
+            (next_page, Lm2Action::Keep),
+        ];
+        let probabilities = vec![[0.1, 0.8, 0.1], [0.2, 0.7, 0.1], [0.3, 0.6, 0.1]];
+
+        let features = lm2_context_arbiter_feature_vector(&decoded, &probabilities, 1);
+
+        assert_eq!(features.len(), LM2_CONTEXT_ARBITER_FEATURE_COUNT_V2);
+        assert_eq!(&features[116..119], &[0.2, 0.7, 0.1]);
+        assert_eq!(&features[119..122], &[0.0, 0.0, 0.0]);
+        assert_eq!(&features[122..125], &[0.1, 0.8, 0.1]);
+        assert_eq!(&features[125..128], &[0.0, 0.0, 0.0]);
+        assert_eq!(&features[128..131], &[0.0, 0.0, 0.0]);
+        assert_eq!(&features[131..135], &[0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(&features[135..139], &[0.0, 0.375, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn context_arbiter_policy_is_asymmetric_about_body_text() {
+        let calibration = Lm2ContextArbiterCalibration {
+            rescue_keep_threshold: 0.8,
+            demote_to_marginalia_threshold: 0.99,
+            demote_to_noise_threshold: 0.95,
+            reclassify_nonkeep_threshold: 0.995,
+        };
+        assert_eq!(
+            lm2_context_arbiter_policy(Lm2Action::Marginalia, [0.01, 0.81, 0.18], &calibration,),
+            Lm2Action::Keep
+        );
+        assert_eq!(
+            lm2_context_arbiter_policy(Lm2Action::HideNoise, [0.01, 0.05, 0.94], &calibration,),
+            Lm2Action::HideNoise
+        );
+        assert_eq!(
+            lm2_context_arbiter_policy(Lm2Action::HideNoise, [0.001, 0.001, 0.998], &calibration,),
+            Lm2Action::Marginalia
+        );
+        assert_eq!(
+            lm2_context_arbiter_policy(Lm2Action::Keep, [0.03, 0.01, 0.96], &calibration,),
+            Lm2Action::Keep
+        );
+        assert_eq!(
+            lm2_context_arbiter_policy(Lm2Action::Keep, [0.01, 0.0, 0.99], &calibration,),
+            Lm2Action::Marginalia
+        );
+        assert_eq!(
+            lm2_context_arbiter_policy(Lm2Action::Keep, [0.95, 0.04, 0.01], &calibration,),
+            Lm2Action::HideNoise
+        );
+    }
+
+    #[test]
+    fn context_hgb_export_nodes_follow_sklearn_branch_contract() {
+        let leaf = |value| [value, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let tree = vec![[0.0, 0.0, 0.5, 0.0, 1.0, 2.0, 0.0], leaf(2.0), leaf(-1.0)];
+        let model = Lm2ContextTwopassHgbModel {
+            name: "fixture".to_owned(),
+            baseline_prediction: vec![0.0, 0.0, 0.0],
+            trees: vec![vec![tree.clone(), tree.clone(), tree]],
+        };
+        assert_eq!(model.raw_prediction(&[0.25]), [2.0, 2.0, 2.0]);
+        assert_eq!(model.raw_prediction(&[0.75]), [-1.0, -1.0, -1.0]);
+    }
+
+    #[test]
+    fn note_head_features_normalize_protected_leading_markers() {
+        assert_eq!(
+            lm2_note_head_normalized_text("12 Authority."),
+            Some((12, "12 Authority.".to_owned()))
+        );
+        assert_eq!(
+            lm2_note_head_normalized_text("\u{E000}12\u{E001} Authority."),
+            Some((12, "12 Authority.".to_owned()))
+        );
+        assert_eq!(lm2_note_head_normalized_text("12Authority."), None);
+        assert_eq!(lm2_note_head_normalized_text("6.3 Heterogeneity"), None);
+        assert_eq!(
+            lm2_note_head_normalized_text("6. 3 U.S.C. authority"),
+            Some((6, "6. 3 U.S.C. authority".to_owned()))
+        );
+        assert_eq!(lm2_note_head_normalized_text("\u{E000}0\u{E001} No."), None);
+    }
+
+    #[test]
+    fn note_head_sequence_features_use_adjacent_numeric_candidates() {
+        let decoded = vec![
+            (
+                lm2_test_source_line("p0:l10", 10, "10 First.", 1.0, false, None),
+                Lm2Action::Marginalia,
+            ),
+            (
+                lm2_test_source_line("p0:l20", 20, "11 Second.", 1.0, false, None),
+                Lm2Action::Keep,
+            ),
+            (
+                lm2_test_source_line("p0:l30", 30, "12 Third.", 1.0, false, None),
+                Lm2Action::Marginalia,
+            ),
+        ];
+        let probabilities = vec![[0.1, 0.2, 0.7], [0.2, 0.3, 0.5], [0.3, 0.4, 0.3]];
+        let features = lm2_note_head_sequence_features(&decoded, &probabilities);
+        let middle = features[1].unwrap();
+        assert_eq!(&middle[0..5], &[1.0, -0.05, 0.0, 0.2, 1.0]);
+        assert_eq!(&middle[5..8], &[0.1, 0.2, 0.7]);
+        assert_eq!(&middle[8..13], &[1.0, 0.05, 0.0, 0.2, 1.0]);
+        assert_eq!(&middle[13..16], &[0.3, 0.4, 0.3]);
+    }
+
     fn heading_reflow_fixture(
         first_text: &str,
         second_text: &str,
@@ -14082,6 +15810,9 @@ mod tests {
             fasttab_model: None,
             native_catboost_model: None,
             context_twopass_model: None,
+            context_arbiter_model: None,
+            note_head_model: None,
+            link_ranker_model: None,
             numeric_catboost_model: None,
             static_front_overlay: None,
             model: Some(Lm2Model {
@@ -16255,6 +17986,9 @@ mod tests {
             fasttab_model: None,
             native_catboost_model: None,
             context_twopass_model: None,
+            context_arbiter_model: None,
+            note_head_model: None,
+            link_ranker_model: None,
             numeric_catboost_model: None,
             static_front_overlay: None,
             model: Some(Lm2Model {
@@ -16294,6 +18028,9 @@ mod tests {
             fasttab_model: None,
             native_catboost_model: None,
             context_twopass_model: None,
+            context_arbiter_model: None,
+            note_head_model: None,
+            link_ranker_model: None,
             numeric_catboost_model: None,
             static_front_overlay: None,
             model: Some(Lm2Model {
@@ -16631,6 +18368,9 @@ mod tests {
             fasttab_model: None,
             native_catboost_model: None,
             context_twopass_model: None,
+            context_arbiter_model: None,
+            note_head_model: None,
+            link_ranker_model: None,
             numeric_catboost_model: None,
             static_front_overlay: None,
             model: Some(Lm2Model {
@@ -16735,6 +18475,9 @@ mod tests {
             fasttab_model: None,
             native_catboost_model: None,
             context_twopass_model: None,
+            context_arbiter_model: None,
+            note_head_model: None,
+            link_ranker_model: None,
             numeric_catboost_model: None,
             static_front_overlay: None,
             model: Some(Lm2Model {
@@ -16784,6 +18527,9 @@ mod tests {
             fasttab_model: None,
             native_catboost_model: None,
             context_twopass_model: None,
+            context_arbiter_model: None,
+            note_head_model: None,
+            link_ranker_model: None,
             numeric_catboost_model: None,
             static_front_overlay: None,
             model: Some(Lm2Model {

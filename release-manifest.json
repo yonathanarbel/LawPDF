@@ -17,6 +17,14 @@
       "path": "profile-models/lm2-context-twopass-runtime/lm2-context-twopass-hgb-v1.json",
       "sha256": "c7c9986cd98f733e523696a7f94ffd658d9c578f79bd8f189382d86da54d2840"
     },
+    "note_head_model": {
+      "path": "profile-models/lm2-note-head-runtime/lm2-note-head-hgb-v1.json",
+      "sha256": "56e158e0c72ceca67ccd2bdcb60d09229abdb655afb8c06ad4ab13b87e3f6901"
+    },
+    "link_ranker_model": {
+      "path": "profile-models/lm2-link-ranker-runtime/lm2-footnote-link-ranker-hgb-v1.json",
+      "sha256": "52364ca3816781944ee0b00559d9dc45fab6a854bd9eb603f7df3639dcf4726b"
+    },
     "catboost_version": "1.2.10",
     "platform_libraries": {
       "macos": {
@@ -33,11 +41,11 @@
   "package_contracts": {
     "windows-x86_64": {
       "builder": "scripts/package-windows.ps1",
-      "runtime_verification": "lawpdf.exe --lm2-runtime-status --require-native --require-context"
+      "runtime_verification": "lawpdf.exe --lm2-runtime-status --require-native --require-context --require-note-head --require-link-ranker"
     },
     "macos-arm64": {
       "builder": "scripts/package-macos.sh",
-      "runtime_verification": "LawPDF --lm2-runtime-status --require-native --require-context"
+      "runtime_verification": "LawPDF --lm2-runtime-status --require-native --require-context --require-note-head --require-link-ranker"
     }
   }
 }

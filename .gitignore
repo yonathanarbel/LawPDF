@@ -46,6 +46,12 @@ __pycache__/
 !/profile-models/lm2-context-twopass-runtime/
 /profile-models/lm2-context-twopass-runtime/*
 !/profile-models/lm2-context-twopass-runtime/lm2-context-twopass-hgb-v1.json
+!/profile-models/lm2-note-head-runtime/
+/profile-models/lm2-note-head-runtime/*
+!/profile-models/lm2-note-head-runtime/lm2-note-head-hgb-v1.json
+!/profile-models/lm2-link-ranker-runtime/
+/profile-models/lm2-link-ranker-runtime/*
+!/profile-models/lm2-link-ranker-runtime/lm2-footnote-link-ranker-hgb-v1.json
 !/profile-models/layout-role-v45-pp-grok-scaleup-0507-candidate/
 /profile-models/layout-role-v45-pp-grok-scaleup-0507-candidate/*
 !/profile-models/layout-role-v45-pp-grok-scaleup-0507-candidate/layout-role-model.json

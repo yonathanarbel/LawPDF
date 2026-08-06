@@ -10,8 +10,8 @@ use serde_json::Value;
 use crate::layout_roles;
 use crate::liquid::{
     ArticleSpan, DeepLiquidSourceLine, DocumentProfile, LiquidBlock, LiquidBlockRole,
-    LiquidBlockSourceLines, LiquidDocument, LiquidFootnoteLinkIntegrity, LiquidRequest,
-    MarkdownOptions, liquid_document_markdown, prepare_liquid_document,
+    LiquidBlockSourceLines, LiquidDocument, LiquidFootnoteLink, LiquidFootnoteLinkIntegrity,
+    LiquidRequest, MarkdownOptions, liquid_document_markdown, prepare_liquid_document,
     should_prefer_ocr_page_text, should_try_ocr_page_text,
 };
 use crate::liquid2::{
@@ -78,6 +78,8 @@ struct LiquidSmokeDocument {
     article_spans: Vec<ArticleSpan>,
     block_count: usize,
     footnote_link_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    footnote_links: Option<Vec<LiquidFootnoteLink>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     footnote_link_integrity: Option<LiquidFootnoteLinkIntegrity>,
     role_counts: BTreeMap<String, usize>,
@@ -1367,6 +1369,10 @@ fn smoke_document(
     lm2_external_emissions_path: Option<&Path>,
 ) -> LiquidSmokeDocument {
     let started = Instant::now();
+    let trace = std::env::var_os("LAWPDF_LM2_TRACE_SMOKE").is_some();
+    if trace {
+        eprintln!("[lm2-smoke] load {}", path.display());
+    }
     let document = match engine.load_document(path) {
         Ok(document) => document,
         Err(error) => {
@@ -1391,6 +1397,7 @@ fn smoke_document(
                 article_spans: Vec::new(),
                 block_count: 0,
                 footnote_link_count: 0,
+                footnote_links: None,
                 footnote_link_integrity: None,
                 role_counts: BTreeMap::new(),
                 role_samples: BTreeMap::new(),
@@ -1414,6 +1421,14 @@ fn smoke_document(
     let mut ocr_attempts = 0usize;
     let mut ocr_errors = Vec::new();
     for page_index in 0..document.page_count {
+        if trace && page_index % 10 == 0 {
+            eprintln!(
+                "[lm2-smoke] {} extract page {}/{}",
+                path.display(),
+                page_index + 1,
+                document.page_count
+            );
+        }
         text_chars.push(engine.load_page_text_chars(path, page_index).ok());
         let mut text = match engine.load_page_text(path, page_index) {
             Ok(text) => text,
@@ -1468,6 +1483,13 @@ fn smoke_document(
             &pages,
             &page_uses_ocr,
         );
+    if trace {
+        eprintln!(
+            "[lm2-smoke] {} extracted {} line(s)",
+            path.display(),
+            deep_source_lines.len()
+        );
+    }
     if lmv_enabled() && (source_lines_only || !use_lm2) {
         apply_liquidvision_features(engine, path, document.page_count, &mut deep_source_lines);
     }
@@ -1500,6 +1522,7 @@ fn smoke_document(
             article_spans: Vec::new(),
             block_count: 0,
             footnote_link_count: 0,
+            footnote_links: None,
             footnote_link_integrity: None,
             role_counts: BTreeMap::new(),
             role_samples: BTreeMap::new(),
@@ -1532,6 +1555,9 @@ fn smoke_document(
         .filter_map(|(index, page)| page.footnote_divider_y_from_top.map(|_| index + 1))
         .collect::<Vec<_>>();
     let result = if use_lm2 {
+        if trace {
+            eprintln!("[lm2-smoke] {} begin LM2", path.display());
+        }
         prepare_liquid_mode2_document(LiquidMode2Request {
             document_epoch: 0,
             path: path.to_path_buf(),
@@ -1557,6 +1583,13 @@ fn smoke_document(
             openrouter_api_key: None,
         })
     };
+    if trace {
+        eprintln!(
+            "[lm2-smoke] {} LM2 complete in {:.1} ms",
+            path.display(),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 
     match result {
         Ok(liquid) => {
@@ -1597,6 +1630,7 @@ fn smoke_document(
             });
             let block_source_lines =
                 include_source_lines.then(|| smoke_block_source_lines(&liquid.block_source_lines));
+            let footnote_links = include_blocks.then(|| liquid.footnote_links.clone());
 
             LiquidSmokeDocument {
                 liquid: Some(liquid_document),
@@ -1619,6 +1653,7 @@ fn smoke_document(
                 article_spans,
                 block_count: liquid.blocks.len(),
                 footnote_link_count: liquid.footnote_links.len(),
+                footnote_links,
                 footnote_link_integrity: liquid.footnote_link_integrity,
                 role_counts,
                 role_samples,
@@ -1653,6 +1688,7 @@ fn smoke_document(
             article_spans: Vec::new(),
             block_count: 0,
             footnote_link_count: 0,
+            footnote_links: None,
             footnote_link_integrity: None,
             role_counts: BTreeMap::new(),
             role_samples: BTreeMap::new(),

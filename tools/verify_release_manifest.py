@@ -63,7 +63,13 @@ def main() -> int:
         )
 
     runtime_assets = manifest["runtime_assets"]
-    for name in ("fasttab_model", "native_model", "context_model"):
+    for name in (
+        "fasttab_model",
+        "native_model",
+        "context_model",
+        "note_head_model",
+        "link_ranker_model",
+    ):
         asset = runtime_assets[name]
         path = root / asset["path"]
         if not path.is_file():
@@ -90,8 +96,14 @@ def main() -> int:
         errors.append(f"missing package contract: {contract_key}")
     elif not (root / contract["builder"]).is_file():
         errors.append(f"missing package builder: {contract['builder']}")
-    elif "--require-native" not in contract.get("runtime_verification", "") or (
-        "--require-context" not in contract.get("runtime_verification", "")
+    elif any(
+        requirement not in contract.get("runtime_verification", "")
+        for requirement in (
+            "--require-native",
+            "--require-context",
+            "--require-note-head",
+            "--require-link-ranker",
+        )
     ):
         errors.append(f"incomplete packaged runtime verification: {contract_key}")
 
