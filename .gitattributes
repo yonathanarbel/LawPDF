@@ -5,6 +5,8 @@
 *.txt text eol=lf
 *.csv text eol=lf
 *.json text eol=lf
+profile-models/lm2-note-head-runtime/lm2-note-head-hgb-v1.json binary
+profile-models/lm2-link-ranker-runtime/lm2-footnote-link-ranker-hgb-v1.json binary
 *.py text eol=lf
 *.sh text eol=lf
 *.yml text eol=lf
