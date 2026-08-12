@@ -234,6 +234,14 @@ pub struct DeepLiquidSourceLine {
     pub bottom: f32,
     pub right: f32,
     pub top: f32,
+    /// Left edge of the first visual row when PDFium combines multiple rows
+    /// into one source item. Falls back to `left` for ordinary one-row lines.
+    #[serde(default)]
+    pub first_visual_left: f32,
+    /// Right edge of the last visual row when PDFium combines multiple rows
+    /// into one source item. Falls back to `right` for ordinary one-row lines.
+    #[serde(default)]
+    pub last_visual_right: f32,
     #[serde(default)]
     pub page_index_norm: f32,
     #[serde(default)]

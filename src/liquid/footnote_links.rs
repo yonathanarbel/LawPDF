@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     LiquidBlock, LiquidBlockRole, LiquidBlockSourceLines, LiquidDocument, LiquidFootnoteLink,
@@ -7,6 +7,7 @@ use super::{
 
 const CALLOUT_START: char = '\u{E000}';
 const CALLOUT_END: char = '\u{E001}';
+const MAX_NOTE_MARKER: u16 = 999;
 
 #[derive(Debug, Clone, Copy)]
 struct Reference {
@@ -24,9 +25,105 @@ struct NoteHead {
 }
 
 pub fn attach_footnote_links(document: &mut LiquidDocument) {
+    restore_source_backed_plain_callouts(&mut document.blocks, &document.block_source_lines);
     let (links, integrity) = resolve_footnote_links(&document.blocks, &document.block_source_lines);
     document.footnote_links = links;
     document.footnote_link_integrity = (integrity.detectable_markers > 0).then_some(integrity);
+}
+
+/// A late paragraph merge can occasionally preserve an inline superscript as
+/// plain digits even though its source row still carries the exact callout
+/// sentinels. Restore only a uniquely located `marker + following word` pair
+/// proved by that same source row; ordinary prose numbers are untouched.
+fn restore_source_backed_plain_callouts(
+    blocks: &mut [LiquidBlock],
+    block_source_lines: &[LiquidBlockSourceLines],
+) {
+    for source in block_source_lines {
+        let Some(block) = blocks.get_mut(source.block_index) else {
+            continue;
+        };
+        if !body_role(block.role) {
+            continue;
+        }
+        let mut existing = callout_markers(&block.text).into_iter().fold(
+            BTreeMap::<u16, usize>::new(),
+            |mut counts, marker| {
+                *counts.entry(marker).or_default() += 1;
+                counts
+            },
+        );
+        for line in &source.lines {
+            for (marker, anchor) in source_callout_anchors(&line.text) {
+                if existing.get_mut(&marker).is_some_and(|count| {
+                    if *count > 0 {
+                        *count -= 1;
+                        true
+                    } else {
+                        false
+                    }
+                }) {
+                    continue;
+                }
+                restore_plain_callout_before_anchor(&mut block.text, marker, &anchor);
+            }
+        }
+    }
+}
+
+fn source_callout_anchors(text: &str) -> Vec<(u16, String)> {
+    let mut anchors = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(relative) = text[cursor..].find(CALLOUT_START) {
+        let start = cursor + relative;
+        let tail_start = start + CALLOUT_START.len_utf8();
+        let Some(end_relative) = text[tail_start..].find(CALLOUT_END) else {
+            break;
+        };
+        let end = tail_start + end_relative;
+        let after = end + CALLOUT_END.len_utf8();
+        if let Ok(marker) = text[tail_start..end].parse::<u16>()
+            && (1..=MAX_NOTE_MARKER).contains(&marker)
+        {
+            let anchor = text[after..]
+                .trim_start()
+                .chars()
+                .skip_while(|ch| !ch.is_alphabetic())
+                .take_while(|ch| ch.is_alphabetic())
+                .collect::<String>();
+            if anchor.len() >= 2 {
+                anchors.push((marker, anchor));
+            }
+        }
+        cursor = after;
+    }
+    anchors
+}
+
+fn restore_plain_callout_before_anchor(text: &mut String, marker: u16, anchor: &str) -> bool {
+    let digits = marker.to_string();
+    let candidates = text
+        .match_indices(&digits)
+        .filter_map(|(start, _)| {
+            let end = start + digits.len();
+            let previous = text[..start].chars().next_back();
+            let boundary_before = previous.is_none_or(|ch| {
+                ch.is_whitespace() || ch.is_ascii_punctuation() || matches!(ch, '”' | '’')
+            });
+            let boundary_after = text[end..].chars().next().is_some_and(char::is_whitespace);
+            let remainder = text[end..].trim_start();
+            (boundary_before && boundary_after && remainder.starts_with(anchor))
+                .then_some((start, end))
+        })
+        .collect::<Vec<_>>();
+    let [(start, end)] = candidates.as_slice() else {
+        return false;
+    };
+    text.replace_range(
+        *start..*end,
+        &format!("{CALLOUT_START}{marker}{CALLOUT_END}"),
+    );
+    true
 }
 
 pub fn resolve_footnote_links(
@@ -58,9 +155,7 @@ pub fn resolve_footnote_links(
         }
         if note_role(block.role) {
             let block_heads = source_note_heads.get(&block_index);
-            if let Some(block_heads) = block_heads
-                && !block_heads.is_empty()
-            {
+            if let Some(block_heads) = block_heads {
                 notes.extend(block_heads.iter().copied());
             } else if let Some(marker) = leading_note_marker(&block.text) {
                 notes.push(NoteHead {
@@ -73,6 +168,7 @@ pub fn resolve_footnote_links(
     }
     notes.sort_unstable();
     notes.dedup();
+    discard_redundant_marker_only_note_heads(&mut notes, blocks);
 
     let mut links = Vec::new();
     let mut unmatched = 0usize;
@@ -113,6 +209,38 @@ pub fn resolve_footnote_links(
     (links, integrity)
 }
 
+/// A flattened PDF can emit an inline callout twice: once as the sentinel in
+/// body prose and once as a standalone number-only Marginalia row.  When the
+/// same page also contains the substantive definition for that marker, the
+/// number-only row is not a second footnote head and must not make the link
+/// ambiguous.  Preserve number-only heads when no fuller same-page definition
+/// exists because some PDFs genuinely split the marker from its continuation.
+fn discard_redundant_marker_only_note_heads(notes: &mut Vec<NoteHead>, blocks: &[LiquidBlock]) {
+    let substantive = notes
+        .iter()
+        .filter(|note| {
+            blocks
+                .get(note.block_index)
+                .is_some_and(|block| !marker_only_note_head(&block.text, note.marker))
+        })
+        .map(|note| (note.marker, note.page_index))
+        .collect::<BTreeSet<_>>();
+    notes.retain(|note| {
+        !blocks
+            .get(note.block_index)
+            .is_some_and(|block| marker_only_note_head(&block.text, note.marker))
+            || !substantive.contains(&(note.marker, note.page_index))
+    });
+}
+
+fn marker_only_note_head(text: &str, marker: u16) -> bool {
+    let trimmed = text.trim();
+    trimmed.parse::<u16>() == Ok(marker)
+        || trimmed
+            .strip_suffix('.')
+            .is_some_and(|digits| digits.trim().parse::<u16>() == Ok(marker))
+}
+
 fn block_note_heads(
     block_source_lines: &[LiquidBlockSourceLines],
 ) -> BTreeMap<usize, Vec<NoteHead>> {
@@ -130,7 +258,11 @@ fn block_note_heads(
                     })
                 })
                 .collect::<Vec<_>>();
-            (!heads.is_empty()).then_some((source.block_index, heads))
+            source
+                .lines
+                .iter()
+                .any(|line| !line.text.trim().is_empty())
+                .then_some((source.block_index, heads))
         })
         .collect()
 }
@@ -199,7 +331,7 @@ fn callout_markers(text: &str) -> Vec<u16> {
         } else if ch == CALLOUT_END {
             if inside
                 && let Ok(marker) = digits.parse::<u16>()
-                && (1..=500).contains(&marker)
+                && (1..=MAX_NOTE_MARKER).contains(&marker)
             {
                 markers.push(marker);
             }
@@ -226,7 +358,7 @@ fn leading_note_marker(text: &str) -> Option<u16> {
         return None;
     }
     let marker = digits.parse::<u16>().ok()?;
-    (1..=500).contains(&marker).then_some(marker)
+    (1..=MAX_NOTE_MARKER).contains(&marker).then_some(marker)
 }
 
 fn body_role(role: LiquidBlockRole) -> bool {
@@ -238,6 +370,8 @@ fn body_role(role: LiquidBlockRole) -> bool {
             | LiquidBlockRole::Subheading
             | LiquidBlockRole::Quote
             | LiquidBlockRole::ListItem
+            | LiquidBlockRole::Table
+            | LiquidBlockRole::Caption
     )
 }
 
@@ -297,6 +431,19 @@ mod tests {
     }
 
     #[test]
+    fn resolves_note_markers_above_five_hundred() {
+        let blocks = vec![
+            block(LiquidBlockRole::Paragraph, "Claim.\u{E000}532\u{E001}"),
+            block(LiquidBlockRole::Marginalia, "532 Authority."),
+        ];
+        let (links, integrity) = resolve_footnote_links(&blocks, &[source(0, 78), source(1, 78)]);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].marker, 532);
+        assert_eq!(integrity.note_heads, 1);
+        assert_eq!(integrity.landing_rate, 1.0);
+    }
+
+    #[test]
     fn repeated_full_issue_numbers_use_same_page_note() {
         let blocks = vec![
             block(LiquidBlockRole::Marginalia, "1 Old article note."),
@@ -321,6 +468,35 @@ mod tests {
             resolve_footnote_links(&blocks, &[source(0, 4), source(1, 4), source(2, 4)]);
         assert!(links.is_empty());
         assert_eq!(integrity.ambiguous, 1);
+    }
+
+    #[test]
+    fn redundant_marker_only_head_defers_to_full_same_page_definition() {
+        let blocks = vec![
+            block(LiquidBlockRole::Paragraph, "Claim.\u{E000}21\u{E001}"),
+            block(LiquidBlockRole::Marginalia, "21"),
+            block(LiquidBlockRole::Marginalia, "21 Full authority."),
+        ];
+        let (links, integrity) =
+            resolve_footnote_links(&blocks, &[source(0, 4), source(1, 4), source(2, 4)]);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].note_block_index, 2);
+        assert_eq!(integrity.note_heads, 1);
+        assert_eq!(integrity.ambiguous, 0);
+        assert_eq!(integrity.landing_rate, 1.0);
+    }
+
+    #[test]
+    fn marker_only_head_is_preserved_without_a_full_definition() {
+        let blocks = vec![
+            block(LiquidBlockRole::Paragraph, "Claim.\u{E000}21\u{E001}"),
+            block(LiquidBlockRole::Marginalia, "21"),
+        ];
+        let (links, integrity) = resolve_footnote_links(&blocks, &[source(0, 4), source(1, 4)]);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].note_block_index, 1);
+        assert_eq!(integrity.note_heads, 1);
+        assert_eq!(integrity.ambiguous, 0);
     }
 
     #[test]
@@ -363,5 +539,128 @@ mod tests {
     #[test]
     fn malformed_callout_is_not_guessed() {
         assert!(callout_markers("Claim.\u{E000}12a\u{E001}").is_empty());
+    }
+
+    #[test]
+    fn restores_plain_callout_only_from_matching_source_provenance() {
+        let mut blocks = vec![block(
+            LiquidBlockRole::Paragraph,
+            "Accountability. 24 Cross-sovereign policing.\u{E000}25\u{E001}",
+        )];
+        let sources = vec![LiquidBlockSourceLines {
+            block_index: 0,
+            lines: vec![LiquidSourceLineRef {
+                id: Some("p8:l6".to_owned()),
+                page_index: 8,
+                line_index: 6,
+                text: "\u{E000}24\u{E001} Cross\u{0002}".to_owned(),
+                role: LiquidBlockRole::Paragraph,
+                note_markers: vec![24],
+            }],
+        }];
+
+        restore_source_backed_plain_callouts(&mut blocks, &sources);
+
+        assert_eq!(
+            blocks[0].text,
+            "Accountability. \u{E000}24\u{E001} Cross-sovereign policing.\u{E000}25\u{E001}"
+        );
+    }
+
+    #[test]
+    fn does_not_restore_plain_number_without_matching_source_provenance() {
+        let mut blocks = vec![block(
+            LiquidBlockRole::Paragraph,
+            "Section 24 Cross references remain ordinary prose.",
+        )];
+        let sources = vec![source(0, 8)];
+
+        restore_source_backed_plain_callouts(&mut blocks, &sources);
+
+        assert_eq!(
+            blocks[0].text,
+            "Section 24 Cross references remain ordinary prose."
+        );
+    }
+
+    #[test]
+    fn restored_source_backed_callout_links_to_its_note() {
+        let mut document = LiquidDocument {
+            title: "Test Article".to_owned(),
+            blocks: vec![
+                block(
+                    LiquidBlockRole::Paragraph,
+                    "Accountability. 24 Cross-sovereign policing.",
+                ),
+                block(LiquidBlockRole::Marginalia, "24 Authority."),
+            ],
+            block_source_lines: vec![
+                LiquidBlockSourceLines {
+                    block_index: 0,
+                    lines: vec![LiquidSourceLineRef {
+                        id: Some("p8:l6".to_owned()),
+                        page_index: 8,
+                        line_index: 6,
+                        text: "\u{E000}24\u{E001} Cross\u{0002}".to_owned(),
+                        role: LiquidBlockRole::Paragraph,
+                        note_markers: vec![24],
+                    }],
+                },
+                LiquidBlockSourceLines {
+                    block_index: 1,
+                    lines: vec![LiquidSourceLineRef {
+                        id: Some("p8:l54".to_owned()),
+                        page_index: 8,
+                        line_index: 54,
+                        text: "\u{E000}24\u{E001}. Authority.".to_owned(),
+                        role: LiquidBlockRole::Marginalia,
+                        note_markers: vec![24],
+                    }],
+                },
+            ],
+            article_spans: Vec::new(),
+            footnote_links: Vec::new(),
+            footnote_link_integrity: None,
+            profile: None,
+            noise_lines_removed: 0,
+            llm_used: false,
+            llm_provider: None,
+            deep_liquid_used: false,
+            deep_liquid_model: None,
+            warnings: Vec::new(),
+            source_signature: "test".to_owned(),
+        };
+
+        attach_footnote_links(&mut document);
+
+        assert_eq!(document.footnote_links.len(), 1);
+        assert_eq!(document.footnote_links[0].marker, 24);
+        assert_eq!(document.footnote_links[0].note_block_index, 1);
+    }
+
+    #[test]
+    fn source_backed_markerless_reporter_volume_is_not_a_note_head() {
+        let blocks = vec![
+            block(LiquidBlockRole::Paragraph, "Claim.\u{E000}121\u{E001}"),
+            block(
+                LiquidBlockRole::Marginalia,
+                "121 COLUM. L. REV. 1659, 1675 n.72 (2021).",
+            ),
+        ];
+        let note_source = LiquidBlockSourceLines {
+            block_index: 1,
+            lines: vec![LiquidSourceLineRef {
+                id: Some("p4:l18".to_owned()),
+                page_index: 4,
+                line_index: 18,
+                text: "121 COLUM. L. REV. 1659, 1675 n.72 (2021).".to_owned(),
+                role: LiquidBlockRole::Marginalia,
+                note_markers: Vec::new(),
+            }],
+        };
+        let (links, integrity) = resolve_footnote_links(&blocks, &[source(0, 4), note_source]);
+        assert!(links.is_empty());
+        assert_eq!(integrity.note_heads, 0);
+        assert_eq!(integrity.unmatched, 1);
     }
 }

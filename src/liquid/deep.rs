@@ -334,6 +334,8 @@ mod tests {
             bottom: 0.0,
             right: 1.0,
             top: 1.0,
+            first_visual_left: 0.0,
+            last_visual_right: 1.0,
             page_index_norm: 0.0,
             lines_from_doc_start: line_index,
             left_margin_ratio: 0.0,

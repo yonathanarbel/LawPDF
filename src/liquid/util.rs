@@ -174,8 +174,26 @@ pub(crate) fn should_preserve_terminal_hyphen(left: &str, next_line: &str) -> bo
         return false;
     }
 
+    let following_word = next_line
+        .trim_start()
+        .strip_prefix(next_word)
+        .and_then(first_word)
+        .map(str::to_ascii_lowercase);
     let prefix = prefix.to_ascii_lowercase();
     let next_word = next_word.to_ascii_lowercase();
+    let lower_left = left.to_ascii_lowercase();
+    // A line-wrapped URL's final hyphen is data, not discretionary
+    // typography. Dropping it silently changes the destination.
+    let preserve_url = lower_left.contains("http://") || lower_left.contains("https://");
+    // Exact pairs cover compounds whose first component is also the stem of
+    // an ordinary unhyphenated word (for example `conflict-` + `ing`). Keep
+    // these narrower than the prefix fallback below.
+    let preserve_pair = matches!((prefix.as_str(), next_word.as_str()), ("conflict", "of"));
+    // `abortion rights` is normally an open compound, but it is hyphenated
+    // attributively in `abortion-rights group`. Keep that narrow source form
+    // without preserving every line-wrapped occurrence of the open compound.
+    let preserve_contextual_pair =
+        prefix == "abortion" && next_word == "rights" && following_word.as_deref() == Some("group");
     let preserve_prefix = matches!(
         prefix.as_str(),
         "well"
@@ -196,6 +214,7 @@ pub(crate) fn should_preserve_terminal_hyphen(left: &str, next_line: &str) -> bo
             | "short"
             | "cross"
             | "self"
+            | "scenario"
     );
     let preserve_next = matches!(
         next_word.as_str(),
@@ -212,7 +231,7 @@ pub(crate) fn should_preserve_terminal_hyphen(left: &str, next_line: &str) -> bo
             | "wide"
     );
 
-    preserve_prefix || preserve_next
+    preserve_url || preserve_pair || preserve_contextual_pair || preserve_prefix || preserve_next
 }
 
 fn terminal_hyphen_prefix(text: &str) -> Option<&str> {

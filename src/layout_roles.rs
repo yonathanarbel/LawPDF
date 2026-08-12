@@ -11,6 +11,7 @@ const FOOTNOTE_SPECIALIST_RUNTIME_BIAS: f64 = -6.0;
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ExtractionStats {
     pub lines_split: usize,
+    pub implicit_spaces_inserted: usize,
     pub markers_attached: usize,
     pub markers_attached_backward: usize,
     pub markers_dropped: usize,
@@ -20,6 +21,7 @@ pub struct ExtractionStats {
 impl ExtractionStats {
     fn merge(&mut self, other: Self) {
         self.lines_split += other.lines_split;
+        self.implicit_spaces_inserted += other.implicit_spaces_inserted;
         self.markers_attached += other.markers_attached;
         self.markers_attached_backward += other.markers_attached_backward;
         self.markers_dropped += other.markers_dropped;
@@ -70,6 +72,8 @@ struct LayoutLine {
     bottom: f32,
     right: f32,
     top: f32,
+    first_visual_left: f32,
+    last_visual_right: f32,
     font_height: f32,
     font_ratio_page: f32,
     font_ratio_page_ref: f32,
@@ -160,6 +164,7 @@ struct CharMeta {
     len: usize,   // byte length of this char
     ch: char,
     font_size: Option<f32>,
+    rect: Option<PdfRect>,
 }
 
 /// Private-use sentinels bracketing a detected inline footnote callout. They ride through
@@ -272,6 +277,8 @@ pub fn deep_source_lines_for_pages_with_extraction_report_and_text_overrides(
                 bottom: line.bottom,
                 right: line.right,
                 top: line.top,
+                first_visual_left: line.first_visual_left,
+                last_visual_right: line.last_visual_right,
                 page_index_norm: 0.0,
                 lines_from_doc_start: 0,
                 left_margin_ratio: 0.0,
@@ -911,7 +918,7 @@ fn extract_lines_with_options(
 
     for item in chars {
         if matches!(item.ch, '\n' | '\r') {
-            flush_line(page, &mut current, &mut lines);
+            trace.stats.implicit_spaces_inserted += flush_line(page, &mut current, &mut lines);
             continue;
         }
 
@@ -920,7 +927,7 @@ fn extract_lines_with_options(
                 && !current.text.trim().is_empty()
                 && is_new_visual_line(&current, rect)
             {
-                flush_line(page, &mut current, &mut lines);
+                trace.stats.implicit_spaces_inserted += flush_line(page, &mut current, &mut lines);
             }
             if extraction_v2
                 && current.has_rect()
@@ -934,7 +941,7 @@ fn extract_lines_with_options(
                     before_text: vec![normalize_line_text(&current.text)],
                     after_text: vec![format!("next fragment starts with {:?}", item.ch)],
                 });
-                flush_line(page, &mut current, &mut lines);
+                trace.stats.implicit_spaces_inserted += flush_line(page, &mut current, &mut lines);
             }
             current.push(item.ch, Some(rect));
             current.push_style(item);
@@ -944,7 +951,7 @@ fn extract_lines_with_options(
         }
     }
 
-    flush_line(page, &mut current, &mut lines);
+    trace.stats.implicit_spaces_inserted += flush_line(page, &mut current, &mut lines);
     if extraction_v2 {
         trace.merge(merge_or_drop_standalone_marker_fragments(
             page_index, &mut lines,
@@ -1205,10 +1212,12 @@ fn same_visual_line(left: &LayoutLine, right: &LayoutLine) -> bool {
     (left_center - right_center).abs() <= left.font_height.max(right.font_height).max(1.0) * 0.35
 }
 
-fn flush_line(page: &PageInfo, current: &mut LineBuilder, lines: &mut Vec<LayoutLine>) {
-    if let Some(line) = current.take_line(page) {
+fn flush_line(page: &PageInfo, current: &mut LineBuilder, lines: &mut Vec<LayoutLine>) -> usize {
+    let (line, implicit_spaces_inserted) = current.take_line(page);
+    if let Some(line) = line {
         lines.push(line);
     }
+    implicit_spaces_inserted
 }
 
 fn is_new_visual_line(current: &LineBuilder, rect: PdfRect) -> bool {
@@ -1282,27 +1291,45 @@ impl LineBuilder {
             len,
             ch: item.ch,
             font_size: item.font_size,
+            rect: item.rect,
         });
     }
 
-    fn take_line(&mut self, page: &PageInfo) -> Option<LayoutLine> {
+    fn take_line(&mut self, page: &PageInfo) -> (Option<LayoutLine>, usize) {
         let max_internal_space_run = line_internal_space_run(&self.text);
         let space_density = line_space_density(&self.text);
         let leading_space_count = leading_space_count(&self.text);
         let trailing_space_count = trailing_space_count(&self.text);
+        let implicit_spaces_inserted =
+            insert_missing_interword_spaces(&mut self.text, &mut self.char_meta);
         if self.wrap_callouts {
             wrap_superscript_callouts(&mut self.text, &self.char_meta);
         }
         let text = normalize_line_text(&self.text);
         if text.is_empty() || self.rect_count == 0 || page.width <= 0.0 || page.height <= 0.0 {
             self.clear();
-            return None;
+            return (None, implicit_spaces_inserted);
         }
         let font_height = if self.font_size_count > 0 {
             self.font_size_total / self.font_size_count as f32
         } else {
             self.average_height()
         };
+        let first_break = self.char_meta.iter().position(|meta| meta.ch == '\u{0002}');
+        let last_break = self
+            .char_meta
+            .iter()
+            .rposition(|meta| meta.ch == '\u{0002}');
+        let first_visual_left = self.char_meta[..first_break.unwrap_or(self.char_meta.len())]
+            .iter()
+            .filter_map(|meta| meta.rect.map(|rect| rect.left))
+            .reduce(f32::min)
+            .unwrap_or(self.left);
+        let last_visual_right = self.char_meta[last_break.map_or(0, |index| index + 1)..]
+            .iter()
+            .filter_map(|meta| meta.rect.map(|rect| rect.right))
+            .reduce(f32::max)
+            .unwrap_or(self.right);
         let style_count = self.font_size_count.max(self.rect_count).max(1);
         let line = LayoutLine {
             text,
@@ -1314,6 +1341,8 @@ impl LineBuilder {
             bottom: self.bottom,
             right: self.right,
             top: self.top,
+            first_visual_left,
+            last_visual_right,
             font_height,
             font_ratio_page: 1.0,
             font_ratio_page_ref: 1.0,
@@ -1376,7 +1405,7 @@ impl LineBuilder {
             contents_or_index_entry: false,
         };
         self.clear();
-        Some(line)
+        (Some(line), implicit_spaces_inserted)
     }
 
     fn clear(&mut self) {
@@ -1399,6 +1428,122 @@ impl LineBuilder {
 /// body text (i.e. superscript reference markers) — and wrap them in `CALLOUT_START`/`CALLOUT_END`
 /// sentinels on the raw line text (before whitespace normalization). Conservative by design:
 /// requires real body content on the line, so standalone/marginal number lines are left alone.
+const IMPLICIT_WORD_SPACE_GAP_RATIO: f32 = 0.14;
+const TRACKED_TEXT_MIN_WIDE_GAPS: usize = 3;
+
+#[derive(Debug, Default)]
+struct VisualLineGapGroup {
+    center: f32,
+    font_size: f32,
+    eligible_pairs: usize,
+    insertion_offsets: Vec<usize>,
+}
+
+/// PDFium occasionally omits a space glyph even though the adjacent words retain
+/// a conspicuous geometric gap. Recover only high-confidence, same-baseline
+/// word boundaries. In addition to alphabetic pairs, accept punctuation only in
+/// the directions that conventionally border a space: closing punctuation before
+/// a word, or a word before opening punctuation. Widely tracked display text (for
+/// example a spaced-out author name) has many such gaps on one visual row, so
+/// exclude rows where wide gaps make up at least a quarter of eligible pairs.
+fn insert_missing_interword_spaces(text: &mut String, meta: &mut [CharMeta]) -> usize {
+    let mut groups: Vec<VisualLineGapGroup> = Vec::new();
+
+    for pair in meta.windows(2) {
+        let previous = &pair[0];
+        let current = &pair[1];
+        if !is_implicit_space_boundary(previous.ch, current.ch) {
+            continue;
+        }
+        let (Some(previous_rect), Some(current_rect)) = (previous.rect, current.rect) else {
+            continue;
+        };
+        let previous_height = previous_rect.height().max(1.0);
+        let current_height = current_rect.height().max(1.0);
+        let previous_center = (previous_rect.top + previous_rect.bottom) * 0.5;
+        let current_center = (current_rect.top + current_rect.bottom) * 0.5;
+        let font_size = previous
+            .font_size
+            .unwrap_or(previous_height)
+            .max(current.font_size.unwrap_or(current_height))
+            .max(1.0);
+        if (previous_center - current_center).abs() > previous_height.max(current_height) * 0.25 {
+            continue;
+        }
+        let previous_font = previous.font_size.unwrap_or(previous_height).max(1.0);
+        let current_font = current.font_size.unwrap_or(current_height).max(1.0);
+        if previous_font.min(current_font) / previous_font.max(current_font) < 0.80 {
+            continue;
+        }
+
+        let center = (previous_center + current_center) * 0.5;
+        let starts_new_group = groups.last().is_none_or(|group| {
+            (group.center - center).abs() > group.font_size.max(font_size) * 0.30
+        });
+        if starts_new_group {
+            groups.push(VisualLineGapGroup {
+                center,
+                font_size,
+                ..Default::default()
+            });
+        }
+        let group = groups
+            .last_mut()
+            .expect("visual gap group was just created");
+        group.eligible_pairs += 1;
+        group.center = (group.center + center) * 0.5;
+        group.font_size = group.font_size.max(font_size);
+
+        let gap_ratio = (current_rect.left - previous_rect.right) / font_size;
+        if gap_ratio >= IMPLICIT_WORD_SPACE_GAP_RATIO {
+            group.insertion_offsets.push(current.start);
+        }
+    }
+
+    let mut insertion_offsets = groups
+        .into_iter()
+        .filter(|group| {
+            group.insertion_offsets.len() < TRACKED_TEXT_MIN_WIDE_GAPS
+                || group.insertion_offsets.len() * 4 < group.eligible_pairs
+        })
+        .flat_map(|group| group.insertion_offsets)
+        .collect::<Vec<_>>();
+    insertion_offsets.sort_unstable();
+    insertion_offsets.dedup();
+    if insertion_offsets.is_empty() {
+        return 0;
+    }
+
+    for &offset in insertion_offsets.iter().rev() {
+        if offset <= text.len() && text.is_char_boundary(offset) {
+            text.insert(offset, ' ');
+        }
+    }
+    for item in meta {
+        item.start += insertion_offsets.partition_point(|offset| *offset <= item.start);
+    }
+    insertion_offsets.len()
+}
+
+fn is_implicit_space_boundary(previous: char, current: char) -> bool {
+    let previous_alpha = previous.is_ascii_alphabetic();
+    let current_alpha = current.is_ascii_alphabetic();
+    (previous_alpha && current_alpha)
+        || (is_space_closing_punctuation(previous) && current_alpha)
+        || (previous_alpha && is_space_opening_punctuation(current))
+}
+
+fn is_space_closing_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        '.' | ',' | ';' | ':' | '?' | '!' | ')' | ']' | '}' | '"' | '\'' | '\u{2019}' | '\u{201D}'
+    )
+}
+
+fn is_space_opening_punctuation(ch: char) -> bool {
+    matches!(ch, '(' | '[' | '{' | '"' | '\'' | '\u{2018}' | '\u{201C}')
+}
+
 fn wrap_superscript_callouts(text: &mut String, meta: &[CharMeta]) {
     if meta.len() < 6 {
         return;
@@ -12450,6 +12595,100 @@ mod tests {
     }
 
     #[test]
+    fn line_extraction_recovers_omitted_interword_space_from_geometry() {
+        let page = PageInfo::new(612.0, 792.0);
+        let mut chars = Vec::new();
+        push_text_run(&mut chars, 72.0, 680.0, 10.0, 10.0, "Amendment");
+        // A normal glyph-to-glyph advance is 5 points in this fixture. The
+        // extra 1.8-point gap is 0.18 em and represents a missing space glyph.
+        push_text_run(&mut chars, 118.8, 680.0, 10.0, 10.0, "should apply");
+
+        let (lines, trace) = extract_lines_with_options(0, &page, &chars, false);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "Amendment should apply");
+        assert_eq!(trace.stats.implicit_spaces_inserted, 1);
+    }
+
+    #[test]
+    fn line_extraction_recovers_only_directional_punctuation_spaces() {
+        let page = PageInfo::new(612.0, 792.0);
+
+        let mut quoted = Vec::new();
+        push_text_run(&mut quoted, 72.0, 680.0, 10.0, 10.0, "expressive,\u{201D}");
+        push_text_run(&mut quoted, 133.8, 680.0, 10.0, 10.0, "it said");
+        let (quoted_lines, quoted_trace) = extract_lines_with_options(0, &page, &quoted, false);
+        assert_eq!(quoted_lines[0].text, "expressive,\u{201D} it said");
+        assert_eq!(quoted_trace.stats.implicit_spaces_inserted, 1);
+
+        let mut parenthetical = Vec::new();
+        push_text_run(&mut parenthetical, 72.0, 660.0, 10.0, 10.0, "direct");
+        push_text_run(
+            &mut parenthetical,
+            103.8,
+            660.0,
+            10.0,
+            10.0,
+            "(or redirect)",
+        );
+        push_text_run(&mut parenthetical, 168.6, 660.0, 10.0, 10.0, "leaders");
+        let (parenthetical_lines, parenthetical_trace) =
+            extract_lines_with_options(0, &page, &parenthetical, false);
+        assert_eq!(parenthetical_lines[0].text, "direct (or redirect) leaders");
+        assert_eq!(parenthetical_trace.stats.implicit_spaces_inserted, 2);
+
+        let mut abbreviation = Vec::new();
+        push_text_run(&mut abbreviation, 72.0, 640.0, 10.0, 10.0, "U.S.");
+        push_text_run(&mut abbreviation, 93.8, 640.0, 10.0, 10.0, "workplace");
+        let (abbreviation_lines, abbreviation_trace) =
+            extract_lines_with_options(0, &page, &abbreviation, false);
+        assert_eq!(abbreviation_lines[0].text, "U.S. workplace");
+        assert_eq!(abbreviation_trace.stats.implicit_spaces_inserted, 1);
+    }
+
+    #[test]
+    fn line_extraction_keeps_tight_punctuation_adjacency() {
+        let page = PageInfo::new(612.0, 792.0);
+        let mut chars = Vec::new();
+        push_text_run(
+            &mut chars,
+            72.0,
+            680.0,
+            10.0,
+            10.0,
+            "direct(or redirect)leaders",
+        );
+
+        let (lines, trace) = extract_lines_with_options(0, &page, &chars, false);
+
+        assert_eq!(lines[0].text, "direct(or redirect)leaders");
+        assert_eq!(trace.stats.implicit_spaces_inserted, 0);
+    }
+
+    #[test]
+    fn line_extraction_does_not_split_widely_tracked_display_text() {
+        let page = PageInfo::new(612.0, 792.0);
+        let mut chars = Vec::new();
+        let mut left = 72.0;
+        for ch in "NADIABANTEKA".chars() {
+            chars.push(PageTextChar {
+                ch,
+                rect: Some(PdfRect::new(left, 680.0, left + 5.0, 690.0)),
+                font_size: Some(10.0),
+                bold: false,
+                italic: false,
+            });
+            left += 6.8;
+        }
+
+        let (lines, trace) = extract_lines_with_options(0, &page, &chars, false);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "NADIABANTEKA");
+        assert_eq!(trace.stats.implicit_spaces_inserted, 0);
+    }
+
+    #[test]
     fn extraction_v2_splits_midline_font_step_note_prose() {
         let page = PageInfo::new(612.0, 792.0);
         let mut chars = Vec::new();
@@ -13490,6 +13729,8 @@ mod tests {
             bottom,
             right,
             top,
+            first_visual_left: left,
+            last_visual_right: right,
             font_height: top - bottom,
             font_ratio_page: 1.0,
             font_ratio_page_ref: 1.0,

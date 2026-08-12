@@ -17,6 +17,7 @@ const MIN_BETWEEN_BOUNDARIES_PAGES: usize = 2;
 const BOUNDARY_SCORE_THRESHOLD: f32 = 3.0;
 const RESET_LOOKBACK_PAGES: usize = 6;
 const PRIOR_NOTE_LOOKBACK_PAGES: usize = 12;
+const MAX_NOTE_MARKER: u16 = 999;
 pub(crate) const ARTICLE_SEGMENTATION_VERSION: &str = "article-segments-v1";
 
 #[derive(Debug, Clone)]
@@ -622,7 +623,7 @@ fn observe_page(
                     .then_some(line.note_marker)
                     .flatten()
             })
-            .filter(|marker| (1..=500).contains(marker))
+            .filter(|marker| (1..=MAX_NOTE_MARKER).contains(marker))
             .collect::<Vec<_>>()
     };
     note_markers.sort_unstable();

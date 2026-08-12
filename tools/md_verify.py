@@ -5,8 +5,13 @@ This checks reconstructed Markdown against structural invariants that law
 review articles satisfy by construction, so no human labels are required:
 
   * footnote numbers run 1..N monotonically across the article
-  * every emitted reference has exactly one definition and vice versa
+  * every emitted reference has exactly one definition, and every numeric
+    definition is referenced (author/symbol notes are allowed to stand alone)
   * a footnote marker never opens a body paragraph
+  * page-break instructions such as "footnote continued on next page" do not
+    survive into the export
+  * an open body paragraph is not split from a continuation by a blank
+    Markdown boundary (lowercase is critical; uppercase is warning-only)
   * heading outlines nest legally and do not contain citation prose
   * running headers, table-of-contents leaders, and page numbers do not
     survive into the body
@@ -48,6 +53,11 @@ FRAGMENT_PARAGRAPH_WORDS = 4
 # Headings longer than this are usually body text misclassified, or two
 # headings fused into one block.
 LONG_HEADING_WORDS = 18
+# A terminal marker can split one physical source line into two Markdown
+# blocks even when the text before the marker happens to end a sentence. Keep
+# this deliberately short so ordinary footnoted paragraph endings do not all
+# become warnings.
+SHORT_MARKER_SPLICE_WORDS = 30
 
 PRIVATE_USE = re.compile(r"[-]")
 # LawPDF's own callout/marker sentinels, which must never reach the output.
@@ -68,7 +78,14 @@ BARE_NOTE_OPENER = re.compile(r"^(\d{1,3})\.?\s+(?=[A-Z(“\"])")
 ENUMERATOR = re.compile(
     r"(?:^|\s)(?:[IVXLC]+\.|[A-Z]\.|\d+\.|[a-z]\.)(?=\s+\S)"
 )
-CASE_CITATION = re.compile(r"\b\d+\s+[A-Z][A-Za-z.]*\s+\d+|\bv\.\s+[A-Z]")
+# A case name is a perfectly ordinary article title or subsection heading.
+# Only reporter-shaped text is citation prose; `Foo v. Bar` by itself is not.
+REPORTER_CITATION = re.compile(r"\b\d+\s+[A-Z][A-Za-z.]*\s+\d+")
+CASE_VERSUS = re.compile(r"\bv\.\s+(?=[A-Z])")
+FOOTNOTE_CONTINUED = re.compile(
+    r"\bfootnote\s+continued\s+on\s+next\s+page\b", re.IGNORECASE
+)
+ENUMERATED_HEADING = re.compile(r"^(?:[IVXLC]+|[A-Z]|\d+)\.\s+\S")
 WORD = re.compile(r"[0-9a-zÀ-ɏ]+")
 
 
@@ -148,7 +165,7 @@ def split_blocks(lines: Sequence[str]) -> list[Block]:
     in_fence = False
     for index, raw in enumerate(lines, start=1):
         line = raw.rstrip("\n")
-        if line.lstrip().startswith("```"):
+        if line.lstrip().startswith(("```", "~~~")):
             in_fence = not in_fence
         if not line.strip() and not in_fence:
             if current:
@@ -176,11 +193,18 @@ def is_heading(block: Block) -> bool:
 
 def is_table_or_code(block: Block) -> bool:
     first = block.first.lstrip()
-    return first.startswith("```") or first.startswith("|")
+    return first.startswith(("```", "~~~", "|"))
 
 
 def is_list_item(block: Block) -> bool:
     return bool(re.match(r"^\s*([*+-]|\d+[.)])\s+", block.first))
+
+
+def is_quote_or_rule(block: Block) -> bool:
+    first = block.first.lstrip()
+    return first.startswith(">") or bool(
+        re.fullmatch(r"(?:-{3,}|\*{3,}|_{3,})", first)
+    )
 
 
 def word_count(text: str) -> int:
@@ -191,6 +215,48 @@ def strip_markup(text: str) -> str:
     text = FOOTNOTE_REF.sub(" ", text)
     text = re.sub(r"[*_`#>]+", " ", text)
     return text
+
+
+def is_plain_body_block(block: Block) -> bool:
+    return not (
+        is_heading(block)
+        or is_footnote_def(block)
+        or is_table_or_code(block)
+        or is_list_item(block)
+        or is_quote_or_rule(block)
+    )
+
+
+def paragraph_is_visibly_open(text: str) -> bool:
+    """Whether a prose block visibly ends before completing its sentence."""
+    cleaned = strip_markup(text).rstrip().rstrip("*_`")
+    cleaned = cleaned.rstrip("\"'\u2019\u201d)]}")
+    return bool(cleaned and cleaned[-1] not in ".!?")
+
+
+def starts_with_lowercase_prose(text: str) -> bool:
+    """Require lowercase at the start, rather than later in a numeric label."""
+    cleaned = strip_markup(text).lstrip()
+    cleaned = cleaned.lstrip("*_`\"'\u201c\u2018([{")
+    return bool(cleaned and cleaned[0].isalpha() and cleaned[0].islower())
+
+
+def starts_with_uppercase_prose(text: str) -> bool:
+    """Require uppercase at the start, rather than later in a numeric label."""
+    cleaned = strip_markup(text).lstrip()
+    cleaned = cleaned.lstrip("*_`\"'\u201c\u2018([{")
+    return bool(cleaned and cleaned[0].isalpha() and cleaned[0].isupper())
+
+
+def is_short_marker_it_splice(previous: str, current: str) -> bool:
+    """Catch a narrow marker-induced split hidden by terminal punctuation."""
+    if word_count(strip_markup(previous)) > SHORT_MARKER_SPLICE_WORDS:
+        return False
+    if re.search(r"\[\^[^\]]+\]\s*[*_`\"'\u2019\u201d)\]}]*$", previous) is None:
+        return False
+    cleaned = strip_markup(current).lstrip()
+    cleaned = cleaned.lstrip("*_`\"'\u201c\u2018([{")
+    return re.match(r"It\b", cleaned) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +308,10 @@ def check_footnotes(blocks: Sequence[Block], report: DocumentReport) -> None:
             references[ident][0],
             f"reference [^{ident}] has no definition",
         )
-    for ident in sorted(defined - referenced):
+    # Numeric notes are the article's ordered apparatus and must be linked.
+    # Author and symbol notes are often emitted deliberately without an inline
+    # body reference, so they are allowed here rather than failing the gate.
+    for ident in sorted(ident for ident in defined - referenced if ident.isdigit()):
         report.add(
             "footnote.orphan_definition",
             CRITICAL,
@@ -291,6 +360,89 @@ def check_footnotes(blocks: Sequence[Block], report: DocumentReport) -> None:
                 f"note {current[0]} is defined after note {previous[0]}",
             )
             break
+
+
+def check_pagination_artifacts(
+    blocks: Sequence[Block], report: DocumentReport
+) -> None:
+    """Catch literal page-break instructions that leaked into the export."""
+    count = 0
+    for block in blocks:
+        if is_table_or_code(block):
+            continue
+        for offset, line in enumerate(block.lines):
+            if FOOTNOTE_CONTINUED.search(line):
+                count += 1
+                report.add(
+                    "furniture.footnote_continued",
+                    CRITICAL,
+                    block.line + offset,
+                    "literal 'footnote continued on next page' survived into Markdown",
+                )
+    report.stats["footnote_continued_artifacts"] = count
+
+
+def check_blank_boundary_continuations(
+    blocks: Sequence[Block], report: DocumentReport
+) -> None:
+    """Find one prose paragraph split into two blank-delimited blocks.
+
+    Lowercase is a strong continuation signal only when the preceding prose is
+    visibly open, so it is critical. Uppercase is a weaker signal but still
+    useful for surfacing likely misses, so it is warning-only. Structural
+    Markdown blocks and the notes apparatus are excluded in both cases so
+    lists, quotations, tables, code, headings, and definitions do not become
+    false findings.
+    """
+    in_notes = False
+    notes_membership: list[bool] = []
+    for block in blocks:
+        if is_heading(block) and NOTES_HEADING.match(block.first.strip()):
+            in_notes = True
+        notes_membership.append(in_notes)
+
+    lowercase_count = 0
+    uppercase_count = 0
+    for index in range(len(blocks) - 1):
+        previous = blocks[index]
+        current = blocks[index + 1]
+        if notes_membership[index] or notes_membership[index + 1]:
+            continue
+        if not is_plain_body_block(previous) or not is_plain_body_block(current):
+            continue
+        if word_count(strip_markup(previous.text)) < 8:
+            continue
+        if word_count(strip_markup(current.text)) < 2:
+            continue
+        visibly_open = paragraph_is_visibly_open(previous.text)
+        marker_it_splice = is_short_marker_it_splice(previous.text, current.text)
+        if not visibly_open and not marker_it_splice:
+            continue
+        if starts_with_lowercase_prose(current.text):
+            lowercase_count += 1
+            report.add(
+                "paragraph.open_lowercase_boundary",
+                CRITICAL,
+                current.line,
+                "open paragraph is followed across a blank boundary by lowercase prose: "
+                f"{preview(previous.text)} / {preview(current.text)}",
+            )
+        elif starts_with_uppercase_prose(current.text):
+            uppercase_count += 1
+            report.add(
+                "paragraph.open_uppercase_boundary",
+                WARNING,
+                current.line,
+                (
+                    "open paragraph"
+                    if visibly_open
+                    else "short marker-ending paragraph"
+                )
+                + " is followed across a blank boundary by uppercase prose: "
+                f"{preview(previous.text)} / {preview(current.text)}",
+            )
+    report.stats["open_lowercase_boundaries"] = lowercase_count
+    report.stats["open_uppercase_boundaries"] = uppercase_count
 
 
 def check_body(blocks: Sequence[Block], report: DocumentReport) -> None:
@@ -477,7 +629,7 @@ def check_headings(blocks: Sequence[Block], report: DocumentReport) -> None:
                 f"heading ends mid-clause, likely body text: {preview(title)}",
             )
 
-        if CASE_CITATION.search(title) and word_count(title) <= 8:
+        if REPORTER_CITATION.search(title) and word_count(title) <= 8:
             report.add(
                 "heading.citation_prose",
                 CRITICAL,
@@ -503,14 +655,19 @@ def check_headings(blocks: Sequence[Block], report: DocumentReport) -> None:
 
         words = word_count(title)
         if words > LONG_HEADING_WORDS:
+            enumerated_title = (
+                words <= 24
+                and ENUMERATED_HEADING.match(title) is not None
+                and not title.rstrip().endswith((".", "?", "!"))
+            )
             report.add(
                 "heading.overlong",
-                CRITICAL,
+                WARNING if enumerated_title else CRITICAL,
                 line,
                 f"{words}-word heading, likely body text or fused headings: "
                 f"{preview(title)}",
             )
-        elif len(ENUMERATOR.findall(" " + title)) > 1:
+        elif len(ENUMERATOR.findall(" " + CASE_VERSUS.sub("versus ", title))) > 1:
             report.add(
                 "heading.fused",
                 CRITICAL,
@@ -721,6 +878,8 @@ def verify(path: Path, reference: Path | None, source: Path | None) -> DocumentR
     report.stats["blocks"] = len(blocks)
 
     check_footnotes(blocks, report)
+    check_pagination_artifacts(blocks, report)
+    check_blank_boundary_continuations(blocks, report)
     check_body(blocks, report)
     check_headings(blocks, report)
     if reference is not None:

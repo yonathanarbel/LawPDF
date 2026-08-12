@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{CStr, CString};
 #[cfg(any(feature = "devtools", test))]
 use std::ffi::{OsStr, OsString};
@@ -50,7 +50,8 @@ const LM2_D1_RUNTIME_FOOTER_ARTIFACT_OVERLAY_VERSION: &str =
     "d1-footer-artifact-v1-guarded-no-contact";
 const LM2_FOOTNOTE_MONOTONE_OVERLAY_VERSION: &str = "footnote-monotone-v1-marker-context";
 const LM2_FOOTNOTE_CARRYOVER_OVERLAY_VERSION: &str = "footnote-carryover-v1-open-prev-smallfont";
-const LM2_ASSEMBLY_CACHE_VERSION: &str = "lm2-assembly-v35-canonical-heading-boundaries";
+const LM2_ASSEMBLY_CACHE_VERSION: &str = "lm2-assembly-v153-callout-gap-first-row-guard";
+const LM2_MAX_NOTE_MARKER: u16 = 999;
 const LM2_TABLE_FIGURE_ROUTER_OVERLAY_VERSION: &str = "table-figure-router-v4-default-on";
 const LM2_PAGE_OBJECT_OVERLAY_VERSION: &str = "page-object-overlay-v1-guarded-ruled-path";
 const LM2_PAGE_OBJECT_TUNED_OVERLAY_VERSION: &str =
@@ -293,6 +294,8 @@ const LM2_NATIVE_CATBOOST_FLOAT_FEATURES: [&str; 116] = [
 ];
 /// Fewer candidate note heads than this and the sequence says nothing.
 const NOTE_SEQUENCE_MIN_CANDIDATES: usize = 8;
+/// A compact run of explicit document markers is already strong provenance.
+const DOCUMENT_NOTE_SEQUENCE_MIN_CANDIDATES: usize = 4;
 const LM2_NATIVE_CATBOOST_CAT_FEATURES: [&str; 14] = [
     "page_zone_y",
     "page_zone_x",
@@ -2662,7 +2665,28 @@ pub fn prepare_liquid_mode2_document_with_timing(
             &mut decoded,
         );
     }
+    apply_hidden_numbered_note_head_recovery(&mut decoded);
+    apply_explicit_endnote_section_guard(&mut decoded);
+    apply_preceding_small_font_note_continuation_guard(&mut decoded);
+    // The note-head model resolves definitions that were still ambiguous when
+    // the early body overlay ran. Re-run the guarded page sequence now so
+    // flattened multi-digit callouts can use those newly established heads
+    // before block assembly's more permissive one-digit recovery.
+    apply_decoded_page_sequence_callout_recovery(&mut decoded);
+    apply_repository_cover_guard(&mut decoded);
+    apply_strict_no_dot_toc_page_guard(&mut decoded);
+    apply_dense_dotleader_toc_run_guard(&mut decoded);
+    apply_final_assembly_safety_guards(&mut decoded);
+    apply_isolated_body_noise_tail_recovery(&mut decoded);
+    apply_numbered_table_figure_band_role_hints(&mut decoded);
+    // The final furniture guard can still inherit a stale Noise hint for a
+    // terse `N. Id.` line. Reassert the narrower physical note-head rule after
+    // every line-level overlay has finished.
+    apply_hidden_numbered_note_head_recovery(&mut decoded);
+    apply_same_segment_statutory_subdivision_body_rescue(&mut decoded);
     let article_spans = detect_lm2_article_spans(&decoded, request.pages.len());
+    apply_document_discretionary_hyphen_repairs(&mut decoded);
+    apply_document_fused_word_spacing_repairs(&mut decoded);
     timing.overlay_decode_ms = overlay_started.elapsed().as_secs_f64() * 1000.0;
 
     let assembly_started = Instant::now();
@@ -2684,16 +2708,206 @@ pub fn prepare_liquid_mode2_document_with_timing(
     };
     let (title, mut blocks, mut block_source_lines) =
         build_lm2_blocks_with_grouping(&request.title, &decoded, grouping.as_ref(), &article_spans);
+    apply_leading_letterspaced_author_recovery(&mut blocks, &mut block_source_lines);
+    apply_false_marginalia_note_head_reflow(&mut blocks, &mut block_source_lines);
     if runtime.action_neutral_blocksplit {
         apply_action_neutral_blocksplit(&mut blocks, &mut block_source_lines, &decoded);
     }
-    apply_heading_outline_splits(&mut blocks, &mut block_source_lines);
+    apply_heading_outline_splits(&mut blocks, &mut block_source_lines, &decoded);
     apply_heading_continuation_reflow(&mut blocks, &mut block_source_lines, &decoded);
+    apply_heading_leading_source_continuation_split(&mut blocks, &mut block_source_lines, &decoded);
+    apply_front_matter_abstract_author_reflow(&mut blocks, &mut block_source_lines);
+    apply_front_matter_byline_abstract_split(&mut blocks, &mut block_source_lines);
+    apply_hidden_numbered_note_block_recovery(&mut blocks, &mut block_source_lines, &decoded);
+    apply_hidden_numbered_note_block_split_recovery(&mut blocks, &mut block_source_lines, &decoded);
+    // Hidden-note recovery can expose the true head immediately before a
+    // citation pincite that was itself mistaken for a note number.  Re-run
+    // the provenance-backed reflow now that the true head is visible.
+    apply_false_marginalia_note_head_reflow(&mut blocks, &mut block_source_lines);
+    apply_table_figure_block_role_routing(&mut blocks, &block_source_lines, &decoded);
+    // The first pass establishes the main table cluster. A repeated header on
+    // the next page can only be recognized after that cluster is visible.
+    apply_table_figure_block_role_routing(&mut blocks, &block_source_lines, &decoded);
+    apply_front_matter_contents_block_suppression(&mut blocks, &mut block_source_lines);
+    apply_interleaved_note_continuation_reflow(&mut blocks, &mut block_source_lines, &decoded);
+    apply_inline_body_callout_marginalia_reflow(&mut blocks, &mut block_source_lines, &decoded);
+    apply_geometry_backed_leading_callout_bridge(&mut blocks, &mut block_source_lines, &decoded);
+    apply_mixed_marginalia_leading_body_callout_split(
+        &mut blocks,
+        &mut block_source_lines,
+        &decoded,
+    );
+    apply_contiguous_body_marginalia_reflow(&mut blocks, &mut block_source_lines, &decoded);
     apply_deferred_marginalia_reflow(&mut blocks, &mut block_source_lines);
+    apply_above_note_body_marginalia_rescue(&mut blocks, &block_source_lines, &decoded);
+    apply_body_callout_marginalia_rescue(&mut blocks, &block_source_lines, &decoded);
+    apply_physical_sequential_note_head_recovery(&mut blocks, &mut block_source_lines, &decoded);
+    apply_recovered_trailing_note_marker_reflow(&mut blocks, &mut block_source_lines, &decoded);
+    apply_local_monotone_ascii_callout_recovery(&mut blocks, &mut block_source_lines, &decoded);
+    apply_mixed_marginalia_leading_body_callout_split(
+        &mut blocks,
+        &mut block_source_lines,
+        &decoded,
+    );
+    apply_page_sequence_ascii_callout_recovery(&mut blocks, &mut block_source_lines);
+    // The page matcher establishes additional accepted heads. Feed that
+    // stronger provenance back through the exact-successor fixed point, then
+    // recover locally bracketed whitespace-separated body callouts.
+    apply_body_backed_bare_note_head_recovery(&mut blocks, &mut block_source_lines, &decoded);
+    apply_physical_sequential_note_head_recovery(&mut blocks, &mut block_source_lines, &decoded);
+    apply_recovered_trailing_note_marker_reflow(&mut blocks, &mut block_source_lines, &decoded);
+    apply_local_monotone_ascii_callout_recovery(&mut blocks, &mut block_source_lines, &decoded);
+    apply_mixed_marginalia_leading_body_callout_split(
+        &mut blocks,
+        &mut block_source_lines,
+        &decoded,
+    );
     apply_attached_terminal_callout_recovery(&mut blocks, &block_source_lines);
     apply_in_block_standalone_callout_recovery(&mut blocks, &block_source_lines, &decoded);
+    apply_same_row_leading_callout_reflow(&mut blocks, &mut block_source_lines, &decoded);
     apply_numeric_footer_furniture_suppression(&mut blocks, &block_source_lines, &decoded);
+    // Rescue passes can demote a source-backed outline label while fixing its
+    // surrounding body flow. Reapply the provenance-gated splitter only after
+    // all such role mutations are complete.
+    apply_heading_outline_splits(&mut blocks, &mut block_source_lines, &decoded);
+    apply_sandwiched_numbered_outline_recovery(&mut blocks, &mut block_source_lines);
+    // Later body/marginalia rescue passes can conservatively demote a true
+    // single-line definition that the early hidden-note pass recovered.  Make
+    // provenance-backed note heads and adjacent false pincites stable at the
+    // final block boundary before linking.
+    apply_hidden_numbered_note_block_recovery(&mut blocks, &mut block_source_lines, &decoded);
+    apply_false_marginalia_note_head_reflow(&mut blocks, &mut block_source_lines);
+    // Later rescue passes can be what finally settles the preceding physical
+    // note as Marginalia. Re-run the provenance-backed continuation repair at
+    // that stable boundary so an interleaved small-font line cannot remain in
+    // body prose merely because its note target was still ambiguous earlier.
+    apply_sandwiched_body_noise_reflow(&mut blocks, &mut block_source_lines, &decoded);
+    apply_source_gap_body_line_reflow(&mut blocks, &mut block_source_lines, &decoded);
+    apply_embedded_small_font_note_continuation_split(
+        &mut blocks,
+        &mut block_source_lines,
+        &decoded,
+    );
+    // Late source-gap and small-font repairs can settle a body-shaped quote as
+    // markerless Marginalia only after the first above-note rescue ran. Give
+    // that same provenance-gated rescue one final pass before note reflow.
+    apply_above_note_body_marginalia_rescue(&mut blocks, &block_source_lines, &decoded);
+    apply_interleaved_note_continuation_reflow(&mut blocks, &mut block_source_lines, &decoded);
+    apply_final_source_backed_paragraph_splits(&mut blocks, &mut block_source_lines, &decoded);
+    // A newly exposed paragraph boundary can also reveal that the following
+    // source line is a numbered note head. Re-run provenance-backed role
+    // recovery so the split cannot strand that definition in body prose.
+    apply_hidden_numbered_note_block_recovery(&mut blocks, &mut block_source_lines, &decoded);
+    apply_false_marginalia_note_head_reflow(&mut blocks, &mut block_source_lines);
+    // A same-row inline callout can only use its accepted definition after the
+    // late hidden-note pass has recovered that definition's provenance. Re-run
+    // the idempotent bridge here so the adjacent lowercase body row is joined
+    // before the final source-backed splitter.
+    apply_same_row_leading_callout_reflow(&mut blocks, &mut block_source_lines, &decoded);
+    apply_final_physical_footnote_segment_guard(&mut blocks, &mut block_source_lines, &decoded);
+    // The final source-backed split can likewise expose the middle of a
+    // cross-page footnote segment as a standalone Paragraph. Run the guarded
+    // sequential-boundary closure to a tiny fixed point at this stable block
+    // boundary: the first pass can settle the adjacent markerless segment or
+    // numbered target that the second pass then uses as its boundary proof.
+    for _ in 0..2 {
+        if apply_interleaved_note_continuation_reflow(
+            &mut blocks,
+            &mut block_source_lines,
+            &decoded,
+        ) == 0
+        {
+            break;
+        }
+    }
+    // Some body-shaped displays and top-of-page note continuations only have
+    // stable ownership after the final note fixed point.  Re-assert those
+    // source-backed roles here, after no broad rescue pass remains.
+    apply_final_displayed_body_role_rescue(&mut blocks, &mut block_source_lines, &decoded);
+    apply_final_mixed_furniture_prefix_suppression(&mut blocks, &mut block_source_lines, &decoded);
+    apply_final_physical_footnote_segment_guard(&mut blocks, &mut block_source_lines, &decoded);
+    for _ in 0..2 {
+        if apply_interleaved_note_continuation_reflow(
+            &mut blocks,
+            &mut block_source_lines,
+            &decoded,
+        ) == 0
+        {
+            break;
+        }
+    }
+    // Nothing note-oriented runs after this point, so a rescued display cannot
+    // be pulled back into a numbered definition.
+    apply_final_displayed_body_role_rescue(&mut blocks, &mut block_source_lines, &decoded);
+    // The native model can emit one continuation row immediately before its
+    // numbered head in block order even though the source coordinates are
+    // head, continuation, then the remainder of the note. Run this only after
+    // the final role/split fixed point, where those three blocks are stable.
+    apply_inverted_numbered_note_continuation_reflow(
+        &mut blocks,
+        &mut block_source_lines,
+        &decoded,
+    );
+    apply_final_caption_continuation_reflow(&mut blocks, &mut block_source_lines, &decoded);
+    apply_final_noise_inline_callout_bridge(&mut blocks, &mut block_source_lines, &decoded);
+    apply_final_fused_heading_body_splits(&mut blocks, &mut block_source_lines, &decoded);
+    apply_final_body_source_order_and_coalescing(&mut blocks, &mut block_source_lines, &decoded);
+    // Reassert source-backed display boundaries after the first ordering pass,
+    // then run the same guarded coalescer once more. The splitter can expose a
+    // wrapped body row that was not a separate block during the first pass;
+    // the coalescer already treats displayed labels, font cliffs, and genuine
+    // paragraph boundaries as hard stops.
+    apply_final_source_backed_paragraph_splits(&mut blocks, &mut block_source_lines, &decoded);
+    apply_final_body_source_order_and_coalescing(&mut blocks, &mut block_source_lines, &decoded);
+    // Keep displayed labels separated after the last flow join. The splitter
+    // explicitly ignores source-proven lowercase wraps, so this pass is
+    // idempotent for repaired body flow while retaining real definitions.
+    apply_final_source_backed_paragraph_splits(&mut blocks, &mut block_source_lines, &decoded);
+    // The last splitter can expose a source-role boundary (for example a
+    // callout-bearing row tagged Heading or Marginalia) even though the exact
+    // adjacent source geometry proves one lowercase body flow. Nothing after
+    // this pass can split the repaired flow again.
+    apply_final_body_source_order_and_coalescing(&mut blocks, &mut block_source_lines, &decoded);
+    // Reassert the strongest paired note evidence only after every broad
+    // role/reflow pass has finished. A local callout rewrite may expose one
+    // last body join, so coalesce once and then reassert definition markers at
+    // the terminal boundary where nothing can demote them again.
+    apply_body_backed_bare_note_head_recovery(&mut blocks, &mut block_source_lines, &decoded);
+    apply_physical_sequential_note_head_recovery(&mut blocks, &mut block_source_lines, &decoded);
+    apply_recovered_trailing_note_marker_reflow(&mut blocks, &mut block_source_lines, &decoded);
+    apply_local_monotone_ascii_callout_recovery(&mut blocks, &mut block_source_lines, &decoded);
+    apply_mixed_marginalia_leading_body_callout_split(
+        &mut blocks,
+        &mut block_source_lines,
+        &decoded,
+    );
+    apply_final_body_source_order_and_coalescing(&mut blocks, &mut block_source_lines, &decoded);
+    apply_body_backed_bare_note_head_recovery(&mut blocks, &mut block_source_lines, &decoded);
+    apply_physical_sequential_note_head_recovery(&mut blocks, &mut block_source_lines, &decoded);
+    apply_recovered_trailing_note_marker_reflow(&mut blocks, &mut block_source_lines, &decoded);
+    apply_attached_terminal_callout_recovery(&mut blocks, &block_source_lines);
+    apply_mixed_marginalia_leading_body_callout_split(
+        &mut blocks,
+        &mut block_source_lines,
+        &decoded,
+    );
+    apply_terminal_out_of_order_callout_fragment_reflow(&mut blocks, &block_source_lines, &decoded);
+    apply_source_backed_dotted_numeric_callout_restoration(&mut blocks, &block_source_lines);
     apply_leading_callout_backfill(&mut blocks, &block_source_lines);
+    apply_adjacent_duplicate_callout_suppression(&mut blocks);
+    apply_sandwiched_note_url_continuation_reflow(&mut blocks, &mut block_source_lines, &decoded);
+    apply_final_source_backed_figure_caption_isolation(
+        &mut blocks,
+        &mut block_source_lines,
+        &decoded,
+    );
+    apply_final_body_source_order_and_coalescing(&mut blocks, &mut block_source_lines, &decoded);
+    // The terminal body coalescer can finally place a low-font statutory
+    // subdivision directly between its colon lead-in and numbered children.
+    // Re-run the structural display rescue at this stable boundary so the
+    // Markdown note assembler cannot absorb that body display into an open
+    // cross-page footnote.
+    apply_final_displayed_body_role_rescue(&mut blocks, &mut block_source_lines, &decoded);
     let mut warnings = if runtime.native_line_model_active() {
         vec![format!(
             "Review Mode uses {} raw no-stack emissions.",
@@ -2902,7 +3116,125 @@ fn detect_lm2_article_spans(
                 || line.segment_block_footnote_like,
         })
         .collect::<Vec<_>>();
-    detect_article_spans(&lines, page_count)
+    let detected = detect_article_spans(&lines, page_count);
+    filter_lm2_false_article_spans(detected, decoded, page_count)
+}
+
+fn filter_lm2_false_article_spans(
+    detected: Vec<ArticleSpan>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+    page_count: usize,
+) -> Vec<ArticleSpan> {
+    if detected.len() <= 1 {
+        return detected;
+    }
+    let mut kept = detected
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, span)| {
+            (index == 0 || !lm2_false_article_boundary(&span, decoded)).then_some(span)
+        })
+        .collect::<Vec<_>>();
+    for index in 0..kept.len() {
+        kept[index].article_index = index;
+        if let Some((next_page, next_line)) = kept
+            .get(index + 1)
+            .map(|next| (next.start_page_index, next.start_line_index))
+        {
+            kept[index].end_page_index = next_page;
+            kept[index].end_line_index = next_line;
+        } else {
+            kept[index].end_page_index = page_count;
+            kept[index].end_line_index = 0;
+        }
+    }
+    kept
+}
+
+fn lm2_false_article_boundary(
+    span: &ArticleSpan,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> bool {
+    if span.start_page_index == 0 {
+        return false;
+    }
+    let caption_band = decoded.iter().any(|(line, _)| {
+        line.page_index == span.start_page_index
+            && line.line_index <= 8
+            && lm2_numbered_table_figure_caption(&line.text)
+    });
+    if caption_band {
+        return true;
+    }
+
+    let typography_only_internal_outline = span.confidence <= 0.60
+        && span
+            .title_hint
+            .as_deref()
+            .is_some_and(lm2_internal_outline_title_hint)
+        && !span
+            .evidence
+            .iter()
+            .any(|item| matches!(item.kind.as_str(), "publication_section" | "footnote_reset"));
+    typography_only_internal_outline
+}
+
+fn lm2_numbered_table_figure_caption(text: &str) -> bool {
+    let normalized = normalize_text(text);
+    let mut words = normalized.split_whitespace();
+    if !matches!(words.next(), Some("table" | "figure" | "fig.")) {
+        return false;
+    }
+    words.next().is_some_and(|token| {
+        let marker = token.trim_matches(|ch: char| matches!(ch, '.' | ':' | ')' | ']'));
+        !marker.is_empty()
+            && marker.len() <= 8
+            && (marker.chars().all(|ch| ch.is_ascii_digit())
+                || marker.chars().all(|ch| {
+                    matches!(
+                        ch.to_ascii_lowercase(),
+                        'i' | 'v' | 'x' | 'l' | 'c' | 'd' | 'm'
+                    )
+                }))
+    })
+}
+
+fn lm2_explicit_numbered_table_figure_caption(text: &str) -> bool {
+    let normalized = normalize_text(text);
+    let mut words = normalized.split_whitespace();
+    if !matches!(words.next(), Some("table" | "figure" | "fig.")) {
+        return false;
+    }
+    words.next().is_some_and(|token| {
+        let has_caption_punctuation = token.ends_with(':');
+        let marker = token.trim_end_matches(':');
+        has_caption_punctuation
+            && !marker.is_empty()
+            && marker.len() <= 8
+            && (marker.chars().all(|ch| ch.is_ascii_digit())
+                || marker.chars().all(|ch| {
+                    matches!(
+                        ch.to_ascii_lowercase(),
+                        'i' | 'v' | 'x' | 'l' | 'c' | 'd' | 'm'
+                    )
+                }))
+    })
+}
+
+fn lm2_internal_outline_title_hint(text: &str) -> bool {
+    let token = text.split_whitespace().next().unwrap_or_default();
+    if !token.ends_with('.') && !token.ends_with(')') {
+        return false;
+    }
+    let marker = token.trim_matches(|ch: char| matches!(ch, '(' | ')' | '.'));
+    !marker.is_empty()
+        && marker.len() <= 8
+        && marker.chars().all(|ch| {
+            matches!(
+                ch.to_ascii_lowercase(),
+                'i' | 'v' | 'x' | 'l' | 'c' | 'd' | 'm'
+            )
+        })
 }
 
 pub(crate) fn trace_article_spans_from_source_lines(
@@ -3615,7 +3947,7 @@ fn lm2_note_head_normalized_text(text: &str) -> Option<(u16, String)> {
         digits.push(ch);
     }
     let marker = digits.parse::<u16>().ok()?;
-    if !(1..=500).contains(&marker) {
+    if !(1..=LM2_MAX_NOTE_MARKER).contains(&marker) {
         return None;
     }
     let remainder = trimmed.get(end?..)?.trim_start();
@@ -4229,7 +4561,7 @@ fn apply_note_head_model(
             if trace
                 && (line.text.trim_start().starts_with(CALLOUT_START) || line.doc_note_marker > 0)
             {
-                eprintln!(
+                println!(
                     "note-head skipped page={} line={} marker={} action={} text={:?}",
                     line.page_index,
                     line.line_index,
@@ -6238,6 +6570,209 @@ fn apply_document_toc_overlay(decoded: &mut [(DeepLiquidSourceLine, Lm2Action)])
     }
 }
 
+/// Hide an early contents page that uses aligned terminal page locators rather
+/// than dot leaders.  This guard is intentionally page-bounded: a literal
+/// contents header plus several outline rows must be present, and only the run
+/// from that header through the final locator is affected.  A real article
+/// paragraph later on the same page is therefore preserved.
+fn apply_strict_no_dot_toc_page_guard(decoded: &mut [(DeepLiquidSourceLine, Lm2Action)]) -> usize {
+    let mut by_page = BTreeMap::<usize, Vec<(usize, usize)>>::new();
+    for (decoded_index, (line, _)) in decoded.iter().enumerate() {
+        if line.page_index <= 4 {
+            by_page
+                .entry(line.page_index)
+                .or_default()
+                .push((line.line_index, decoded_index));
+        }
+    }
+
+    let mut ranges = Vec::<(usize, usize, usize)>::new();
+    for (page_index, mut lines) in by_page {
+        lines.sort_by_key(|(line_index, _)| *line_index);
+        let Some((header_position, (header_line, _))) =
+            lines.iter().enumerate().find(|(_, (_, decoded_index))| {
+                matches!(
+                    normalize_text(&decoded[*decoded_index].0.text).as_str(),
+                    "contents" | "article contents" | "table of contents"
+                )
+            })
+        else {
+            continue;
+        };
+
+        let mut locator_rows = 0usize;
+        let mut outline_rows = 0usize;
+        let mut last_locator_line = None;
+        for (line_index, decoded_index) in lines.iter().skip(header_position + 1) {
+            let text = collapse_whitespace(&decoded[*decoded_index].0.text);
+            let Some(title) = lm2_toc_strip_trailing_locator(&text) else {
+                continue;
+            };
+            locator_rows += 1;
+            outline_rows += usize::from(lm2_toc_outline_row(&title));
+            last_locator_line = Some(*line_index);
+        }
+        if locator_rows >= 4
+            && outline_rows >= 3
+            && let Some(last_locator_line) = last_locator_line
+        {
+            ranges.push((page_index, *header_line, last_locator_line));
+        }
+    }
+
+    let mut changed = 0usize;
+    for (line, action) in decoded.iter_mut() {
+        if ranges.iter().any(|(page_index, first, last)| {
+            line.page_index == *page_index && (*first..=*last).contains(&line.line_index)
+        }) {
+            if *action != Lm2Action::HideNoise || line.role_hint != Some(LiquidBlockRole::Contents)
+            {
+                changed += 1;
+            }
+            *action = Lm2Action::HideNoise;
+            line.role_hint = Some(LiquidBlockRole::Contents);
+        }
+    }
+    changed
+}
+
+/// Hide an early dotleader contents run as a page sequence, including title
+/// fragments that were emitted on the line immediately before their locator.
+/// Some journals omit a literal `Contents` header and continue the final two
+/// locator rows onto the next page before the real `INTRODUCTION` heading.
+fn apply_dense_dotleader_toc_run_guard(decoded: &mut [(DeepLiquidSourceLine, Lm2Action)]) -> usize {
+    let mut by_page = BTreeMap::<usize, Vec<(usize, usize)>>::new();
+    for (decoded_index, (line, _)) in decoded.iter().enumerate() {
+        if line.page_index <= 2 {
+            by_page
+                .entry(line.page_index)
+                .or_default()
+                .push((line.line_index, decoded_index));
+        }
+    }
+    for lines in by_page.values_mut() {
+        lines.sort_by_key(|(line_index, _)| *line_index);
+    }
+
+    let dense_pages = by_page
+        .iter()
+        .filter_map(|(page_index, lines)| {
+            let leaders = lines
+                .iter()
+                .filter(|(_, decoded_index)| {
+                    lm2_toc_dotleader_line(&decoded[*decoded_index].0.text)
+                })
+                .count();
+            (leaders >= 4).then_some(*page_index)
+        })
+        .collect::<HashSet<_>>();
+    if dense_pages.is_empty() {
+        return 0;
+    }
+
+    let mut ranges = Vec::<(usize, usize, usize)>::new();
+    for page_index in dense_pages.iter().copied() {
+        let Some(lines) = by_page.get(&page_index) else {
+            continue;
+        };
+        let Some(first) = lines
+            .iter()
+            .find(|(_, decoded_index)| lm2_toc_dotleader_line(&decoded[*decoded_index].0.text))
+            .map(|(line_index, _)| *line_index)
+        else {
+            continue;
+        };
+        let last = lines
+            .iter()
+            .rev()
+            .find(|(_, decoded_index)| lm2_toc_dotleader_line(&decoded[*decoded_index].0.text))
+            .map(|(line_index, _)| *line_index)
+            .unwrap_or(first);
+        ranges.push((page_index, first, last));
+
+        let next_page = page_index + 1;
+        let Some(next_lines) = by_page.get(&next_page) else {
+            continue;
+        };
+        let first_body_heading = next_lines.iter().find(|(_, decoded_index)| {
+            matches!(
+                normalize_text(&decoded[*decoded_index].0.text).as_str(),
+                "introduction" | "conclusion"
+            )
+        });
+        let Some((body_line, _)) = first_body_heading else {
+            continue;
+        };
+        let continuation_leaders = next_lines
+            .iter()
+            .filter(|(line_index, decoded_index)| {
+                *line_index < *body_line && lm2_toc_dotleader_line(&decoded[*decoded_index].0.text)
+            })
+            .map(|(line_index, _)| *line_index)
+            .collect::<Vec<_>>();
+        if let (Some(first), Some(last)) = (
+            continuation_leaders.first().copied(),
+            continuation_leaders.last().copied(),
+        ) {
+            ranges.push((next_page, first, last));
+        }
+    }
+
+    let mut changed = 0usize;
+    for (line, action) in decoded.iter_mut() {
+        if ranges.iter().any(|(page_index, first, last)| {
+            line.page_index == *page_index && (*first..=*last).contains(&line.line_index)
+        }) {
+            if *action != Lm2Action::HideNoise || line.role_hint != Some(LiquidBlockRole::Contents)
+            {
+                changed += 1;
+            }
+            *action = Lm2Action::HideNoise;
+            line.role_hint = Some(LiquidBlockRole::Contents);
+        }
+    }
+    changed
+}
+
+fn lm2_toc_strip_trailing_locator(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let split = trimmed.rfind(char::is_whitespace)?;
+    let title = trimmed[..split].trim_end();
+    let locator = trimmed[split..]
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '.' | ',' | ')' | ']' | ':'));
+    if title.is_empty() || locator.is_empty() || locator.len() > 8 {
+        return None;
+    }
+    let numeric = locator.len() <= 4 && locator.chars().all(|ch| ch.is_ascii_digit());
+    let roman = locator.chars().all(|ch| {
+        matches!(
+            ch.to_ascii_lowercase(),
+            'i' | 'v' | 'x' | 'l' | 'c' | 'd' | 'm'
+        )
+    });
+    (numeric || roman).then(|| title.to_owned())
+}
+
+fn lm2_toc_outline_row(title: &str) -> bool {
+    let lower = normalize_text(title);
+    if lower.starts_with("introduction") || lower.starts_with("conclusion") {
+        return true;
+    }
+    let token = title.split_whitespace().next().unwrap_or_default();
+    let marker = token.trim_matches(|ch| matches!(ch, '(' | ')' | '.' | ':' | ';'));
+    (!marker.is_empty()
+        && marker.len() <= 8
+        && marker.chars().all(|ch| {
+            matches!(
+                ch.to_ascii_lowercase(),
+                'i' | 'v' | 'x' | 'l' | 'c' | 'd' | 'm'
+            )
+        }))
+        || (marker.len() == 1 && marker.chars().all(|ch| ch.is_ascii_alphabetic()))
+        || (marker.len() <= 2 && marker.chars().all(|ch| ch.is_ascii_digit()))
+}
+
 fn apply_front_matter_guard(decoded: &mut [(DeepLiquidSourceLine, Lm2Action)]) {
     for (line, action) in decoded.iter_mut() {
         if *action != Lm2Action::Keep {
@@ -7149,6 +7684,788 @@ fn d1_runtime_footer_artifact_candidate(text: &str) -> bool {
         || lower.contains("brought to you for free and open access")
 }
 
+/// Enforce only the high-confidence role boundaries needed for safe block
+/// assembly. Learned decoders may intentionally replace layout hints, but a
+/// divider, a recognisable running head at the first line of a page, or
+/// repository boilerplate at the physical page edge must never be flattened
+/// into surrounding prose. Likewise, a small-font line already identified by
+/// the layout pass as marginalia and placed inside the footnote zone must not
+/// be promoted back into body text by a later overlay.
+fn apply_final_assembly_safety_guards(decoded: &mut [(DeepLiquidSourceLine, Lm2Action)]) {
+    for (line, action) in decoded.iter_mut() {
+        let text = collapse_whitespace(&line.text);
+        let lower = normalize_text(&text);
+        let page_height = line.page_height.max(1.0);
+        let at_physical_edge = line.top <= page_height * 0.08 || line.bottom >= page_height * 0.88;
+        let hard_furniture = lm2_blocksplit_divider_like(&text)
+            || lower == "footnote continued on next page"
+            || (looks_like_running_header(&lower) && (line.line_index <= 2 || at_physical_edge))
+            || (d1_runtime_footer_artifact_candidate(&text) && at_physical_edge)
+            || (line.doc_repeated_edge_text
+                && (line.doc_repeated_top_edge || line.doc_repeated_bottom_edge))
+            || looks_like_page_label_furniture(&text);
+        if hard_furniture {
+            *action = Lm2Action::HideNoise;
+            line.role_hint = Some(LiquidBlockRole::Noise);
+            continue;
+        }
+
+        // `segment_block_toc_like` is deliberately not authoritative here.
+        // PyMuPDF can place the final contents rows and the first real article
+        // paragraph in one segment; hiding the whole segment then deletes body
+        // text and any footnotes on that page.  The line-local leader tests are
+        // strong enough for this final safety pass.  No-leader contents pages
+        // are handled by the bounded page-level overlay instead.
+        if lm2_toc_dotleader_line(&text) || lm2_toc_dotleader_fallback(line) {
+            *action = Lm2Action::HideNoise;
+            line.role_hint = Some(LiquidBlockRole::Contents);
+            continue;
+        }
+
+        if *action == Lm2Action::HideNoise
+            && line.role_hint != Some(LiquidBlockRole::Contents)
+            && !at_physical_edge
+            && word_count(&text) <= 20
+            && uppercase_ratio(&text) >= 0.55
+            && lm2_substantive_section_heading(&text)
+        {
+            *action = Lm2Action::Keep;
+            line.role_hint = Some(LiquidBlockRole::Heading);
+            continue;
+        }
+
+        let marginalia_hint = line.role_hint.is_some_and(|role| {
+            matches!(
+                role,
+                LiquidBlockRole::Footnote | LiquidBlockRole::Marginalia
+            )
+        });
+        let footnote_geometry = line.in_footnote_zone || line.below_footnote_divider;
+        let footnote_font = line.font_ratio_page_ref <= 0.92
+            || line.font_ratio_page <= 0.92
+            || line.font_ratio_doc <= 0.92;
+        if marginalia_hint && footnote_geometry && footnote_font {
+            *action = Lm2Action::Marginalia;
+            line.role_hint = Some(LiquidBlockRole::Footnote);
+        }
+    }
+}
+
+/// Recover a displayed statutory subdivision that the line model mistakes for
+/// footnote prose merely because it uses a smaller font.  The contract is the
+/// physical one visible in the source: an ordinary body line ending in a
+/// colon, followed in the very same body segment by a parenthesized letter and
+/// then a parenthesized number.  A footnote-zone or ruled/table line is never
+/// eligible.
+fn apply_same_segment_statutory_subdivision_body_rescue(
+    decoded: &mut [(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let mut by_page = BTreeMap::<usize, Vec<usize>>::new();
+    for (index, (line, _)) in decoded.iter().enumerate() {
+        by_page.entry(line.page_index).or_default().push(index);
+    }
+    for indices in by_page.values_mut() {
+        indices.sort_by_key(|index| decoded[*index].0.line_index);
+    }
+
+    let mut rescue = BTreeSet::new();
+    for indices in by_page.values() {
+        for anchor_position in 0..indices.len().saturating_sub(2) {
+            let anchor_index = indices[anchor_position];
+            let letter_index = indices[anchor_position + 1];
+            let (anchor, anchor_action) = &decoded[anchor_index];
+            let letter = &decoded[letter_index].0;
+            if *anchor_action != Lm2Action::Keep
+                || !anchor.text.trim_end().ends_with(':')
+                || !lm2_body_segment_line(anchor)
+                || !lm2_body_segment_line(letter)
+                || anchor.segment_block_id != letter.segment_block_id
+                || letter.line_index != anchor.line_index + 1
+                || !lm2_parenthesized_alpha_lead(&letter.text)
+                || letter.font_height > anchor.font_height * 0.92
+            {
+                continue;
+            }
+
+            let numeric_position = indices
+                .iter()
+                .enumerate()
+                .skip(anchor_position + 2)
+                .take(6)
+                .find_map(|(position, index)| {
+                    let line = &decoded[*index].0;
+                    (line.segment_block_id == anchor.segment_block_id
+                        && lm2_parenthesized_numeric_lead(&line.text))
+                    .then_some(position)
+                });
+            let Some(numeric_position) = numeric_position else {
+                continue;
+            };
+
+            let subdivision_font = letter.font_height.max(1.0);
+            for index in indices
+                .iter()
+                .skip(anchor_position + 1)
+                .take_while(|index| {
+                    let line = &decoded[**index].0;
+                    line.segment_block_id == anchor.segment_block_id
+                        && (line.line_index <= decoded[indices[numeric_position]].0.line_index
+                            || line.font_height <= subdivision_font * 1.10)
+                })
+            {
+                rescue.insert(*index);
+            }
+        }
+    }
+
+    let mut repaired = 0usize;
+    for index in rescue {
+        let (line, action) = &mut decoded[index];
+        if *action != Lm2Action::Keep || line.role_hint != Some(LiquidBlockRole::Paragraph) {
+            repaired += 1;
+        }
+        *action = Lm2Action::Keep;
+        line.role_hint = Some(LiquidBlockRole::Paragraph);
+    }
+    repaired
+}
+
+fn lm2_body_segment_line(line: &DeepLiquidSourceLine) -> bool {
+    line.segment_block_shape.eq_ignore_ascii_case("body")
+        && !line.in_footnote_zone
+        && !line.below_footnote_divider
+        && !line.in_ruled_cell
+        && !line.ruled_row_membership_exact
+        && !line.page_table_column_like
+        && !line.page_object_overlaps_image_bbox
+}
+
+/// A late note-continuation overlay can mark a small-font quotation or
+/// displayed definition as being in the note zone even when the page
+/// segmenter still proves that it belongs to an ordinary body block. This
+/// predicate deliberately ignores that mutable note-state, but retains the
+/// immutable body-shape and table/figure exclusion gates.
+fn lm2_source_backed_body_display_line(line: &DeepLiquidSourceLine) -> bool {
+    line.segment_block_id != 0
+        && line.segment_block_shape.eq_ignore_ascii_case("body")
+        && !line.segment_block_footnote_like
+        && !line.below_footnote_divider
+        && !line.in_ruled_cell
+        && !line.ruled_row_membership_exact
+        && !line.page_table_column_like
+        && !line.page_object_overlaps_image_bbox
+        && line.font_ratio_doc >= 0.84
+}
+
+fn lm2_parenthesized_alpha_lead(text: &str) -> bool {
+    let bytes = text.trim_start().as_bytes();
+    bytes.len() >= 4
+        && bytes[0] == b'('
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b')'
+        && bytes[3].is_ascii_whitespace()
+}
+
+fn lm2_parenthesized_numeric_lead(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let Some(remainder) = trimmed.strip_prefix('(') else {
+        return false;
+    };
+    let digits = remainder
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .count();
+    digits > 0 && remainder[digits..].starts_with(") ")
+}
+
+/// Restore a short final body row that a geometric segmenter isolated as table
+/// noise.  This is deliberately narrower than a general Noise rescue: the row
+/// must be the immediate continuation of an open body line, use the same left
+/// edge and font, be physically outside the note band, and end the sentence.
+/// A common instance is a final date row (`October 7, 2025.`) immediately above
+/// the page's real footnotes.
+fn apply_isolated_body_noise_tail_recovery(
+    decoded: &mut [(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let mut repaired = Vec::new();
+    for index in 1..decoded.len() {
+        let (previous_line, previous_action) = &decoded[index - 1];
+        let (line, action) = &decoded[index];
+        if *previous_action != Lm2Action::Keep
+            || *action != Lm2Action::HideNoise
+            || previous_line.page_index != line.page_index
+            || previous_line.line_index.checked_add(1) != Some(line.line_index)
+            || line.segment_block_line_count != 1
+            || line.in_footnote_zone
+            || line.below_footnote_divider
+            || line.doc_footnote_state
+            || line.doc_footnote_continuation
+            || line.doc_repeated_edge_text
+            || line.doc_repeated_top_edge
+            || line.doc_repeated_bottom_edge
+            || line.page_object_overlaps_image_bbox
+            || line.in_ruled_cell
+            || line.ruled_row_membership_exact
+            || line.page_object_path_stroke_near_line_count > 0
+            || lm2_numbered_table_figure_caption(&line.text)
+            || leading_explicit_numbered_note_marker(&line.text).is_some()
+            || note_head_marker(&line.text).is_some()
+            || looks_like_running_header(&normalize_text(&line.text))
+            || looks_like_small_font_page_furniture(&normalize_text(&line.text))
+            || lm2_blocksplit_ends_like_paragraph(&previous_line.text)
+            || !lm2_blocksplit_ends_like_paragraph(&line.text)
+            || !(2..=12).contains(&word_count(&line.text))
+        {
+            continue;
+        }
+        let page_width = line.page_width.max(previous_line.page_width).max(1.0);
+        let same_left = (line.left - previous_line.left).abs() / page_width <= 0.012;
+        let font_ratio = if previous_line.font_height > 0.0 {
+            line.font_height / previous_line.font_height
+        } else {
+            0.0
+        };
+        let body_sized = (0.96..=1.04).contains(&font_ratio)
+            && line.font_ratio_page_ref >= 0.94
+            && line.font_ratio_page >= 0.94
+            && line.font_ratio_doc >= 0.94;
+        if same_left && body_sized {
+            repaired.push(index);
+        }
+    }
+    for index in repaired.iter().copied() {
+        decoded[index].1 = Lm2Action::Keep;
+        decoded[index].0.role_hint = Some(LiquidBlockRole::Paragraph);
+    }
+    repaired.len()
+}
+
+/// Preserve numbered table/figure bands as structured non-body content.  The
+/// caption itself is protected independently of band detection so a running
+/// header cannot swallow bare `Table 1` / `Figure 1` labels.  For tables, use
+/// source geometry to stop at either a real numbered note head or the familiar
+/// first-line-indent/body-margin return after the final row.  This also ignores
+/// a table rule that PDF extraction mislabeled as a footnote divider.
+fn apply_numbered_table_figure_band_role_hints(
+    decoded: &mut [(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let mut by_page = BTreeMap::<usize, Vec<usize>>::new();
+    for (decoded_index, (line, _)) in decoded.iter().enumerate() {
+        by_page
+            .entry(line.page_index)
+            .or_default()
+            .push(decoded_index);
+    }
+    for indices in by_page.values_mut() {
+        indices.sort_by_key(|index| decoded[*index].0.line_index);
+    }
+
+    let mut forced_roles = BTreeMap::<usize, LiquidBlockRole>::new();
+    let mut continuation_pages = BTreeSet::<usize>::new();
+
+    for (page_index, indices) in &by_page {
+        let captions = indices
+            .iter()
+            .enumerate()
+            .filter(|(_, index)| lm2_display_table_figure_caption(&decoded[**index].0))
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>();
+        for caption_position in captions {
+            let caption_index = indices[caption_position];
+            let caption = &decoded[caption_index].0;
+            forced_roles.insert(caption_index, LiquidBlockRole::Caption);
+
+            let mut content_start = caption_position + 1;
+            if word_count(&caption.text) <= 3
+                && let Some(next_index) = indices.get(content_start).copied()
+                && lm2_table_figure_subtitle(&decoded[next_index].0)
+            {
+                forced_roles.insert(next_index, LiquidBlockRole::Caption);
+                content_start += 1;
+            }
+
+            if lm2_display_table_caption(caption) {
+                let (end_position, stopped_at_note) =
+                    lm2_numbered_table_band_end(decoded, indices, content_start);
+                for index in indices
+                    .iter()
+                    .take(end_position)
+                    .skip(content_start)
+                    .copied()
+                {
+                    forced_roles.insert(index, LiquidBlockRole::Table);
+                }
+                if stopped_at_note && end_position > content_start {
+                    continuation_pages.insert(page_index.saturating_add(1));
+                }
+                continue;
+            }
+
+            // Preserve the existing false-divider figure recovery for vector
+            // labels. Raster figures often have no source lines in the image;
+            // in that case the caption/subtitle above are still retained.
+            let divider = indices
+                .iter()
+                .enumerate()
+                .skip(content_start)
+                .find(|(_, index)| decoded[**index].0.below_footnote_divider);
+            let Some((divider_position, divider_index)) = divider else {
+                continue;
+            };
+            let first_below = &decoded[*divider_index].0;
+            let first_below_is_body = leading_explicit_numbered_note_marker(&first_below.text)
+                .is_none()
+                && note_head_marker(&first_below.text).is_none()
+                && word_count(&first_below.text) >= 6
+                && (first_below.font_ratio_page_ref >= 0.94
+                    || first_below.font_ratio_page >= 0.94
+                    || first_below.font_ratio_doc >= 0.94);
+            if first_below_is_body {
+                for index in indices
+                    .iter()
+                    .take(divider_position)
+                    .skip(content_start)
+                    .copied()
+                {
+                    forced_roles.insert(index, LiquidBlockRole::Table);
+                }
+            }
+        }
+    }
+
+    // A table can continue on the next page after page-specific notes.  Skip
+    // only the leading repeated header/folio, then require several independent
+    // table-geometry votes near the page top before carrying the band forward.
+    let mut pending = continuation_pages.into_iter().collect::<Vec<_>>();
+    while let Some(page_index) = pending.pop() {
+        let Some(indices) = by_page.get(&page_index) else {
+            continue;
+        };
+        if indices
+            .iter()
+            .any(|index| lm2_display_table_figure_caption(&decoded[*index].0))
+        {
+            continue;
+        }
+        let content_start = indices
+            .iter()
+            .position(|index| !lm2_table_continuation_furniture(&decoded[*index].0))
+            .unwrap_or(indices.len());
+        if content_start == indices.len() {
+            continue;
+        }
+        let geometry_votes = indices
+            .iter()
+            .skip(content_start)
+            .take(10)
+            .filter(|index| lm2_table_geometry_vote(&decoded[**index].0))
+            .count();
+        if geometry_votes < 2 {
+            continue;
+        }
+        let (end_position, stopped_at_note) =
+            lm2_numbered_table_band_end(decoded, indices, content_start);
+        for index in indices
+            .iter()
+            .take(end_position)
+            .skip(content_start)
+            .copied()
+        {
+            forced_roles.insert(index, LiquidBlockRole::Table);
+        }
+        if stopped_at_note && end_position > content_start {
+            pending.push(page_index.saturating_add(1));
+        }
+    }
+
+    let mut changed = 0usize;
+    for (index, role) in forced_roles {
+        if decoded[index].1 != Lm2Action::HideNoise || decoded[index].0.role_hint != Some(role) {
+            changed += 1;
+        }
+        decoded[index].1 = Lm2Action::HideNoise;
+        decoded[index].0.role_hint = Some(role);
+    }
+    changed
+}
+
+fn lm2_display_table_figure_caption(line: &DeepLiquidSourceLine) -> bool {
+    if line.in_footnote_zone
+        || line.doc_footnote_state
+        || line.doc_footnote_continuation
+        || !lm2_numbered_table_figure_caption(&line.text)
+    {
+        return false;
+    }
+    let mut alphabetic = line.text.chars().filter(|ch| ch.is_alphabetic());
+    let alphabetic_count = alphabetic.clone().count();
+    let display_caps = alphabetic_count >= 4 && alphabetic.all(|ch| ch.is_uppercase());
+    word_count(&line.text) <= 3
+        || (word_count(&line.text) <= 16 && (line.centered || line.margin_centered || display_caps))
+}
+
+fn lm2_display_table_caption(line: &DeepLiquidSourceLine) -> bool {
+    lm2_display_table_figure_caption(line)
+        && normalize_text(&line.text)
+            .split_whitespace()
+            .next()
+            .is_some_and(|word| word == "table")
+}
+
+fn lm2_table_figure_subtitle(line: &DeepLiquidSourceLine) -> bool {
+    let text = clean_lm2_line_text(&line.text);
+    !text.is_empty()
+        && word_count(&text) <= 12
+        && (line.centered || line.margin_centered)
+        && leading_explicit_numbered_note_marker(&text).is_none()
+}
+
+fn lm2_numbered_table_band_end(
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+    indices: &[usize],
+    content_start: usize,
+) -> (usize, bool) {
+    for position in content_start..indices.len() {
+        let line = &decoded[indices[position]].0;
+        if leading_explicit_numbered_note_marker(&line.text).is_some()
+            || note_head_marker(&line.text).is_some()
+        {
+            return (position, true);
+        }
+        if position + 1 < indices.len()
+            && lm2_numbered_table_body_start(line, &decoded[indices[position + 1]].0)
+        {
+            return (position, false);
+        }
+    }
+    (indices.len(), false)
+}
+
+fn lm2_numbered_table_body_start(line: &DeepLiquidSourceLine, next: &DeepLiquidSourceLine) -> bool {
+    if line.page_index != next.page_index
+        || line.line_index.checked_add(1) != Some(next.line_index)
+        || word_count(&line.text) < 6
+        || word_count(&next.text) < 4
+        || tfr_width_norm(line) < 0.62
+        || tfr_width_norm(next) < 0.62
+        || next.page_object_path_stroke_near_line_count > 0
+        || next.segment_block_table_like
+        || next.page_table_column_like
+        || next.in_ruled_cell
+        || next.ruled_row_membership_exact
+    {
+        return false;
+    }
+    let page_width = line.page_width.max(next.page_width).max(1.0);
+    let first_line_indent = (line.left - next.left) / page_width;
+    (0.015..=0.080).contains(&first_line_indent)
+}
+
+fn lm2_table_continuation_furniture(line: &DeepLiquidSourceLine) -> bool {
+    line.line_index <= 4
+        && (table_figure_router_repeated_furniture_like(line)
+            || looks_like_bare_page_number_furniture(line)
+            || looks_like_running_header(&normalize_text(&line.text)))
+}
+
+fn lm2_table_geometry_vote(line: &DeepLiquidSourceLine) -> bool {
+    line.page_object_path_stroke_near_line_count > 0
+        || line.segment_block_table_like
+        || line.page_table_column_like
+        || line.in_ruled_cell
+        || line.ruled_row_membership_exact
+        || line.page_object_ruled_row_membership
+}
+
+/// Restore short numbered note heads that the line classifier rejected as
+/// noise.  The combination of explicit note punctuation, small note font, and
+/// physical footnote-zone membership is much stronger than the learned line
+/// label for terse definitions such as `113. Id.`.  Keeping this deliberately
+/// narrower than [`leading_numeric_token_marker`] avoids treating reporter
+/// citations (`106 VA. L. REV. ...`) as note heads.
+fn apply_hidden_numbered_note_head_recovery(
+    decoded: &mut [(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let mut repaired = 0usize;
+    for (line, action) in decoded.iter_mut() {
+        if *action != Lm2Action::HideNoise
+            || line.role_hint == Some(LiquidBlockRole::Contents)
+            || if line.page_has_footnote_divider {
+                !line.below_footnote_divider
+            } else {
+                !(line.in_footnote_zone || line.doc_footnote_state)
+            }
+            || (line.font_ratio_page_ref > 0.94
+                && line.font_ratio_page > 0.94
+                && line.font_ratio_doc > 0.94)
+            || line.in_ruled_cell
+            || line.page_table_column_like
+            // A journal may print several distinct terse definitions such as
+            // `5. Id.` at the same bottom-edge position.  The repeated-text
+            // detector quite reasonably marks those lines as edge repeats,
+            // but an explicit divider plus a leading note number is stronger
+            // evidence than that furniture prior.
+            || (line.doc_repeated_edge_text && !line.page_has_footnote_divider)
+        {
+            continue;
+        }
+        let Some(marker) = leading_explicit_numbered_note_marker(&line.text) else {
+            continue;
+        };
+        *action = Lm2Action::Marginalia;
+        line.role_hint = Some(LiquidBlockRole::Footnote);
+        line.doc_note_marker = marker;
+        repaired += 1;
+    }
+    repaired
+}
+
+fn leading_explicit_numbered_note_marker(text: &str) -> Option<u16> {
+    let trimmed = text.trim_start();
+    let digits_len = trimmed
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .take(3)
+        .count();
+    if digits_len == 0 {
+        return None;
+    }
+    let marker = trimmed[..digits_len].parse::<u16>().ok()?;
+    let remainder = &trimmed[digits_len..];
+    let punctuation = remainder.chars().next()?;
+    if !matches!(punctuation, '.' | ')' | ']') {
+        return None;
+    }
+    let after = &remainder[punctuation.len_utf8()..];
+    if after.chars().next().is_some_and(|ch| !ch.is_whitespace()) {
+        return None;
+    }
+    (1..=LM2_MAX_NOTE_MARKER)
+        .contains(&marker)
+        .then_some(marker)
+}
+
+/// Remove a repository-generated cover sheet when it is unmistakably present.
+/// Such sheets duplicate article metadata and otherwise become false body text.
+/// The guard requires multiple Digital Commons-style cues on the same opening
+/// page; ordinary first pages and isolated `available at` citations are left
+/// alone. Some repositories concatenate the final contact sentence with the
+/// first title line of the real article, so preserve that trailing title.
+fn apply_repository_cover_guard(decoded: &mut [(DeepLiquidSourceLine, Lm2Action)]) -> usize {
+    let cover_pages = repository_cover_pages(decoded);
+    if cover_pages.is_empty() {
+        return 0;
+    }
+
+    let mut changed = 0usize;
+    for (line, action) in decoded.iter_mut() {
+        if cover_pages.contains(&line.page_index) {
+            if *action != Lm2Action::HideNoise || line.role_hint != Some(LiquidBlockRole::Noise) {
+                changed += 1;
+            }
+            *action = Lm2Action::HideNoise;
+            line.role_hint = Some(LiquidBlockRole::Noise);
+            continue;
+        }
+        let follows_cover = line
+            .page_index
+            .checked_sub(1)
+            .is_some_and(|page| cover_pages.contains(&page));
+        if follows_cover && let Some(title) = title_after_repository_contact_prefix(&line.text) {
+            line.text = title;
+            *action = Lm2Action::Keep;
+            line.role_hint = Some(LiquidBlockRole::Heading);
+            changed += 1;
+        }
+    }
+    changed
+}
+
+fn repository_cover_pages(decoded: &[(DeepLiquidSourceLine, Lm2Action)]) -> HashSet<usize> {
+    let mut cues_by_page: BTreeMap<usize, HashSet<&'static str>> = BTreeMap::new();
+    for (line, _) in decoded {
+        if line.page_index > 1 {
+            continue;
+        }
+        let lower = normalize_text(&line.text);
+        for (label, cue) in [
+            ("works", "follow this and additional works at"),
+            ("citation", "recommended citation"),
+            ("access", "brought to you for free and open access"),
+            ("inclusion", "accepted for inclusion"),
+            ("review", "review by an authorized administrator"),
+        ] {
+            if lower.contains(cue) {
+                cues_by_page
+                    .entry(line.page_index)
+                    .or_default()
+                    .insert(label);
+            }
+        }
+    }
+    cues_by_page
+        .into_iter()
+        .filter_map(|(page_index, cues)| (cues.len() >= 2).then_some(page_index))
+        .collect()
+}
+
+fn title_after_repository_contact_prefix(text: &str) -> Option<String> {
+    let lower = normalize_text(text);
+    if !lower.contains("for more information, please contact") {
+        return None;
+    }
+    let at = text.find('@')?;
+    let end_of_email = text[at..]
+        .find(char::is_whitespace)
+        .map(|offset| at + offset)
+        .unwrap_or(text.len());
+    let title = collapse_whitespace(
+        text.get(end_of_email..)?
+            .trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, '.' | ':' | ';')),
+    );
+    (word_count(&title) >= 4 && uppercase_ratio(&title) >= 0.55).then_some(title)
+}
+
+/// Some repository-produced PDFs move every footnote into a full-size,
+/// full-page section headed `Footnotes` or `Endnotes`. Geometry-based note
+/// classifiers correctly see those lines as body-sized, while the standalone
+/// note numbers are often classified as noise. Recover this explicit document
+/// structure only when the heading is followed by a substantial monotone
+/// numeric sequence. This keeps ordinary numbered prose and incidental
+/// headings outside the recovery path.
+fn apply_explicit_endnote_section_guard(
+    decoded: &mut [(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    if decoded.is_empty() {
+        return 0;
+    }
+
+    let mut ordered = (0..decoded.len()).collect::<Vec<_>>();
+    ordered.sort_by_key(|index| {
+        let line = &decoded[*index].0;
+        (line.page_index, line.line_index)
+    });
+
+    let Some((heading_position, _)) = ordered.iter().enumerate().find(|(_, index)| {
+        matches!(
+            normalize_text(&collapse_whitespace(&decoded[**index].0.text)).as_str(),
+            "footnotes" | "endnotes"
+        )
+    }) else {
+        return 0;
+    };
+
+    let markers = ordered
+        .iter()
+        .skip(heading_position + 1)
+        .filter_map(|index| {
+            let line = &decoded[*index].0;
+            if looks_like_bare_page_number_furniture(line) {
+                return None;
+            }
+            collapse_whitespace(&line.text).parse::<u16>().ok()
+        })
+        .filter(|marker| *marker > 0 && *marker <= 999)
+        .collect::<Vec<_>>();
+    let monotone = markers
+        .windows(2)
+        .all(|pair| pair[1] > pair[0] && pair[1] <= pair[0].saturating_add(3));
+    if markers.len() < 4 || markers[0] > 5 || !monotone {
+        return 0;
+    }
+
+    let body_indices = &ordered[..heading_position];
+    let mut replacements: BTreeMap<usize, Vec<(usize, usize, u16)>> = BTreeMap::new();
+    let mut body_position = 0usize;
+    let mut byte_position = 0usize;
+    let mut all_callouts_recovered = true;
+    for marker in &markers {
+        let mut found = None;
+        while body_position < body_indices.len() {
+            let index = body_indices[body_position];
+            if let Some((start, end)) =
+                attached_ascii_callout_range(&decoded[index].0.text, *marker, byte_position)
+            {
+                found = Some((index, start, end));
+                byte_position = end;
+                break;
+            }
+            body_position += 1;
+            byte_position = 0;
+        }
+        let Some((index, start, end)) = found else {
+            all_callouts_recovered = false;
+            break;
+        };
+        replacements
+            .entry(index)
+            .or_default()
+            .push((start, end, *marker));
+    }
+    if all_callouts_recovered {
+        for (index, mut ranges) in replacements {
+            ranges.sort_by_key(|(start, _, _)| *start);
+            for (start, end, marker) in ranges.into_iter().rev() {
+                decoded[index]
+                    .0
+                    .text
+                    .replace_range(start..end, &format!("{CALLOUT_START}{marker}{CALLOUT_END}"));
+            }
+            decoded[index].1 = Lm2Action::Keep;
+            decoded[index].0.role_hint = Some(LiquidBlockRole::Paragraph);
+        }
+    }
+
+    let heading_index = ordered[heading_position];
+    decoded[heading_index].1 = Lm2Action::HideNoise;
+    decoded[heading_index].0.role_hint = Some(LiquidBlockRole::Noise);
+
+    let mut recovered = 0usize;
+    for index in ordered.into_iter().skip(heading_position + 1) {
+        let (line, action) = &mut decoded[index];
+        let text = collapse_whitespace(&line.text);
+        if text.is_empty() || looks_like_bare_page_number_furniture(line) {
+            continue;
+        }
+        *action = Lm2Action::Marginalia;
+        line.role_hint = Some(LiquidBlockRole::Marginalia);
+        // Marker-continuity features are intentionally permissive and may have
+        // labeled citation continuations such as `55 Fed. Reg. ...` before the
+        // explicit section was recognized. Inside this guarded section, only
+        // the standalone numeric lines are authoritative note heads.
+        line.doc_note_marker = 0;
+        if let Ok(marker) = text.parse::<u16>()
+            && markers.binary_search(&marker).is_ok()
+        {
+            line.doc_note_marker = marker;
+        }
+        recovered += 1;
+    }
+    recovered
+}
+
+fn attached_ascii_callout_range(text: &str, marker: u16, from: usize) -> Option<(usize, usize)> {
+    let digits = marker.to_string();
+    let mut cursor = from.min(text.len());
+    while let Some(relative) = text.get(cursor..)?.find(&digits) {
+        let start = cursor + relative;
+        let end = start + digits.len();
+        let before = text.get(..start)?.chars().next_back();
+        let after = text.get(end..)?.chars().next();
+        let attached = before.is_some_and(|ch| {
+            !ch.is_whitespace()
+                && !ch.is_ascii_digit()
+                && !matches!(ch, '§' | '-' | '*' | CALLOUT_START | CALLOUT_END)
+        });
+        let bounded = after.is_none_or(|ch| !ch.is_ascii_digit());
+        if attached && bounded {
+            return Some((start, end));
+        }
+        cursor = end;
+    }
+    None
+}
+
 fn apply_footnote_carryover_overlay(decoded: &mut [(DeepLiquidSourceLine, Lm2Action)]) {
     if decoded.is_empty() {
         return;
@@ -7216,7 +8533,7 @@ fn footnote_carryover_page_state(
         open: !footnote_carryover_has_terminal_punctuation(&line.text),
         expected_marker: footnote_carryover_last_marker(decoded, indices)
             .and_then(|marker| marker.checked_add(1))
-            .filter(|marker| *marker <= 500),
+            .filter(|marker| *marker <= LM2_MAX_NOTE_MARKER),
     }
 }
 
@@ -7532,6 +8849,81 @@ fn apply_open_footnote_carryover_overlay(decoded: &mut [(DeepLiquidSourceLine, L
     }
 }
 
+/// A long note can continue at the bottom of the next page immediately above
+/// that page's first numbered note. Some PDFs omit a divider above the
+/// continuation, so geometric zone detection begins only at the numbered head
+/// and the small-font continuation is otherwise spliced into body prose.
+/// Recover only a contiguous run of at least two clearly footnote-sized lines
+/// directly preceding a recognized note head.
+fn apply_preceding_small_font_note_continuation_guard(
+    decoded: &mut [(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let mut pages = BTreeMap::<usize, Vec<usize>>::new();
+    for (index, (line, _)) in decoded.iter().enumerate() {
+        pages.entry(line.page_index).or_default().push(index);
+    }
+    for indices in pages.values_mut() {
+        indices.sort_by_key(|index| decoded[*index].0.line_index);
+    }
+
+    let mut repairs = Vec::<usize>::new();
+    for indices in pages.values() {
+        for (position, index) in indices.iter().copied().enumerate() {
+            let head = &decoded[index].0;
+            let marker = numeric_note_head_candidate(&decoded[index]).or_else(|| {
+                (head.in_footnote_zone || head.below_footnote_divider)
+                    .then(|| leading_numeric_token_marker(&head.text))
+                    .flatten()
+            });
+            if marker.is_none() || position < 2 {
+                continue;
+            }
+
+            let mut run = Vec::new();
+            let mut next_line_index = head.line_index;
+            for candidate_index in indices[..position].iter().copied().rev().take(12) {
+                let candidate = &decoded[candidate_index].0;
+                if candidate.line_index.saturating_add(1) != next_line_index
+                    || candidate.in_footnote_zone
+                    || candidate.below_footnote_divider
+                    || candidate.doc_note_marker > 0
+                    || leading_note_marker(&candidate.text).is_some()
+                    || candidate.doc_repeated_edge_text
+                    || footnote_monotone_font_ratio(candidate) > 0.86
+                    || word_count(&candidate.text) < 2
+                    || matches!(
+                        candidate.role_hint,
+                        Some(
+                            LiquidBlockRole::Heading
+                                | LiquidBlockRole::Subheading
+                                | LiquidBlockRole::Title
+                                | LiquidBlockRole::Table
+                                | LiquidBlockRole::Noise
+                        )
+                    )
+                {
+                    break;
+                }
+                run.push(candidate_index);
+                next_line_index = candidate.line_index;
+            }
+            if run.len() >= 2 {
+                repairs.extend(run);
+            }
+        }
+    }
+
+    repairs.sort_unstable();
+    repairs.dedup();
+    for index in &repairs {
+        decoded[*index].1 = Lm2Action::Marginalia;
+        decoded[*index].0.role_hint = Some(LiquidBlockRole::Footnote);
+        decoded[*index].0.in_footnote_zone = true;
+        decoded[*index].0.doc_footnote_continuation = true;
+    }
+    repairs.len()
+}
+
 fn open_footnote_carryover_page_tail_state(
     decoded: &[(DeepLiquidSourceLine, Lm2Action)],
     indices: &[usize],
@@ -7805,7 +9197,7 @@ fn push_marker_digits(markers: &mut Vec<u16>, digits: &mut String) {
         return;
     }
     if let Ok(value) = digits.parse::<u16>()
-        && (1..=500).contains(&value)
+        && (1..=LM2_MAX_NOTE_MARKER).contains(&value)
     {
         markers.push(value);
     }
@@ -7858,7 +9250,27 @@ fn attached_terminal_ascii_marker(text: &str) -> Option<u16> {
         return None;
     }
     let value = digits.parse::<u16>().ok()?;
-    (1..=500).contains(&value).then_some(value)
+    (1..=LM2_MAX_NOTE_MARKER).contains(&value).then_some(value)
+}
+
+fn attached_terminal_body_marker(text: &str) -> Option<u16> {
+    if let Some(marker) = attached_terminal_ascii_marker(text) {
+        return Some(marker);
+    }
+    let trimmed = text.trim_end();
+    if !trimmed.ends_with(CALLOUT_END) {
+        return None;
+    }
+    let start = trimmed.rfind(CALLOUT_START)?;
+    let prefix = trimmed[..start].trim_end();
+    if !prefix.chars().any(char::is_alphabetic) {
+        return None;
+    }
+    let digits = &trimmed[start + CALLOUT_START.len_utf8()..trimmed.len() - CALLOUT_END.len_utf8()];
+    let marker = digits.parse::<u16>().ok()?;
+    (1..=LM2_MAX_NOTE_MARKER)
+        .contains(&marker)
+        .then_some(marker)
 }
 
 fn footnote_monotone_continuation_candidate(line: &DeepLiquidSourceLine) -> bool {
@@ -10355,6 +11767,7 @@ fn apply_same_row_body_fragment_overlay(
 fn apply_same_page_body_callout_overlay(
     decoded: &mut [(DeepLiquidSourceLine, Lm2Action)],
 ) -> usize {
+    let sequence_repairs = apply_decoded_page_sequence_callout_recovery(decoded);
     let mut definition_markers: BTreeMap<usize, HashSet<u16>> = BTreeMap::new();
     for item @ (line, _) in decoded.iter() {
         let marker = numeric_note_head_candidate(item).or_else(|| {
@@ -10376,7 +11789,7 @@ fn apply_same_page_body_callout_overlay(
         let Some(marker) = marker_line.text.trim().parse::<u16>().ok() else {
             continue;
         };
-        if !(1..=500).contains(&marker)
+        if !(1..=LM2_MAX_NOTE_MARKER).contains(&marker)
             || marker_line.in_footnote_zone
             || marker_line.below_footnote_divider
             || marker_line.doc_footnote_state
@@ -10396,7 +11809,7 @@ fn apply_same_page_body_callout_overlay(
         }
     }
 
-    let mut repaired = 0usize;
+    let mut repaired = sequence_repairs;
     for (previous_index, marker_index, marker) in standalone_repairs {
         if previous_index >= 2 {
             let continuation_index = previous_index - 1;
@@ -10473,6 +11886,192 @@ fn apply_same_page_body_callout_overlay(
     repaired
 }
 
+/// Recover flattened law-review superscripts before the permissive local
+/// callout overlay sees them as one-digit notes. Performing the guarded page
+/// sequence alignment on source lines preserves the corrected marker through
+/// block assembly and prevents `26` rendered as `2 6` from becoming two links.
+fn apply_decoded_page_sequence_callout_recovery(
+    decoded: &mut [(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let mut marker_rows_by_page = BTreeMap::<usize, Vec<(usize, u16)>>::new();
+    for item @ (line, _) in decoded.iter() {
+        let Some(primary) = numeric_note_head_candidate(item).or_else(|| {
+            (line.in_footnote_zone || line.below_footnote_divider)
+                .then(|| leading_numeric_token_marker(&line.text))
+                .flatten()
+        }) else {
+            continue;
+        };
+        let rows = marker_rows_by_page.entry(line.page_index).or_default();
+        rows.push((line.line_index, primary));
+        for marker in embedded_numeric_note_head_markers(&line.text) {
+            rows.push((line.line_index, marker));
+        }
+    }
+
+    let mut body_indices_by_page = BTreeMap::<usize, Vec<usize>>::new();
+    for (index, (line, _)) in decoded.iter().enumerate() {
+        if !line.in_footnote_zone
+            && !line.below_footnote_divider
+            && !line.doc_footnote_state
+            && !line.doc_repeated_edge_text
+        {
+            body_indices_by_page
+                .entry(line.page_index)
+                .or_default()
+                .push(index);
+        }
+    }
+    for indices in body_indices_by_page.values_mut() {
+        indices.sort_by_key(|index| decoded[*index].0.line_index);
+    }
+
+    let mut repaired = 0usize;
+    for (page_index, mut marker_rows) in marker_rows_by_page {
+        marker_rows.sort_unstable();
+        marker_rows.dedup();
+        let candidate_count = marker_rows.len();
+        let markers = strongest_local_marker_sequence(&marker_rows);
+        if markers.is_empty()
+            || markers.len() == 1 && candidate_count != 1
+            || markers.len() == 1 && markers[0] < 10
+        {
+            continue;
+        }
+        let Some(body_indices) = body_indices_by_page.get(&page_index) else {
+            continue;
+        };
+
+        let mut body_position = 0usize;
+        let mut byte_position = 0usize;
+        let mut replacements = BTreeMap::<usize, Vec<(usize, usize, u16)>>::new();
+        let mut cleanup_indices = Vec::<usize>::new();
+        let mut complete = true;
+        for marker in markers {
+            let mut found: Option<(usize, usize, usize, usize, PageSequenceMatchKind)> = None;
+            for matched_position in body_position..body_indices.len() {
+                let index = body_indices[matched_position];
+                let text = &decoded[index].0.text;
+                let from = if matched_position == body_position {
+                    byte_position
+                } else {
+                    0
+                };
+                if let Some((start, end, kind)) = page_sequence_callout_range(text, marker, from) {
+                    if candidate_count == 1 && !kind.singleton_safe() {
+                        continue;
+                    }
+                    let candidate = (matched_position, index, start, end, kind);
+                    if found.as_ref().is_none_or(
+                        |(best_position, best_index, best_start, best_end, best_kind)| {
+                            (
+                                sequence_selection_priority(kind, text, start, end),
+                                matched_position,
+                                start,
+                            ) < (
+                                sequence_selection_priority(
+                                    *best_kind,
+                                    &decoded[*best_index].0.text,
+                                    *best_start,
+                                    *best_end,
+                                ),
+                                *best_position,
+                                *best_start,
+                            )
+                        },
+                    ) {
+                        found = Some(candidate);
+                    }
+                }
+            }
+            let Some((matched_position, index, start, end, kind)) = found else {
+                complete = false;
+                break;
+            };
+            body_position = matched_position;
+            if kind == PageSequenceMatchKind::InferredQuoteBoundary {
+                body_position += 1;
+                byte_position = 0;
+            } else {
+                byte_position = end;
+            }
+            if kind.replaces_text() {
+                if kind == PageSequenceMatchKind::PartialDigit
+                    && let Some(next_index) = body_indices.get(matched_position + 1).copied()
+                    && decoded[next_index].0.line_index
+                        == decoded[index].0.line_index.saturating_add(1)
+                    && split_callout_fragment_completes_marker(
+                        &decoded[index].0.text[start..end],
+                        &decoded[next_index].0.text,
+                        marker,
+                    )
+                {
+                    cleanup_indices.push(next_index);
+                }
+                replacements
+                    .entry(index)
+                    .or_default()
+                    .push((start, end, marker));
+            }
+        }
+        if !complete || replacements.is_empty() {
+            continue;
+        }
+        for (index, mut ranges) in replacements {
+            ranges.sort_by_key(|(start, _, _)| *start);
+            for (start, end, marker) in ranges.into_iter().rev() {
+                decoded[index]
+                    .0
+                    .text
+                    .replace_range(start..end, &format!("{CALLOUT_START}{marker}{CALLOUT_END}"));
+                repaired += 1;
+            }
+            decoded[index].1 = Lm2Action::Keep;
+            decoded[index].0.role_hint = Some(LiquidBlockRole::Paragraph);
+        }
+        cleanup_indices.sort_unstable();
+        cleanup_indices.dedup();
+        for index in cleanup_indices {
+            decoded[index].0.text.clear();
+            decoded[index].1 = Lm2Action::HideNoise;
+            decoded[index].0.role_hint = Some(LiquidBlockRole::Noise);
+        }
+    }
+    repaired
+}
+
+fn strongest_local_marker_sequence(rows: &[(usize, u16)]) -> Vec<u16> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut best = vec![1usize; rows.len()];
+    let mut previous = vec![usize::MAX; rows.len()];
+    let mut end = 0usize;
+    for i in 0..rows.len() {
+        for j in 0..i {
+            let delta = rows[i].1.saturating_sub(rows[j].1);
+            if (1..=3).contains(&delta) && best[j] + 1 > best[i] {
+                best[i] = best[j] + 1;
+                previous[i] = j;
+            }
+        }
+        if best[i] > best[end] {
+            end = i;
+        }
+    }
+    let mut positions = Vec::new();
+    let mut cursor = end;
+    while cursor != usize::MAX {
+        positions.push(cursor);
+        cursor = previous[cursor];
+    }
+    positions.reverse();
+    positions
+        .into_iter()
+        .map(|position| rows[position].1)
+        .collect()
+}
+
 fn same_visual_baseline_fragment(
     previous: &DeepLiquidSourceLine,
     line: &DeepLiquidSourceLine,
@@ -10531,6 +12130,8 @@ fn build_lm2_blocks_with_grouping(
     let mut blocks = Vec::new();
     let mut sources = Vec::new();
     let mut title = fallback_title.trim().to_owned();
+    let repository_covers = repository_cover_pages(decoded);
+    let repository_title = repository_citation_title(decoded, &repository_covers);
     let recovered_title = lm2_recover_leading_source_title(decoded);
     let recovered_line_ids = recovered_title
         .as_ref()
@@ -10551,27 +12152,20 @@ fn build_lm2_blocks_with_grouping(
     let mut current_group_index: Option<usize> = None;
 
     if let Some(recovered) = &recovered_title {
-        for (index, line) in recovered.lines.iter().enumerate() {
-            let role = if index == 0 {
-                LiquidBlockRole::Title
-            } else {
-                LiquidBlockRole::Heading
-            };
-            let text = clean_lm2_line_text(&line.text);
-            if text.is_empty() {
-                continue;
-            }
-            let block_index = blocks.len();
-            blocks.push(LiquidBlock {
-                role,
-                text,
-                label: None,
-            });
-            sources.push(LiquidBlockSourceLines {
-                block_index,
-                lines: vec![line_ref(line, role)],
-            });
-        }
+        let block_index = blocks.len();
+        blocks.push(LiquidBlock {
+            role: LiquidBlockRole::Title,
+            text: recovered.title.clone(),
+            label: None,
+        });
+        sources.push(LiquidBlockSourceLines {
+            block_index,
+            lines: recovered
+                .lines
+                .iter()
+                .map(|line| line_ref(line, LiquidBlockRole::Title))
+                .collect(),
+        });
     }
 
     for (line, action) in decoded {
@@ -10588,7 +12182,10 @@ fn build_lm2_blocks_with_grouping(
             continue;
         }
         if *action == Lm2Action::HideNoise {
-            if line.role_hint == Some(LiquidBlockRole::Table) {
+            if matches!(
+                line.role_hint,
+                Some(LiquidBlockRole::Table | LiquidBlockRole::Caption)
+            ) {
                 flush_block(
                     &mut blocks,
                     &mut sources,
@@ -10599,14 +12196,15 @@ fn build_lm2_blocks_with_grouping(
                 let text = clean_lm2_line_text(&line.text);
                 if !text.is_empty() {
                     let block_index = blocks.len();
+                    let role = line.role_hint.expect("table/figure role remains available");
                     blocks.push(LiquidBlock {
-                        role: LiquidBlockRole::Table,
+                        role,
                         text,
-                        label: Some("Table/Figure".to_owned()),
+                        label: (role == LiquidBlockRole::Table).then(|| "Table/Figure".to_owned()),
                     });
                     sources.push(LiquidBlockSourceLines {
                         block_index,
-                        lines: vec![line_ref(line, LiquidBlockRole::Table)],
+                        lines: vec![line_ref(line, role)],
                     });
                 }
                 current_last_line = None;
@@ -10648,12 +12246,13 @@ fn build_lm2_blocks_with_grouping(
             && current_last_line
                 .as_ref()
                 .is_some_and(|previous| previous.page_index != line.page_index);
-        let starts_new_paragraph = current_role == LiquidBlockRole::Paragraph
-            && role == LiquidBlockRole::Paragraph
+        let starts_new_paragraph = current_role == role
+            && matches!(role, LiquidBlockRole::Paragraph | LiquidBlockRole::Abstract)
             && current_last_line.as_ref().is_some_and(|previous| {
                 if let Some(group_index) = line_group_index.get(&line.id).copied() {
                     if previous.page_index == line.page_index {
                         current_group_index != Some(group_index)
+                            || paragraph_boundary(previous, line)
                     } else {
                         paragraph_boundary(previous, line)
                     }
@@ -10707,17 +12306,44 @@ fn build_lm2_blocks_with_grouping(
         current_role,
     );
 
-    if let Some(fallback) = lm2_fallback_title_from_blocks(&blocks)
-        && (title.is_empty() || looks_like_filename_fallback_title(&title))
-    {
-        title = fallback;
+    if let Some(fallback) = lm2_fallback_title_from_blocks(&blocks) {
+        let short_metadata_title = word_count(&title) <= 4
+            && word_count(&fallback) >= word_count(&title).saturating_add(4)
+            && uppercase_ratio(&fallback) >= 0.62
+            && title_case_ratio(&title) >= 0.75;
+        if title.is_empty()
+            || looks_like_filename_fallback_title(&title)
+            || short_metadata_title
+            || lm2_recovered_title_is_better(&fallback, &title)
+        {
+            title = fallback;
+        }
     }
     if let Some(recovered) = recovered_title
         && (title.is_empty()
             || looks_like_filename_fallback_title(&title)
+            || recovered.authoritative_display
             || lm2_recovered_title_is_better(&recovered.title, &title))
     {
         title = recovered.title;
+    }
+    if let Some(mut repository_title) = repository_title
+        && (title.is_empty()
+            || looks_like_filename_fallback_title(&title)
+            || lm2_recovered_title_is_better(&repository_title, &title)
+            || title_word_overlap(&repository_title, &title) >= 0.80
+                && uppercase_ratio(&title) >= 0.70)
+    {
+        if title.trim_end().ends_with('?')
+            && !repository_title
+                .trim_end()
+                .chars()
+                .next_back()
+                .is_some_and(|ch| matches!(ch, '?' | '!' | '.'))
+        {
+            repository_title.push('?');
+        }
+        title = repository_title;
     }
     if title.is_empty() {
         title = "Untitled document".to_owned();
@@ -10759,7 +12385,14 @@ fn same_page_body_referenced_note_heads(
     decoded: &[(DeepLiquidSourceLine, Lm2Action)],
 ) -> HashSet<String> {
     let mut body_markers: BTreeMap<usize, HashSet<u16>> = BTreeMap::new();
+    let mut contextual_note_heads: BTreeMap<usize, HashSet<u16>> = BTreeMap::new();
     for (line, action) in decoded {
+        if *action == Lm2Action::Marginalia {
+            contextual_note_heads
+                .entry(line.page_index)
+                .or_default()
+                .extend(sentineled_note_head_markers_in_context(&line.text));
+        }
         if *action != Lm2Action::Keep
             || line.in_footnote_zone
             || line.below_footnote_divider
@@ -10781,6 +12414,14 @@ fn same_page_body_referenced_note_heads(
                 return None;
             }
             let marker = numeric_note_head_candidate(item)?;
+            if contextual_note_heads
+                .get(&line.page_index)
+                .is_some_and(|markers| markers.contains(&marker))
+            {
+                // Prefer the protected contextual head over a bare same-page
+                // pincite that happens to equal a body callout.
+                return None;
+            }
             body_markers
                 .get(&line.page_index)
                 .is_some_and(|markers| markers.contains(&marker))
@@ -10793,18 +12434,63 @@ fn note_start_line_ids_for_scope(
     decoded: &[(DeepLiquidSourceLine, Lm2Action)],
     article_spans: &[ArticleSpan],
 ) -> HashSet<String> {
+    // A dedicated Footnotes/Endnotes section can provide an unusually strong
+    // document-level marker sequence. Once that sequence is present, it is
+    // better evidence than a citation-shaped line such as `55 Fed. Reg. ...`
+    // inside another note. Make the preference per article so bound volumes can
+    // still restart numbering independently.
+    let mut document_markers_by_article: BTreeMap<usize, Vec<(usize, usize, u16)>> =
+        BTreeMap::new();
+    for (line, action) in decoded {
+        if *action != Lm2Action::Marginalia || line.doc_note_marker == 0 {
+            continue;
+        }
+        let article_index =
+            article_index_at(article_spans, line.page_index, line.line_index).unwrap_or(usize::MAX);
+        document_markers_by_article
+            .entry(article_index)
+            .or_default()
+            .push((line.page_index, line.line_index, line.doc_note_marker));
+    }
+    let authoritative_document_marker_articles = document_markers_by_article
+        .into_iter()
+        .filter_map(|(article_index, mut markers)| {
+            // Decoder storage order is not a reading-order contract. The
+            // explicit-endnote detector itself uses page/line order, so apply
+            // the same ordering before judging its recovered sequence.
+            markers.sort_by_key(|(page_index, line_index, _)| (*page_index, *line_index));
+            let markers = markers
+                .into_iter()
+                .map(|(_, _, marker)| marker)
+                .collect::<Vec<_>>();
+            let strong_sequence = markers.len() >= DOCUMENT_NOTE_SEQUENCE_MIN_CANDIDATES
+                && markers.first().is_some_and(|marker| *marker <= 5)
+                && markers
+                    .windows(2)
+                    .all(|pair| pair[1] > pair[0] && pair[1].saturating_sub(pair[0]) <= 3);
+            strong_sequence.then_some(article_index)
+        })
+        .collect::<HashSet<_>>();
+
     let mut by_article: BTreeMap<usize, Vec<(&String, u16)>> = BTreeMap::new();
     for (index, (line, action)) in decoded.iter().enumerate() {
         if *action != Lm2Action::Marginalia {
             continue;
         }
-        let Some(number) = note_head_marker(&line.text)
-            .or_else(|| sequence_numeric_note_head_marker(decoded, index))
-        else {
-            continue;
-        };
         let article_index =
             article_index_at(article_spans, line.page_index, line.line_index).unwrap_or(usize::MAX);
+        let number = if authoritative_document_marker_articles.contains(&article_index) {
+            (line.doc_note_marker > 0).then_some(line.doc_note_marker)
+        } else {
+            (line.doc_note_marker > 0)
+                .then_some(line.doc_note_marker)
+                .or_else(|| leading_sentineled_note_head_marker(line))
+                .or_else(|| note_head_marker(&line.text))
+                .or_else(|| sequence_numeric_note_head_marker(decoded, index))
+        };
+        let Some(number) = number else {
+            continue;
+        };
         by_article
             .entry(article_index)
             .or_default()
@@ -10945,7 +12631,9 @@ fn leading_numeric_token_marker(text: &str) -> Option<u16> {
         return None;
     }
     let marker = digits.parse::<u16>().ok()?;
-    (1..=500).contains(&marker).then_some(marker)
+    (1..=LM2_MAX_NOTE_MARKER)
+        .contains(&marker)
+        .then_some(marker)
 }
 
 fn article_index_at(
@@ -11054,6 +12742,2390 @@ fn apply_action_neutral_blocksplit(
     }
 }
 
+/// Reflow passes can correctly bridge prose around interleaved footnotes but,
+/// in doing so, can also recombine paragraph blocks that the first assembly
+/// pass separated. At the stable final boundary, split only inside remaining
+/// Paragraph/Abstract blocks and only where the original source geometry still
+/// proves a paragraph start. Existing block text is sliced rather than rebuilt
+/// so recovered callout sentinels remain byte-for-byte intact.
+fn apply_final_source_backed_paragraph_splits(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let mut source_by_block = std::mem::take(sources)
+        .into_iter()
+        .map(|source| (source.block_index, source.lines))
+        .collect::<BTreeMap<_, _>>();
+    let old_blocks = std::mem::take(blocks);
+    let mut rebuilt_blocks = Vec::with_capacity(old_blocks.len());
+    let mut rebuilt_sources = Vec::new();
+    let mut repaired = 0usize;
+
+    for (old_index, block) in old_blocks.into_iter().enumerate() {
+        let Some(refs) = source_by_block.remove(&old_index) else {
+            rebuilt_blocks.push(block);
+            continue;
+        };
+        if !matches!(
+            block.role,
+            LiquidBlockRole::Paragraph | LiquidBlockRole::Abstract
+        ) || refs.len() < 2
+        {
+            let block_index = rebuilt_blocks.len();
+            rebuilt_blocks.push(block);
+            rebuilt_sources.push(LiquidBlockSourceLines {
+                block_index,
+                lines: refs,
+            });
+            continue;
+        }
+
+        let mut splits = Vec::<(usize, usize)>::new();
+        let mut search_from = 0usize;
+        for ref_index in 1..refs.len() {
+            let (Some(previous), Some(current)) = (
+                refs[ref_index - 1]
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id)),
+                refs[ref_index]
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id)),
+            ) else {
+                continue;
+            };
+            if !lm2_final_paragraph_boundary(previous, current)
+                || lm2_strong_source_body_wrap(previous, current)
+            {
+                continue;
+            }
+            let needle = clean_lm2_line_text(&refs[ref_index].text);
+            if needle.is_empty() || needle.chars().all(|ch| ch.is_ascii_digit()) {
+                continue;
+            }
+            let Some(relative) = block.text[search_from..].find(&needle) else {
+                continue;
+            };
+            let position = search_from + relative;
+            if position == 0
+                || block.text[..position].ends_with(CALLOUT_START)
+                || position <= splits.last().map(|split| split.0).unwrap_or(0)
+            {
+                continue;
+            }
+            splits.push((position, ref_index));
+            search_from = position + needle.len();
+        }
+
+        if splits.is_empty() {
+            let block_index = rebuilt_blocks.len();
+            rebuilt_blocks.push(block);
+            rebuilt_sources.push(LiquidBlockSourceLines {
+                block_index,
+                lines: refs,
+            });
+            continue;
+        }
+
+        let mut boundaries = Vec::with_capacity(splits.len() + 2);
+        boundaries.push((0usize, 0usize));
+        boundaries.extend(splits);
+        boundaries.push((block.text.len(), refs.len()));
+        for (segment_index, pair) in boundaries.windows(2).enumerate() {
+            let (text_start, ref_start) = pair[0];
+            let (text_end, ref_end) = pair[1];
+            let text = block.text[text_start..text_end].trim().to_owned();
+            if text.is_empty() || ref_start == ref_end {
+                continue;
+            }
+            let segment_refs = &refs[ref_start..ref_end];
+            let segment_role = lm2_final_split_child_role(block.role, segment_refs, &line_by_id);
+            let block_index = rebuilt_blocks.len();
+            rebuilt_blocks.push(LiquidBlock {
+                role: segment_role,
+                text,
+                label: (segment_index == 0).then(|| block.label.clone()).flatten(),
+            });
+            rebuilt_sources.push(LiquidBlockSourceLines {
+                block_index,
+                lines: segment_refs.to_vec(),
+            });
+            if segment_index > 0 {
+                repaired += 1;
+            }
+        }
+    }
+
+    *blocks = rebuilt_blocks;
+    *sources = rebuilt_sources;
+    repaired
+}
+
+/// Separate a complete body sentence that a late heading reflow fused onto an
+/// outline heading. Both sides must be independent one-row source segments,
+/// and the body side must already carry a Paragraph-like source role and
+/// terminal sentence punctuation; wrapped headings therefore stay intact.
+fn lm2_final_caption_source_line(line: &DeepLiquidSourceLine) -> bool {
+    !line.in_footnote_zone
+        && !line.below_footnote_divider
+        && !line.in_ruled_cell
+        && !line.ruled_row_membership_exact
+        && !line.page_table_column_like
+        && !line.segment_block_table_like
+        && !line.page_object_overlaps_image_bbox
+        && !line.segment_block_furniture_like
+}
+
+/// Keep a wrapped Figure/Table caption together when the source rows have one
+/// segment, style, and ordinary line rhythm. The next heading is protected by
+/// the same-segment, font/style, left-edge, and vertical-gap requirements.
+fn apply_final_caption_continuation_reflow(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let mut repaired = 0usize;
+    loop {
+        let source_position = sources
+            .iter()
+            .enumerate()
+            .map(|(position, source)| (source.block_index, position))
+            .collect::<HashMap<_, _>>();
+        let mut operation = None;
+        for target in 0..blocks.len().saturating_sub(1) {
+            let donor = target + 1;
+            if !lm2_explicit_numbered_table_figure_caption(&blocks[target].text)
+                || !matches!(
+                    blocks[target].role,
+                    LiquidBlockRole::Caption
+                        | LiquidBlockRole::Noise
+                        | LiquidBlockRole::Table
+                        | LiquidBlockRole::Paragraph
+                )
+                || !matches!(
+                    blocks[donor].role,
+                    LiquidBlockRole::Paragraph | LiquidBlockRole::Noise | LiquidBlockRole::Caption
+                )
+                || !blocks[donor]
+                    .text
+                    .trim_start()
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_lowercase)
+            {
+                continue;
+            }
+            let (Some(target_position), Some(donor_position)) = (
+                source_position.get(&target).copied(),
+                source_position.get(&donor).copied(),
+            ) else {
+                continue;
+            };
+            let (Some(previous_ref), Some(current_ref)) = (
+                sources[target_position].lines.last(),
+                sources[donor_position].lines.first(),
+            ) else {
+                continue;
+            };
+            let (Some(previous), Some(current)) = (
+                previous_ref
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied()),
+                current_ref
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied()),
+            ) else {
+                continue;
+            };
+            let page_width = previous.page_width.max(current.page_width).max(1.0);
+            let font_ratio = previous.font_height.max(current.font_height)
+                / previous.font_height.min(current.font_height).max(1.0);
+            if previous.page_index != current.page_index
+                || previous.line_index.saturating_add(1) != current.line_index
+                || previous.segment_block_id != current.segment_block_id
+                || previous.segment_block_id == 0
+                || !lm2_final_caption_source_line(previous)
+                || !lm2_final_caption_source_line(current)
+                || previous.bold != current.bold
+                || previous.italic != current.italic
+                || font_ratio > 1.10
+                || (previous.left - current.left).abs() / page_width > 0.03
+                || vertical_gap(previous, current) > 0.025
+            {
+                continue;
+            }
+            operation = Some((target, donor));
+            break;
+        }
+        let Some((target, donor)) = operation else {
+            break;
+        };
+        let donor_text = blocks[donor].text.clone();
+        append_line(&mut blocks[target].text, &donor_text);
+        blocks[target].role = LiquidBlockRole::Caption;
+        blocks[target].label = None;
+        lm2_merge_block_sources(target, donor, sources);
+        lm2_remove_block(donor, blocks, sources);
+        repaired += 1;
+    }
+    repaired
+}
+
+/// Make the PDF's explicit `Figure N:` rows authoritative at the final
+/// assembly boundary. Earlier grouping can label an ordinary sentence such as
+/// `Figure 2 illustrates ...` as a caption, hide a caption-only row as noise,
+/// or fuse the small italic caption with the following body paragraph. The
+/// source segment gives us a narrow, layout-backed correction: an explicit
+/// caption row plus only its contiguous, same-segment, same-style rows.
+fn apply_final_source_backed_figure_caption_isolation(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    #[derive(Clone)]
+    struct CaptionGroup {
+        ids: Vec<String>,
+        text: String,
+    }
+
+    let mut groups = Vec::<CaptionGroup>::new();
+    for (anchor, _) in decoded.iter().filter(|(line, _)| {
+        lm2_explicit_numbered_table_figure_caption(&line.text)
+            && normalize_text(&line.text)
+                .split_whitespace()
+                .next()
+                .is_some_and(|word| matches!(word, "figure" | "fig."))
+    }) {
+        let mut rows = decoded
+            .iter()
+            .map(|(line, _)| line)
+            .filter(|line| {
+                line.page_index == anchor.page_index
+                    && line.segment_block_id == anchor.segment_block_id
+                    && line.line_index >= anchor.line_index
+                    && line.bold == anchor.bold
+                    && line.italic == anchor.italic
+                    && line.font_height.max(anchor.font_height)
+                        / line.font_height.min(anchor.font_height).max(1.0)
+                        <= 1.10
+                    && lm2_final_caption_source_line(line)
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|line| line.line_index);
+
+        let mut expected = anchor.line_index;
+        let mut ids = Vec::new();
+        let mut text = String::new();
+        for line in rows {
+            if line.line_index != expected
+                || (!ids.is_empty() && lm2_explicit_numbered_table_figure_caption(&line.text))
+            {
+                break;
+            }
+            ids.push(line.id.clone());
+            append_line(&mut text, &line.text);
+            expected += 1;
+        }
+        if !ids.is_empty() && !text.is_empty() {
+            groups.push(CaptionGroup { ids, text });
+        }
+    }
+    if groups.is_empty() {
+        return 0;
+    }
+
+    let group_by_id = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(group_index, group)| group.ids.iter().map(move |id| (id.as_str(), group_index)))
+        .collect::<HashMap<_, _>>();
+    let deep_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let ref_by_id = sources
+        .iter()
+        .flat_map(|source| source.lines.iter())
+        .filter_map(|line| line.id.as_deref().map(|id| (id, line.clone())))
+        .collect::<HashMap<_, _>>();
+    let source_by_block = sources
+        .iter()
+        .map(|source| (source.block_index, source.lines.clone()))
+        .collect::<HashMap<_, _>>();
+
+    let mut seen = HashSet::<usize>::new();
+    let mut rebuilt_blocks = Vec::new();
+    let mut rebuilt_sources = Vec::new();
+    let mut repaired = 0usize;
+
+    let push_segment = |rebuilt_blocks: &mut Vec<LiquidBlock>,
+                        rebuilt_sources: &mut Vec<LiquidBlockSourceLines>,
+                        role: LiquidBlockRole,
+                        text: String,
+                        lines: Vec<LiquidSourceLineRef>| {
+        if text.trim().is_empty() {
+            return;
+        }
+        let block_index = rebuilt_blocks.len();
+        rebuilt_blocks.push(LiquidBlock {
+            role,
+            text,
+            label: None,
+        });
+        if !lines.is_empty() {
+            rebuilt_sources.push(LiquidBlockSourceLines { block_index, lines });
+        }
+    };
+
+    for (block_index, block) in blocks.iter().enumerate() {
+        let refs = source_by_block
+            .get(&block_index)
+            .cloned()
+            .unwrap_or_default();
+        let contains_caption = refs.iter().any(|line| {
+            line.id
+                .as_deref()
+                .is_some_and(|id| group_by_id.contains_key(id))
+        });
+        if !contains_caption {
+            let mut cloned = block.clone();
+            if cloned.role == LiquidBlockRole::Caption
+                && lm2_numbered_table_figure_caption(&cloned.text)
+                && !lm2_explicit_numbered_table_figure_caption(&cloned.text)
+            {
+                cloned.role = LiquidBlockRole::Paragraph;
+                cloned.label = None;
+                repaired += 1;
+            }
+            let new_index = rebuilt_blocks.len();
+            rebuilt_blocks.push(cloned);
+            if !refs.is_empty() {
+                rebuilt_sources.push(LiquidBlockSourceLines {
+                    block_index: new_index,
+                    lines: refs,
+                });
+            }
+            continue;
+        }
+
+        repaired += 1;
+        let mut body_refs = Vec::<LiquidSourceLineRef>::new();
+        let flush_body =
+            |body_refs: &mut Vec<LiquidSourceLineRef>,
+             rebuilt_blocks: &mut Vec<LiquidBlock>,
+             rebuilt_sources: &mut Vec<LiquidBlockSourceLines>| {
+                if body_refs.is_empty() {
+                    return;
+                }
+                let mut text = String::new();
+                for line in body_refs.iter() {
+                    append_line(&mut text, &line.text);
+                }
+                let role = body_refs
+                    .iter()
+                    .find_map(|line| {
+                        matches!(
+                            line.role,
+                            LiquidBlockRole::Paragraph
+                                | LiquidBlockRole::ListItem
+                                | LiquidBlockRole::Heading
+                                | LiquidBlockRole::Subheading
+                        )
+                        .then_some(line.role)
+                    })
+                    .unwrap_or(LiquidBlockRole::Paragraph);
+                push_segment(
+                    rebuilt_blocks,
+                    rebuilt_sources,
+                    role,
+                    text,
+                    std::mem::take(body_refs),
+                );
+            };
+
+        for line in refs {
+            let group_index = line
+                .id
+                .as_deref()
+                .and_then(|id| group_by_id.get(id).copied());
+            if let Some(group_index) = group_index {
+                flush_body(&mut body_refs, &mut rebuilt_blocks, &mut rebuilt_sources);
+                if seen.insert(group_index) {
+                    let group = &groups[group_index];
+                    let caption_refs = group
+                        .ids
+                        .iter()
+                        .filter_map(|id| ref_by_id.get(id.as_str()).cloned())
+                        .collect::<Vec<_>>();
+                    push_segment(
+                        &mut rebuilt_blocks,
+                        &mut rebuilt_sources,
+                        LiquidBlockRole::Caption,
+                        group.text.clone(),
+                        caption_refs,
+                    );
+                }
+                continue;
+            }
+            let keep_as_body = line.id.as_deref().is_some_and(|id| {
+                deep_by_id
+                    .get(id)
+                    .is_some_and(|deep| lm2_final_caption_source_line(deep))
+            });
+            if keep_as_body {
+                body_refs.push(line);
+            }
+        }
+        flush_body(&mut body_refs, &mut rebuilt_blocks, &mut rebuilt_sources);
+    }
+
+    *blocks = rebuilt_blocks;
+    *sources = rebuilt_sources;
+    repaired
+}
+
+fn lm2_leading_body_callout_with_remainder(text: &str) -> Option<(u16, String)> {
+    if let Some(marker) = leading_sentineled_marker(text) {
+        let end = leading_callout_marker_end(text.trim_start())?;
+        let remainder = text.trim_start()[end..].trim_start();
+        return remainder
+            .chars()
+            .next()
+            .is_some_and(char::is_alphabetic)
+            .then(|| (marker, text.trim_start().to_owned()));
+    }
+    let marker = leading_numeric_token_marker(text)?;
+    let digits = marker.to_string();
+    let trimmed = text.trim_start();
+    let remainder = trimmed[digits.len()..].trim_start();
+    remainder
+        .chars()
+        .next()
+        .is_some_and(char::is_alphabetic)
+        .then(|| {
+            (
+                marker,
+                format!("{CALLOUT_START}{marker}{CALLOUT_END} {remainder}"),
+            )
+        })
+}
+
+fn lm2_final_noise_bridge_body_line(line: &DeepLiquidSourceLine) -> bool {
+    !line.in_footnote_zone
+        && !line.below_footnote_divider
+        && !line.in_ruled_cell
+        && !line.ruled_row_membership_exact
+        && !line.page_table_column_like
+        && !line.segment_block_table_like
+        && !line.page_object_overlaps_image_bbox
+        && !line.page_object_hide_candidate
+        && !line.segment_block_furniture_like
+        && line.font_ratio_doc >= 0.84
+        && line.text.chars().any(char::is_alphabetic)
+}
+
+/// Restore a body row hidden between an open paragraph and a same-baseline
+/// leading callout fragment. The three consecutive rows must be one mixed
+/// source segment in body typography, and the callout needs a distinct
+/// accepted definition. A nearby path stroke alone is not furniture evidence.
+fn apply_final_noise_inline_callout_bridge(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let accepted_heads = sources
+        .iter()
+        .flat_map(|source| source.lines.iter())
+        .flat_map(|line| line.note_markers.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut repaired = 0usize;
+
+    loop {
+        let source_position = sources
+            .iter()
+            .enumerate()
+            .map(|(position, source)| (source.block_index, position))
+            .collect::<HashMap<_, _>>();
+        let mut operation = None;
+        for target in 0..blocks.len().saturating_sub(2) {
+            let middle = target + 1;
+            let donor = target + 2;
+            if !matches!(
+                blocks[target].role,
+                LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+            ) || blocks[middle].role != LiquidBlockRole::Noise
+                || !matches!(
+                    blocks[donor].role,
+                    LiquidBlockRole::Paragraph
+                        | LiquidBlockRole::Lead
+                        | LiquidBlockRole::Quote
+                        | LiquidBlockRole::Marginalia
+                        | LiquidBlockRole::Footnote
+                )
+                || !lm2_reflow_paragraph_is_visibly_open(&strip_callout_sentinels_lm2(
+                    &blocks[target].text,
+                ))
+                || !blocks[middle]
+                    .text
+                    .trim_start()
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_lowercase)
+            {
+                continue;
+            }
+            let Some((marker, donor_text)) =
+                lm2_leading_body_callout_with_remainder(&blocks[donor].text)
+            else {
+                continue;
+            };
+            if !accepted_heads.contains(&marker) {
+                continue;
+            }
+            let (Some(target_position), Some(middle_position), Some(donor_position)) = (
+                source_position.get(&target).copied(),
+                source_position.get(&middle).copied(),
+                source_position.get(&donor).copied(),
+            ) else {
+                continue;
+            };
+            let (Some(previous_ref), Some(middle_ref), Some(current_ref)) = (
+                sources[target_position].lines.last(),
+                sources[middle_position].lines.first(),
+                sources[donor_position].lines.first(),
+            ) else {
+                continue;
+            };
+            if sources[middle_position].lines.len() != 1 || sources[donor_position].lines.is_empty()
+            {
+                continue;
+            }
+            let (Some(previous), Some(middle_line), Some(current)) = (
+                previous_ref
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied()),
+                middle_ref
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied()),
+                current_ref
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied()),
+            ) else {
+                continue;
+            };
+            let font_max = previous
+                .font_height
+                .max(middle_line.font_height)
+                .max(current.font_height);
+            let font_min = previous
+                .font_height
+                .min(middle_line.font_height)
+                .min(current.font_height)
+                .max(1.0);
+            if previous.page_index != middle_line.page_index
+                || middle_line.page_index != current.page_index
+                || previous.line_index.saturating_add(1) != middle_line.line_index
+                || middle_line.line_index.saturating_add(1) != current.line_index
+                || previous.segment_block_id == 0
+                || previous.segment_block_id != middle_line.segment_block_id
+                || middle_line.segment_block_id != current.segment_block_id
+                || !previous.segment_block_shape.eq_ignore_ascii_case("mixed")
+                || !lm2_final_noise_bridge_body_line(previous)
+                || !lm2_final_noise_bridge_body_line(middle_line)
+                || !lm2_final_noise_bridge_body_line(current)
+                || !same_visual_baseline_fragment(middle_line, current)
+                || font_max / font_min > 1.18
+            {
+                continue;
+            }
+            operation = Some((target, middle, donor, donor_text));
+            break;
+        }
+
+        let Some((target, middle, donor, donor_text)) = operation else {
+            break;
+        };
+        let middle_text = blocks[middle].text.clone();
+        append_line(&mut blocks[target].text, &middle_text);
+        append_line(&mut blocks[target].text, &donor_text);
+        blocks[target].role = LiquidBlockRole::Paragraph;
+        blocks[target].label = None;
+        lm2_merge_block_sources(target, middle, sources);
+        lm2_remove_block(middle, blocks, sources);
+        lm2_merge_block_sources(target, middle, sources);
+        lm2_remove_block(middle, blocks, sources);
+        if let Some(source) = sources
+            .iter_mut()
+            .find(|source| source.block_index == target)
+        {
+            for line in &mut source.lines {
+                line.role = LiquidBlockRole::Paragraph;
+                line.note_markers.clear();
+            }
+        }
+        let _ = donor;
+        repaired += 1;
+    }
+    repaired
+}
+
+fn apply_final_fused_heading_body_splits(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let mut source_by_block = std::mem::take(sources)
+        .into_iter()
+        .map(|source| (source.block_index, source.lines))
+        .collect::<BTreeMap<_, _>>();
+    let old_blocks = std::mem::take(blocks);
+    let mut rebuilt_blocks = Vec::with_capacity(old_blocks.len());
+    let mut rebuilt_sources = Vec::new();
+    let mut repaired = 0usize;
+
+    for (old_index, block) in old_blocks.into_iter().enumerate() {
+        let Some(refs) = source_by_block.remove(&old_index) else {
+            rebuilt_blocks.push(block);
+            continue;
+        };
+        let split = if matches!(
+            block.role,
+            LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+        ) && refs.len() >= 2
+            && lm2_heading_starts_new_outline_item(&block.text)
+        {
+            (1..refs.len()).find_map(|ref_index| {
+                let before = &refs[..ref_index];
+                let after = &refs[ref_index..];
+                if !before.iter().all(|line| {
+                    matches!(
+                        line.role,
+                        LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+                    )
+                }) || !after.iter().all(|line| {
+                    matches!(
+                        line.role,
+                        LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+                    )
+                }) {
+                    return None;
+                }
+                let previous = before
+                    .last()?
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied())?;
+                let current = after
+                    .first()?
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied())?;
+                if previous.page_index != current.page_index
+                    || previous.line_index.checked_add(1) != Some(current.line_index)
+                    || previous.segment_block_id == current.segment_block_id
+                    || previous.segment_block_line_count != 1
+                    || current.segment_block_line_count != 1
+                    || !lm2_source_backed_body_display_line(current)
+                    || !lm2_blocksplit_ends_like_paragraph(&strip_callout_sentinels_lm2(
+                        &current.text,
+                    ))
+                    || !current
+                        .text
+                        .chars()
+                        .find(|ch| ch.is_alphabetic())
+                        .is_some_and(char::is_uppercase)
+                    || vertical_gap(previous, current) > 0.040
+                {
+                    return None;
+                }
+                let needle = clean_lm2_line_text(&refs[ref_index].text);
+                let position = (!needle.is_empty())
+                    .then(|| block.text.find(&needle))
+                    .flatten()?;
+                (position > 0).then_some((position, ref_index))
+            })
+        } else {
+            None
+        };
+
+        let Some((text_position, ref_position)) = split else {
+            let block_index = rebuilt_blocks.len();
+            rebuilt_blocks.push(block);
+            rebuilt_sources.push(LiquidBlockSourceLines {
+                block_index,
+                lines: refs,
+            });
+            continue;
+        };
+
+        let heading_text = block.text[..text_position].trim().to_owned();
+        let body_text = block.text[text_position..].trim().to_owned();
+        if heading_text.is_empty() || body_text.is_empty() {
+            let block_index = rebuilt_blocks.len();
+            rebuilt_blocks.push(block);
+            rebuilt_sources.push(LiquidBlockSourceLines {
+                block_index,
+                lines: refs,
+            });
+            continue;
+        }
+        let heading_index = rebuilt_blocks.len();
+        rebuilt_blocks.push(LiquidBlock {
+            role: block.role,
+            text: heading_text,
+            label: block.label,
+        });
+        rebuilt_sources.push(LiquidBlockSourceLines {
+            block_index: heading_index,
+            lines: refs[..ref_position].to_vec(),
+        });
+        let body_index = rebuilt_blocks.len();
+        rebuilt_blocks.push(LiquidBlock {
+            role: LiquidBlockRole::Paragraph,
+            text: body_text,
+            label: None,
+        });
+        rebuilt_sources.push(LiquidBlockSourceLines {
+            block_index: body_index,
+            lines: refs[ref_position..].to_vec(),
+        });
+        repaired += 1;
+    }
+
+    *blocks = rebuilt_blocks;
+    *sources = rebuilt_sources;
+    repaired
+}
+
+fn lm2_final_split_child_role(
+    fallback: LiquidBlockRole,
+    refs: &[LiquidSourceLineRef],
+    line_by_id: &HashMap<&str, &DeepLiquidSourceLine>,
+) -> LiquidBlockRole {
+    let physical_footnote_rows = !refs.is_empty()
+        && refs.iter().all(|line| {
+            line.id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+                .is_some_and(lm2_hard_physical_footnote_line)
+        });
+    if physical_footnote_rows {
+        return LiquidBlockRole::Marginalia;
+    }
+
+    let hard_body_rows = !refs.is_empty()
+        && refs.iter().all(|line| {
+            matches!(
+                line.role,
+                LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+            ) || line
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+                .is_some_and(|line| {
+                    lm2_hard_body_display_line(line) || lm2_source_backed_body_display_line(line)
+                })
+        });
+    hard_body_rows
+        .then_some(LiquidBlockRole::Paragraph)
+        .unwrap_or(fallback)
+}
+
+fn lm2_hard_physical_footnote_line(line: &DeepLiquidSourceLine) -> bool {
+    line.in_footnote_zone
+        && line.segment_block_footnote_like
+        && line.segment_block_shape.eq_ignore_ascii_case("footnote")
+        && line.font_ratio_doc <= 0.94
+        && !line.in_ruled_cell
+        && !line.ruled_row_membership_exact
+        && !line.page_table_column_like
+        && !line.page_object_overlaps_image_bbox
+}
+
+/// Reassert the role of body displays that late note ownership can demote.
+/// The two accepted shapes are deliberately structural: a statutory
+/// subdivision between its colon lead-in and numbered children, or an
+/// indented quotation between a colon lead-in and the page's first real note.
+fn apply_final_displayed_body_role_rescue(
+    blocks: &mut [LiquidBlock],
+    sources: &mut [LiquidBlockSourceLines],
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let source_by_block = sources
+        .iter()
+        .enumerate()
+        .map(|(position, source)| (source.block_index, position))
+        .collect::<HashMap<_, _>>();
+    let owner_by_coordinate = sources
+        .iter()
+        .flat_map(|source| {
+            source.lines.iter().map(move |line| {
+                (
+                    (line.page_index, line.line_index),
+                    (source.block_index, line),
+                )
+            })
+        })
+        .collect::<HashMap<_, _>>();
+    let mut operations = Vec::new();
+
+    for block_index in 1..blocks.len().saturating_sub(1) {
+        if !matches!(
+            blocks[block_index].role,
+            LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote
+        ) {
+            continue;
+        }
+        let (Some(previous_position), Some(current_position), Some(next_position)) = (
+            source_by_block.get(&(block_index - 1)).copied(),
+            source_by_block.get(&block_index).copied(),
+            source_by_block.get(&(block_index + 1)).copied(),
+        ) else {
+            continue;
+        };
+        let previous_refs = &sources[previous_position].lines;
+        let current_refs = &sources[current_position].lines;
+        let next_refs = &sources[next_position].lines;
+        let (Some(previous_ref), Some(first_ref), Some(last_ref), Some(next_ref)) = (
+            previous_refs.last(),
+            current_refs.first(),
+            current_refs.last(),
+            next_refs.first(),
+        ) else {
+            continue;
+        };
+        let (Some(previous), Some(first), Some(last), Some(next)) = (
+            previous_ref
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied()),
+            first_ref
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied()),
+            last_ref
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied()),
+            next_ref
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied()),
+        ) else {
+            continue;
+        };
+        if previous.page_index != first.page_index
+            || first.page_index != last.page_index
+            || previous.line_index.checked_add(1) != Some(first.line_index)
+            || last.line_index.checked_add(1) != Some(next.line_index)
+            || previous.segment_block_id == 0
+            || current_refs
+                .iter()
+                .any(|line| !line.note_markers.is_empty())
+            || !(lm2_hard_body_display_line(previous)
+                || lm2_source_backed_body_display_line(previous))
+            || current_refs.iter().any(|line| {
+                line.id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied())
+                    .is_none_or(|deep| {
+                        !(lm2_hard_body_display_line(deep)
+                            || lm2_source_backed_body_display_line(deep))
+                            || deep.page_index != first.page_index
+                            || deep.segment_block_id != previous.segment_block_id
+                    })
+            })
+        {
+            continue;
+        }
+
+        let statutory = blocks[block_index - 1].role == LiquidBlockRole::Paragraph
+            && blocks[block_index + 1].role == LiquidBlockRole::Paragraph
+            && blocks[block_index - 1].text.trim_end().ends_with(':')
+            && lm2_parenthesized_alpha_lead(&blocks[block_index].text)
+            && lm2_parenthesized_numeric_lead(&blocks[block_index + 1].text)
+            && (lm2_hard_body_display_line(next) || lm2_source_backed_body_display_line(next))
+            && next.segment_block_id == previous.segment_block_id
+            && first.font_height <= previous.font_height * 0.92;
+
+        let following_is_numbered_note = owner_by_coordinate
+            .get(&(last.page_index, last.line_index.saturating_add(1)))
+            .is_some_and(|(owner, line)| {
+                matches!(
+                    blocks.get(*owner).map(|block| block.role),
+                    Some(LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote)
+                ) && !line.note_markers.is_empty()
+            });
+        let page_width = first.page_width.max(previous.page_width).max(1.0);
+        let quote = blocks[block_index - 1].role == LiquidBlockRole::Paragraph
+            && blocks[block_index - 1].text.trim_end().ends_with(':')
+            && following_is_numbered_note
+            && (first.left - previous.left) / page_width > 0.02
+            && first.font_height <= previous.font_height * 0.92
+            && blocks[block_index]
+                .text
+                .chars()
+                .find(|ch| ch.is_alphabetic())
+                .is_some_and(char::is_uppercase);
+
+        if statutory {
+            operations.push((block_index, current_position, LiquidBlockRole::Paragraph));
+        } else if quote {
+            operations.push((block_index, current_position, LiquidBlockRole::Quote));
+        }
+    }
+
+    for (block_index, source_position, role) in &operations {
+        blocks[*block_index].role = *role;
+        blocks[*block_index].label = None;
+        for line in &mut sources[*source_position].lines {
+            line.role = *role;
+            line.note_markers.clear();
+        }
+    }
+    operations.len()
+}
+
+fn lm2_hard_body_display_line(line: &DeepLiquidSourceLine) -> bool {
+    line.segment_block_id != 0
+        && line.segment_block_shape.eq_ignore_ascii_case("body")
+        && !line.segment_block_footnote_like
+        && !line.in_footnote_zone
+        && !line.below_footnote_divider
+        && !line.doc_footnote_state
+        && !line.doc_footnote_continuation
+        && !line.in_ruled_cell
+        && !line.ruled_row_membership_exact
+        && !line.page_table_column_like
+        && !line.page_object_overlaps_image_bbox
+}
+
+/// Remove only leading source rows that are independently proven page
+/// furniture. This handles production slugs in their own block and journal
+/// running heads fused to the first real body row without rebuilding body text
+/// or disturbing recovered callout sentinels.
+fn apply_final_mixed_furniture_prefix_suppression(
+    blocks: &mut [LiquidBlock],
+    sources: &mut [LiquidBlockSourceLines],
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let source_position = sources
+        .iter()
+        .enumerate()
+        .map(|(position, source)| (source.block_index, position))
+        .collect::<HashMap<_, _>>();
+    let mut operations = Vec::new();
+
+    for block_index in 0..blocks.len() {
+        if !matches!(
+            blocks[block_index].role,
+            LiquidBlockRole::Paragraph
+                | LiquidBlockRole::Lead
+                | LiquidBlockRole::Quote
+                | LiquidBlockRole::Heading
+                | LiquidBlockRole::Subheading
+                | LiquidBlockRole::Noise
+        ) {
+            continue;
+        }
+        let Some(position) = source_position.get(&block_index).copied() else {
+            continue;
+        };
+        let refs = &sources[position].lines;
+        let prefix_count = refs
+            .iter()
+            .take_while(|line| {
+                line.id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied())
+                    .is_some_and(lm2_final_hard_furniture_line)
+            })
+            .count();
+        if prefix_count == 0 {
+            continue;
+        }
+        if prefix_count == refs.len() {
+            operations.push((block_index, position, prefix_count, None, false));
+            continue;
+        }
+        let mut remainder = blocks[block_index].text.trim_start();
+        let mut stripped = 0usize;
+        for line in refs.iter().take(prefix_count) {
+            let cleaned = clean_lm2_line_text(&line.text);
+            let Some(next) = remainder.strip_prefix(cleaned.trim()) else {
+                break;
+            };
+            remainder = next.trim_start();
+            stripped += 1;
+        }
+        if stripped > 0 && !remainder.is_empty() {
+            let salvage_body = blocks[block_index].role == LiquidBlockRole::Noise
+                && refs[stripped..].iter().all(|line| {
+                    line.id
+                        .as_deref()
+                        .and_then(|id| line_by_id.get(id).copied())
+                        .is_some_and(lm2_hard_body_display_line)
+                });
+            operations.push((
+                block_index,
+                position,
+                stripped,
+                Some(remainder.to_owned()),
+                salvage_body,
+            ));
+        }
+    }
+
+    for (block_index, position, count, replacement, salvage_body) in &operations {
+        if let Some(replacement) = replacement {
+            blocks[*block_index].text = replacement.clone();
+            sources[*position].lines.drain(..*count);
+            if *salvage_body {
+                blocks[*block_index].role = LiquidBlockRole::Paragraph;
+                blocks[*block_index].label = None;
+                for line in &mut sources[*position].lines {
+                    line.role = LiquidBlockRole::Paragraph;
+                }
+            }
+        } else {
+            blocks[*block_index].role = LiquidBlockRole::Noise;
+            blocks[*block_index].label = None;
+        }
+    }
+    operations.len()
+}
+
+fn lm2_final_hard_furniture_line(line: &DeepLiquidSourceLine) -> bool {
+    let text = collapse_whitespace(&line.text);
+    let lower = normalize_text(&text);
+    lower == "footnote continued on next page"
+        || looks_like_production_slug_boilerplate(&text)
+        || (line.line_index <= 1
+            && lower.contains("printer")
+            && (lower.contains("delete") || lower.contains("proof")))
+        || (line.line_index <= 2
+            && looks_like_running_header(&lower)
+            && !(lm2_hard_body_display_line(line)
+                && attached_terminal_body_marker(&line.text).is_some())
+            && (line.segment_block_furniture_like
+                || line.segment_block_shape.eq_ignore_ascii_case("furniture")
+                || line.doc_repeated_edge_text
+                || line.role_hint.is_some_and(|role| {
+                    matches!(
+                        role,
+                        LiquidBlockRole::Noise | LiquidBlockRole::Header | LiquidBlockRole::Footer
+                    )
+                })))
+        || (line.doc_repeated_edge_text
+            && (line.doc_repeated_top_edge || line.doc_repeated_bottom_edge))
+        || (looks_like_page_label_furniture(&text)
+            && !(lm2_hard_body_display_line(line)
+                && attached_terminal_body_marker(&line.text).is_some())
+            && (line.segment_block_furniture_like
+                || line.segment_block_shape.eq_ignore_ascii_case("furniture")
+                || line.doc_repeated_edge_text
+                || line.role_hint.is_some_and(|role| {
+                    matches!(
+                        role,
+                        LiquidBlockRole::Noise | LiquidBlockRole::Header | LiquidBlockRole::Footer
+                    )
+                })))
+}
+
+fn lm2_final_paragraph_boundary(
+    previous: &DeepLiquidSourceLine,
+    current: &DeepLiquidSourceLine,
+) -> bool {
+    paragraph_boundary(previous, current)
+        || lm2_displayed_lead_label_boundary(previous, current)
+        || lm2_small_font_to_body_cliff_boundary(previous, current)
+}
+
+fn lm2_lettered_list_item_start(text: &str) -> bool {
+    let token = text
+        .trim_start()
+        .split_whitespace()
+        .next()
+        .unwrap_or_default();
+    let marker = token.trim_end_matches(['.', ')']);
+    marker.len() == 1
+        && marker.chars().all(|ch| ch.is_ascii_lowercase())
+        && marker.len() != token.len()
+}
+
+fn lm2_safe_mixed_segment_line(line: &DeepLiquidSourceLine) -> bool {
+    line.segment_block_id != 0
+        && line.segment_block_shape.eq_ignore_ascii_case("mixed")
+        && !line.segment_block_footnote_like
+        && !line.in_footnote_zone
+        && !line.below_footnote_divider
+        && !line.in_ruled_cell
+        && !line.ruled_row_membership_exact
+        && !line.page_table_column_like
+        && !line.page_object_overlaps_image_bbox
+        && line.font_ratio_doc >= 0.90
+}
+
+/// Strong proof that two adjacent source rows are a single wrapped body flow,
+/// even when PDF extraction reports a tall/overlapping row or positions a
+/// leading inline footnote marker far to the right. The signed margin gate
+/// excludes ordinary first-line paragraph indents and colon-led quotations.
+fn lm2_strong_source_body_wrap(
+    previous: &DeepLiquidSourceLine,
+    current: &DeepLiquidSourceLine,
+) -> bool {
+    if previous.page_index != current.page_index
+        || previous.line_index.checked_add(1) != Some(current.line_index)
+        || !lm2_reflow_starts_like_continuation(&current.text)
+    {
+        return false;
+    }
+    let page_width = previous.page_width.max(current.page_width).max(1.0);
+    let signed_left_delta = (current.left - previous.left) / page_width;
+    let font_ratio = previous.font_height.max(current.font_height)
+        / previous.font_height.min(current.font_height).max(1.0);
+    let ordinary_body_wrap = (lm2_hard_body_display_line(previous)
+        || lm2_source_backed_body_display_line(previous))
+        && (lm2_hard_body_display_line(current) || lm2_source_backed_body_display_line(current));
+    let current_lower = current.text.trim_start().to_ascii_lowercase();
+    let hanging_list_conjunction = previous.segment_block_id == current.segment_block_id
+        && previous.segment_block_line_index.checked_add(1)
+            == Some(current.segment_block_line_index)
+        && lm2_safe_mixed_segment_line(previous)
+        && lm2_safe_mixed_segment_line(current)
+        && lm2_lettered_list_item_start(&previous.text)
+        && (current_lower.starts_with("or ") || current_lower.starts_with("and "))
+        && (0.0..=0.055).contains(&signed_left_delta);
+    if !ordinary_body_wrap && !hanging_list_conjunction {
+        return false;
+    }
+    let previous_open = previous.text.trim_end().ends_with('\u{0002}')
+        || !lm2_blocksplit_ends_like_paragraph(&strip_callout_sentinels_lm2(&previous.text))
+        || hanging_list_conjunction;
+    if !previous_open || font_ratio > 1.20 {
+        return false;
+    }
+    let right_indent_ceiling = if hanging_list_conjunction {
+        0.055
+    } else {
+        PARAGRAPH_FIRST_LINE_INDENT
+    };
+    if signed_left_delta > right_indent_ceiling {
+        return false;
+    }
+    let terminal_discretionary = previous.text.trim_end().ends_with('\u{0002}');
+    let leading_inline_marker = leading_numeric_token_marker(&previous.text).is_some()
+        || leading_sentineled_marker(&previous.text).is_some();
+    let first_line_body_return = ordinary_body_wrap
+        && previous.segment_block_id == current.segment_block_id
+        && previous.segment_block_line_index == 0
+        && current.segment_block_line_index == 1
+        && signed_left_delta < 0.0;
+    let outdent_floor = if terminal_discretionary || leading_inline_marker {
+        -0.20
+    } else if first_line_body_return {
+        -0.08
+    } else {
+        -0.06
+    };
+    signed_left_delta >= outdent_floor && vertical_gap(previous, current) <= 0.036
+}
+
+fn lm2_displayed_lead_label_boundary(
+    previous: &DeepLiquidSourceLine,
+    current: &DeepLiquidSourceLine,
+) -> bool {
+    if previous.page_index != current.page_index
+        || previous.segment_block_id != current.segment_block_id
+        || !lm2_source_backed_body_display_line(previous)
+        || !lm2_source_backed_body_display_line(current)
+        || current.page_width <= 0.0
+        || current.left / current.page_width < 0.14
+    {
+        return false;
+    }
+    lm2_displayed_lead_label_text(&current.text)
+        && (current.font_ratio_doc <= 0.98 || current.font_height <= previous.font_height * 0.95)
+}
+
+fn lm2_displayed_lead_label_text(text: &str) -> bool {
+    let text = collapse_whitespace(text);
+    let Some(colon) = text.find(':') else {
+        return false;
+    };
+    if colon > 120 {
+        return false;
+    }
+    let label = text[..colon].trim();
+    let remainder = text[colon + 1..].trim_start();
+    let label_words = label.split_whitespace().collect::<Vec<_>>();
+    (2..=14).contains(&label_words.len())
+        && label_words.iter().all(|word| {
+            let word = word.trim_matches(|ch: char| !ch.is_alphabetic());
+            word.is_empty()
+                || matches!(
+                    word.to_ascii_lowercase().as_str(),
+                    "a" | "an" | "and" | "as" | "for" | "in" | "of" | "or" | "the" | "to"
+                )
+                || word.chars().next().is_some_and(char::is_uppercase)
+        })
+        && remainder
+            .chars()
+            .find(|ch| ch.is_alphabetic())
+            .is_some_and(char::is_uppercase)
+}
+
+fn lm2_cross_page_displayed_lead_label_boundary(
+    previous: &DeepLiquidSourceLine,
+    current: &DeepLiquidSourceLine,
+) -> bool {
+    current.page_index == previous.page_index.saturating_add(1)
+        && current.line_index <= 3
+        && current.segment_block_line_index == 0
+        && lm2_source_backed_body_display_line(current)
+        && lm2_displayed_lead_label_text(&current.text)
+        && current.font_ratio_doc <= 0.98
+}
+
+fn lm2_small_font_to_body_cliff_boundary(
+    previous: &DeepLiquidSourceLine,
+    current: &DeepLiquidSourceLine,
+) -> bool {
+    previous.page_index == current.page_index
+        && previous.segment_block_id == current.segment_block_id
+        && lm2_body_segment_line(previous)
+        && lm2_body_segment_line(current)
+        && current.font_height >= previous.font_height * 1.07
+        && previous.font_ratio_doc <= 0.97
+        && current.font_ratio_doc >= 0.96
+        && vertical_gap(previous, current) <= 0.025
+        && lm2_blocksplit_ends_like_paragraph(&strip_callout_sentinels_lm2(&previous.text))
+        && current
+            .text
+            .chars()
+            .find(|ch| ch.is_alphabetic())
+            .is_some_and(char::is_uppercase)
+}
+
+/// Split a merged run when the first source row on the next page is itself a
+/// source-backed displayed label. This exposes the independent display before
+/// source-order repair, without treating an ordinary page break as a split.
+fn apply_final_cross_page_display_run_splits(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let mut source_by_block = std::mem::take(sources)
+        .into_iter()
+        .map(|source| (source.block_index, source.lines))
+        .collect::<BTreeMap<_, _>>();
+    let old_blocks = std::mem::take(blocks);
+    let mut rebuilt_blocks = Vec::with_capacity(old_blocks.len());
+    let mut rebuilt_sources = Vec::new();
+    let mut repaired = 0usize;
+
+    for (old_index, block) in old_blocks.into_iter().enumerate() {
+        let Some(refs) = source_by_block.remove(&old_index) else {
+            rebuilt_blocks.push(block);
+            continue;
+        };
+        if !matches!(
+            block.role,
+            LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+        ) || refs.len() < 2
+        {
+            let block_index = rebuilt_blocks.len();
+            rebuilt_blocks.push(block);
+            rebuilt_sources.push(LiquidBlockSourceLines {
+                block_index,
+                lines: refs,
+            });
+            continue;
+        }
+
+        let mut splits = Vec::<(usize, usize)>::new();
+        let mut search_from = 0usize;
+        for ref_index in 1..refs.len() {
+            let (Some(previous), Some(current)) = (
+                refs[ref_index - 1]
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied()),
+                refs[ref_index]
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied()),
+            ) else {
+                continue;
+            };
+            if !lm2_cross_page_displayed_lead_label_boundary(previous, current) {
+                continue;
+            }
+            let needle = clean_lm2_line_text(&refs[ref_index].text);
+            let Some(relative) = (!needle.is_empty())
+                .then(|| block.text[search_from..].find(&needle))
+                .flatten()
+            else {
+                continue;
+            };
+            let position = search_from + relative;
+            if position == 0 {
+                continue;
+            }
+            splits.push((position, ref_index));
+            search_from = position + needle.len();
+        }
+
+        if splits.is_empty() {
+            let block_index = rebuilt_blocks.len();
+            rebuilt_blocks.push(block);
+            rebuilt_sources.push(LiquidBlockSourceLines {
+                block_index,
+                lines: refs,
+            });
+            continue;
+        }
+
+        let mut boundaries = vec![(0usize, 0usize)];
+        boundaries.extend(splits);
+        boundaries.push((block.text.len(), refs.len()));
+        for pair in boundaries.windows(2) {
+            let (text_start, ref_start) = pair[0];
+            let (text_end, ref_end) = pair[1];
+            let text = block.text[text_start..text_end].trim().to_owned();
+            if text.is_empty() || ref_start == ref_end {
+                continue;
+            }
+            let segment_refs = refs[ref_start..ref_end].to_vec();
+            let block_index = rebuilt_blocks.len();
+            rebuilt_blocks.push(LiquidBlock {
+                role: lm2_final_split_child_role(block.role, &segment_refs, &line_by_id),
+                text,
+                label: None,
+            });
+            rebuilt_sources.push(LiquidBlockSourceLines {
+                block_index,
+                lines: segment_refs,
+            });
+        }
+        repaired += 1;
+    }
+
+    *blocks = rebuilt_blocks;
+    *sources = rebuilt_sources;
+    repaired
+}
+
+fn lm2_inline_dash_noise_fragment(text: &str) -> bool {
+    let cleaned = strip_callout_sentinels_lm2(text);
+    let trimmed = cleaned.trim();
+    let Some(remainder) = trimmed
+        .strip_prefix('\u{2014}')
+        .or_else(|| trimmed.strip_prefix('\u{2013}'))
+    else {
+        return false;
+    };
+    remainder.trim().is_empty()
+        || word_count(remainder) <= 4
+            && !remainder.chars().any(char::is_numeric)
+            && remainder.chars().any(char::is_alphabetic)
+}
+
+fn lm2_text_before_terminal_body_marker(text: &str) -> &str {
+    let trimmed = text.trim_end();
+    if trimmed.ends_with(CALLOUT_END)
+        && let Some(start) = trimmed.rfind(CALLOUT_START)
+    {
+        return trimmed[..start].trim_end();
+    }
+    if let Some(marker) = attached_terminal_ascii_marker(trimmed) {
+        let marker = marker.to_string();
+        if let Some(prefix) = trimmed.strip_suffix(&marker) {
+            return prefix.trim_end();
+        }
+    }
+    trimmed
+}
+
+/// Recover an em/en-dash fragment that PDF geometry isolated as a one-row
+/// Noise block at the right edge of a body line. The following lowercase row
+/// must return sharply to the body margin, so ordinary dash separators and
+/// genuine paragraph starts remain untouched.
+fn apply_final_inline_dash_fragment_reflow(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let mut repaired = 0usize;
+
+    loop {
+        let source_position = sources
+            .iter()
+            .enumerate()
+            .map(|(position, source)| (source.block_index, position))
+            .collect::<HashMap<_, _>>();
+        let mut operation = None;
+        for middle in 1..blocks.len().saturating_sub(1) {
+            let target = middle - 1;
+            let donor = middle + 1;
+            if !matches!(
+                blocks[target].role,
+                LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+            ) || blocks[middle].role != LiquidBlockRole::Noise
+                || !matches!(
+                    blocks[donor].role,
+                    LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+                )
+                || !lm2_inline_dash_noise_fragment(&blocks[middle].text)
+            {
+                continue;
+            }
+            let (Some(target_position), Some(middle_position), Some(donor_position)) = (
+                source_position.get(&target).copied(),
+                source_position.get(&middle).copied(),
+                source_position.get(&donor).copied(),
+            ) else {
+                continue;
+            };
+            let (Some(previous_ref), [fragment_ref], Some(current_ref)) = (
+                sources[target_position].lines.last(),
+                sources[middle_position].lines.as_slice(),
+                sources[donor_position].lines.first(),
+            ) else {
+                continue;
+            };
+            let (Some(previous), Some(fragment), Some(current)) = (
+                previous_ref
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied()),
+                fragment_ref
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied()),
+                current_ref
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied()),
+            ) else {
+                continue;
+            };
+            let page_width = previous
+                .page_width
+                .max(fragment.page_width)
+                .max(current.page_width)
+                .max(1.0);
+            let font_ratio = previous
+                .font_height
+                .max(fragment.font_height)
+                .max(current.font_height)
+                / previous
+                    .font_height
+                    .min(fragment.font_height)
+                    .min(current.font_height)
+                    .max(1.0);
+            if previous.page_index != fragment.page_index
+                || fragment.page_index != current.page_index
+                || previous.line_index.checked_add(1) != Some(fragment.line_index)
+                || fragment.line_index.checked_add(1) != Some(current.line_index)
+                || !same_visual_row_fragment(previous, fragment)
+                || (current.left - fragment.left) / page_width > -0.20
+                || vertical_gap(fragment, current) > 0.020
+                || font_ratio > 1.15
+                || !lm2_reflow_paragraph_is_visibly_open(lm2_text_before_terminal_body_marker(
+                    &blocks[target].text,
+                ))
+                || !lm2_reflow_starts_like_continuation(&current.text)
+                || !lm2_final_flow_line_ref(previous_ref, previous)
+                || !lm2_final_flow_line_ref(current_ref, current)
+                || lm2_final_hard_furniture_line(fragment)
+                || fragment.in_footnote_zone
+                || fragment.below_footnote_divider
+                || fragment.in_ruled_cell
+                || fragment.ruled_row_membership_exact
+                || fragment.page_table_column_like
+                || fragment.page_object_overlaps_image_bbox
+                || fragment.font_ratio_doc < 0.90
+            {
+                continue;
+            }
+            operation = Some((target, middle, donor));
+            break;
+        }
+
+        let Some((target, middle, donor)) = operation else {
+            break;
+        };
+        let fragment_text = blocks[middle].text.clone();
+        let donor_text = blocks[donor].text.clone();
+        append_line(&mut blocks[target].text, &fragment_text);
+        append_line(&mut blocks[target].text, &donor_text);
+        lm2_merge_block_sources(target, middle, sources);
+        lm2_remove_block(middle, blocks, sources);
+        lm2_merge_block_sources(target, middle, sources);
+        lm2_remove_block(middle, blocks, sources);
+        repaired += 1;
+    }
+
+    repaired
+}
+
+fn lm2_body_sized_fragment_line(
+    line_ref: &LiquidSourceLineRef,
+    line: &DeepLiquidSourceLine,
+) -> bool {
+    matches!(
+        line_ref.role,
+        LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+    ) && !line.segment_block_footnote_like
+        && !line.in_footnote_zone
+        && !line.below_footnote_divider
+        && !line.in_ruled_cell
+        && !line.ruled_row_membership_exact
+        && !line.page_table_column_like
+        && !line.page_object_overlaps_image_bbox
+        && line.font_ratio_doc >= 0.84
+        && line.text.chars().any(char::is_alphabetic)
+}
+
+/// Join adjacent blocks that are actually consecutive horizontal fragments of
+/// one physical row. A numeric superscript may be the middle fragment; a
+/// body-sized continuation mislabeled Table is accepted only when its source
+/// ref still says Paragraph-like. The touching-x/baseline proof excludes
+/// ordinary columns, list rows, and vertically separated paragraphs.
+fn apply_final_same_baseline_fragment_reflow(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let mut repaired = 0usize;
+
+    loop {
+        let source_position = sources
+            .iter()
+            .enumerate()
+            .map(|(position, source)| (source.block_index, position))
+            .collect::<HashMap<_, _>>();
+        let mut operation = None;
+        for target in 0..blocks.len().saturating_sub(1) {
+            let donor = target + 1;
+            if !matches!(
+                blocks[target].role,
+                LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+            ) {
+                continue;
+            }
+            let (Some(target_position), Some(donor_position)) = (
+                source_position.get(&target).copied(),
+                source_position.get(&donor).copied(),
+            ) else {
+                continue;
+            };
+            let (Some(previous_ref), Some(current_ref)) = (
+                sources[target_position].lines.last(),
+                sources[donor_position].lines.first(),
+            ) else {
+                continue;
+            };
+            let (Some(previous), Some(current)) = (
+                previous_ref
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied()),
+                current_ref
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied()),
+            ) else {
+                continue;
+            };
+            let donor_marker = lm2_source_ref_is_standalone_callout(current_ref)
+                .then(|| strip_callout_sentinels_lm2(&current_ref.text))
+                .and_then(|text| text.trim().parse::<u16>().ok());
+            let previous_marker = lm2_source_ref_is_standalone_callout(previous_ref);
+            let body_donor = lm2_body_sized_fragment_line(current_ref, current);
+            if donor_marker.is_none() && !body_donor {
+                continue;
+            }
+            if !matches!(
+                blocks[donor].role,
+                LiquidBlockRole::Paragraph
+                    | LiquidBlockRole::Lead
+                    | LiquidBlockRole::Quote
+                    | LiquidBlockRole::Noise
+                    | LiquidBlockRole::Marginalia
+                    | LiquidBlockRole::Footnote
+                    | LiquidBlockRole::Table
+            ) {
+                continue;
+            }
+
+            let anchor = if previous_marker {
+                sources[target_position]
+                    .lines
+                    .iter()
+                    .rev()
+                    .skip(1)
+                    .find_map(|line_ref| {
+                        line_ref
+                            .id
+                            .as_deref()
+                            .and_then(|id| line_by_id.get(id).copied())
+                            .filter(|line| lm2_body_sized_fragment_line(line_ref, line))
+                    })
+            } else {
+                lm2_body_sized_fragment_line(previous_ref, previous).then_some(previous)
+            };
+            let Some(anchor) = anchor else {
+                continue;
+            };
+            let row_proven = if donor_marker.is_some() {
+                lm2_marker_can_attach_to_previous_line(current, previous)
+            } else if previous_marker {
+                let page_height = anchor.page_height.max(current.page_height).max(1.0);
+                let page_width = anchor.page_width.max(current.page_width).max(1.0);
+                let body_baseline = (anchor.bottom - current.bottom).abs() / page_height <= 0.003
+                    && (anchor.top - current.top).abs() / page_height <= 0.004;
+                let horizontally_contiguous = current.left >= previous.right - 2.0
+                    && current.left <= previous.right + (page_width * 0.008).max(2.5);
+                lm2_marker_can_attach_to_previous_line(previous, anchor)
+                    && body_baseline
+                    && horizontally_contiguous
+            } else {
+                same_visual_row_fragment(previous, current)
+            };
+            if !row_proven {
+                continue;
+            }
+            if donor_marker.is_none() {
+                let font_ratio = anchor.font_height.max(current.font_height)
+                    / anchor.font_height.min(current.font_height).max(1.0);
+                if font_ratio > 1.20 {
+                    continue;
+                }
+            }
+            operation = Some((target, donor, donor_marker));
+            break;
+        }
+
+        let Some((target, donor, donor_marker)) = operation else {
+            break;
+        };
+        if let Some(marker) = donor_marker {
+            if attached_terminal_body_marker(&blocks[target].text) != Some(marker) {
+                append_standalone_marker_to_line(&mut blocks[target].text, &marker.to_string());
+            }
+        } else {
+            let donor_text = blocks[donor].text.clone();
+            append_line(&mut blocks[target].text, &donor_text);
+        }
+        lm2_merge_block_sources(target, donor, sources);
+        lm2_remove_block(donor, blocks, sources);
+        repaired += 1;
+    }
+
+    repaired
+}
+
+/// Join adjacent body fragments only when source geometry proves they are one
+/// physical flow. A fully inverted adjacent source interval may be swapped
+/// only when each block's emitted text independently follows its own source
+/// rows; source refs alone are never permission to reorder prose.
+/// This runs after every role/split repair so no later pass can reintroduce an
+/// out-of-order interval or strand a wrapped line behind an artificial block
+/// boundary.
+fn apply_final_body_source_order_and_coalescing(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let mut repaired = apply_final_cross_page_display_run_splits(blocks, sources, decoded);
+    repaired += apply_final_inline_dash_fragment_reflow(blocks, sources, decoded);
+    repaired += apply_final_same_baseline_fragment_reflow(blocks, sources, decoded);
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let first_body_line_by_page = sources
+        .iter()
+        .filter(|source| {
+            lm2_final_body_block_candidate(source.block_index, blocks, sources, &line_by_id)
+        })
+        .flat_map(|source| source.lines.iter())
+        .filter_map(|line_ref| {
+            let line = line_ref
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())?;
+            lm2_final_flow_line_ref(line_ref, line).then_some(line)
+        })
+        .fold(HashMap::<usize, usize>::new(), |mut first, line| {
+            first
+                .entry(line.page_index)
+                .and_modify(|index| *index = (*index).min(line.line_index))
+                .or_insert(line.line_index);
+            first
+        });
+    // Correct an actually inverted adjacent body pair only when each emitted
+    // block independently follows the text order of its own source rows. A
+    // merged block can have sorted provenance even when its appended text was
+    // reversed; the text-congruence gate deliberately rejects that shape.
+    loop {
+        let mut operation = None;
+        for index in 0..blocks.len().saturating_sub(1) {
+            if !lm2_final_body_block_candidate(index, blocks, sources, &line_by_id)
+                || !lm2_final_body_block_candidate(index + 1, blocks, sources, &line_by_id)
+                || !lm2_block_text_follows_source_rows(index, blocks, sources, &line_by_id)
+                || !lm2_block_text_follows_source_rows(index + 1, blocks, sources, &line_by_id)
+            {
+                continue;
+            }
+            let (Some(left), Some(right)) = (
+                lm2_body_source_interval(index, sources, &line_by_id),
+                lm2_body_source_interval(index + 1, sources, &line_by_id),
+            ) else {
+                continue;
+            };
+            if left.0 > right.1 {
+                let previous = line_by_id
+                    .values()
+                    .copied()
+                    .find(|line| (line.page_index, line.line_index) == right.1);
+                let current = line_by_id
+                    .values()
+                    .copied()
+                    .find(|line| (line.page_index, line.line_index) == left.0);
+                if !matches!((previous, current), (Some(previous), Some(current)) if
+                    lm2_strong_source_body_wrap(previous, current)
+                        || lm2_same_physical_body_segment_order(previous, current))
+                {
+                    continue;
+                }
+                operation = Some(index);
+                break;
+            }
+        }
+        let Some(index) = operation else {
+            break;
+        };
+        blocks.swap(index, index + 1);
+        for source in sources.iter_mut() {
+            if source.block_index == index {
+                source.block_index = index + 1;
+            } else if source.block_index == index + 1 {
+                source.block_index = index;
+            }
+        }
+        repaired += 1;
+    }
+
+    // Resolve adjacent open lowercase wraps before the general transparent-gap
+    // pass. This uses raw source text so a terminal U+0002 hyphen remains
+    // available even after the assembled block text has discarded it.
+    loop {
+        let mut operation = None;
+        for index in 0..blocks.len().saturating_sub(1) {
+            if !matches!(
+                blocks[index].role,
+                LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+            ) || !matches!(
+                blocks[index + 1].role,
+                LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+            ) {
+                continue;
+            }
+            let Some((previous, current, _)) =
+                lm2_body_edge_lines(index, index + 1, sources, &line_by_id)
+            else {
+                continue;
+            };
+            if lm2_strong_source_body_wrap(previous, current) {
+                operation = Some((index, previous.text.trim_end().ends_with('\u{0002}')));
+                break;
+            }
+        }
+        let Some((target, source_discretionary_hyphen)) = operation else {
+            break;
+        };
+        let donor = target + 1;
+        let donor_text = blocks[donor].text.clone();
+        if source_discretionary_hyphen && !blocks[target].text.trim_end().ends_with('-') {
+            blocks[target].text.push('-');
+        }
+        append_line(&mut blocks[target].text, &donor_text);
+        lm2_merge_block_sources(target, donor, sources);
+        lm2_remove_block(donor, blocks, sources);
+        repaired += 1;
+    }
+
+    // Fold a source-isolated superscript into the preceding prose before the
+    // ordinary continuity pass. The donor prose still has to be in the same
+    // physical body flow and must not cross a real paragraph boundary.
+    loop {
+        let mut operation = None;
+        for index in 0..blocks.len().saturating_sub(2) {
+            if blocks[index].role != LiquidBlockRole::Paragraph
+                || blocks[index + 2].role != LiquidBlockRole::Paragraph
+                || !lm2_standalone_callout_block(&blocks[index + 1].text)
+            {
+                continue;
+            }
+            let Some((previous, current, _)) =
+                lm2_body_edge_lines(index, index + 2, sources, &line_by_id)
+            else {
+                continue;
+            };
+            if previous.page_index == current.page_index
+                && previous.segment_block_id == current.segment_block_id
+                && current.line_index > previous.line_index
+                && !lm2_final_paragraph_boundary(previous, current)
+            {
+                operation = Some(index);
+                break;
+            }
+        }
+        let Some(index) = operation else {
+            break;
+        };
+        let marker = blocks[index + 1].text.clone();
+        if marker.chars().all(|ch| ch.is_ascii_digit()) {
+            append_standalone_marker_to_line(&mut blocks[index].text, &marker);
+        } else {
+            blocks[index].text = format!("{}{}", blocks[index].text.trim_end(), marker.trim());
+        }
+        lm2_merge_block_sources(index, index + 1, sources);
+        lm2_remove_block(index + 1, blocks, sources);
+        repaired += 1;
+    }
+
+    loop {
+        let mut operation = None;
+        for target in 0..blocks.len().saturating_sub(1) {
+            if !lm2_final_body_block_candidate(target, blocks, sources, &line_by_id) {
+                continue;
+            }
+            let mut donor = None;
+            for index in (target + 1)..blocks.len() {
+                if lm2_final_body_block_candidate(index, blocks, sources, &line_by_id) {
+                    donor = Some(index);
+                    break;
+                }
+                if !matches!(
+                    blocks[index].role,
+                    LiquidBlockRole::Noise
+                        | LiquidBlockRole::Header
+                        | LiquidBlockRole::Footer
+                        | LiquidBlockRole::Marginalia
+                        | LiquidBlockRole::Footnote
+                ) {
+                    break;
+                }
+            }
+            let Some(donor) = donor else {
+                continue;
+            };
+            if !blocks[target + 1..donor].iter().all(|block| {
+                matches!(
+                    block.role,
+                    LiquidBlockRole::Noise
+                        | LiquidBlockRole::Header
+                        | LiquidBlockRole::Footer
+                        | LiquidBlockRole::Marginalia
+                        | LiquidBlockRole::Footnote
+                )
+            }) {
+                continue;
+            }
+            let Some((previous, current, terminal_callout_gap)) =
+                lm2_body_edge_lines(target, donor, sources, &line_by_id)
+            else {
+                continue;
+            };
+            if lm2_proven_body_continuation(
+                &blocks[target].text,
+                &blocks[donor].text,
+                previous,
+                current,
+                terminal_callout_gap,
+                &first_body_line_by_page,
+            ) {
+                operation = Some((target, donor));
+                break;
+            }
+        }
+        let Some((target, donor)) = operation else {
+            break;
+        };
+        let donor_text = blocks[donor].text.clone();
+        append_line(&mut blocks[target].text, &donor_text);
+        lm2_merge_block_sources(target, donor, sources);
+        lm2_remove_block(donor, blocks, sources);
+        repaired += 1;
+    }
+
+    repaired
+}
+
+fn lm2_same_physical_body_segment_order(
+    previous: &DeepLiquidSourceLine,
+    current: &DeepLiquidSourceLine,
+) -> bool {
+    previous.page_index == current.page_index
+        && previous.line_index < current.line_index
+        && current.line_index.saturating_sub(previous.line_index) <= 8
+        && previous.segment_block_id != 0
+        && previous.segment_block_id == current.segment_block_id
+        && lm2_source_backed_body_display_line(previous)
+        && lm2_source_backed_body_display_line(current)
+        && previous.font_height.max(current.font_height)
+            / previous.font_height.min(current.font_height).max(1.0)
+            <= 1.25
+}
+
+fn lm2_body_source_interval(
+    block_index: usize,
+    sources: &[LiquidBlockSourceLines],
+    line_by_id: &HashMap<&str, &DeepLiquidSourceLine>,
+) -> Option<((usize, usize), (usize, usize))> {
+    let source = sources
+        .iter()
+        .find(|source| source.block_index == block_index)?;
+    let mut coordinates = source.lines.iter().filter_map(|line| {
+        let deep = line
+            .id
+            .as_deref()
+            .and_then(|id| line_by_id.get(id).copied())?;
+        lm2_final_flow_line_ref(line, deep).then_some((deep.page_index, deep.line_index))
+    });
+    let first = coordinates.next()?;
+    Some(
+        coordinates.fold((first, first), |(minimum, maximum), coordinate| {
+            (minimum.min(coordinate), maximum.max(coordinate))
+        }),
+    )
+}
+
+fn lm2_block_text_follows_source_rows(
+    block_index: usize,
+    blocks: &[LiquidBlock],
+    sources: &[LiquidBlockSourceLines],
+    line_by_id: &HashMap<&str, &DeepLiquidSourceLine>,
+) -> bool {
+    let Some(block) = blocks.get(block_index) else {
+        return false;
+    };
+    let Some(source) = sources
+        .iter()
+        .find(|source| source.block_index == block_index)
+    else {
+        return false;
+    };
+    let haystack = lm2_text_order_tokens(&block.text);
+    if haystack.is_empty() {
+        return false;
+    }
+    let mut cursor = 0usize;
+    let mut previous_coordinate = None;
+    let mut matched_rows = 0usize;
+    let mut comparable_rows = 0usize;
+    for line in &source.lines {
+        let Some(deep) = line
+            .id
+            .as_deref()
+            .and_then(|id| line_by_id.get(id).copied())
+            .filter(|deep| lm2_final_flow_line_ref(line, deep))
+        else {
+            continue;
+        };
+        let coordinate = (deep.page_index, deep.line_index);
+        if previous_coordinate.is_some_and(|previous| coordinate <= previous) {
+            return false;
+        }
+        previous_coordinate = Some(coordinate);
+        let anchor = lm2_text_order_tokens(&deep.text)
+            .into_iter()
+            .take(4)
+            .collect::<Vec<_>>();
+        if anchor.len() < 2 {
+            continue;
+        }
+        comparable_rows += 1;
+        if anchor.len() > haystack.len().saturating_sub(cursor) {
+            return false;
+        }
+        let Some(relative) = haystack[cursor..]
+            .windows(anchor.len())
+            .position(|window| window == anchor.as_slice())
+        else {
+            return false;
+        };
+        cursor += relative + anchor.len();
+        matched_rows += 1;
+    }
+    comparable_rows > 0 && matched_rows == comparable_rows
+}
+
+fn lm2_text_order_tokens(text: &str) -> Vec<String> {
+    strip_callout_sentinels_lm2(text)
+        .replace('\u{0002}', "")
+        .split_whitespace()
+        .filter_map(|token| {
+            let token = token.trim_matches(|ch: char| !ch.is_alphanumeric());
+            (!token.is_empty() && token.chars().any(char::is_alphabetic))
+                .then(|| token.to_lowercase())
+        })
+        .collect()
+}
+
+fn lm2_final_body_block_candidate(
+    block_index: usize,
+    blocks: &[LiquidBlock],
+    sources: &[LiquidBlockSourceLines],
+    line_by_id: &HashMap<&str, &DeepLiquidSourceLine>,
+) -> bool {
+    let Some(block) = blocks.get(block_index) else {
+        return false;
+    };
+    if matches!(
+        block.role,
+        LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+    ) {
+        return true;
+    }
+    if !matches!(
+        block.role,
+        LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+    ) {
+        return false;
+    }
+    let Some(source) = sources
+        .iter()
+        .find(|source| source.block_index == block_index)
+    else {
+        return false;
+    };
+    let textual_continuation = block.text.trim_end().ends_with('-')
+        || leading_sentineled_marker(&block.text).is_some()
+        || lm2_reflow_starts_like_continuation(&block.text);
+    let contains_body_flow = source.lines.iter().any(|line| {
+        matches!(
+            line.role,
+            LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+        ) && line
+            .id
+            .as_deref()
+            .and_then(|id| line_by_id.get(id).copied())
+            .is_some_and(|deep| lm2_body_sized_source_flow_ref(line, deep))
+    });
+    let embedded_body_continuation = source.lines.as_slice().first().is_some_and(|line| {
+        line.id
+            .as_deref()
+            .and_then(|id| line_by_id.get(id).copied())
+            .is_some_and(|deep| {
+                source.lines.len() == 1
+                    && deep.segment_block_line_index > 0
+                    && deep.segment_block_shape.eq_ignore_ascii_case("body")
+                    && !deep.bold
+                    && !deep.is_block_indented
+                    && lm2_source_backed_body_display_line(deep)
+                    && deep.font_ratio_doc >= 0.95
+            })
+    });
+    (textual_continuation || contains_body_flow || embedded_body_continuation)
+        && source.lines.iter().any(|line| {
+            line.id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+                .is_some_and(|deep| lm2_final_flow_line_ref(line, deep))
+        })
+}
+
+fn lm2_body_edge_lines<'a>(
+    target: usize,
+    donor: usize,
+    sources: &'a [LiquidBlockSourceLines],
+    line_by_id: &HashMap<&str, &'a DeepLiquidSourceLine>,
+) -> Option<(&'a DeepLiquidSourceLine, &'a DeepLiquidSourceLine, bool)> {
+    let target_source = sources.iter().find(|source| source.block_index == target)?;
+    let donor_source = sources.iter().find(|source| source.block_index == donor)?;
+    let previous = target_source
+        .lines
+        .iter()
+        .filter_map(|line| {
+            line.id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+                .filter(|deep| lm2_final_flow_line_ref(line, deep))
+        })
+        .max_by_key(|line| (line.page_index, line.line_index))?;
+    let terminal_callout_gap = target_source.lines.iter().any(|line| {
+        line.page_index == previous.page_index
+            && line.line_index == previous.line_index.saturating_add(1)
+            && lm2_source_ref_is_standalone_callout(line)
+    }) || sources
+        .iter()
+        .filter(|source| source.block_index > target && source.block_index < donor)
+        .flat_map(|source| source.lines.iter())
+        .any(|line| {
+            line.page_index == previous.page_index
+                && line.line_index == previous.line_index.saturating_add(1)
+                && lm2_source_ref_is_standalone_callout(line)
+        })
+        || line_by_id.values().copied().any(|line| {
+            line.page_index == previous.page_index
+                && line.line_index == previous.line_index.saturating_add(1)
+                && lm2_standalone_callout_block(&line.text)
+        });
+    let current = donor_source
+        .lines
+        .iter()
+        .filter_map(|line| {
+            line.id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+                .filter(|deep| lm2_final_flow_line_ref(line, deep))
+        })
+        .min_by_key(|line| (line.page_index, line.line_index))?;
+    Some((previous, current, terminal_callout_gap))
+}
+
+fn lm2_source_ref_is_standalone_callout(line: &LiquidSourceLineRef) -> bool {
+    let cleaned = strip_callout_sentinels_lm2(&line.text);
+    cleaned
+        .trim()
+        .parse::<u16>()
+        .is_ok_and(|marker| marker <= LM2_MAX_NOTE_MARKER)
+}
+
+fn lm2_final_flow_line_ref(line_ref: &LiquidSourceLineRef, line: &DeepLiquidSourceLine) -> bool {
+    if lm2_final_hard_furniture_line(line)
+        || line.below_footnote_divider
+        || line.in_ruled_cell
+        || line.ruled_row_membership_exact
+        || line.page_table_column_like
+        || line.page_object_overlaps_image_bbox
+    {
+        return false;
+    }
+    if line.in_footnote_zone
+        && !lm2_source_backed_body_display_line(line)
+        && !lm2_body_sized_source_flow_ref(line_ref, line)
+    {
+        return false;
+    }
+    matches!(
+        line_ref.role,
+        LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+    ) || lm2_source_backed_body_display_line(line)
+        || line.segment_block_shape.eq_ignore_ascii_case("mixed")
+}
+
+fn lm2_body_sized_source_flow_ref(
+    line_ref: &LiquidSourceLineRef,
+    line: &DeepLiquidSourceLine,
+) -> bool {
+    matches!(
+        line_ref.role,
+        LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+    ) && !lm2_final_hard_furniture_line(line)
+        && !line.below_footnote_divider
+        && !line.in_ruled_cell
+        && !line.ruled_row_membership_exact
+        && !line.page_table_column_like
+        && !line.page_object_overlaps_image_bbox
+        && line.font_ratio_doc >= 0.95
+        && line.text.chars().any(char::is_alphabetic)
+}
+
+fn lm2_proven_body_continuation(
+    before: &str,
+    after: &str,
+    previous: &DeepLiquidSourceLine,
+    current: &DeepLiquidSourceLine,
+    terminal_callout_gap: bool,
+    first_body_line_by_page: &HashMap<usize, usize>,
+) -> bool {
+    if lm2_displayed_lead_label_boundary(previous, current)
+        || lm2_cross_page_displayed_lead_label_boundary(previous, current)
+        || lm2_small_font_to_body_cliff_boundary(previous, current)
+    {
+        return false;
+    }
+    let before_without_callouts = strip_callout_sentinels_lm2(before);
+    let open = lm2_reflow_paragraph_is_visibly_open(&before_without_callouts);
+    let discretionary_hyphen = before_without_callouts.trim_end().ends_with('-')
+        && after
+            .trim_start()
+            .chars()
+            .next()
+            .is_some_and(char::is_alphabetic);
+    let continuation_start = lm2_reflow_starts_like_continuation(after);
+    let leading_callout = leading_sentineled_marker(after).is_some();
+    let page_width = previous.page_width.max(current.page_width).max(1.0);
+    let signed_left_delta = (current.left - previous.left) / page_width;
+    let current_visual_left = if current.first_visual_left > 0.0 {
+        current.first_visual_left
+    } else {
+        current.left
+    };
+    let visual_signed_left_delta = (current_visual_left - previous.left) / page_width;
+    let font_ratio = previous.font_height.max(current.font_height)
+        / previous.font_height.min(current.font_height).max(1.0);
+    let indented_after_colon =
+        before.trim_end().ends_with(':') && (current.left - previous.left) / page_width > 0.02;
+    let next_mixed_lettered_list_item = previous.page_index == current.page_index
+        && previous.segment_block_id == current.segment_block_id
+        && lm2_safe_mixed_segment_line(previous)
+        && lm2_safe_mixed_segment_line(current)
+        && lm2_lettered_list_item_start(&current.text)
+        && signed_left_delta < 0.0;
+    if next_mixed_lettered_list_item {
+        return false;
+    }
+    if previous.page_index == current.page_index {
+        let adjacent = current.line_index == previous.line_index + 1
+            || terminal_callout_gap && current.line_index == previous.line_index + 2;
+        if !adjacent {
+            return false;
+        }
+        if same_visual_row_fragment(previous, current)
+            || leading_callout && same_visual_row_leading_callout_fragment(previous, current)
+            || terminal_callout_gap && same_visual_row_after_standalone_callout(previous, current)
+        {
+            return terminal_callout_gap
+                || open
+                || discretionary_hyphen
+                || continuation_start
+                || leading_callout;
+        }
+        let same_margin_after_inline_callout = terminal_callout_gap
+            && current.line_index == previous.line_index + 2
+            && signed_left_delta.abs() <= 0.012
+            && visual_signed_left_delta <= PARAGRAPH_FIRST_LINE_INDENT
+            && vertical_gap(previous, current) <= 0.006
+            && font_ratio <= 1.18;
+        if same_margin_after_inline_callout {
+            return true;
+        }
+        // A first line may be indented by roughly four percent of page width
+        // and then return to the body margin on its wrapped second line. That
+        // negative (outdent) delta is flow, while an equally large positive
+        // delta remains a new-paragraph/blockquote boundary.
+        if signed_left_delta > 0.04
+            || signed_left_delta < -0.06
+            || font_ratio > 1.18
+            || indented_after_colon
+            || lm2_final_paragraph_boundary(previous, current) && !discretionary_hyphen
+        {
+            return false;
+        }
+        return if previous.segment_block_id == current.segment_block_id {
+            open || discretionary_hyphen || continuation_start || leading_callout
+        } else {
+            discretionary_hyphen || continuation_start || leading_callout
+        };
+    }
+    // Facing journal pages alternate their body margin.  A continuation can
+    // therefore move right by about four percent of page width or left by as
+    // much as seven percent even though it is the first body line on the next
+    // page.  Outdents are especially safe; right shifts still require visibly
+    // open prose so closed, first-line-indented paragraphs remain boundaries.
+    let cross_page_margin_ok = (-0.08..=0.05).contains(&signed_left_delta);
+    let mirrored_open_continuation = open && cross_page_margin_ok;
+    if current.page_index != previous.page_index + 1
+        || first_body_line_by_page.get(&current.page_index).copied() != Some(current.line_index)
+        || !(open || discretionary_hyphen || continuation_start)
+        || paragraph_boundary(previous, current)
+            && !discretionary_hyphen
+            && !mirrored_open_continuation
+    {
+        return false;
+    }
+    !indented_after_colon && cross_page_margin_ok && font_ratio <= 1.18
+}
+
+fn lm2_standalone_callout_block(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed
+        .parse::<u16>()
+        .is_ok_and(|marker| marker <= LM2_MAX_NOTE_MARKER)
+        || leading_callout_marker_end(trimmed).is_some_and(|end| end == trimmed.len())
+}
+
+fn lm2_merge_block_sources(target: usize, donor: usize, sources: &mut [LiquidBlockSourceLines]) {
+    let donor_lines = sources
+        .iter()
+        .find(|source| source.block_index == donor)
+        .map(|source| source.lines.clone())
+        .unwrap_or_default();
+    if let Some(target_source) = sources
+        .iter_mut()
+        .find(|source| source.block_index == target)
+    {
+        target_source.lines.extend(donor_lines);
+        target_source
+            .lines
+            .sort_by_key(|line| (line.page_index, line.line_index));
+    }
+}
+
+fn lm2_remove_block(
+    index: usize,
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+) {
+    blocks.remove(index);
+    sources.retain(|source| source.block_index != index);
+    for source in sources {
+        if source.block_index > index {
+            source.block_index -= 1;
+        }
+    }
+}
+
 fn flush_action_neutral_blocksplit(
     blocks: &mut Vec<LiquidBlock>,
     sources: &mut Vec<LiquidBlockSourceLines>,
@@ -11092,6 +15164,7 @@ fn flush_action_neutral_blocksplit(
 fn apply_heading_outline_splits(
     blocks: &mut Vec<LiquidBlock>,
     sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
 ) -> usize {
     if blocks.is_empty() || sources.is_empty() {
         return 0;
@@ -11100,13 +15173,63 @@ fn apply_heading_outline_splits(
         .iter()
         .map(|source| (source.block_index, source.lines.clone()))
         .collect::<BTreeMap<_, _>>();
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
     let old_blocks = std::mem::take(blocks);
     let mut rebuilt_blocks = Vec::with_capacity(old_blocks.len());
     let mut rebuilt_sources = Vec::with_capacity(sources.len());
     let mut split_count = 0usize;
 
-    for (old_index, block) in old_blocks.into_iter().enumerate() {
+    for (old_index, mut block) in old_blocks.into_iter().enumerate() {
         let refs = source_by_block.remove(&old_index).unwrap_or_default();
+        if matches!(
+            block.role,
+            LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+        ) && refs
+            .first()
+            .is_some_and(|source| lm2_lowercase_roman_heading_source(source, &line_by_id))
+        {
+            block.role = LiquidBlockRole::Heading;
+        }
+        if matches!(
+            block.role,
+            LiquidBlockRole::Paragraph | LiquidBlockRole::Marginalia
+        ) && refs.len() == 1
+            && let Some(role) = lm2_paragraph_outline_anchor(&refs[0], &line_by_id)
+        {
+            block.role = role;
+            split_count += 1;
+        }
+        if block.role == LiquidBlockRole::Paragraph
+            && let Some(groups) = lm2_paragraph_outline_groups(&refs, &line_by_id)
+        {
+            split_count += groups.len().saturating_sub(1);
+            for (role, group) in groups {
+                let mut text = String::new();
+                for line in &group {
+                    let cleaned = clean_lm2_line_text(&line.text);
+                    if !cleaned.is_empty() {
+                        append_line(&mut text, &cleaned);
+                    }
+                }
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let block_index = rebuilt_blocks.len();
+                rebuilt_blocks.push(LiquidBlock {
+                    role,
+                    text,
+                    label: block.label.clone(),
+                });
+                rebuilt_sources.push(LiquidBlockSourceLines {
+                    block_index,
+                    lines: group,
+                });
+            }
+            continue;
+        }
         if !matches!(
             block.role,
             LiquidBlockRole::Heading | LiquidBlockRole::Subheading
@@ -11162,6 +15285,417 @@ fn apply_heading_outline_splits(
     split_count
 }
 
+fn lm2_paragraph_outline_groups(
+    refs: &[LiquidSourceLineRef],
+    line_by_id: &HashMap<&str, &DeepLiquidSourceLine>,
+) -> Option<Vec<(LiquidBlockRole, Vec<LiquidSourceLineRef>)>> {
+    if refs.len() < 2 {
+        return None;
+    }
+    let mut groups = Vec::new();
+    let mut cursor = 0usize;
+    let mut found = false;
+
+    while cursor < refs.len() {
+        let anchor = (cursor..refs.len()).find(|index| {
+            lm2_paragraph_outline_anchor(&refs[*index], line_by_id).is_some()
+                || lm2_early_page_terse_numeric_outline(&refs[*index])
+                || lm2_terse_lowercase_lettered_outline(&refs[*index])
+        });
+        let Some(anchor) = anchor else {
+            if cursor < refs.len() {
+                groups.push((LiquidBlockRole::Paragraph, refs[cursor..].to_vec()));
+            }
+            break;
+        };
+        found = true;
+        if anchor > cursor {
+            groups.push((LiquidBlockRole::Paragraph, refs[cursor..anchor].to_vec()));
+        }
+        let role = lm2_paragraph_outline_anchor(&refs[anchor], line_by_id)
+            .or_else(|| {
+                lm2_early_page_terse_numeric_outline(&refs[anchor])
+                    .then_some(LiquidBlockRole::Subheading)
+                    .or_else(|| {
+                        lm2_terse_lowercase_lettered_outline(&refs[anchor])
+                            .then_some(LiquidBlockRole::Subheading)
+                    })
+            })
+            .expect("outline anchor role remains available");
+        let mut end = anchor + 1;
+        while end < refs.len()
+            && end - anchor < 5
+            && lm2_paragraph_outline_continuation(&refs[end - 1], &refs[end], line_by_id)
+        {
+            end += 1;
+        }
+        groups.push((role, refs[anchor..end].to_vec()));
+        cursor = end;
+    }
+
+    found.then_some(groups)
+}
+
+/// Some journals place a terse run-in heading immediately below the running
+/// head. A page-relative small-font prior can make that early line look
+/// footnote-like, but the first dozen physical lines are not the footnote band.
+fn lm2_early_page_terse_numeric_outline(source: &LiquidSourceLineRef) -> bool {
+    source.line_index <= 12
+        && source.note_markers.is_empty()
+        && lm2_terse_numeric_outline_text(&source.text)
+}
+
+fn lm2_terse_lowercase_lettered_outline(source: &LiquidSourceLineRef) -> bool {
+    if !source.note_markers.is_empty() {
+        return false;
+    }
+    let stripped = lm2_strip_leading_star_pagination(&source.text);
+    let trimmed = stripped.trim();
+    let token = trimmed.split_whitespace().next().unwrap_or_default();
+    let marker = token.trim_end_matches(['.', ')', ':']);
+    marker.len() == 1
+        && marker.chars().all(|ch| ch.is_ascii_lowercase())
+        && marker.len() != token.len()
+        && (3..=12).contains(&word_count(trimmed))
+        && !trimmed
+            .chars()
+            .next_back()
+            .is_some_and(|ch| matches!(ch, '.' | ',' | ';' | ':' | '?' | '!'))
+        && lm2_title_case_numbered_outline(trimmed)
+}
+
+fn lm2_terse_numeric_outline_text(text: &str) -> bool {
+    let stripped = lm2_strip_leading_star_pagination(text);
+    let trimmed = stripped.trim();
+    let token = trimmed.split_whitespace().next().unwrap_or_default();
+    let marker = token.trim_end_matches(['.', ')', ':']);
+    let remainder = trimmed[token.len()..].trim_start();
+    marker
+        .parse::<u16>()
+        .ok()
+        .is_some_and(|number| (1..=20).contains(&number))
+        && marker.len() != token.len()
+        && (2..=8).contains(&word_count(trimmed))
+        && !trimmed
+            .chars()
+            .next_back()
+            .is_some_and(|ch| matches!(ch, '.' | ',' | ';' | ':' | '?' | '!'))
+        // This narrow early-page fallback is only for terse standalone labels.
+        // Reject a title followed by run-in prose even when the combined line
+        // happens to fit the fallback's eight-word ceiling.
+        && !remainder.contains(". ")
+        && !remainder.contains(['—', '–'])
+        && remainder
+            .chars()
+            .find(|ch| ch.is_alphabetic())
+            .is_some_and(char::is_uppercase)
+}
+
+/// A numbered title immediately sandwiched between contiguous body lines is
+/// an outline heading even when it sits just above the page's footnotes and
+/// the note detector mistakes its enumerator for a note marker.
+fn apply_sandwiched_numbered_outline_recovery(
+    blocks: &mut [LiquidBlock],
+    sources: &mut [LiquidBlockSourceLines],
+) -> usize {
+    if blocks.len() < 3 {
+        return 0;
+    }
+    let source_by_block = sources
+        .iter()
+        .enumerate()
+        .map(|(source_index, source)| (source.block_index, source_index))
+        .collect::<BTreeMap<_, _>>();
+    let mut repaired = 0usize;
+
+    for index in 1..blocks.len() - 1 {
+        if blocks[index].role != LiquidBlockRole::Marginalia
+            || !matches!(
+                blocks[index - 1].role,
+                LiquidBlockRole::Paragraph
+                    | LiquidBlockRole::Lead
+                    | LiquidBlockRole::Quote
+                    | LiquidBlockRole::ListItem
+            )
+            || !matches!(
+                blocks[index + 1].role,
+                LiquidBlockRole::Paragraph
+                    | LiquidBlockRole::Lead
+                    | LiquidBlockRole::Quote
+                    | LiquidBlockRole::ListItem
+            )
+        {
+            continue;
+        }
+        let Some(&previous_source_index) = source_by_block.get(&(index - 1)) else {
+            continue;
+        };
+        let Some(&current_source_index) = source_by_block.get(&index) else {
+            continue;
+        };
+        let Some(&next_source_index) = source_by_block.get(&(index + 1)) else {
+            continue;
+        };
+        let previous = &sources[previous_source_index].lines;
+        let current = &sources[current_source_index].lines;
+        let next = &sources[next_source_index].lines;
+        let (Some(previous), [current], Some(next)) =
+            (previous.last(), current.as_slice(), next.first())
+        else {
+            continue;
+        };
+        let marker = current.note_markers.first().copied();
+        let lexical_heading = lm2_outline_heading_role(&current.text)
+            == Some(LiquidBlockRole::Subheading)
+            && (3..=8).contains(&word_count(&current.text))
+            && lm2_title_case_numbered_outline(&current.text);
+        let contiguous_body = previous.page_index == current.page_index
+            && current.page_index == next.page_index
+            && previous.line_index + 1 == current.line_index
+            && current.line_index + 1 == next.line_index;
+        if marker.is_some_and(|number| (1..=20).contains(&number))
+            && lexical_heading
+            && contiguous_body
+        {
+            blocks[index].role = LiquidBlockRole::Subheading;
+            let current = &mut sources[current_source_index].lines[0];
+            current.role = LiquidBlockRole::Subheading;
+            current.note_markers.clear();
+            repaired += 1;
+        }
+    }
+    repaired
+}
+
+fn lm2_title_case_numbered_outline(text: &str) -> bool {
+    let stripped = lm2_strip_leading_star_pagination(text);
+    let mut words = stripped.split_whitespace();
+    let _marker = words.next();
+    words.all(|word| {
+        let cleaned = word.trim_matches(|ch: char| !ch.is_alphabetic());
+        cleaned.is_empty()
+            || matches!(
+                cleaned.to_ascii_lowercase().as_str(),
+                "a" | "an" | "and" | "for" | "in" | "of" | "on" | "or" | "the" | "to"
+            )
+            || cleaned.chars().next().is_some_and(char::is_uppercase)
+    })
+}
+
+fn lm2_paragraph_outline_anchor(
+    source: &LiquidSourceLineRef,
+    line_by_id: &HashMap<&str, &DeepLiquidSourceLine>,
+) -> Option<LiquidBlockRole> {
+    let text = lm2_strip_leading_star_pagination(&source.text);
+    let lowercase_roman = lm2_lowercase_roman_outline_marker(text);
+    let lowercase_special = matches!(
+        normalize_text(text).as_str(),
+        "abstract"
+            | "acknowledgments"
+            | "appendix"
+            | "conclusion"
+            | "discussion"
+            | "introduction"
+            | "limitations"
+            | "methodology"
+            | "methods"
+            | "recommendations"
+            | "references"
+            | "results"
+    );
+    let mut role = lm2_outline_heading_role(text)
+        .or_else(|| lowercase_roman.map(|_| LiquidBlockRole::Heading))
+        .or_else(|| lowercase_special.then_some(LiquidBlockRole::Heading))?;
+    let lower = text.to_ascii_lowercase();
+    if text.contains(".-")
+        || text.contains(".—")
+        || text.contains('—')
+        || text.contains("....")
+        || !source.note_markers.is_empty()
+        || word_count(text) > 20
+        || lower.starts_with("part ")
+        || lower.starts_with("chapter ")
+    {
+        return None;
+    }
+    let line = source
+        .id
+        .as_deref()
+        .and_then(|id| line_by_id.get(id).copied())?;
+    if lowercase_roman.is_some() {
+        if !lm2_lowercase_roman_heading_source(source, line_by_id) {
+            return None;
+        }
+        role = LiquidBlockRole::Heading;
+    }
+    if lowercase_special
+        && !(line.bold
+            && (line.centered
+                || line.margin_centered
+                || line.segment_block_shape.eq_ignore_ascii_case("heading")))
+    {
+        return None;
+    }
+    if lm2_low_footnote_zone_evidence(line) {
+        return None;
+    }
+    if line.segment_block_toc_like
+        || line.prev_line_has_dotleader
+        || line.prev4_dotleader_count > 0
+        || line.prev4_spaced_dotleader_count > 0
+        || line.prev4_strong_dotleader_count > 0
+        || line.prev4_toc_leader_context
+    {
+        return None;
+    }
+    let page_width = line.page_width.max(1.0);
+    let width_ratio = (line.right - line.left).abs() / page_width;
+    let strong_lexical_cue = lower.contains("question no.")
+        || lower.contains("exception")
+        || lower.contains("cancellation")
+        || role == LiquidBlockRole::Heading;
+    let marker = text
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches('(')
+        .trim_end_matches(['.', ')', ':']);
+    let small_numeric_marker = marker
+        .parse::<u16>()
+        .ok()
+        .is_some_and(|number| (1..=20).contains(&number));
+    let lettered_candidate = marker.len() == 1
+        && marker.chars().all(|ch| ch.is_ascii_alphabetic())
+        && !matches!(marker, "I" | "V" | "X");
+    if marker.chars().all(|ch| ch.is_ascii_digit()) && !small_numeric_marker {
+        return None;
+    }
+    let terse_numeric_heading = small_numeric_marker
+        && (2..=8).contains(&word_count(text))
+        && !text
+            .trim_end()
+            .chars()
+            .next_back()
+            .is_some_and(|ch| matches!(ch, '.' | ',' | ';' | ':'));
+    let plausible_layout = if lettered_candidate {
+        strong_lexical_cue || (width_ratio <= 0.60 && !text.contains(','))
+    } else {
+        strong_lexical_cue || terse_numeric_heading || width_ratio <= 0.60
+    };
+    plausible_layout.then_some(role)
+}
+
+fn lm2_lowercase_roman_heading_source(
+    source: &LiquidSourceLineRef,
+    line_by_id: &HashMap<&str, &DeepLiquidSourceLine>,
+) -> bool {
+    if lm2_lowercase_roman_outline_marker(&source.text).is_none() || !source.note_markers.is_empty()
+    {
+        return false;
+    }
+    let Some(line) = source
+        .id
+        .as_deref()
+        .and_then(|id| line_by_id.get(id).copied())
+    else {
+        return false;
+    };
+    line.segment_block_shape == "heading"
+        && line.bold
+        && (line.centered || line.margin_centered)
+        && !line.segment_block_toc_like
+        && !line.segment_block_table_like
+        && !line.page_table_column_like
+        && !line.in_ruled_cell
+        && !line.page_object_ruled_row_membership
+        && !line.page_object_overlaps_image_bbox
+        && !line.in_footnote_zone
+        && !line.below_footnote_divider
+}
+
+fn lm2_lowercase_roman_outline_marker(text: &str) -> Option<u16> {
+    let token = text.trim_start().split_whitespace().next()?;
+    if !token.ends_with('.') && !token.ends_with(')') {
+        return None;
+    }
+    let marker = token.trim_matches(|ch: char| matches!(ch, '(' | ')' | '.'));
+    if marker.is_empty()
+        || marker.len() > 8
+        || !marker.chars().all(|ch| {
+            ch.is_ascii_lowercase() && matches!(ch, 'i' | 'v' | 'x' | 'l' | 'c' | 'd' | 'm')
+        })
+    {
+        return None;
+    }
+    lm2_roman_marker_value(marker)
+}
+
+fn lm2_roman_marker_value(marker: &str) -> Option<u16> {
+    let mut total = 0u16;
+    let mut previous = 0u16;
+    for ch in marker.chars().rev() {
+        let current = match ch.to_ascii_lowercase() {
+            'i' => 1,
+            'v' => 5,
+            'x' => 10,
+            'l' => 50,
+            'c' => 100,
+            'd' => 500,
+            'm' => 1000,
+            _ => return None,
+        };
+        if current < previous {
+            total = total.checked_sub(current)?;
+        } else {
+            total = total.checked_add(current)?;
+            previous = current;
+        }
+    }
+    (total > 0).then_some(total)
+}
+
+fn lm2_paragraph_outline_continuation(
+    previous: &LiquidSourceLineRef,
+    next: &LiquidSourceLineRef,
+    line_by_id: &HashMap<&str, &DeepLiquidSourceLine>,
+) -> bool {
+    if lm2_outline_heading_role(&next.text).is_some()
+        || !next
+            .text
+            .trim_start()
+            .chars()
+            .find(|ch| ch.is_alphabetic())
+            .is_some_and(char::is_lowercase)
+    {
+        return false;
+    }
+    let Some(previous_line) = previous
+        .id
+        .as_deref()
+        .and_then(|id| line_by_id.get(id).copied())
+    else {
+        return false;
+    };
+    let Some(next_line) = next
+        .id
+        .as_deref()
+        .and_then(|id| line_by_id.get(id).copied())
+    else {
+        return false;
+    };
+    if previous_line.page_index != next_line.page_index
+        || next_line.line_index != previous_line.line_index + 1
+    {
+        return false;
+    }
+    let max_height = (previous_line.top - previous_line.bottom)
+        .abs()
+        .max((next_line.top - next_line.bottom).abs())
+        .max(0.1);
+    (previous_line.font_height - next_line.font_height).abs() <= max_height * 0.22
+        && lm2_vertical_interval_gap(previous_line, next_line) <= max_height * 0.90 + 2.0
+}
+
 /// Recombine physical lines that form one logical heading. Native model
 /// emissions intentionally keep heading lines separate, so this pass uses the
 /// source geometry and the document's outline grammar instead of relying on a
@@ -11194,17 +15728,32 @@ fn apply_heading_continuation_reflow(
         let mut next = index + 1;
         while next < old_blocks.len() {
             let next_refs = source_by_block.get(&next).cloned().unwrap_or_default();
-            if !lm2_should_merge_heading_continuation(
+            let demote_to_prose = lm2_should_demote_heading_into_prose(
                 &merged,
                 &old_blocks[next],
                 &merged_refs,
                 &next_refs,
                 &line_by_id,
-            ) {
+            );
+            if !demote_to_prose
+                && !lm2_should_merge_heading_continuation(
+                    &merged,
+                    &old_blocks[next],
+                    &merged_refs,
+                    &next_refs,
+                    &line_by_id,
+                )
+            {
                 break;
             }
             append_line(&mut merged.text, &old_blocks[next].text);
             merged_refs.extend(source_by_block.remove(&next).unwrap_or_default());
+            if demote_to_prose {
+                merged.role = LiquidBlockRole::Paragraph;
+            } else if merged.role == LiquidBlockRole::Paragraph {
+                merged.role =
+                    lm2_outline_heading_role(&merged.text).unwrap_or(LiquidBlockRole::Subheading);
+            }
             merged_count += 1;
             next += 1;
         }
@@ -11225,6 +15774,120 @@ fn apply_heading_continuation_reflow(
     merged_count
 }
 
+/// A wrapped outline heading can contribute only its first physical row to a
+/// Heading block while PyMuPDF groups the short final row with the following
+/// body paragraph. Move that one source row into the heading when the first
+/// line ends open (typically a comma), the continuation is short and aligned,
+/// and the next source row begins a new body segment.
+fn apply_heading_leading_source_continuation_split(
+    blocks: &mut [LiquidBlock],
+    sources: &mut [LiquidBlockSourceLines],
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let source_position = sources
+        .iter()
+        .enumerate()
+        .map(|(position, source)| (source.block_index, position))
+        .collect::<HashMap<_, _>>();
+    let mut repaired = 0usize;
+
+    for block_index in 0..blocks.len().saturating_sub(1) {
+        if !matches!(
+            blocks[block_index].role,
+            LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+        ) || blocks[block_index + 1].role != LiquidBlockRole::Paragraph
+            || !lm2_heading_starts_new_outline_item(&blocks[block_index].text)
+            || !blocks[block_index]
+                .text
+                .trim_end()
+                .ends_with([',', ':', '-', '\u{2013}', '\u{2014}'])
+        {
+            continue;
+        }
+        let (Some(current_position), Some(next_position)) = (
+            source_position.get(&block_index).copied(),
+            source_position.get(&(block_index + 1)).copied(),
+        ) else {
+            continue;
+        };
+        if sources[next_position].lines.len() < 2 {
+            continue;
+        }
+        let (Some(previous_ref), Some(continuation_ref), Some(body_ref)) = (
+            sources[current_position].lines.last(),
+            sources[next_position].lines.first(),
+            sources[next_position].lines.get(1),
+        ) else {
+            continue;
+        };
+        let (Some(previous), Some(continuation), Some(body)) = (
+            previous_ref
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied()),
+            continuation_ref
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied()),
+            body_ref
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied()),
+        ) else {
+            continue;
+        };
+        let continuation_text = clean_lm2_line_text(&continuation_ref.text);
+        if previous.page_index != continuation.page_index
+            || previous.line_index.checked_add(1) != Some(continuation.line_index)
+            || continuation.page_index != body.page_index
+            || continuation.line_index.checked_add(1) != Some(body.line_index)
+            || !(1..=12).contains(&word_count(&continuation_text))
+            || continuation_text.trim_end().ends_with([':', ';', '?', '!'])
+            || !body
+                .text
+                .trim_start()
+                .chars()
+                .find(|ch| ch.is_alphabetic())
+                .is_some_and(char::is_uppercase)
+            || continuation.segment_block_id == body.segment_block_id
+        {
+            continue;
+        }
+        let page_width = previous.page_width.max(continuation.page_width).max(1.0);
+        let previous_center = (previous.left + previous.right) * 0.5;
+        let continuation_center = (continuation.left + continuation.right) * 0.5;
+        let aligned = (previous_center - continuation_center).abs() <= page_width * 0.04;
+        let similar_font = (previous.font_ratio_doc - continuation.font_ratio_doc).abs() <= 0.12
+            && (previous.font_height - continuation.font_height).abs()
+                <= previous.font_height.max(continuation.font_height).max(0.1) * 0.18;
+        if !aligned || !similar_font {
+            continue;
+        }
+        let Some(remainder) = blocks[block_index + 1]
+            .text
+            .strip_prefix(&continuation_text)
+            .map(str::trim_start)
+            .filter(|remainder| !remainder.is_empty())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+
+        append_line(&mut blocks[block_index].text, &continuation_text);
+        blocks[block_index + 1].text = remainder;
+        let mut moved = sources[next_position].lines.remove(0);
+        moved.role = blocks[block_index].role;
+        moved.note_markers.clear();
+        sources[current_position].lines.push(moved);
+        repaired += 1;
+    }
+    repaired
+}
+
 fn lm2_should_merge_heading_continuation(
     current: &LiquidBlock,
     next: &LiquidBlock,
@@ -11232,14 +15895,33 @@ fn lm2_should_merge_heading_continuation(
     next_refs: &[LiquidSourceLineRef],
     line_by_id: &HashMap<&str, &DeepLiquidSourceLine>,
 ) -> bool {
-    if current.role != next.role
-        || !matches!(
-            current.role,
-            LiquidBlockRole::Heading | LiquidBlockRole::Subheading
-        )
-        || current.text.chars().count() + next.text.chars().count() > 200
-        || word_count(&current.text) + word_count(&next.text) > 30
+    let current_is_outline = lm2_heading_starts_new_outline_item(&current.text);
+    let open_run_in_body = lm2_numbered_run_in_body(&current.text).is_some_and(|body| {
+        !lm2_blocksplit_ends_like_paragraph(body)
+            && next.role == LiquidBlockRole::Paragraph
+            && lm2_reflow_starts_like_continuation(&next.text)
+    });
+    let current_is_heading = matches!(
+        current.role,
+        LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+    );
+    let next_is_heading_candidate = matches!(
+        next.role,
+        LiquidBlockRole::Heading | LiquidBlockRole::Subheading | LiquidBlockRole::Paragraph
+    );
+    let char_limit = if current_is_outline { 360 } else { 200 };
+    let word_limit = if current_is_outline { 55 } else { 30 };
+    if (!current_is_heading && !current_is_outline)
+        || !next_is_heading_candidate
+        || (!open_run_in_body
+            && (current.text.chars().count() + next.text.chars().count() > char_limit
+                || word_count(&current.text) + word_count(&next.text) > word_limit))
         || lm2_heading_starts_new_outline_item(&next.text)
+        || matches!(
+            current.text.trim_end().chars().last(),
+            Some('?') | Some('!')
+        )
+        || (!open_run_in_body && current.role != next.role && next_refs.len() != 1)
     {
         return false;
     }
@@ -11270,13 +15952,13 @@ fn lm2_should_merge_heading_continuation(
     let page_width = previous_line.page_width.max(next_line.page_width).max(1.0);
     let previous_center = (previous_line.left + previous_line.right) * 0.5;
     let next_center = (next_line.left + next_line.right) * 0.5;
-    let both_centered = (previous_line.centered || previous_line.margin_centered)
-        && (next_line.centered || next_line.margin_centered);
-    let aligned = if both_centered {
-        (previous_center - next_center).abs() <= page_width * 0.06
-    } else {
-        (previous_line.left - next_line.left).abs() <= page_width * 0.06
-    };
+    let centered_alignment = (previous_line.centered
+        || previous_line.margin_centered
+        || next_line.centered
+        || next_line.margin_centered)
+        && (previous_center - next_center).abs() <= page_width * 0.06;
+    let aligned =
+        centered_alignment || (previous_line.left - next_line.left).abs() <= page_width * 0.06;
     if !aligned {
         return false;
     }
@@ -11296,7 +15978,86 @@ fn lm2_should_merge_heading_continuation(
     let first_opens_continuation = current_trimmed.ends_with(':') || current_trimmed.ends_with('-');
     let both_all_caps =
         uppercase_ratio(&current.text) >= 0.85 && uppercase_ratio(&next.text) >= 0.85;
-    first_has_marker || first_opens_continuation || both_all_caps
+    first_has_marker || first_opens_continuation || both_all_caps || open_run_in_body
+}
+
+/// Body portion of an Arabic run-in heading (`1. Label. — Body`).  The
+/// assembler uses this only to preserve body flow; Markdown remains
+/// responsible for rendering the heading/body boundary.
+fn lm2_numbered_run_in_body(text: &str) -> Option<&str> {
+    let trimmed = lm2_strip_leading_star_pagination(text);
+    let marker = trimmed.split_whitespace().next()?;
+    let digits = marker.strip_suffix('.')?;
+    if digits.is_empty() || digits.len() > 2 || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let after_marker = trimmed[marker.len()..].trim_start();
+    let heading_end = after_marker.find('.')?;
+    let mut body = after_marker[heading_end + 1..].trim_start();
+    body = body.trim_start_matches(|ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '-' | '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{FFFD}'
+            )
+    });
+    (!body.is_empty()
+        && body
+            .chars()
+            .find(|ch| ch.is_alphabetic())
+            .is_some_and(char::is_uppercase))
+    .then_some(body)
+}
+
+fn lm2_should_demote_heading_into_prose(
+    current: &LiquidBlock,
+    next: &LiquidBlock,
+    current_refs: &[LiquidSourceLineRef],
+    next_refs: &[LiquidSourceLineRef],
+    line_by_id: &HashMap<&str, &DeepLiquidSourceLine>,
+) -> bool {
+    if !matches!(
+        current.role,
+        LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+    ) || next.role != LiquidBlockRole::Paragraph
+        || current_refs.len() != 1
+        || next_refs.is_empty()
+        || lm2_heading_starts_new_outline_item(&current.text)
+        || current.text.chars().count() > 120
+        || !current.text.contains(". ")
+        || current.text.trim_end().ends_with(['.', '?', '!', ':'])
+        || !next
+            .text
+            .trim_start()
+            .chars()
+            .next()
+            .is_some_and(char::is_lowercase)
+    {
+        return false;
+    }
+    let Some(first) = current_refs[0]
+        .id
+        .as_deref()
+        .and_then(|id| line_by_id.get(id).copied())
+    else {
+        return false;
+    };
+    let Some(second) = next_refs[0]
+        .id
+        .as_deref()
+        .and_then(|id| line_by_id.get(id).copied())
+    else {
+        return false;
+    };
+    if first.page_index != second.page_index
+        || second.line_index != first.line_index + 1
+        || first.segment_block_id != second.segment_block_id
+    {
+        return false;
+    }
+    let first_height = (first.top - first.bottom).abs().max(0.1);
+    let second_height = (second.top - second.bottom).abs().max(0.1);
+    (first.font_height - second.font_height).abs() <= first_height.max(second_height) * 0.22
 }
 
 fn lm2_vertical_interval_gap(first: &DeepLiquidSourceLine, second: &DeepLiquidSourceLine) -> f32 {
@@ -11314,7 +16075,11 @@ fn lm2_vertical_interval_gap(first: &DeepLiquidSourceLine, second: &DeepLiquidSo
 }
 
 fn lm2_heading_starts_new_outline_item(text: &str) -> bool {
-    let trimmed = text.trim_start();
+    lm2_outline_heading_role(text).is_some()
+}
+
+fn lm2_outline_heading_role(text: &str) -> Option<LiquidBlockRole> {
+    let trimmed = lm2_strip_leading_star_pagination(text);
     let lower = trimmed.to_ascii_lowercase();
     let canonical = lower
         .trim_matches(|ch: char| !ch.is_alphanumeric() && !ch.is_whitespace())
@@ -11341,24 +16106,62 @@ fn lm2_heading_starts_new_outline_item(text: &str) -> bool {
             | "related work"
             | "results"
     ) {
-        return true;
+        return trimmed
+            .chars()
+            .find(|ch| ch.is_alphabetic())
+            .is_some_and(char::is_uppercase)
+            .then_some(LiquidBlockRole::Heading);
     }
-    if trimmed.starts_with('§') || lower.starts_with("part ") || lower.starts_with("chapter ") {
-        return true;
+    if lower.starts_with("part ") || lower.starts_with("chapter ") {
+        return Some(LiquidBlockRole::Heading);
     }
-    let Some(token) = trimmed.split_whitespace().next() else {
-        return false;
-    };
+    let token = trimmed.split_whitespace().next()?;
     let unwrapped = token.trim_start_matches('(');
     let marker = unwrapped.trim_end_matches(['.', ')', ':']);
     if marker.is_empty() || marker.len() == unwrapped.len() {
-        return false;
+        return None;
     }
-    marker.chars().all(|ch| ch.is_ascii_digit())
-        || marker
+    if marker.chars().all(|ch| ch.is_ascii_digit()) {
+        let remainder = trimmed[token.len()..].trim_start();
+        if remainder
             .chars()
-            .all(|ch| matches!(ch, 'I' | 'V' | 'X' | 'L' | 'C'))
-        || (marker.len() == 1 && marker.chars().all(|ch| ch.is_ascii_alphabetic()))
+            .find(|ch| ch.is_alphabetic())
+            .is_some_and(char::is_lowercase)
+        {
+            return None;
+        }
+        return Some(LiquidBlockRole::Subheading);
+    }
+    if (marker.len() > 1 || matches!(marker, "I" | "V" | "X"))
+        && marker
+            .chars()
+            .all(|ch| matches!(ch, 'I' | 'V' | 'X' | 'L' | 'C' | 'D' | 'M'))
+    {
+        return Some(LiquidBlockRole::Heading);
+    }
+    if marker.len() == 1 && marker.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return Some(LiquidBlockRole::Subheading);
+    }
+    None
+}
+
+fn lm2_strip_leading_star_pagination(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    let Some(after_star) = trimmed.strip_prefix('*') else {
+        return trimmed;
+    };
+    let digits = after_star
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .count();
+    if !(2..=4).contains(&digits) {
+        return trimmed;
+    }
+    let rest = &after_star[digits..];
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return trimmed;
+    }
+    rest.trim_start()
 }
 
 fn apply_deferred_marginalia_reflow(
@@ -11374,6 +16177,3078 @@ fn apply_deferred_marginalia_reflow(
         total += reflowed;
     }
     total
+}
+
+/// Preserve a front-matter abstract that continues onto the next page and
+/// then transitions into an explicit `AUTHOR.` paragraph.  The continuation's
+/// small type can otherwise look like footnote marginalia and wind up in the
+/// generic Notes appendix.
+fn apply_front_matter_abstract_author_reflow(
+    blocks: &mut [LiquidBlock],
+    sources: &mut [LiquidBlockSourceLines],
+) -> usize {
+    let source_position = sources
+        .iter()
+        .enumerate()
+        .map(|(position, source)| (source.block_index, position))
+        .collect::<HashMap<_, _>>();
+    let mut repaired = 0usize;
+
+    for block_index in 1..blocks.len() {
+        if blocks[block_index].role != LiquidBlockRole::Marginalia {
+            continue;
+        }
+        let Some(current_position) = source_position.get(&block_index).copied() else {
+            continue;
+        };
+        if sources[current_position].lines.is_empty()
+            || sources[current_position]
+                .lines
+                .iter()
+                .any(|line| line.page_index > 2 || !line.note_markers.is_empty())
+        {
+            continue;
+        }
+        let first_page_doi_author_material =
+            sources[current_position].lines.first().is_some_and(|line| {
+                line.page_index == 0 && normalize_text(&line.text).starts_with("doi:")
+            }) && sources[current_position].lines.iter().skip(1).any(|line| {
+                line.text
+                    .trim_start()
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| matches!(ch, '*' | '\u{2217}' | '\u{2020}' | '\u{2021}'))
+            });
+        if first_page_doi_author_material {
+            sources[current_position].lines.remove(0);
+            let mut text = String::new();
+            for line in &mut sources[current_position].lines {
+                line.role = LiquidBlockRole::AuthorInfo;
+                line.note_markers.clear();
+                append_line(&mut text, &clean_lm2_line_text(&line.text));
+            }
+            blocks[block_index].text = collapse_whitespace(&text).trim().to_owned();
+            blocks[block_index].role = LiquidBlockRole::AuthorInfo;
+            blocks[block_index].label = None;
+            repaired += 1;
+            continue;
+        }
+        let Some(author_line_position) = sources[current_position]
+            .lines
+            .iter()
+            .position(|line| normalize_text(&line.text).starts_with("author."))
+        else {
+            continue;
+        };
+        if author_line_position == 0 {
+            blocks[block_index].role = LiquidBlockRole::AuthorInfo;
+            repaired += 1;
+            continue;
+        }
+        let Some(abstract_index) = (0..block_index)
+            .rev()
+            .find(|index| blocks[*index].role == LiquidBlockRole::Abstract)
+        else {
+            continue;
+        };
+        let Some(abstract_position) = source_position.get(&abstract_index).copied() else {
+            continue;
+        };
+        let author_offset = blocks[block_index]
+            .text
+            .to_ascii_lowercase()
+            .find("author.")
+            .unwrap_or(0);
+        if author_offset == 0 {
+            continue;
+        }
+        let continuation = blocks[block_index].text[..author_offset].trim().to_owned();
+        let author = blocks[block_index].text[author_offset..].trim().to_owned();
+        if continuation.is_empty() || author.is_empty() {
+            continue;
+        }
+        append_line(&mut blocks[abstract_index].text, &continuation);
+        blocks[block_index].text = author;
+        blocks[block_index].role = LiquidBlockRole::AuthorInfo;
+        blocks[block_index].label = None;
+
+        let mut author_lines = sources[current_position]
+            .lines
+            .split_off(author_line_position);
+        for line in &mut sources[current_position].lines {
+            line.role = LiquidBlockRole::Abstract;
+            line.note_markers.clear();
+        }
+        let mut continuation_lines = std::mem::take(&mut sources[current_position].lines);
+        sources[abstract_position]
+            .lines
+            .append(&mut continuation_lines);
+        for line in &mut author_lines {
+            line.role = LiquidBlockRole::AuthorInfo;
+            line.note_markers.clear();
+        }
+        sources[current_position].lines = author_lines;
+        repaired += 1;
+    }
+    repaired
+}
+
+/// Split a first-page byline from an immediately following unlabelled abstract
+/// when the PDF text layer flattened both into one Paragraph block.  A short
+/// starred person name immediately after an explicit Title is authoritative;
+/// ordinary paragraph geometry is not, because display bylines and the first
+/// abstract line are often left-aligned identically.  Continue the Abstract
+/// role across page furniture, but never beyond a contents block, page two, or
+/// the first substantive section heading.
+fn apply_front_matter_byline_abstract_split(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+) -> usize {
+    let source_by_block = sources
+        .iter()
+        .map(|source| (source.block_index, source.lines.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let candidate_index = blocks.iter().enumerate().find_map(|(index, block)| {
+        if block.role != LiquidBlockRole::Paragraph
+            || !blocks[..index]
+                .iter()
+                .any(|previous| previous.role == LiquidBlockRole::Title)
+            || blocks[..index].iter().any(|previous| {
+                matches!(
+                    previous.role,
+                    LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+                ) && lm2_substantive_section_heading(&previous.text)
+            })
+        {
+            return None;
+        }
+        let refs = source_by_block.get(&index)?;
+        let [first, second, ..] = refs.as_slice() else {
+            return None;
+        };
+        let byline = clean_lm2_line_text(&first.text);
+        let opening = clean_lm2_line_text(&second.text);
+        (first.page_index <= 1
+            && first.page_index == second.page_index
+            && first.line_index.checked_add(1) == Some(second.line_index)
+            && lm2_front_matter_starred_byline(&byline)
+            && word_count(&opening) >= 6
+            && !looks_like_lm2_author_heading(&opening)
+            && block
+                .text
+                .strip_prefix(&byline)
+                .is_some_and(|remainder| !remainder.trim().is_empty()))
+        .then_some(index)
+    });
+    let Some(candidate_index) = candidate_index else {
+        return 0;
+    };
+
+    let mut source_by_block = std::mem::take(sources)
+        .into_iter()
+        .map(|source| (source.block_index, source.lines))
+        .collect::<BTreeMap<_, _>>();
+    let old_blocks = std::mem::take(blocks);
+    let mut rebuilt_blocks = Vec::with_capacity(old_blocks.len() + 1);
+    let mut rebuilt_sources = Vec::with_capacity(source_by_block.len() + 1);
+    let mut abstract_mode = false;
+    let mut repaired = 0usize;
+
+    for (old_index, mut block) in old_blocks.into_iter().enumerate() {
+        let mut refs = source_by_block.remove(&old_index).unwrap_or_default();
+        if old_index == candidate_index {
+            let mut abstract_refs = refs.split_off(1);
+            let mut byline_ref = refs.pop().expect("candidate has a byline source line");
+            let byline = clean_lm2_line_text(&byline_ref.text);
+            let abstract_text = block
+                .text
+                .strip_prefix(&byline)
+                .expect("candidate text starts with its byline")
+                .trim()
+                .to_owned();
+            byline_ref.role = LiquidBlockRole::AuthorInfo;
+            for line in &mut abstract_refs {
+                line.role = LiquidBlockRole::Abstract;
+                line.note_markers.clear();
+            }
+
+            let byline_index = rebuilt_blocks.len();
+            rebuilt_blocks.push(LiquidBlock {
+                role: LiquidBlockRole::AuthorInfo,
+                text: byline,
+                label: None,
+            });
+            rebuilt_sources.push(LiquidBlockSourceLines {
+                block_index: byline_index,
+                lines: vec![byline_ref],
+            });
+
+            let abstract_index = rebuilt_blocks.len();
+            rebuilt_blocks.push(LiquidBlock {
+                role: LiquidBlockRole::Abstract,
+                text: abstract_text,
+                label: None,
+            });
+            rebuilt_sources.push(LiquidBlockSourceLines {
+                block_index: abstract_index,
+                lines: abstract_refs,
+            });
+            abstract_mode = true;
+            repaired += 1;
+            continue;
+        }
+
+        if abstract_mode {
+            let first_page = refs.first().map(|line| line.page_index);
+            if lm2_grouped_contents_block(&block.text)
+                || matches!(
+                    block.role,
+                    LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+                ) && lm2_substantive_section_heading(&block.text)
+                || first_page.is_some_and(|page| page > 1)
+            {
+                abstract_mode = false;
+            } else if block.role == LiquidBlockRole::Paragraph
+                && first_page.is_some_and(|page| page <= 1)
+            {
+                block.role = LiquidBlockRole::Abstract;
+                for line in &mut refs {
+                    line.role = LiquidBlockRole::Abstract;
+                    line.note_markers.clear();
+                }
+                repaired += 1;
+            }
+        }
+
+        let block_index = rebuilt_blocks.len();
+        rebuilt_blocks.push(block);
+        if !refs.is_empty() {
+            rebuilt_sources.push(LiquidBlockSourceLines {
+                block_index,
+                lines: refs,
+            });
+        }
+    }
+
+    *blocks = rebuilt_blocks;
+    *sources = rebuilt_sources;
+    repaired
+}
+
+fn lm2_front_matter_starred_byline(text: &str) -> bool {
+    let text = text.trim();
+    let words = word_count(text);
+    let has_trailing_marker = text
+        .chars()
+        .next_back()
+        .is_some_and(|ch| matches!(ch, '*' | '\u{2217}' | '\u{2020}' | '\u{2021}'));
+    (2..=8).contains(&words)
+        && has_trailing_marker
+        && title_case_ratio(text) >= 0.55
+        && !text.contains([':', '?', '!'])
+}
+
+/// A contents page can lose its dot leaders in the PDF text layer.  Once the
+/// page is grouped, its dense run of page locators and outline labels is much
+/// stronger evidence than any one line-level role.  Keep it as explicit Noise
+/// so neither fake numeric note heads nor rescued prose reach Markdown.
+fn apply_front_matter_contents_block_suppression(
+    blocks: &mut [LiquidBlock],
+    sources: &mut [LiquidBlockSourceLines],
+) -> usize {
+    let mut repaired = 0usize;
+    for source in sources.iter_mut() {
+        let Some(block) = blocks.get_mut(source.block_index) else {
+            continue;
+        };
+        let Some(page_index) = source.lines.first().map(|line| line.page_index) else {
+            continue;
+        };
+        if page_index > 2
+            || source
+                .lines
+                .iter()
+                .any(|line| line.page_index != page_index)
+            || !lm2_grouped_contents_block(&block.text)
+        {
+            continue;
+        }
+        if block.role != LiquidBlockRole::Noise {
+            repaired += 1;
+        }
+        block.role = LiquidBlockRole::Noise;
+        block.label = None;
+        for line in &mut source.lines {
+            line.role = LiquidBlockRole::Noise;
+            line.note_markers.clear();
+        }
+    }
+    repaired
+}
+
+fn lm2_grouped_contents_block(text: &str) -> bool {
+    let normalized = collapse_whitespace(text);
+    let lower = normalize_text(&normalized);
+    let page_locators = normalized
+        .split_whitespace()
+        .filter_map(|token| {
+            token
+                .trim_matches(|ch: char| !ch.is_ascii_digit())
+                .parse::<u16>()
+                .ok()
+        })
+        .filter(|value| (100..=9999).contains(value))
+        .count();
+    if page_locators < 5 {
+        return false;
+    }
+    let outline_labels = normalized
+        .split_whitespace()
+        .filter(|token| {
+            let token = token.trim_matches(|ch: char| matches!(ch, '(' | ')' | '[' | ']'));
+            let marker = token.trim_end_matches(['.', ')', ':']);
+            marker.len() != token.len()
+                && (marker.chars().all(|ch| ch.is_ascii_digit())
+                    || marker.len() == 1 && marker.chars().all(|ch| ch.is_ascii_alphabetic())
+                    || marker.len() <= 6
+                        && marker.chars().all(|ch| {
+                            matches!(ch.to_ascii_lowercase(), 'i' | 'v' | 'x' | 'l' | 'c')
+                        }))
+        })
+        .count();
+    lower.contains("article contents")
+        || lower.contains("table of contents")
+        || (outline_labels >= 3 && lower.contains("conclusion "))
+}
+
+/// Restore a single body/table row that grouping emitted after the Paragraph
+/// which physically surrounds it.  The target must have an exact one-line
+/// source gap, the displaced block must be the immediately following block and
+/// contain exactly that row, and typography must prove body or ruled-cell
+/// membership. This repairs callout-bearing lines without globally sorting
+/// blocks or rebuilding text (which would discard recovered sentinels).
+fn apply_source_gap_body_line_reflow(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let mut repaired = 0usize;
+
+    for _ in 0..16 {
+        let definitions = lm2_explicit_definition_markers(sources, &line_by_id);
+        let owner_by_coordinate = sources
+            .iter()
+            .enumerate()
+            .flat_map(|(source_position, source)| {
+                source
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .map(move |(line_position, line)| {
+                        (
+                            (line.page_index, line.line_index),
+                            (source_position, line_position, source.block_index),
+                        )
+                    })
+            })
+            .collect::<HashMap<_, _>>();
+        let mut operation = None;
+
+        'target: for (target_position, source) in sources.iter().enumerate() {
+            let Some(target_block) = blocks.get(source.block_index) else {
+                continue;
+            };
+            if target_block.role != LiquidBlockRole::Paragraph || source.lines.len() < 2 {
+                continue;
+            }
+            for current_position in 1..source.lines.len() {
+                let previous = &source.lines[current_position - 1];
+                let current = &source.lines[current_position];
+                if previous.page_index != current.page_index
+                    || previous.line_index.checked_add(2) != Some(current.line_index)
+                {
+                    continue;
+                }
+                let missing_index = previous.line_index + 1;
+                let Some((candidate_position, candidate_line_position, candidate_block_index)) =
+                    owner_by_coordinate
+                        .get(&(current.page_index, missing_index))
+                        .copied()
+                else {
+                    continue;
+                };
+                if candidate_block_index != source.block_index + 1
+                    || candidate_position <= target_position
+                    || sources[candidate_position].lines.len() != 1
+                    || candidate_line_position != 0
+                {
+                    continue;
+                }
+                let Some(candidate_block) = blocks.get(candidate_block_index) else {
+                    continue;
+                };
+                if !matches!(
+                    candidate_block.role,
+                    LiquidBlockRole::Paragraph
+                        | LiquidBlockRole::Marginalia
+                        | LiquidBlockRole::Table
+                ) {
+                    continue;
+                }
+                let candidate_ref = &sources[candidate_position].lines[0];
+                let Some(candidate_line) = candidate_ref
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied())
+                else {
+                    continue;
+                };
+                let table_evidence = candidate_line.in_ruled_cell
+                    || candidate_line.ruled_row_membership_exact
+                    || candidate_line.page_object_ruled_row_membership
+                    || candidate_line.page_table_column_like;
+                if !table_evidence && !lm2_body_sized_reflow_line(candidate_line) {
+                    continue;
+                }
+                if !candidate_ref.note_markers.is_empty()
+                    && !candidate_ref
+                        .note_markers
+                        .iter()
+                        .all(|marker| definitions.contains(marker))
+                {
+                    continue;
+                }
+                let current_needle = clean_lm2_line_text(&current.text);
+                let previous_needle = clean_lm2_line_text(&previous.text);
+                let candidate_text = candidate_block.text.trim().to_owned();
+                if current_needle.is_empty()
+                    || previous_needle.is_empty()
+                    || candidate_text.is_empty()
+                {
+                    continue;
+                }
+                let Some(previous_offset) = target_block.text.find(&previous_needle) else {
+                    continue;
+                };
+                let search_from = previous_offset + previous_needle.len();
+                let Some(relative_current) = target_block.text[search_from..].find(&current_needle)
+                else {
+                    continue;
+                };
+                let insertion_offset = search_from + relative_current;
+                operation = Some((
+                    target_position,
+                    current_position,
+                    candidate_position,
+                    source.block_index,
+                    candidate_block_index,
+                    insertion_offset,
+                    candidate_text,
+                ));
+                break 'target;
+            }
+        }
+
+        let Some((
+            target_position,
+            current_position,
+            candidate_position,
+            target_block_index,
+            candidate_block_index,
+            insertion_offset,
+            candidate_text,
+        )) = operation
+        else {
+            break;
+        };
+
+        let mut inserted = candidate_text;
+        if !inserted.chars().last().is_some_and(char::is_whitespace) {
+            inserted.push(' ');
+        }
+        blocks[target_block_index]
+            .text
+            .insert_str(insertion_offset, &inserted);
+        let mut candidate_ref = sources[candidate_position].lines[0].clone();
+        candidate_ref.role = LiquidBlockRole::Paragraph;
+        sources[target_position]
+            .lines
+            .insert(current_position, candidate_ref);
+
+        blocks.remove(candidate_block_index);
+        sources.remove(candidate_position);
+        for source in sources.iter_mut() {
+            if source.block_index > candidate_block_index {
+                source.block_index -= 1;
+            }
+        }
+        repaired += 1;
+    }
+
+    repaired
+}
+
+/// Restore a body-sized physical row that a late furniture guard isolated as
+/// Noise between the paragraphs immediately above and below it.  The source
+/// rows must be consecutive. Ordinarily the isolated row must retain a
+/// Paragraph hint and share its extraction segment with one of its neighbors.
+/// A second, equally narrow path accepts a body-sized false Noise row whose
+/// terminal discretionary-hyphen artifact joins the next lowercase row at the
+/// same body margin. This is the inverse of a false single-row furniture split,
+/// not a general Noise recovery rule.
+fn apply_sandwiched_body_noise_reflow(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let mut repaired = 0usize;
+
+    loop {
+        let source_position = sources
+            .iter()
+            .enumerate()
+            .map(|(position, source)| (source.block_index, position))
+            .collect::<HashMap<_, _>>();
+        let mut operation = None;
+        for block_index in 0..blocks.len().saturating_sub(2) {
+            if blocks[block_index].role != LiquidBlockRole::Paragraph
+                || blocks[block_index + 1].role != LiquidBlockRole::Noise
+                || blocks[block_index + 2].role != LiquidBlockRole::Paragraph
+            {
+                continue;
+            }
+            let (Some(previous_position), Some(candidate_position), Some(next_position)) = (
+                source_position.get(&block_index).copied(),
+                source_position.get(&(block_index + 1)).copied(),
+                source_position.get(&(block_index + 2)).copied(),
+            ) else {
+                continue;
+            };
+            if sources[candidate_position].lines.len() != 1 {
+                continue;
+            }
+            let (Some(previous_ref), Some(candidate_ref), Some(next_ref)) = (
+                sources[previous_position].lines.last(),
+                sources[candidate_position].lines.first(),
+                sources[next_position].lines.first(),
+            ) else {
+                continue;
+            };
+            let (Some(previous), Some(candidate), Some(next)) = (
+                previous_ref
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied()),
+                candidate_ref
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied()),
+                next_ref
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied()),
+            ) else {
+                continue;
+            };
+            let ordinary_paragraph_hint = candidate.role_hint == Some(LiquidBlockRole::Paragraph)
+                && (candidate.segment_block_id == previous.segment_block_id
+                    || candidate.segment_block_id == next.segment_block_id);
+            let terminal_dehyphen_bridge = {
+                let candidate_clean = clean_lm2_line_text(&candidate.text);
+                let horizontal_tolerance =
+                    (candidate.page_width.max(next.page_width) * 0.008).max(2.5);
+                let candidate_center = (candidate.top + candidate.bottom) * 0.5;
+                let next_center = (next.top + next.bottom) * 0.5;
+                let row_step = (candidate_center - next_center).abs();
+                lm2_reflow_paragraph_is_visibly_open(&blocks[block_index].text)
+                    && lm2_reflow_starts_like_continuation(&candidate.text)
+                    && (candidate.text.trim_end().ends_with('\u{0002}')
+                        || candidate_clean.trim_end().ends_with('-'))
+                    && lm2_reflow_starts_like_continuation(&next.text)
+                    && (candidate.left - next.left).abs() <= horizontal_tolerance
+                    && row_step > 0.0
+                    && row_step <= candidate.font_height.max(next.font_height) * 1.8
+                    && lm2_body_sized_reflow_line(previous)
+                    && lm2_body_sized_reflow_line(next)
+                    && !previous.doc_repeated_edge_text
+                    && !next.doc_repeated_edge_text
+            };
+            if previous.page_index != candidate.page_index
+                || candidate.page_index != next.page_index
+                || previous.line_index.checked_add(1) != Some(candidate.line_index)
+                || candidate.line_index.checked_add(1) != Some(next.line_index)
+                || !ordinary_paragraph_hint && !terminal_dehyphen_bridge
+                || !lm2_body_sized_reflow_line(candidate)
+                || candidate.doc_repeated_edge_text
+                || candidate.page_object_overlaps_image_bbox
+                || !candidate_ref.note_markers.is_empty()
+                || word_count(&candidate.text) < 5
+            {
+                continue;
+            }
+            operation = Some((
+                block_index,
+                previous_position,
+                candidate_position,
+                next_position,
+            ));
+            break;
+        }
+
+        let Some((block_index, previous_position, candidate_position, next_position)) = operation
+        else {
+            break;
+        };
+        let candidate_text = blocks[block_index + 1].text.clone();
+        let next_text = blocks[block_index + 2].text.clone();
+        append_line(&mut blocks[block_index].text, &candidate_text);
+        append_line(&mut blocks[block_index].text, &next_text);
+
+        let mut candidate_refs = sources[candidate_position].lines.clone();
+        for line in &mut candidate_refs {
+            line.role = LiquidBlockRole::Paragraph;
+        }
+        let next_refs = sources[next_position].lines.clone();
+        sources[previous_position].lines.extend(candidate_refs);
+        sources[previous_position].lines.extend(next_refs);
+
+        blocks.remove(block_index + 2);
+        blocks.remove(block_index + 1);
+        let mut removed_positions = [candidate_position, next_position];
+        removed_positions.sort_unstable_by(|left, right| right.cmp(left));
+        for position in removed_positions {
+            sources.remove(position);
+        }
+        for source in sources.iter_mut() {
+            if source.block_index > block_index + 2 {
+                source.block_index -= 2;
+            }
+        }
+        repaired += 1;
+    }
+
+    repaired
+}
+
+/// A PyMuPDF block can straddle the visual boundary between body text and the
+/// footnote band.  When that happens, one or more small-font continuation rows
+/// are appended to a Paragraph even though their source role or their physical
+/// neighbor is Marginalia. Split only a trailing small-font run, preserving its
+/// source order as a standalone Marginalia block for ordinary note assembly.
+fn apply_embedded_small_font_note_continuation_split(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let mut split_by_block = BTreeMap::<usize, usize>::new();
+
+    for source in sources.iter() {
+        let Some(block) = blocks.get(source.block_index) else {
+            continue;
+        };
+        if !matches!(
+            block.role,
+            LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+        ) || source.lines.is_empty()
+        {
+            continue;
+        }
+        let mut suffix_start = source.lines.len();
+        while suffix_start > 0 {
+            let line = &source.lines[suffix_start - 1];
+            let Some(deep) = line
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+            else {
+                break;
+            };
+            let small_votes = [
+                deep.font_ratio_page_ref,
+                deep.font_ratio_page,
+                deep.font_ratio_doc,
+            ]
+            .into_iter()
+            .filter(|ratio| *ratio <= 0.88)
+            .count();
+            if !line.note_markers.is_empty()
+                || small_votes < 2
+                || deep.in_ruled_cell
+                || deep.ruled_row_membership_exact
+                || deep.page_table_column_like
+                || deep.page_object_overlaps_image_bbox
+            {
+                break;
+            }
+            let physical_note_evidence = deep.in_footnote_zone
+                || deep.below_footnote_divider
+                || deep.doc_footnote_continuation
+                || deep.doc_footnote_state && deep.segment_block_footnote_like;
+            if !physical_note_evidence
+                || deep.segment_block_shape.eq_ignore_ascii_case("body")
+                    && !deep.in_footnote_zone
+                    && !deep.below_footnote_divider
+            {
+                break;
+            }
+            suffix_start -= 1;
+        }
+        if suffix_start < source.lines.len() {
+            split_by_block.insert(source.block_index, suffix_start);
+        }
+    }
+    if split_by_block.is_empty() {
+        return 0;
+    }
+
+    let mut source_by_block = std::mem::take(sources)
+        .into_iter()
+        .map(|source| (source.block_index, source.lines))
+        .collect::<BTreeMap<_, _>>();
+    let old_blocks = std::mem::take(blocks);
+    let mut rebuilt_blocks = Vec::with_capacity(old_blocks.len() + split_by_block.len());
+    let mut rebuilt_sources = Vec::with_capacity(source_by_block.len() + split_by_block.len());
+    let mut repaired = 0usize;
+
+    for (old_index, block) in old_blocks.into_iter().enumerate() {
+        let Some(mut refs) = source_by_block.remove(&old_index) else {
+            rebuilt_blocks.push(block);
+            continue;
+        };
+        let Some(suffix_start) = split_by_block.get(&old_index).copied() else {
+            let block_index = rebuilt_blocks.len();
+            rebuilt_blocks.push(block);
+            rebuilt_sources.push(LiquidBlockSourceLines {
+                block_index,
+                lines: refs,
+            });
+            continue;
+        };
+        let mut note_refs = refs.split_off(suffix_start);
+        for line in &mut note_refs {
+            line.role = LiquidBlockRole::Marginalia;
+            line.note_markers.clear();
+        }
+        let needle = note_refs
+            .first()
+            .map(|line| clean_lm2_line_text(&line.text))
+            .unwrap_or_default();
+        let Some(note_start) = (!needle.is_empty())
+            .then(|| block.text.rfind(&needle))
+            .flatten()
+        else {
+            let block_index = rebuilt_blocks.len();
+            rebuilt_blocks.push(block);
+            refs.extend(note_refs);
+            rebuilt_sources.push(LiquidBlockSourceLines {
+                block_index,
+                lines: refs,
+            });
+            continue;
+        };
+        let body_text = block.text[..note_start].trim().to_owned();
+        let note_text = block.text[note_start..].trim().to_owned();
+        if !body_text.is_empty() && !refs.is_empty() {
+            let block_index = rebuilt_blocks.len();
+            rebuilt_blocks.push(LiquidBlock {
+                role: block.role,
+                text: body_text,
+                label: block.label.clone(),
+            });
+            rebuilt_sources.push(LiquidBlockSourceLines {
+                block_index,
+                lines: refs,
+            });
+        }
+        let note_index = rebuilt_blocks.len();
+        rebuilt_blocks.push(LiquidBlock {
+            role: LiquidBlockRole::Marginalia,
+            text: note_text,
+            label: None,
+        });
+        rebuilt_sources.push(LiquidBlockSourceLines {
+            block_index: note_index,
+            lines: note_refs,
+        });
+        repaired += 1;
+    }
+
+    *blocks = rebuilt_blocks;
+    *sources = rebuilt_sources;
+    repaired
+}
+
+/// Repair the native grouping shape in which a single small-font continuation
+/// row is emitted immediately before its numbered note head in block order.
+/// Source coordinates must prove the opposite order: head N, continuation,
+/// markerless note text, then head N+1. The continuation must share the head's
+/// physical segment, while the following row must already belong to a note
+/// block. This is deliberately narrower than a general block sort.
+fn apply_inverted_numbered_note_continuation_reflow(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let mut repaired = 0usize;
+
+    for _ in 0..16 {
+        let owner_by_coordinate = sources
+            .iter()
+            .enumerate()
+            .flat_map(|(source_position, source)| {
+                source
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .map(move |(line_position, line)| {
+                        (
+                            (line.page_index, line.line_index),
+                            (source_position, line_position, source.block_index),
+                        )
+                    })
+            })
+            .collect::<HashMap<_, _>>();
+        let mut operation = None;
+
+        for (candidate_position, source) in sources.iter().enumerate() {
+            let Some(block) = blocks.get(source.block_index) else {
+                continue;
+            };
+            if !matches!(
+                block.role,
+                LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+            ) || source.lines.len() != 1
+            {
+                continue;
+            }
+            let candidate_ref = &source.lines[0];
+            if !candidate_ref.note_markers.is_empty() {
+                continue;
+            }
+            let Some(candidate) = candidate_ref
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+            else {
+                continue;
+            };
+            let small_votes = [
+                candidate.font_ratio_page_ref,
+                candidate.font_ratio_page,
+                candidate.font_ratio_doc,
+            ]
+            .into_iter()
+            .filter(|ratio| *ratio <= 0.88)
+            .count();
+            if small_votes < 2
+                || candidate.in_ruled_cell
+                || candidate.ruled_row_membership_exact
+                || candidate.page_table_column_like
+                || candidate.page_object_overlaps_image_bbox
+            {
+                continue;
+            }
+            let (Some(previous_line_index), Some(next_line_index)) = (
+                candidate.line_index.checked_sub(1),
+                candidate.line_index.checked_add(1),
+            ) else {
+                continue;
+            };
+            let (
+                Some((head_position, head_line_position, head_block_index)),
+                Some((tail_position, tail_line_position, tail_block_index)),
+            ) = (
+                owner_by_coordinate
+                    .get(&(candidate.page_index, previous_line_index))
+                    .copied(),
+                owner_by_coordinate
+                    .get(&(candidate.page_index, next_line_index))
+                    .copied(),
+            )
+            else {
+                continue;
+            };
+            if source.block_index.checked_add(1) != Some(head_block_index)
+                || head_block_index.checked_add(1) != Some(tail_block_index)
+                || !matches!(
+                    blocks.get(head_block_index).map(|block| block.role),
+                    Some(LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote)
+                )
+                || !matches!(
+                    blocks.get(tail_block_index).map(|block| block.role),
+                    Some(LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote)
+                )
+            {
+                continue;
+            }
+            let Some(head_source) = sources.get(head_position) else {
+                continue;
+            };
+            let Some(head_ref) = head_source.lines.get(head_line_position) else {
+                continue;
+            };
+            if head_source.lines.len() != 1 || head_ref.note_markers.len() != 1 {
+                continue;
+            }
+            let marker = head_ref.note_markers[0];
+            let Some(head) = head_ref
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+            else {
+                continue;
+            };
+            let head_small_votes = [
+                head.font_ratio_page_ref,
+                head.font_ratio_page,
+                head.font_ratio_doc,
+            ]
+            .into_iter()
+            .filter(|ratio| *ratio <= 0.88)
+            .count();
+            if head_small_votes < 2
+                || head.page_index != candidate.page_index
+                || head.segment_block_id != candidate.segment_block_id
+                || head.in_ruled_cell
+                || head.ruled_row_membership_exact
+                || head.page_object_overlaps_image_bbox
+            {
+                continue;
+            }
+            let Some(tail_ref) = sources
+                .get(tail_position)
+                .and_then(|tail| tail.lines.get(tail_line_position))
+            else {
+                continue;
+            };
+            let Some(next_marker) = marker.checked_add(1) else {
+                continue;
+            };
+            let direct_next_head = tail_ref.note_markers.as_slice() == [next_marker];
+            if !direct_next_head && !tail_ref.note_markers.is_empty() {
+                continue;
+            }
+            let Some(tail) = tail_ref
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+            else {
+                continue;
+            };
+            if !tail.in_footnote_zone
+                || tail.in_ruled_cell
+                || tail.ruled_row_membership_exact
+                || tail.page_table_column_like
+                || tail.page_object_overlaps_image_bbox
+            {
+                continue;
+            }
+            if !direct_next_head {
+                let Some(following_index) = next_line_index.checked_add(1) else {
+                    continue;
+                };
+                let Some((following_position, following_line_position, following_block_index)) =
+                    owner_by_coordinate
+                        .get(&(candidate.page_index, following_index))
+                        .copied()
+                else {
+                    continue;
+                };
+                if following_block_index != tail_block_index
+                    || sources
+                        .get(following_position)
+                        .and_then(|following| following.lines.get(following_line_position))
+                        .is_none_or(|following| following.note_markers.as_slice() != [next_marker])
+                {
+                    continue;
+                }
+            }
+            let cleaned = clean_lm2_line_text(&candidate_ref.text);
+            if cleaned.is_empty() || !block.text.trim().ends_with(&cleaned) {
+                continue;
+            }
+            operation = Some((
+                candidate_position,
+                head_position,
+                source.block_index,
+                head_block_index,
+                cleaned,
+            ));
+            break;
+        }
+
+        let Some((
+            candidate_position,
+            head_position,
+            candidate_block_index,
+            head_block_index,
+            cleaned,
+        )) = operation
+        else {
+            break;
+        };
+        let mut moved = sources[candidate_position].lines[0].clone();
+        moved.role = LiquidBlockRole::Marginalia;
+        moved.note_markers.clear();
+        sources[head_position].lines.push(moved);
+        append_line(&mut blocks[head_block_index].text, &cleaned);
+
+        blocks.remove(candidate_block_index);
+        sources.remove(candidate_position);
+        for source in sources.iter_mut() {
+            if source.block_index > candidate_block_index {
+                source.block_index -= 1;
+            }
+        }
+        repaired += 1;
+    }
+
+    repaired
+}
+
+/// Identify the narrow cross-page ownership shape for an unnumbered note
+/// continuation: every row in one physical segment is footnote-shaped, the
+/// exact next row starts note N+1, and the preceding page's highest numbered
+/// note is N with visibly unfinished prose. The open-prose and lowercase
+/// continuation gates prevent a bottom-page body segment from being consumed
+/// merely because coarse page geometry calls it footnote-like.
+fn physical_open_note_continuation_blocks(
+    blocks: &[LiquidBlock],
+    sources: &[LiquidBlockSourceLines],
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> HashSet<usize> {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let owner_by_coordinate = sources
+        .iter()
+        .flat_map(|source| {
+            source.lines.iter().map(move |line| {
+                (
+                    (line.page_index, line.line_index),
+                    (source.block_index, line),
+                )
+            })
+        })
+        .collect::<HashMap<_, _>>();
+    let mut candidate_segments =
+        BTreeMap::<(usize, usize), (BTreeSet<usize>, HashSet<usize>)>::new();
+
+    for source in sources {
+        if source.lines.is_empty()
+            || source
+                .lines
+                .iter()
+                .any(|line| !line.note_markers.is_empty())
+        {
+            continue;
+        }
+        let deep_lines = source
+            .lines
+            .iter()
+            .filter_map(|line| {
+                line.id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied())
+            })
+            .collect::<Vec<_>>();
+        if deep_lines.len() != source.lines.len()
+            || deep_lines.iter().any(|line| {
+                !line.in_footnote_zone
+                    || !line.segment_block_footnote_like
+                    || !line.segment_block_shape.eq_ignore_ascii_case("footnote")
+                    || line.in_ruled_cell
+                    || line.ruled_row_membership_exact
+                        && !line.below_footnote_divider
+                        && line.segment_block_line_index != 0
+                    || line.page_table_column_like
+                    || line.page_object_overlaps_image_bbox
+            })
+        {
+            continue;
+        }
+        let page_index = source.lines[0].page_index;
+        let segment_block_id = deep_lines[0].segment_block_id;
+        if source
+            .lines
+            .iter()
+            .any(|line| line.page_index != page_index)
+            || segment_block_id == 0
+            || deep_lines.iter().any(|line| {
+                line.page_index != page_index || line.segment_block_id != segment_block_id
+            })
+        {
+            continue;
+        }
+        let entry = candidate_segments
+            .entry((page_index, segment_block_id))
+            .or_default();
+        entry
+            .0
+            .extend(source.lines.iter().map(|line| line.line_index));
+        entry.1.insert(source.block_index);
+    }
+
+    let mut protected = HashSet::new();
+    for ((page_index, _), (line_indexes, block_indexes)) in candidate_segments {
+        let line_indexes = line_indexes.into_iter().collect::<Vec<_>>();
+        if line_indexes.is_empty()
+            || line_indexes
+                .windows(2)
+                .any(|pair| pair[0].checked_add(1) != Some(pair[1]))
+        {
+            continue;
+        }
+        let Some(first_line_index) = line_indexes.first().copied() else {
+            continue;
+        };
+        let Some((first_block_index, first_ref)) = owner_by_coordinate
+            .get(&(page_index, first_line_index))
+            .copied()
+        else {
+            continue;
+        };
+        if !block_indexes.contains(&first_block_index) {
+            continue;
+        }
+        let starts_lowercase = first_ref
+            .text
+            .chars()
+            .find(|ch| ch.is_alphabetic())
+            .is_some_and(char::is_lowercase);
+        let Some(next_line_index) = line_indexes.last().and_then(|last| last.checked_add(1)) else {
+            continue;
+        };
+        let Some((next_block_index, next_ref)) = owner_by_coordinate
+            .get(&(page_index, next_line_index))
+            .copied()
+        else {
+            continue;
+        };
+        if !matches!(
+            blocks.get(next_block_index).map(|block| block.role),
+            Some(LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote)
+        ) || next_ref.note_markers.len() != 1
+        {
+            continue;
+        }
+        let next_marker = next_ref.note_markers[0];
+        let Some(previous_page) = page_index.checked_sub(1) else {
+            continue;
+        };
+        let previous_note = sources
+            .iter()
+            .filter(|previous_source| {
+                matches!(
+                    blocks
+                        .get(previous_source.block_index)
+                        .map(|block| block.role),
+                    Some(LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote)
+                )
+            })
+            .flat_map(|previous_source| {
+                previous_source.lines.iter().flat_map(move |line| {
+                    if line.page_index != previous_page {
+                        return Vec::new();
+                    }
+                    line.note_markers
+                        .iter()
+                        .copied()
+                        .map(|marker| (marker, previous_source.block_index))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .max_by_key(|(marker, _)| *marker);
+        let Some((previous_marker, previous_block_index)) = previous_note else {
+            continue;
+        };
+        if previous_marker.checked_add(1) != Some(next_marker) {
+            continue;
+        }
+        let previous_visibly_open = blocks.get(previous_block_index).is_some_and(|block| {
+            block
+                .text
+                .trim_end()
+                .chars()
+                .rev()
+                .find(|ch| {
+                    !matches!(
+                        *ch,
+                        '"' | '\'' | ')' | ']' | '}' | '\u{2019}' | '\u{201d}' | CALLOUT_END
+                    )
+                })
+                .is_some_and(|ch| {
+                    ch.is_alphanumeric()
+                        || matches!(
+                            ch,
+                            ',' | ';' | ':' | '/' | '(' | '-' | '\u{2010}'..='\u{2015}'
+                        )
+                })
+        });
+        let mut segment_text = String::new();
+        let all_refs_marginalia = line_indexes.iter().all(|line_index| {
+            owner_by_coordinate
+                .get(&(page_index, *line_index))
+                .is_some_and(|(_, line)| {
+                    matches!(
+                        line.role,
+                        LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote
+                    ) && line.note_markers.is_empty()
+                })
+        });
+        for line_index in &line_indexes {
+            if let Some((_, line)) = owner_by_coordinate.get(&(page_index, *line_index)) {
+                append_line(&mut segment_text, &line.text);
+            }
+        }
+        let uppercase_citation_continuation = all_refs_marginalia
+            && blocks.get(previous_block_index).is_some_and(|previous| {
+                lm2_citation_suffix_cross_page_bridge(&previous.text, &segment_text)
+                    || lm2_uppercase_note_continuation_cue(&segment_text)
+            });
+        if (!previous_visibly_open && !uppercase_citation_continuation)
+            || (!starts_lowercase && !uppercase_citation_continuation)
+        {
+            continue;
+        }
+        protected.extend(block_indexes);
+    }
+
+    protected
+}
+
+fn lm2_uppercase_note_continuation_cue(text: &str) -> bool {
+    let lower = normalize_text(text);
+    lower.starts_with("see ")
+        || lower.starts_with("see, ")
+        || lower.starts_with("but see ")
+        || lower.starts_with("cf. ")
+        || lower.starts_with("compare ")
+        || lower.starts_with("accord ")
+        || lower.contains("http://")
+        || lower.contains("https://")
+        || lower.contains("www.")
+        || lower.contains(" v. ")
+        || lower.contains(" f.2d ")
+        || lower.contains(" f.3d ")
+        || lower.contains(" f.4th ")
+        || lower.contains(" u.s. ")
+        || lower.contains(" u.s.c. ")
+        || lower.contains('§')
+        || [
+            "(jan.", "(feb.", "(mar.", "(apr.", "(may ", "(june ", "(july ", "(aug.", "(sept.",
+            "(oct.", "(nov.", "(dec.",
+        ]
+        .iter()
+        .any(|cue| lower.contains(cue))
+}
+
+/// Preserve only a markerless segment with exact cross-page note ownership
+/// after all body-role rescue and source-backed splitting has completed. The
+/// Markdown note assembler remains responsible for attaching the continuation
+/// to the numbered definition.
+fn apply_final_physical_footnote_segment_guard(
+    blocks: &mut [LiquidBlock],
+    sources: &mut [LiquidBlockSourceLines],
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let repaired_blocks = physical_open_note_continuation_blocks(blocks, sources, decoded)
+        .into_iter()
+        .filter(|block_index| {
+            matches!(
+                blocks.get(*block_index).map(|block| block.role),
+                Some(LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote)
+            )
+        })
+        .collect::<HashSet<_>>();
+
+    for block_index in &repaired_blocks {
+        if let Some(block) = blocks.get_mut(*block_index) {
+            block.role = LiquidBlockRole::Marginalia;
+            block.label = None;
+        }
+    }
+    repaired_blocks.len()
+}
+
+/// Consolidate a numbered note whose physical tail was split across a
+/// markerless note block and an earlier body block. Some extractors emit the
+/// final short row in a new body-shaped segment, causing block order to invert
+/// even though source-row order remains unambiguous. Require a numbered note
+/// immediately before the complete physical interval, markerless donor blocks
+/// wholly contained in that interval, and footnote geometry through the
+/// penultimate row. At most one short, lowercase, sentence-ending final spill
+/// may leave the footnote segment.
+fn apply_gapped_numbered_note_tail_reflow(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let mut repaired = 0usize;
+
+    for _ in 0..8 {
+        let owner_by_coordinate = sources
+            .iter()
+            .enumerate()
+            .flat_map(|(source_position, source)| {
+                source
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .map(move |(line_position, line)| {
+                        (
+                            (line.page_index, line.line_index),
+                            (source_position, line_position, source.block_index),
+                        )
+                    })
+            })
+            .collect::<HashMap<_, _>>();
+        let mut operation = None;
+
+        'candidate: for (_candidate_position, candidate_source) in sources.iter().enumerate() {
+            let Some(candidate_block) = blocks.get(candidate_source.block_index) else {
+                continue;
+            };
+            if !matches!(
+                candidate_block.role,
+                LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+            ) || candidate_source.lines.len() < 2
+                || candidate_source
+                    .lines
+                    .iter()
+                    .any(|line| !line.note_markers.is_empty())
+            {
+                continue;
+            }
+            let mut candidate_coordinates = candidate_source
+                .lines
+                .iter()
+                .map(|line| (line.page_index, line.line_index))
+                .collect::<Vec<_>>();
+            candidate_coordinates.sort_unstable();
+            candidate_coordinates.dedup();
+            if candidate_coordinates.len() != candidate_source.lines.len()
+                || candidate_coordinates
+                    .windows(2)
+                    .any(|pair| pair[0].0 != pair[1].0)
+                || !candidate_coordinates
+                    .windows(2)
+                    .any(|pair| pair[0].1.saturating_add(1) < pair[1].1)
+            {
+                continue;
+            }
+            let page_index = candidate_coordinates[0].0;
+            let first_line_index = candidate_coordinates[0].1;
+            let last_line_index = candidate_coordinates.last().expect("candidate rows").1;
+            let Some(previous_line_index) = first_line_index.checked_sub(1) else {
+                continue;
+            };
+            let Some((target_position, target_line_position, target_block_index)) =
+                owner_by_coordinate
+                    .get(&(page_index, previous_line_index))
+                    .copied()
+            else {
+                continue;
+            };
+            let Some(target_block) = blocks.get(target_block_index) else {
+                continue;
+            };
+            let Some(target_source) = sources.get(target_position) else {
+                continue;
+            };
+            let target_markers = target_source
+                .lines
+                .iter()
+                .flat_map(|line| line.note_markers.iter().copied())
+                .collect::<BTreeSet<_>>();
+            if candidate_source.block_index >= target_block_index
+                || !matches!(
+                    target_block.role,
+                    LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote
+                )
+                || target_line_position + 1 != target_source.lines.len()
+                || target_markers.len() != 1
+            {
+                continue;
+            }
+            let Some(previous_deep) = target_source.lines[target_line_position]
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+            else {
+                continue;
+            };
+            if !previous_deep.segment_block_footnote_like
+                || !previous_deep
+                    .segment_block_shape
+                    .eq_ignore_ascii_case("footnote")
+                || !previous_deep.in_footnote_zone
+                || previous_deep.in_ruled_cell
+                || previous_deep.ruled_row_membership_exact
+                || previous_deep.page_table_column_like
+                || previous_deep.page_object_overlaps_image_bbox
+            {
+                continue;
+            }
+
+            let mut interval = Vec::new();
+            for line_index in first_line_index..=last_line_index {
+                let Some(owner) = owner_by_coordinate.get(&(page_index, line_index)).copied()
+                else {
+                    continue 'candidate;
+                };
+                interval.push((line_index, owner));
+            }
+            let donor_blocks = interval
+                .iter()
+                .map(|(_, (_, _, block_index))| *block_index)
+                .collect::<BTreeSet<_>>();
+            if !donor_blocks.contains(&candidate_source.block_index)
+                || donor_blocks.len() < 2
+                || donor_blocks.contains(&target_block_index)
+            {
+                continue;
+            }
+            for donor_block_index in &donor_blocks {
+                let Some(donor_source) = sources
+                    .iter()
+                    .find(|source| source.block_index == *donor_block_index)
+                else {
+                    continue 'candidate;
+                };
+                if donor_source.lines.iter().any(|line| {
+                    line.page_index != page_index
+                        || line.line_index < first_line_index
+                        || line.line_index > last_line_index
+                        || !line.note_markers.is_empty()
+                }) {
+                    continue 'candidate;
+                }
+                if *donor_block_index != candidate_source.block_index
+                    && !matches!(
+                        blocks.get(*donor_block_index).map(|block| block.role),
+                        Some(LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote)
+                    )
+                {
+                    continue 'candidate;
+                }
+            }
+
+            let first_deep = interval[0].1.0;
+            let Some(first_deep) = sources[first_deep].lines[interval[0].1.1]
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+            else {
+                continue;
+            };
+            for (_, (source_position, line_position, _)) in
+                interval.iter().take(interval.len().saturating_sub(1))
+            {
+                let Some(deep) = sources[*source_position].lines[*line_position]
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied())
+                else {
+                    continue 'candidate;
+                };
+                if deep.segment_block_id != previous_deep.segment_block_id
+                    || !deep.segment_block_footnote_like
+                    || !deep.segment_block_shape.eq_ignore_ascii_case("footnote")
+                    || !deep.in_footnote_zone
+                    || deep.in_ruled_cell
+                    || deep.ruled_row_membership_exact
+                    || deep.page_table_column_like
+                    || deep.page_object_overlaps_image_bbox
+                {
+                    continue 'candidate;
+                }
+            }
+            let (final_source_position, final_line_position, final_block_index) =
+                interval.last().expect("interval row").1;
+            let Some(final_deep) = sources[final_source_position].lines[final_line_position]
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+            else {
+                continue;
+            };
+            let final_in_footnote_segment = final_deep.segment_block_id
+                == previous_deep.segment_block_id
+                && final_deep.segment_block_footnote_like
+                && final_deep
+                    .segment_block_shape
+                    .eq_ignore_ascii_case("footnote")
+                && final_deep.in_footnote_zone
+                && !final_deep.in_ruled_cell
+                && !final_deep.ruled_row_membership_exact
+                && !final_deep.page_table_column_like
+                && !final_deep.page_object_overlaps_image_bbox;
+            if !final_in_footnote_segment {
+                let horizontal_tolerance =
+                    (first_deep.page_width.max(final_deep.page_width) * 0.008).max(2.5);
+                if final_block_index != candidate_source.block_index
+                    || !lm2_body_sized_reflow_line(final_deep)
+                    || final_deep.doc_repeated_edge_text
+                    || (final_deep.left - first_deep.left).abs() > horizontal_tolerance
+                    || !lm2_reflow_starts_like_continuation(&final_deep.text)
+                    || word_count(&final_deep.text) > 8
+                    || !lm2_blocksplit_ends_like_paragraph(final_deep.text.trim_end())
+                {
+                    continue;
+                }
+            }
+
+            let ordered_refs = interval
+                .iter()
+                .map(|(_, (source_position, line_position, _))| {
+                    sources[*source_position].lines[*line_position].clone()
+                })
+                .collect::<Vec<_>>();
+            operation = Some((
+                target_position,
+                target_block_index,
+                donor_blocks,
+                ordered_refs,
+            ));
+            break;
+        }
+
+        let Some((target_position, target_block_index, donor_blocks, mut ordered_refs)) = operation
+        else {
+            break;
+        };
+        for line in &mut ordered_refs {
+            line.role = LiquidBlockRole::Marginalia;
+            line.note_markers.clear();
+            append_line(&mut blocks[target_block_index].text, &line.text);
+        }
+        sources[target_position].lines.extend(ordered_refs);
+
+        let removed_blocks = donor_blocks.iter().copied().collect::<Vec<_>>();
+        for block_index in removed_blocks.iter().rev() {
+            blocks.remove(*block_index);
+        }
+        sources.retain(|source| !donor_blocks.contains(&source.block_index));
+        for source in sources.iter_mut() {
+            let removed_before = removed_blocks
+                .iter()
+                .filter(|block_index| **block_index < source.block_index)
+                .count();
+            source.block_index -= removed_before;
+        }
+        repaired += 1;
+    }
+
+    repaired
+}
+
+/// Restore a physical note continuation that a grouping pass appended to a
+/// body block after skipping over intervening note heads.  The source-line gap
+/// and the immediately preceding Marginalia line are the contract; no document
+/// title or citation text is consulted.
+fn apply_interleaved_note_continuation_reflow(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let mut repaired = apply_gapped_numbered_note_tail_reflow(blocks, sources, decoded);
+
+    for _ in 0..16 {
+        let owner_by_coordinate = sources
+            .iter()
+            .enumerate()
+            .flat_map(|(source_position, source)| {
+                source
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .map(move |(line_position, line)| {
+                        (
+                            (line.page_index, line.line_index),
+                            (source_position, line_position, source.block_index),
+                        )
+                    })
+            })
+            .collect::<HashMap<_, _>>();
+        let mut operation = None;
+        'source: for (source_position, source) in sources.iter().enumerate() {
+            let Some(block) = blocks.get(source.block_index) else {
+                continue;
+            };
+            if !matches!(
+                block.role,
+                LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+            ) || source.lines.len() < 2
+            {
+                continue;
+            }
+            for line_position in 1..source.lines.len() {
+                let previous = &source.lines[line_position - 1];
+                let candidate = &source.lines[line_position];
+                if candidate.page_index != previous.page_index
+                    || candidate.line_index <= previous.line_index.saturating_add(1)
+                    || line_position + 1 != source.lines.len()
+                {
+                    continue;
+                }
+                let Some(candidate_line) = candidate
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied())
+                else {
+                    continue;
+                };
+                let Some(previous_coordinate) = candidate.line_index.checked_sub(1) else {
+                    continue;
+                };
+                let Some((target_position, _, target_block_index)) = owner_by_coordinate
+                    .get(&(candidate.page_index, previous_coordinate))
+                    .copied()
+                else {
+                    continue;
+                };
+                let Some(target_block) = blocks.get(target_block_index) else {
+                    continue;
+                };
+                let target_has_note_provenance =
+                    sources.get(target_position).is_some_and(|target| {
+                        target.lines.iter().any(|line| {
+                            !line.note_markers.is_empty()
+                                || line
+                                    .id
+                                    .as_deref()
+                                    .and_then(|id| line_by_id.get(id).copied())
+                                    .is_some_and(|deep| {
+                                        deep.doc_note_marker > 0
+                                            || leading_explicit_numbered_note_marker(&deep.text)
+                                                .is_some()
+                                            || note_head_marker(&deep.text).is_some()
+                                    })
+                        })
+                    });
+                if !matches!(
+                    target_block.role,
+                    LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote
+                ) || !target_has_note_provenance
+                    || !candidate_line.in_footnote_zone
+                    || candidate_line.in_ruled_cell
+                {
+                    continue;
+                }
+                let bodyish_note_continuation = [
+                    candidate_line.font_ratio_page_ref,
+                    candidate_line.font_ratio_page,
+                    candidate_line.font_ratio_doc,
+                ]
+                .into_iter()
+                .filter(|ratio| *ratio >= 0.92)
+                .count()
+                    >= 2;
+                if !bodyish_note_continuation {
+                    continue;
+                }
+                let cleaned = clean_lm2_line_text(&candidate.text);
+                if cleaned.is_empty() || !block.text.trim_end().ends_with(&cleaned) {
+                    continue;
+                }
+                operation = Some((
+                    source_position,
+                    line_position,
+                    target_position,
+                    source.block_index,
+                    target_block_index,
+                    cleaned,
+                ));
+                break 'source;
+            }
+        }
+        let Some((
+            source_position,
+            line_position,
+            target_position,
+            source_block_index,
+            target_block_index,
+            cleaned,
+        )) = operation
+        else {
+            break;
+        };
+
+        let mut moved = sources[source_position].lines.remove(line_position);
+        moved.role = LiquidBlockRole::Marginalia;
+        moved.note_markers.clear();
+        sources[target_position].lines.push(moved);
+        if let Some(prefix) = blocks[source_block_index]
+            .text
+            .trim_end()
+            .strip_suffix(&cleaned)
+        {
+            blocks[source_block_index].text = prefix.trim_end().to_owned();
+        }
+        append_line(&mut blocks[target_block_index].text, &cleaned);
+        repaired += 1;
+    }
+
+    // A table prior can still capture the remaining tail of the very same
+    // note.  Restore only source-provenance Marginalia that is physically
+    // contiguous with a preceding note and starts like continuation prose.
+    let owner_by_coordinate = sources
+        .iter()
+        .flat_map(|source| {
+            source
+                .lines
+                .iter()
+                .map(move |line| ((line.page_index, line.line_index), source.block_index))
+        })
+        .collect::<HashMap<_, _>>();
+    for source in sources.iter() {
+        let Some(block) = blocks.get(source.block_index) else {
+            continue;
+        };
+        if block.role != LiquidBlockRole::Table
+            || source.lines.is_empty()
+            || source.lines.iter().any(|line| {
+                line.role != LiquidBlockRole::Marginalia || !line.note_markers.is_empty()
+            })
+            || leading_numeric_token_marker(&block.text).is_some()
+        {
+            continue;
+        }
+        let first = &source.lines[0];
+        let Some(previous_line_index) = first.line_index.checked_sub(1) else {
+            continue;
+        };
+        let Some(previous_block_index) = owner_by_coordinate
+            .get(&(first.page_index, previous_line_index))
+            .copied()
+        else {
+            continue;
+        };
+        if !matches!(
+            blocks.get(previous_block_index).map(|block| block.role),
+            Some(LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote)
+        ) || source.lines.iter().any(|line| {
+            line.id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+                .is_none_or(|line| !line.in_footnote_zone || line.in_ruled_cell)
+        }) {
+            continue;
+        }
+        if let Some(block) = blocks.get_mut(source.block_index) {
+            block.role = LiquidBlockRole::Marginalia;
+            block.label = None;
+            repaired += 1;
+        }
+    }
+
+    // A cross-page note can resume below the next page's body and immediately
+    // before the following numbered note.  Table priors are especially prone
+    // to capturing short, citation-dense carryovers such as a year followed by
+    // docket information.  A Paragraph can also capture the middle of one
+    // physical footnote segment when only its first row retained a Marginalia
+    // hint. Restore either shape only when the next source row is exactly the
+    // next numbered definition and the preceding page ended with its
+    // predecessor. A final Paragraph can retain all-Marginalia source roles;
+    // in that shape the complete physical footnote segment plus an open prior
+    // note replaces the discretionary-hyphen requirement. Those provenance
+    // checks keep real tables and body prose out.
+    let mut paragraph_segment_repairs = HashSet::new();
+    for source in sources.iter() {
+        let Some(block) = blocks.get(source.block_index) else {
+            continue;
+        };
+        if source.lines.is_empty() {
+            continue;
+        }
+        let paragraph_segment = block.role == LiquidBlockRole::Paragraph
+            && source.lines.iter().all(|line| {
+                line.role == LiquidBlockRole::Paragraph && line.note_markers.is_empty()
+            })
+            && source.lines.first().is_some_and(|first| {
+                let Some(first_deep) = first
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied())
+                else {
+                    return false;
+                };
+                let same_physical_segment = source.lines.iter().all(|line| {
+                    line.id
+                        .as_deref()
+                        .and_then(|id| line_by_id.get(id).copied())
+                        .is_some_and(|deep| {
+                            deep.page_index == first_deep.page_index
+                                && deep.segment_block_id == first_deep.segment_block_id
+                                && deep.segment_block_footnote_like
+                                && deep.segment_block_shape.eq_ignore_ascii_case("footnote")
+                                && deep.in_footnote_zone
+                                && !deep.in_ruled_cell
+                                && !deep.ruled_row_membership_exact
+                                && !deep.page_table_column_like
+                                && !deep.page_object_overlaps_image_bbox
+                        })
+                });
+                let preceding_same_segment_marginalia = first
+                    .line_index
+                    .checked_sub(1)
+                    .and_then(|line_index| {
+                        owner_by_coordinate
+                            .get(&(first.page_index, line_index))
+                            .copied()
+                    })
+                    .and_then(|previous_block_index| {
+                        let previous_source = sources
+                            .iter()
+                            .find(|candidate| candidate.block_index == previous_block_index)?;
+                        let previous_ref = previous_source.lines.last()?;
+                        let previous_deep = previous_ref
+                            .id
+                            .as_deref()
+                            .and_then(|id| line_by_id.get(id).copied())?;
+                        Some(
+                            matches!(
+                                blocks.get(previous_block_index).map(|block| block.role),
+                                Some(LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote)
+                            ) && previous_ref.note_markers.is_empty()
+                                && previous_deep.page_index == first_deep.page_index
+                                && previous_deep.segment_block_id == first_deep.segment_block_id
+                                && previous_deep.segment_block_footnote_like
+                                && previous_deep.in_footnote_zone,
+                        )
+                    })
+                    .unwrap_or(false);
+                same_physical_segment && preceding_same_segment_marginalia
+            });
+        let near_rule_paragraph_segment = block.role == LiquidBlockRole::Paragraph
+            && lm2_near_rule_cross_page_note_segment(source, &line_by_id);
+        let table_carryover = block.role == LiquidBlockRole::Table
+            && source.lines.iter().all(|line| {
+                line.role == LiquidBlockRole::Marginalia && line.note_markers.is_empty()
+            });
+        let source_marginalia_carryover = block.role == LiquidBlockRole::Paragraph
+            && source.lines.iter().all(|line| {
+                line.role == LiquidBlockRole::Marginalia && line.note_markers.is_empty()
+            })
+            && source.lines.first().is_some_and(|first| {
+                let Some(first_deep) = first
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied())
+                else {
+                    return false;
+                };
+                source.lines.iter().all(|line| {
+                    line.id
+                        .as_deref()
+                        .and_then(|id| line_by_id.get(id).copied())
+                        .is_some_and(|deep| {
+                            deep.page_index == first_deep.page_index
+                                && deep.segment_block_id == first_deep.segment_block_id
+                                && deep.segment_block_footnote_like
+                                && deep.segment_block_shape.eq_ignore_ascii_case("footnote")
+                                && deep.in_footnote_zone
+                                && !deep.in_ruled_cell
+                                && !deep.ruled_row_membership_exact
+                                && !deep.page_table_column_like
+                                && !deep.page_object_overlaps_image_bbox
+                        })
+                })
+            });
+        if !paragraph_segment
+            && !near_rule_paragraph_segment
+            && !table_carryover
+            && !source_marginalia_carryover
+        {
+            continue;
+        }
+        let page_index = source.lines[0].page_index;
+        if source
+            .lines
+            .iter()
+            .any(|line| line.page_index != page_index)
+            || source.lines.iter().any(|line| {
+                line.id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied())
+                    .is_none_or(|line| {
+                        !line.in_footnote_zone && !near_rule_paragraph_segment
+                            || line.in_ruled_cell
+                            || table_carryover
+                                && [
+                                    line.font_ratio_page_ref,
+                                    line.font_ratio_page,
+                                    line.font_ratio_doc,
+                                ]
+                                .into_iter()
+                                .filter(|ratio| *ratio <= 0.90)
+                                .count()
+                                    < 2
+                    })
+            })
+        {
+            continue;
+        }
+        let Some(next_line_index) = source
+            .lines
+            .last()
+            .and_then(|line| line.line_index.checked_add(1))
+        else {
+            continue;
+        };
+        let Some(next_block_index) = owner_by_coordinate
+            .get(&(page_index, next_line_index))
+            .copied()
+        else {
+            continue;
+        };
+        if !matches!(
+            blocks.get(next_block_index).map(|block| block.role),
+            Some(LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote)
+        ) {
+            continue;
+        }
+        let next_markers = sources
+            .iter()
+            .find(|candidate| candidate.block_index == next_block_index)
+            .into_iter()
+            .flat_map(|candidate| &candidate.lines)
+            .filter(|line| line.page_index == page_index && line.line_index == next_line_index)
+            .flat_map(|line| line.note_markers.iter().copied())
+            .collect::<BTreeSet<_>>();
+        if next_markers.len() != 1 {
+            continue;
+        }
+        let next_marker = *next_markers.iter().next().expect("one next marker");
+        let previous_page_note = page_index.checked_sub(1).and_then(|previous_page| {
+            sources
+                .iter()
+                .filter(|candidate| {
+                    matches!(
+                        blocks.get(candidate.block_index).map(|block| block.role),
+                        Some(LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote)
+                    )
+                })
+                .flat_map(|candidate| {
+                    candidate
+                        .lines
+                        .iter()
+                        .filter(move |line| line.page_index == previous_page)
+                        .flat_map(move |line| {
+                            line.note_markers
+                                .iter()
+                                .copied()
+                                .map(move |marker| (marker, candidate.block_index))
+                        })
+                })
+                .max_by_key(|(marker, _)| *marker)
+        });
+        if previous_page_note.and_then(|(marker, _)| marker.checked_add(1)) != Some(next_marker) {
+            continue;
+        }
+        // A body-sized Paragraph needs one more open-note signal than a Table:
+        // the previous page's N definition must visibly end at a discretionary
+        // hyphen. This is the source-backed `Intro-` / `duce` shape and keeps a
+        // complete body paragraph out even if a segment prior is overbroad.
+        if paragraph_segment
+            && previous_page_note
+                .and_then(|(_, block_index)| blocks.get(block_index))
+                .is_none_or(|block| !block.text.trim_end().ends_with('-'))
+        {
+            continue;
+        }
+        if near_rule_paragraph_segment
+            && previous_page_note
+                .and_then(|(_, block_index)| blocks.get(block_index))
+                .is_none_or(|previous| {
+                    !lm2_reflow_paragraph_is_visibly_open(&previous.text)
+                        || !lm2_reflow_starts_like_continuation(&block.text)
+                })
+        {
+            continue;
+        }
+        if source_marginalia_carryover
+            && previous_page_note
+                .and_then(|(_, block_index)| blocks.get(block_index))
+                .is_none_or(|previous| {
+                    !(lm2_reflow_paragraph_is_visibly_open(&previous.text)
+                        && lm2_reflow_starts_like_continuation(&block.text)
+                        || lm2_citation_suffix_cross_page_bridge(&previous.text, &block.text))
+                })
+        {
+            continue;
+        }
+        if let Some(block) = blocks.get_mut(source.block_index) {
+            block.role = LiquidBlockRole::Marginalia;
+            block.label = None;
+            if paragraph_segment || near_rule_paragraph_segment {
+                paragraph_segment_repairs.insert(source.block_index);
+            }
+            repaired += 1;
+        }
+    }
+    for source in sources.iter_mut() {
+        if paragraph_segment_repairs.contains(&source.block_index) {
+            for line in &mut source.lines {
+                line.role = LiquidBlockRole::Marginalia;
+            }
+        }
+    }
+    repaired
+}
+
+fn lm2_near_rule_cross_page_note_segment(
+    source: &LiquidBlockSourceLines,
+    line_by_id: &HashMap<&str, &DeepLiquidSourceLine>,
+) -> bool {
+    let deep = source
+        .lines
+        .iter()
+        .filter_map(|line| {
+            line.id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+        })
+        .collect::<Vec<_>>();
+    let Some(first) = deep.first().copied() else {
+        return false;
+    };
+    deep.len() >= 2
+        && source.lines.iter().all(|line| {
+            matches!(
+                line.role,
+                LiquidBlockRole::Paragraph
+                    | LiquidBlockRole::Marginalia
+                    | LiquidBlockRole::Footnote
+            ) && line.note_markers.is_empty()
+        })
+        && first.page_object_thin_horizontal_near_line_count > 0
+        && first.dist_to_nearest_rule <= first.font_height.max(1.0)
+        && deep.iter().all(|line| {
+            line.page_index == first.page_index
+                && line.segment_block_id == first.segment_block_id
+                && line.segment_block_shape.eq_ignore_ascii_case("body")
+                && !line.in_footnote_zone
+                && !line.in_ruled_cell
+                && !line.ruled_row_membership_exact
+                && !line.page_table_column_like
+                && !line.page_object_overlaps_image_bbox
+                && [
+                    line.font_ratio_page_ref,
+                    line.font_ratio_page,
+                    line.font_ratio_doc,
+                ]
+                .into_iter()
+                .filter(|ratio| *ratio <= 0.90)
+                .count()
+                    >= 2
+        })
+}
+
+fn lm2_citation_suffix_cross_page_bridge(previous: &str, continuation: &str) -> bool {
+    let previous = strip_callout_sentinels_lm2(previous);
+    let previous = previous.trim_end();
+    let continuation = collapse_whitespace(continuation);
+    let normalized = continuation
+        .replace('\u{2019}', "'")
+        .replace('\u{2018}', "'");
+    let lower = normalized.to_ascii_lowercase();
+    let suffix = lower.starts_with("p'ship,")
+        || lower.starts_with("partnership,")
+        || lower.starts_with("l.l.c.,")
+        || lower.starts_with("llc,")
+        || lower.starts_with("ltd.,")
+        || lower.starts_with("inc.,");
+    let reporter = lower
+        .split_whitespace()
+        .take(12)
+        .any(|token| matches!(token, "f.2d" | "f.3d" | "f.4th" | "u.s." | "s.ct."));
+    suffix
+        && reporter
+        && ["Ltd.", "L.L.C.", "LLC", "Inc.", "P'ship", "P\u{2019}ship"]
+            .iter()
+            .any(|ending| previous.ends_with(ending))
+}
+
+fn lm2_body_sized_reflow_line(line: &DeepLiquidSourceLine) -> bool {
+    if line.in_ruled_cell
+        || line.ruled_row_membership_exact
+        || line.page_table_column_like
+        || line.page_object_overlaps_image_bbox
+    {
+        return false;
+    }
+    [
+        line.font_ratio_page_ref,
+        line.font_ratio_page,
+        line.font_ratio_doc,
+    ]
+    .into_iter()
+    .filter(|ratio| *ratio >= 0.94)
+    .count()
+        >= 2
+}
+
+fn lm2_explicit_definition_markers(
+    sources: &[LiquidBlockSourceLines],
+    line_by_id: &HashMap<&str, &DeepLiquidSourceLine>,
+) -> HashSet<u16> {
+    sources
+        .iter()
+        .flat_map(|source| &source.lines)
+        .filter(|line| {
+            let trimmed = line.text.trim_start();
+            let digits = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+            let explicit_punctuation = trimmed[digits..]
+                .chars()
+                .next()
+                .is_some_and(|ch| matches!(ch, '.' | ')' | ']'));
+            explicit_punctuation
+                || line
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied())
+                    .is_some_and(|line| {
+                        lm2_note_head_zone_evidence(line) && !lm2_body_sized_reflow_line(line)
+                    })
+        })
+        .flat_map(|line| line.note_markers.iter().copied())
+        .collect()
+}
+
+/// A body row containing one or more superscript callouts can be labelled as a
+/// note head when the row is the first item above the real footnote band.  Move
+/// it back into the immediately preceding paragraph only when typography or
+/// exact same-row geometry says body, and every marker has a real definition.
+fn apply_inline_body_callout_marginalia_reflow(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    if blocks.len() < 2 {
+        return 0;
+    }
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let definitions = lm2_explicit_definition_markers(sources, &line_by_id);
+    let mut source_by_block = sources
+        .iter()
+        .map(|source| (source.block_index, source.lines.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let old_blocks = std::mem::take(blocks);
+    let mut rebuilt_blocks = Vec::with_capacity(old_blocks.len());
+    let mut rebuilt_sources = Vec::with_capacity(sources.len());
+    let mut repaired = 0usize;
+    let mut index = 0usize;
+
+    while index < old_blocks.len() {
+        let candidate = if index + 1 < old_blocks.len()
+            && matches!(
+                old_blocks[index].role,
+                LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+            )
+            && matches!(
+                old_blocks[index + 1].role,
+                LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote
+            ) {
+            let previous_refs = source_by_block.get(&index).cloned().unwrap_or_default();
+            let current_refs = source_by_block
+                .get(&(index + 1))
+                .cloned()
+                .unwrap_or_default();
+            let mut markers = sentineled_note_markers(&old_blocks[index + 1].text);
+            if markers.is_empty() {
+                markers.extend(
+                    current_refs
+                        .iter()
+                        .flat_map(|line| line.note_markers.iter().copied()),
+                );
+                markers.sort_unstable();
+                markers.dedup();
+            }
+            if let (Some(previous_ref), [current_ref]) =
+                (previous_refs.last(), current_refs.as_slice())
+                && previous_ref.page_index == current_ref.page_index
+                && previous_ref.line_index.checked_add(1) == Some(current_ref.line_index)
+                && !markers.is_empty()
+                && markers.iter().all(|marker| definitions.contains(marker))
+                && let (Some(previous_line), Some(current_line)) = (
+                    previous_ref
+                        .id
+                        .as_deref()
+                        .and_then(|id| line_by_id.get(id).copied()),
+                    current_ref
+                        .id
+                        .as_deref()
+                        .and_then(|id| line_by_id.get(id).copied()),
+                )
+                && let Some(leading_marker) = leading_sentineled_marker(&old_blocks[index + 1].text)
+                    .or_else(|| leading_numeric_token_marker(&old_blocks[index + 1].text))
+                && (lm2_body_sized_reflow_line(current_line)
+                    || lm2_same_row_leading_callout_with_prose(
+                        previous_line,
+                        current_line,
+                        leading_marker,
+                    ))
+                && lm2_strip_leading_ascii_or_decoded_callout(
+                    &old_blocks[index + 1].text,
+                    leading_marker,
+                )
+                .is_some()
+            {
+                Some((previous_refs, current_refs))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let block_index = rebuilt_blocks.len();
+        if let Some((mut previous_refs, mut current_refs)) = candidate {
+            let mut merged = old_blocks[index].clone();
+            let candidate_text = leading_sentineled_marker(&old_blocks[index + 1].text)
+                .map(|_| old_blocks[index + 1].text.clone())
+                .or_else(|| {
+                    let marker = leading_numeric_token_marker(&old_blocks[index + 1].text)?;
+                    let remainder = lm2_strip_leading_ascii_or_decoded_callout(
+                        &old_blocks[index + 1].text,
+                        marker,
+                    )?;
+                    Some(format!("{CALLOUT_START}{marker}{CALLOUT_END} {remainder}"))
+                })
+                .unwrap_or_else(|| old_blocks[index + 1].text.clone());
+            append_line(&mut merged.text, &candidate_text);
+            for line in &mut current_refs {
+                line.role = LiquidBlockRole::Paragraph;
+                line.note_markers.clear();
+            }
+            previous_refs.append(&mut current_refs);
+            rebuilt_blocks.push(merged);
+            rebuilt_sources.push(LiquidBlockSourceLines {
+                block_index,
+                lines: previous_refs,
+            });
+            source_by_block.remove(&index);
+            source_by_block.remove(&(index + 1));
+            repaired += 1;
+            index += 2;
+            continue;
+        }
+
+        rebuilt_blocks.push(old_blocks[index].clone());
+        if let Some(lines) = source_by_block.remove(&index)
+            && !lines.is_empty()
+        {
+            rebuilt_sources.push(LiquidBlockSourceLines { block_index, lines });
+        }
+        index += 1;
+    }
+    *blocks = rebuilt_blocks;
+    *sources = rebuilt_sources;
+    repaired
+}
+
+/// Join a body-sized continuation that sits between an open paragraph and the
+/// next paragraph's leading callout.  Exact source-line adjacency plus a real
+/// definition lets this cover table/marginalia misroutes without swallowing a
+/// genuine note continuation.
+fn apply_geometry_backed_leading_callout_bridge(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    if blocks.len() < 3 {
+        return 0;
+    }
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let definitions = lm2_explicit_definition_markers(sources, &line_by_id);
+    let mut source_by_block = sources
+        .iter()
+        .map(|source| (source.block_index, source.lines.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let old_blocks = std::mem::take(blocks);
+    let mut rebuilt_blocks = Vec::with_capacity(old_blocks.len());
+    let mut rebuilt_sources = Vec::with_capacity(sources.len());
+    let mut repaired = 0usize;
+    let mut index = 0usize;
+
+    while index < old_blocks.len() {
+        let bridge = if index + 2 < old_blocks.len()
+            && old_blocks[index].role == LiquidBlockRole::Paragraph
+            && matches!(
+                old_blocks[index + 1].role,
+                LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote | LiquidBlockRole::Table
+            )
+            && old_blocks[index + 2].role == LiquidBlockRole::Paragraph
+            && lm2_reflow_paragraph_is_visibly_open(&old_blocks[index].text)
+            && leading_numeric_token_marker(&old_blocks[index + 1].text).is_none()
+            && leading_sentineled_marker(&old_blocks[index + 1].text).is_none()
+        {
+            let before_refs = source_by_block.get(&index).cloned().unwrap_or_default();
+            let bridge_refs = source_by_block
+                .get(&(index + 1))
+                .cloned()
+                .unwrap_or_default();
+            let after_refs = source_by_block
+                .get(&(index + 2))
+                .cloned()
+                .unwrap_or_default();
+            let marker = leading_sentineled_marker(&old_blocks[index + 2].text);
+            if let (
+                Some(before_ref),
+                Some(bridge_first),
+                Some(bridge_last),
+                Some(after_ref),
+                Some(marker),
+            ) = (
+                before_refs.last(),
+                bridge_refs.first(),
+                bridge_refs.last(),
+                after_refs.first(),
+                marker,
+            ) && definitions.contains(&marker)
+                && bridge_refs.iter().all(|line| line.note_markers.is_empty())
+                && before_ref.page_index == bridge_first.page_index
+                && bridge_first.page_index == bridge_last.page_index
+                && bridge_last.page_index == after_ref.page_index
+                && before_ref.line_index.checked_add(1) == Some(bridge_first.line_index)
+                && bridge_last.line_index.checked_add(1) == Some(after_ref.line_index)
+                && bridge_refs.iter().all(|line| {
+                    line.id
+                        .as_deref()
+                        .and_then(|id| line_by_id.get(id).copied())
+                        .is_some_and(lm2_body_sized_reflow_line)
+                })
+            {
+                Some((before_refs, bridge_refs, after_refs, marker))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let block_index = rebuilt_blocks.len();
+        if let Some((mut before_refs, mut bridge_refs, after_refs, marker)) = bridge {
+            let mut merged = old_blocks[index].clone();
+            append_line(&mut merged.text, &old_blocks[index + 1].text);
+            merged
+                .text
+                .push_str(&format!("{CALLOUT_START}{marker}{CALLOUT_END}"));
+            for line in &mut bridge_refs {
+                line.role = LiquidBlockRole::Paragraph;
+                line.note_markers.clear();
+            }
+            before_refs.append(&mut bridge_refs);
+            rebuilt_blocks.push(merged);
+            rebuilt_sources.push(LiquidBlockSourceLines {
+                block_index,
+                lines: before_refs,
+            });
+
+            let marker_end = leading_callout_marker_end(&old_blocks[index + 2].text)
+                .expect("geometry bridge requires a leading callout");
+            let mut continuation = old_blocks[index + 2].clone();
+            continuation.text = continuation.text[marker_end..].trim_start().to_owned();
+            let continuation_index = rebuilt_blocks.len();
+            rebuilt_blocks.push(continuation);
+            rebuilt_sources.push(LiquidBlockSourceLines {
+                block_index: continuation_index,
+                lines: after_refs,
+            });
+            source_by_block.remove(&index);
+            source_by_block.remove(&(index + 1));
+            source_by_block.remove(&(index + 2));
+            repaired += 1;
+            index += 3;
+            continue;
+        }
+
+        rebuilt_blocks.push(old_blocks[index].clone());
+        if let Some(lines) = source_by_block.remove(&index)
+            && !lines.is_empty()
+        {
+            rebuilt_sources.push(LiquidBlockSourceLines { block_index, lines });
+        }
+        index += 1;
+    }
+    *blocks = rebuilt_blocks;
+    *sources = rebuilt_sources;
+    repaired
+}
+
+/// Split the rare block where a same-row body superscript and its following
+/// words were classified Marginalia immediately before the page's real note
+/// continuation.  Reading order then groups both regions together (for
+/// example `29 If sovereign ide-` followed by the continuation of note 22).
+/// Move only the first body line back to its paragraph and preserve the rest as
+/// note material.
+fn apply_mixed_marginalia_leading_body_callout_split(
+    blocks: &mut [LiquidBlock],
+    sources: &mut [LiquidBlockSourceLines],
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let source_position = sources
+        .iter()
+        .enumerate()
+        .map(|(position, source)| (source.block_index, position))
+        .collect::<HashMap<_, _>>();
+    let note_pages = sources
+        .iter()
+        .flat_map(|source| {
+            source.lines.iter().flat_map(|line| {
+                line.note_markers
+                    .iter()
+                    .map(move |marker| (line.page_index, *marker))
+            })
+        })
+        .collect::<HashSet<_>>();
+    let mut operations = Vec::new();
+
+    for block_index in 1..blocks.len() {
+        if blocks[block_index - 1].role != LiquidBlockRole::Paragraph
+            || blocks[block_index].role != LiquidBlockRole::Marginalia
+        {
+            continue;
+        }
+        let (Some(previous_position), Some(current_position)) = (
+            source_position.get(&(block_index - 1)).copied(),
+            source_position.get(&block_index).copied(),
+        ) else {
+            continue;
+        };
+        let previous_source = &sources[previous_position];
+        let current_source = &sources[current_position];
+        if current_source.lines.len() < 2 {
+            continue;
+        }
+        let (Some(previous_ref), Some(first_ref)) =
+            (previous_source.lines.last(), current_source.lines.first())
+        else {
+            continue;
+        };
+        if !first_ref.note_markers.is_empty() {
+            continue;
+        }
+        let (Some(previous_line), Some(first_line)) = (
+            previous_ref
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied()),
+            first_ref
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied()),
+        ) else {
+            continue;
+        };
+        let Some(marker) = leading_sentineled_marker(&first_ref.text)
+            .or_else(|| leading_numeric_token_marker(&first_ref.text))
+        else {
+            continue;
+        };
+        let previous_markers = sentineled_note_markers(&blocks[block_index - 1].text);
+        let body_sequence_bracket = previous_markers.contains(&marker.saturating_sub(1))
+            && previous_markers.contains(&marker.saturating_add(1));
+        if !note_pages.contains(&(first_ref.page_index, marker))
+            || (!body_sequence_bracket
+                && (lm2_note_head_zone_evidence(first_line)
+                    || !lm2_same_row_leading_callout_with_prose(previous_line, first_line, marker)))
+        {
+            continue;
+        }
+        let later_note_material = current_source.lines[1..].iter().any(|line| {
+            if !line.note_markers.is_empty() {
+                return true;
+            }
+            line.id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+                .is_some_and(|line| {
+                    lm2_low_footnote_zone_evidence(line) || lm2_note_head_zone_evidence(line)
+                })
+        });
+        if !later_note_material {
+            continue;
+        }
+        let Some(remainder) =
+            lm2_strip_leading_ascii_or_decoded_callout(&first_ref.text, marker).map(str::to_owned)
+        else {
+            continue;
+        };
+        operations.push((
+            block_index,
+            previous_position,
+            current_position,
+            marker,
+            remainder,
+            clean_lm2_line_text(&previous_ref.text),
+        ));
+    }
+
+    for (block_index, previous_position, current_position, marker, remainder, previous_text) in
+        operations.iter().cloned()
+    {
+        let insertion = format!(
+            "{CALLOUT_START}{marker}{CALLOUT_END} {}",
+            clean_lm2_line_text(&remainder)
+        );
+        if let Some(start) = blocks[block_index - 1].text.rfind(&previous_text) {
+            let end = start + previous_text.len();
+            blocks[block_index - 1].text.insert_str(end, &insertion);
+        } else {
+            blocks[block_index - 1].text =
+                format!("{}{}", blocks[block_index - 1].text.trim_end(), insertion);
+        }
+
+        let mut first_ref = sources[current_position].lines.remove(0);
+        first_ref.role = LiquidBlockRole::Paragraph;
+        first_ref.note_markers.clear();
+        sources[previous_position].lines.push(first_ref);
+
+        let remaining_refs = sources[current_position].lines.clone();
+        let mut remaining_text = String::new();
+        for line in &remaining_refs {
+            append_line(&mut remaining_text, &line.text);
+        }
+        blocks[block_index].text = collapse_whitespace(&remaining_text).trim().to_owned();
+    }
+
+    operations.len()
+}
+
+/// A mixed Marginalia split can move `N Prose` into a body block whose text
+/// already contains later-page continuation text. Reinsert that fragment after
+/// its exact physical predecessor when the body itself proves N-1/N/N+1 and N
+/// currently appears after N+1.
+fn apply_terminal_out_of_order_callout_fragment_reflow(
+    blocks: &mut [LiquidBlock],
+    sources: &[LiquidBlockSourceLines],
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let line_by_coordinate = decoded
+        .iter()
+        .map(|(line, _)| ((line.page_index, line.line_index), line))
+        .collect::<HashMap<_, _>>();
+    let source_by_block = sources
+        .iter()
+        .map(|source| (source.block_index, source))
+        .collect::<HashMap<_, _>>();
+    let mut repaired = 0usize;
+
+    for (block_index, block) in blocks.iter_mut().enumerate() {
+        if !matches!(
+            block.role,
+            LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+        ) {
+            continue;
+        }
+        let markers = sentineled_note_markers(&block.text);
+        let Some(source) = source_by_block.get(&block_index).copied() else {
+            continue;
+        };
+        for line_ref in &source.lines {
+            let Some(marker) = leading_sentineled_marker(&line_ref.text)
+                .or_else(|| leading_numeric_token_marker(&line_ref.text))
+            else {
+                continue;
+            };
+            if !markers.contains(&marker.saturating_sub(1))
+                || !markers.contains(&marker)
+                || !markers.contains(&marker.saturating_add(1))
+            {
+                continue;
+            }
+            let Some(current) = line_ref
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+            else {
+                continue;
+            };
+            let Some(previous_line_index) = current.line_index.checked_sub(1) else {
+                continue;
+            };
+            let Some(previous) = line_by_coordinate
+                .get(&(current.page_index, previous_line_index))
+                .copied()
+            else {
+                continue;
+            };
+            let Some(remainder) =
+                lm2_strip_leading_ascii_or_decoded_callout(&line_ref.text, marker)
+            else {
+                continue;
+            };
+            let rendered = format!(
+                "{CALLOUT_START}{marker}{CALLOUT_END} {}",
+                clean_lm2_line_text(remainder)
+            );
+            let Some(fragment_start) = block.text.rfind(&rendered) else {
+                continue;
+            };
+            let next_marker = format!("{CALLOUT_START}{}{CALLOUT_END}", marker + 1);
+            let Some(next_start) = block.text.find(&next_marker) else {
+                continue;
+            };
+            let anchor = clean_lm2_line_text(&previous.text);
+            let Some(anchor_start) = block.text.rfind(&anchor) else {
+                continue;
+            };
+            let anchor_end = anchor_start + anchor.len();
+            if fragment_start < next_start || fragment_start <= anchor_end {
+                continue;
+            }
+            let fragment_end = fragment_start + rendered.len();
+            let mut rewritten = block.text.clone();
+            rewritten.replace_range(fragment_start..fragment_end, "");
+            rewritten.insert_str(anchor_end, &rendered);
+            block.text = collapse_whitespace(&rewritten).trim().to_owned();
+            repaired += 1;
+            break;
+        }
+    }
+    repaired
+}
+
+/// Do not let a page-level marker sequence consume the middle component of a
+/// dotted software/version number (`V3.3.2`). The original source row provides
+/// an exact positive reconstruction, so ordinary decimals and real callouts
+/// remain untouched.
+fn apply_source_backed_dotted_numeric_callout_restoration(
+    blocks: &mut [LiquidBlock],
+    sources: &[LiquidBlockSourceLines],
+) -> usize {
+    let source_by_block = sources
+        .iter()
+        .map(|source| (source.block_index, source))
+        .collect::<HashMap<_, _>>();
+    let mut repaired = 0usize;
+    for (block_index, block) in blocks.iter_mut().enumerate() {
+        if !matches!(
+            block.role,
+            LiquidBlockRole::Paragraph
+                | LiquidBlockRole::Lead
+                | LiquidBlockRole::Quote
+                | LiquidBlockRole::ListItem
+        ) {
+            continue;
+        }
+        let markers = sentineled_note_markers(&block.text);
+        if markers.is_empty() {
+            continue;
+        }
+        let Some(source) = source_by_block.get(&block_index).copied() else {
+            continue;
+        };
+        for line_ref in &source.lines {
+            if line_ref.text.contains(CALLOUT_START) {
+                continue;
+            }
+            let clean = clean_lm2_line_text(&line_ref.text);
+            let bytes = clean.as_bytes();
+            let mut position = 0usize;
+            while position < bytes.len() {
+                if !bytes[position].is_ascii_digit() {
+                    position += 1;
+                    continue;
+                }
+                let start = position;
+                while position < bytes.len() && bytes[position].is_ascii_digit() {
+                    position += 1;
+                }
+                let end = position;
+                if start == 0
+                    || end >= bytes.len()
+                    || bytes[start - 1] != b'.'
+                    || bytes[end] != b'.'
+                {
+                    continue;
+                }
+                for marker in &markers {
+                    let mut corrupted = clean.clone();
+                    corrupted.replace_range(
+                        start..end,
+                        &format!("{CALLOUT_START}{marker}{CALLOUT_END}"),
+                    );
+                    if block.text.contains(&corrupted) {
+                        block.text = block.text.replacen(&corrupted, &clean, 1);
+                        repaired += 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    repaired
+}
+
+/// Rejoin a body line that the line model called Marginalia even though its
+/// source provenance is physically contiguous with an open Paragraph. This is
+/// especially common for an indented displayed quotation at a page top or for
+/// its short final line. Genuine note heads are excluded by source markers.
+fn apply_contiguous_body_marginalia_reflow(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let footnote_zone_ids = decoded
+        .iter()
+        .filter(|(line, _)| lm2_low_footnote_zone_evidence(line))
+        .map(|(line, _)| line.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut total = 0usize;
+    for _ in 0..8 {
+        let repaired =
+            apply_contiguous_body_marginalia_reflow_once(blocks, sources, &footnote_zone_ids);
+        if repaired == 0 {
+            break;
+        }
+        total += repaired;
+    }
+    total
+}
+
+fn apply_contiguous_body_marginalia_reflow_once(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    footnote_zone_ids: &HashSet<&str>,
+) -> usize {
+    if blocks.len() < 2 {
+        return 0;
+    }
+    let mut source_by_block = sources
+        .iter()
+        .map(|source| (source.block_index, source.lines.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let old_blocks = std::mem::take(blocks);
+    let mut rebuilt_blocks = Vec::with_capacity(old_blocks.len());
+    let mut rebuilt_sources = Vec::with_capacity(sources.len());
+    let mut repaired = 0usize;
+    let mut index = 0usize;
+
+    while index < old_blocks.len() {
+        let merge_pair = if index + 1 < old_blocks.len()
+            && lm2_source_blocks_contiguous(&source_by_block, index, index + 1)
+        {
+            let left = &old_blocks[index];
+            let right = &old_blocks[index + 1];
+            let left_false_marginalia =
+                lm2_false_body_marginalia(left, source_by_block.get(&index), footnote_zone_ids)
+                    && right.role == LiquidBlockRole::Paragraph
+                    && left.text.split_whitespace().count() >= 4
+                    && lm2_reflow_paragraph_is_visibly_open(&left.text)
+                    && lm2_reflow_starts_like_continuation(&right.text);
+            let right_false_marginalia = left.role == LiquidBlockRole::Paragraph
+                && lm2_false_body_marginalia(
+                    right,
+                    source_by_block.get(&(index + 1)),
+                    footnote_zone_ids,
+                )
+                && lm2_reflow_paragraph_is_visibly_open(&left.text)
+                && lm2_reflow_starts_like_continuation(&right.text);
+            left_false_marginalia || right_false_marginalia
+        } else {
+            false
+        };
+
+        let block_index = rebuilt_blocks.len();
+        if merge_pair {
+            let mut merged = old_blocks[index].clone();
+            merged.role = LiquidBlockRole::Paragraph;
+            append_line(&mut merged.text, &old_blocks[index + 1].text);
+            rebuilt_blocks.push(merged);
+            let mut refs = source_by_block.remove(&index).unwrap_or_default();
+            refs.extend(source_by_block.remove(&(index + 1)).unwrap_or_default());
+            if !refs.is_empty() {
+                rebuilt_sources.push(LiquidBlockSourceLines {
+                    block_index,
+                    lines: refs,
+                });
+            }
+            repaired += 1;
+            index += 2;
+            continue;
+        }
+
+        rebuilt_blocks.push(old_blocks[index].clone());
+        if let Some(lines) = source_by_block.remove(&index)
+            && !lines.is_empty()
+        {
+            rebuilt_sources.push(LiquidBlockSourceLines { block_index, lines });
+        }
+        index += 1;
+    }
+
+    if repaired > 0 {
+        *blocks = rebuilt_blocks;
+        *sources = rebuilt_sources;
+    } else {
+        *blocks = old_blocks;
+    }
+    repaired
+}
+
+fn lm2_false_body_marginalia(
+    block: &LiquidBlock,
+    source_lines: Option<&Vec<LiquidSourceLineRef>>,
+    footnote_zone_ids: &HashSet<&str>,
+) -> bool {
+    matches!(
+        block.role,
+        LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote
+    ) && source_lines.is_some_and(|lines| {
+        !lines.is_empty()
+            && lines.iter().all(|line| {
+                line.note_markers.is_empty()
+                    && line
+                        .id
+                        .as_deref()
+                        .is_none_or(|id| !footnote_zone_ids.contains(id))
+            })
+    })
+}
+
+fn lm2_source_blocks_contiguous(
+    sources: &BTreeMap<usize, Vec<LiquidSourceLineRef>>,
+    left_index: usize,
+    right_index: usize,
+) -> bool {
+    let (Some(left), Some(right)) = (sources.get(&left_index), sources.get(&right_index)) else {
+        return false;
+    };
+    let (Some(left_line), Some(right_line)) = (left.last(), right.first()) else {
+        return false;
+    };
+    left_line.page_index == right_line.page_index
+        && left_line.line_index.checked_add(1) == Some(right_line.line_index)
+}
+
+/// Undo recurrent false footnote heads created by flattened citation text:
+/// a URL filename split after a hyphen (`...10-5-` + `15.pdf`) and a journal
+/// page followed by a parenthesized year (`REV.` + `99 (2020)`). A third shape
+/// is a pincite followed by citation comparison text (`at` + `232. Compare`).
+/// All shapes require neighboring, provenance-backed note heads before the
+/// false marker is removed and the continuation is restored.
+fn apply_false_marginalia_note_head_reflow(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+) -> usize {
+    if blocks.len() < 3 {
+        return 0;
+    }
+    let mut source_by_block = sources
+        .iter()
+        .map(|source| (source.block_index, source.lines.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let old_blocks = std::mem::take(blocks);
+    let mut rebuilt_blocks = Vec::with_capacity(old_blocks.len());
+    let mut rebuilt_sources = Vec::with_capacity(sources.len());
+    let mut repaired = 0usize;
+    let mut index = 0usize;
+
+    while index < old_blocks.len() {
+        let source_backed_previous_note = old_blocks[index].role == LiquidBlockRole::Noise
+            && source_by_block.get(&index).is_some_and(|lines| {
+                !lines.is_empty()
+                    && lines
+                        .iter()
+                        .all(|line| line.role == LiquidBlockRole::Marginalia)
+            });
+        let false_head = if index + 2 < old_blocks.len()
+            && (old_blocks[index].role == LiquidBlockRole::Marginalia
+                || (old_blocks[index].role == LiquidBlockRole::Noise
+                    && source_backed_previous_note))
+            && old_blocks[index + 1].role == LiquidBlockRole::Marginalia
+            && old_blocks[index + 2].role == LiquidBlockRole::Marginalia
+        {
+            let previous_marker = lm2_source_primary_note_marker(source_by_block.get(&index));
+            let current_marker = lm2_source_primary_note_marker(source_by_block.get(&(index + 1)));
+            let next_marker = lm2_source_primary_note_marker(source_by_block.get(&(index + 2)));
+            current_marker.is_some_and(|marker| {
+                let current = old_blocks[index + 1].text.trim_start();
+                let digits = marker.to_string();
+                let tail = current
+                    .strip_prefix(&digits)
+                    .map(str::trim_start)
+                    .unwrap_or("");
+                let url_filename = old_blocks[index].text.trim_end().ends_with('-')
+                    && tail.to_ascii_lowercase().starts_with(".pdf");
+                let citation_page = lm2_starts_parenthesized_year(tail)
+                    && previous_marker
+                        .zip(next_marker)
+                        .is_some_and(|(previous, next)| {
+                            next == previous.saturating_add(1) && marker > next && marker <= 999
+                        });
+                let compare_pincite =
+                    previous_marker
+                        .zip(next_marker)
+                        .is_some_and(|(previous, next)| {
+                            let after_punctuation = tail
+                                .strip_prefix('.')
+                                .or_else(|| tail.strip_prefix(')'))
+                                .or_else(|| tail.strip_prefix(']'))
+                                .map(str::trim_start)
+                                .unwrap_or(tail);
+                            next == previous.saturating_add(1)
+                                && marker != next
+                                && old_blocks[index]
+                                    .text
+                                    .trim_end()
+                                    .to_ascii_lowercase()
+                                    .ends_with(" at")
+                                && after_punctuation
+                                    .to_ascii_lowercase()
+                                    .starts_with("compare ")
+                        });
+                let standalone_pincite =
+                    previous_marker
+                        .zip(next_marker)
+                        .is_some_and(|(previous, next)| {
+                            next == previous.saturating_add(1)
+                                && marker != next
+                                && tail.trim() == "."
+                                && (old_blocks[index]
+                                    .text
+                                    .trim_end()
+                                    .ends_with(['-', '\u{2013}', '\u{2014}'])
+                                    || old_blocks[index]
+                                        .text
+                                        .trim_end()
+                                        .to_ascii_lowercase()
+                                        .ends_with("supra note")
+                                    || old_blocks[index]
+                                        .text
+                                        .trim_end()
+                                        .to_ascii_lowercase()
+                                        .ends_with(" at")
+                                    || old_blocks[index]
+                                        .text
+                                        .trim_end()
+                                        .to_ascii_lowercase()
+                                        .ends_with("dkt. no."))
+                        });
+                url_filename || citation_page || compare_pincite || standalone_pincite
+            })
+        } else {
+            false
+        };
+
+        let block_index = rebuilt_blocks.len();
+        if false_head {
+            let mut merged = old_blocks[index].clone();
+            // A false out-of-sequence pincite can make the sequence decoder
+            // demote the real preceding note. Its source provenance and the
+            // surrounding N/N+1 heads make that demotion safe to reverse.
+            merged.role = LiquidBlockRole::Marginalia;
+            let continuation = old_blocks[index + 1].text.trim_start();
+            let preserves_url_hyphen = merged.text.trim_end().ends_with('-')
+                && lm2_source_primary_note_marker(source_by_block.get(&(index + 1))).is_some_and(
+                    |marker| {
+                        continuation
+                            .strip_prefix(&marker.to_string())
+                            .is_some_and(|tail| tail.trim_start().starts_with(".pdf"))
+                    },
+                );
+            if preserves_url_hyphen {
+                merged.text.push_str(continuation);
+            } else if continuation.trim_end() == "."
+                && merged
+                    .text
+                    .trim_end()
+                    .ends_with(['-', '\u{2013}', '\u{2014}'])
+            {
+                merged.text.push_str(continuation);
+            } else {
+                append_line(&mut merged.text, continuation);
+            }
+            rebuilt_blocks.push(merged);
+            let mut refs = source_by_block.remove(&index).unwrap_or_default();
+            let mut continuation_refs = source_by_block.remove(&(index + 1)).unwrap_or_default();
+            for line in &mut continuation_refs {
+                line.note_markers.clear();
+            }
+            refs.extend(continuation_refs);
+            if !refs.is_empty() {
+                rebuilt_sources.push(LiquidBlockSourceLines {
+                    block_index,
+                    lines: refs,
+                });
+            }
+            repaired += 1;
+            index += 2;
+            continue;
+        }
+
+        rebuilt_blocks.push(old_blocks[index].clone());
+        if let Some(lines) = source_by_block.remove(&index)
+            && !lines.is_empty()
+        {
+            rebuilt_sources.push(LiquidBlockSourceLines { block_index, lines });
+        }
+        index += 1;
+    }
+
+    *blocks = rebuilt_blocks;
+    *sources = rebuilt_sources;
+    repaired
+}
+
+fn lm2_source_primary_note_marker(lines: Option<&Vec<LiquidSourceLineRef>>) -> Option<u16> {
+    lines?
+        .iter()
+        .find_map(|line| line.note_markers.first().copied())
+}
+
+fn lm2_starts_parenthesized_year(text: &str) -> bool {
+    let Some(year) = text.strip_prefix('(').and_then(|tail| tail.get(..4)) else {
+        return false;
+    };
+    year.chars().all(|ch| ch.is_ascii_digit())
+        && year
+            .parse::<u16>()
+            .is_ok_and(|year| (1500..=2200).contains(&year))
+        && text.get(5..6) == Some(")")
 }
 
 /// PDF text layers occasionally flatten a superscript into an attached ASCII
@@ -11401,49 +19276,1779 @@ fn apply_attached_terminal_callout_recovery(
         .collect::<BTreeMap<_, _>>();
     let mut repaired = 0usize;
     for (block_index, block) in blocks.iter_mut().enumerate() {
-        if !matches!(
+        let ordinary_body_role = matches!(
             block.role,
             LiquidBlockRole::Paragraph
                 | LiquidBlockRole::Lead
                 | LiquidBlockRole::Quote
                 | LiquidBlockRole::ListItem
-        ) {
-            continue;
-        }
+        );
+        let table_body_role = matches!(
+            block.role,
+            LiquidBlockRole::Table | LiquidBlockRole::Caption
+        );
         let Some(source) = source_by_block.get(&block_index) else {
             continue;
         };
+        let unmarked_body_candidate =
+            matches!(
+                block.role,
+                LiquidBlockRole::Noise | LiquidBlockRole::Marginalia
+            ) && source.lines.iter().all(|line| line.note_markers.is_empty());
+        if !ordinary_body_role && !table_body_role && !unmarked_body_candidate {
+            continue;
+        }
         for line in &source.lines {
-            let Some(marker) = attached_terminal_ascii_marker(&line.text) else {
-                continue;
-            };
-            let local_note = note_pages.get(&marker).is_some_and(|pages| {
-                pages.contains(&line.page_index)
-                    || pages.contains(&line.page_index.saturating_add(1))
-            });
-            if !local_note {
-                continue;
-            }
             let cleaned = clean_lm2_line_text(&line.text);
-            let digits = marker.to_string();
-            if !cleaned.ends_with(&digits) {
+            let mut ranges = Vec::new();
+            if table_body_role {
+                for (marker, pages) in &note_pages {
+                    if !(pages.contains(&line.page_index)
+                        || pages.contains(&line.page_index.saturating_add(1)))
+                    {
+                        continue;
+                    }
+                    let mut from = 0usize;
+                    while let Some((start, end)) =
+                        attached_ascii_callout_range(&cleaned, *marker, from)
+                    {
+                        ranges.push((start, end, *marker));
+                        from = end;
+                    }
+                }
+            } else if let Some(marker) = attached_terminal_ascii_marker(&cleaned)
+                && note_pages.get(&marker).is_some_and(|pages| {
+                    pages.contains(&line.page_index)
+                        || pages.contains(&line.page_index.saturating_add(1))
+                })
+            {
+                let digits = marker.to_string();
+                ranges.push((cleaned.len() - digits.len(), cleaned.len(), marker));
+            }
+            if ranges.is_empty() {
                 continue;
             }
-            let prefix_len = cleaned.len() - digits.len();
-            let replacement = format!(
-                "{}{}{}{}",
-                &cleaned[..prefix_len],
-                CALLOUT_START,
-                digits,
-                CALLOUT_END
-            );
+            ranges.sort_by_key(|(start, _, _)| *start);
+            ranges.dedup();
+            let mut replacement = cleaned.clone();
+            for (start, end, marker) in ranges.iter().copied().rev() {
+                replacement
+                    .replace_range(start..end, &format!("{CALLOUT_START}{marker}{CALLOUT_END}"));
+            }
             if block.text.contains(&cleaned) {
                 block.text = block.text.replacen(&cleaned, &replacement, 1);
-                repaired += 1;
+                if unmarked_body_candidate {
+                    block.role = LiquidBlockRole::Paragraph;
+                    block.label = None;
+                }
+                repaired += ranges.len();
             }
         }
     }
     repaired
+}
+
+fn lm2_physical_sequential_note_row(line: &DeepLiquidSourceLine) -> bool {
+    let small_font_votes = [
+        line.font_ratio_page_ref <= 0.94,
+        line.font_ratio_page <= 0.94,
+        line.font_ratio_doc <= 0.94,
+    ]
+    .into_iter()
+    .filter(|vote| *vote)
+    .count();
+    let ordinary_note_zone = if line.page_has_footnote_divider {
+        line.below_footnote_divider
+    } else {
+        (line.in_footnote_zone || line.doc_footnote_state)
+            && (line.segment_block_footnote_like
+                || line.segment_block_shape.eq_ignore_ascii_case("footnote"))
+    };
+    // A divider can be geometrically assigned to the wrong horizontal rule.
+    // Retain a tiny, non-centred Marginalia row as a candidate so the exact
+    // N-1/N+1 sequence and following note prose can decide it later.
+    let missed_divider_note = line.role_hint == Some(LiquidBlockRole::Marginalia)
+        && line.font_ratio_doc <= 0.70
+        && !line.centered
+        && line.line_index > 0
+        && (line.in_footnote_zone
+            || line.segment_block_footnote_like
+            || line.font_ratio_page_ref <= 0.70);
+    (ordinary_note_zone || missed_divider_note)
+        && small_font_votes >= 2
+        && !line.in_ruled_cell
+        && !line.ruled_row_membership_exact
+        && !line.page_table_column_like
+        && (!line.segment_block_table_like || missed_divider_note)
+        && !line.page_object_overlaps_image_bbox
+        && !line.page_object_hide_candidate
+        && (!line.segment_block_furniture_like || missed_divider_note)
+        && !line.doc_repeated_edge_text
+}
+
+/// A matching body callout supplies stronger semantic evidence than a local
+/// N-1/N+1 sequence. In that paired case, retain tiny, non-centred Marginalia
+/// rows even when the divider or segment detector assigned the rule poorly.
+fn lm2_body_paired_bare_note_row(line: &DeepLiquidSourceLine) -> bool {
+    let small_font_votes = [
+        line.font_ratio_page_ref <= 0.94,
+        line.font_ratio_page <= 0.94,
+        line.font_ratio_doc <= 0.94,
+    ]
+    .into_iter()
+    .filter(|vote| *vote)
+    .count();
+    line.font_ratio_doc <= 0.70
+        && small_font_votes >= 2
+        && !line.centered
+        && line.line_index > 0
+        && !line.in_ruled_cell
+        && !line.ruled_row_membership_exact
+        && !line.page_table_column_like
+        && !line.page_object_overlaps_image_bbox
+        && !line.page_object_hide_candidate
+        && !line.doc_repeated_edge_text
+}
+
+fn lm2_body_paired_note_prose_row(line: &DeepLiquidSourceLine) -> bool {
+    lm2_body_paired_bare_note_row(line)
+        || (line.font_ratio_doc <= 0.82
+            && !line.in_ruled_cell
+            && !line.ruled_row_membership_exact
+            && !line.page_table_column_like
+            && !line.page_object_overlaps_image_bbox
+            && !line.page_object_hide_candidate
+            && !line.doc_repeated_edge_text)
+}
+
+fn lm2_leading_numeric_or_bare_marker(text: &str) -> Option<u16> {
+    let trimmed = text.trim();
+    trimmed
+        .parse::<u16>()
+        .ok()
+        .filter(|marker| (1..=LM2_MAX_NOTE_MARKER).contains(marker))
+        .or_else(|| leading_numeric_token_marker(text))
+}
+
+fn lm2_note_tail_visibly_closed(text: &str) -> bool {
+    text.trim_end()
+        .trim_end_matches(['"', '\'', '\u{2019}', '\u{201d}', ')', ']', '}'])
+        .trim_end()
+        .chars()
+        .next_back()
+        .is_some_and(|ch| matches!(ch, '.' | '?' | '!' | ')' | ']'))
+}
+
+/// Recover bare `N` and `N prose` note heads across grouping-block boundaries.
+/// The marker must be the exact successor of an accepted physical note head,
+/// occur within eight source rows, and retain small-font footnote geometry.
+/// This excludes page numbers, reporter volumes, years, and table counters
+/// without depending on document-specific words.
+fn apply_physical_sequential_note_head_recovery(
+    blocks: &mut [LiquidBlock],
+    sources: &mut [LiquidBlockSourceLines],
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let mut rows = sources
+        .iter()
+        .enumerate()
+        .flat_map(|(source_position, source)| {
+            source
+                .lines
+                .iter()
+                .enumerate()
+                .map(move |(line_position, line)| {
+                    (
+                        line.page_index,
+                        line.line_index,
+                        source_position,
+                        line_position,
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+
+    let mut accepted = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(row_position, &(_, _, source_position, line_position))| {
+            sources[source_position].lines[line_position]
+                .note_markers
+                .iter()
+                .copied()
+                .max()
+                .map(|marker| (row_position, marker))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut repairs = Vec::<(usize, usize, u16)>::new();
+    loop {
+        let mut pass_repairs = Vec::new();
+        for (row_position, &(page_index, line_index, source_position, line_position)) in
+            rows.iter().enumerate()
+        {
+            if accepted.contains_key(&row_position) {
+                continue;
+            }
+            let line_ref = &sources[source_position].lines[line_position];
+            let Some(deep) = line_ref
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+            else {
+                continue;
+            };
+            let Some(candidate) = lm2_leading_numeric_or_bare_marker(&line_ref.text) else {
+                continue;
+            };
+            if !lm2_physical_sequential_note_row(deep) {
+                continue;
+            }
+            let previous_proof =
+                accepted
+                    .range(..row_position)
+                    .next_back()
+                    .is_some_and(|(position, marker)| {
+                        row_position.saturating_sub(*position) <= 16
+                            && *marker == candidate.saturating_sub(1)
+                            && rows[*position].0.abs_diff(page_index) <= 1
+                    });
+            let next_proof =
+                accepted
+                    .range((row_position + 1)..)
+                    .next()
+                    .is_some_and(|(position, marker)| {
+                        position.saturating_sub(row_position) <= 16
+                            && *marker == candidate.saturating_add(1)
+                            && rows[*position].0.abs_diff(page_index) <= 1
+                    });
+            if !previous_proof && !next_proof {
+                continue;
+            }
+            let bare_marker = line_ref.text.trim() == candidate.to_string();
+            let bare_followed_by_note_prose = bare_marker
+                && rows.get(row_position + 1).is_some_and(
+                    |&(next_page, next_line, next_source, next_position)| {
+                        if next_page != page_index || next_line != line_index.saturating_add(1) {
+                            return false;
+                        }
+                        let next_ref = &sources[next_source].lines[next_position];
+                        next_ref
+                            .id
+                            .as_deref()
+                            .and_then(|id| line_by_id.get(id).copied())
+                            .is_some_and(|next| {
+                                lm2_physical_sequential_note_row(next)
+                                    && lm2_leading_numeric_or_bare_marker(&next_ref.text).is_none()
+                                    && next_ref.text.chars().any(char::is_alphabetic)
+                                    && deep.font_height.max(next.font_height)
+                                        / deep.font_height.min(next.font_height).max(1.0)
+                                        <= 1.18
+                            })
+                    },
+                );
+            let previous_text = row_position.checked_sub(1).map(|position| {
+                let (_, _, source, line) = rows[position];
+                sources[source].lines[line].text.as_str()
+            });
+            if !bare_followed_by_note_prose
+                && previous_text.is_none_or(|text| !lm2_note_tail_visibly_closed(text))
+            {
+                continue;
+            }
+            pass_repairs.push((row_position, source_position, line_position, candidate));
+        }
+        if pass_repairs.is_empty() {
+            break;
+        }
+        for (row_position, source_position, line_position, marker) in pass_repairs {
+            accepted.insert(row_position, marker);
+            repairs.push((source_position, line_position, marker));
+        }
+    }
+
+    let mut repaired = 0usize;
+    let mut touched_sources = BTreeSet::new();
+    for (source_position, line_position, marker) in repairs {
+        let line = &mut sources[source_position].lines[line_position];
+        line.role = LiquidBlockRole::Marginalia;
+        line.note_markers.push(marker);
+        line.note_markers.sort_unstable();
+        line.note_markers.dedup();
+        touched_sources.insert(source_position);
+        repaired += 1;
+    }
+    for source_position in touched_sources {
+        let all_note_rows = sources[source_position].lines.iter().all(|line| {
+            line.id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+                .is_some_and(lm2_physical_sequential_note_row)
+        });
+        if !all_note_rows {
+            continue;
+        }
+        for line in &mut sources[source_position].lines {
+            line.role = LiquidBlockRole::Marginalia;
+        }
+        if let Some(block) = blocks.get_mut(sources[source_position].block_index) {
+            block.role = LiquidBlockRole::Marginalia;
+            block.label = None;
+        }
+    }
+    repaired
+}
+
+/// A grouping boundary can leave a recovered bare note marker at the end of a
+/// body/Noise block while its definition prose begins the next Marginalia
+/// block. Move only that final physical row across the boundary; the body or
+/// URL text that precedes it remains in its original block.
+fn apply_recovered_trailing_note_marker_reflow(
+    blocks: &mut [LiquidBlock],
+    sources: &mut [LiquidBlockSourceLines],
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let mut repaired = 0usize;
+    loop {
+        let source_position = sources
+            .iter()
+            .enumerate()
+            .map(|(position, source)| (source.block_index, position))
+            .collect::<HashMap<_, _>>();
+        let mut operation = None;
+        for block_index in 0..blocks.len().saturating_sub(1) {
+            if matches!(
+                blocks[block_index].role,
+                LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote
+            ) {
+                continue;
+            }
+            let next_block = block_index + 1;
+            let (Some(current_position), Some(next_position)) = (
+                source_position.get(&block_index).copied(),
+                source_position.get(&next_block).copied(),
+            ) else {
+                continue;
+            };
+            let Some(next_ref) = sources[next_position].lines.first() else {
+                continue;
+            };
+            let Some((marker_position, marker_ref)) = sources[current_position]
+                .lines
+                .iter()
+                .enumerate()
+                .find(|(_, line)| {
+                    line.page_index == next_ref.page_index
+                        && line.line_index.saturating_add(1) == next_ref.line_index
+                        && line
+                            .text
+                            .trim()
+                            .parse::<u16>()
+                            .ok()
+                            .is_some_and(|marker| line.note_markers.contains(&marker))
+                })
+            else {
+                continue;
+            };
+            let marker = marker_ref
+                .text
+                .trim()
+                .parse::<u16>()
+                .expect("paired marker row was validated above");
+            if marker_ref.text.trim() != marker.to_string()
+                || !matches!(
+                    blocks[next_block].role,
+                    LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote
+                )
+            {
+                continue;
+            }
+            let (Some(marker_line), Some(next_line)) = (
+                marker_ref
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied()),
+                next_ref
+                    .id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied()),
+            ) else {
+                continue;
+            };
+            if marker_line.page_index != next_line.page_index
+                || marker_line.line_index.saturating_add(1) != next_line.line_index
+                || !(lm2_physical_sequential_note_row(marker_line)
+                    || lm2_body_paired_bare_note_row(marker_line))
+                || next_ref.role != LiquidBlockRole::Marginalia
+                || !(lm2_physical_sequential_note_row(next_line)
+                    || lm2_body_paired_note_prose_row(next_line))
+                || next_ref.note_markers.iter().any(|next| *next <= marker)
+            {
+                continue;
+            }
+            operation = Some((
+                block_index,
+                next_block,
+                current_position,
+                next_position,
+                marker_position,
+            ));
+            break;
+        }
+        let Some((block_index, next_block, current_position, next_position, marker_position)) =
+            operation
+        else {
+            break;
+        };
+        let marker_text =
+            clean_lm2_line_text(&sources[current_position].lines[marker_position].text);
+        if !remove_unique_whitespace_token(&mut blocks[block_index].text, &marker_text) {
+            continue;
+        }
+        let mut marker_ref = sources[current_position].lines.remove(marker_position);
+        marker_ref.role = LiquidBlockRole::Marginalia;
+        let next_text = blocks[next_block].text.clone();
+        blocks[next_block].text = collapse_whitespace(&format!("{marker_text} {next_text}"));
+        blocks[next_block].role = LiquidBlockRole::Marginalia;
+        blocks[next_block].label = None;
+        sources[next_position].lines.insert(0, marker_ref);
+        if blocks[block_index].text.trim().is_empty() {
+            blocks[block_index].role = LiquidBlockRole::Noise;
+            blocks[block_index].label = None;
+        }
+        repaired += 1;
+    }
+    repaired
+}
+
+fn remove_unique_whitespace_token(text: &mut String, token: &str) -> bool {
+    let bytes = text.as_bytes();
+    let token_bytes = token.as_bytes();
+    if token_bytes.is_empty() || token_bytes.iter().any(|byte| byte.is_ascii_whitespace()) {
+        return false;
+    }
+    let mut matches = Vec::new();
+    let mut cursor = 0usize;
+    while cursor + token_bytes.len() <= bytes.len() {
+        let Some(relative) = text[cursor..].find(token) else {
+            break;
+        };
+        let start = cursor + relative;
+        let end = start + token_bytes.len();
+        let left_ok = start == 0 || bytes[start - 1].is_ascii_whitespace();
+        let right_ok = end == bytes.len() || bytes[end].is_ascii_whitespace();
+        if left_ok && right_ok {
+            matches.push((start, end));
+        }
+        cursor = end;
+    }
+    if matches.len() != 1 {
+        return false;
+    }
+    let (start, end) = matches[0];
+    text.replace_range(start..end, "");
+    *text = collapse_whitespace(text).trim().to_owned();
+    true
+}
+
+/// Recover a URL-only note continuation that is physically sandwiched between
+/// consecutive numbered definitions. The exact N / URL rows / N+1 source
+/// sequence prevents ordinary body URLs from being absorbed into notes.
+fn apply_sandwiched_note_url_continuation_reflow(
+    blocks: &mut [LiquidBlock],
+    sources: &mut [LiquidBlockSourceLines],
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let source_position = sources
+        .iter()
+        .enumerate()
+        .map(|(position, source)| (source.block_index, position))
+        .collect::<HashMap<_, _>>();
+    let mut repaired = 0usize;
+    for block_index in 1..blocks.len().saturating_sub(1) {
+        if !matches!(
+            blocks[block_index - 1].role,
+            LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote
+        ) || !matches!(
+            blocks[block_index].role,
+            LiquidBlockRole::Noise | LiquidBlockRole::Paragraph
+        ) || !matches!(
+            blocks[block_index + 1].role,
+            LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote
+        ) || !blocks[block_index]
+            .text
+            .to_ascii_lowercase()
+            .contains("http")
+        {
+            continue;
+        }
+        let (Some(previous_position), Some(current_position), Some(next_position)) = (
+            source_position.get(&(block_index - 1)).copied(),
+            source_position.get(&block_index).copied(),
+            source_position.get(&(block_index + 1)).copied(),
+        ) else {
+            continue;
+        };
+        let (Some(previous_marker), Some(next_marker)) = (
+            lm2_source_primary_note_marker(Some(&sources[previous_position].lines)),
+            lm2_source_primary_note_marker(Some(&sources[next_position].lines)),
+        ) else {
+            continue;
+        };
+        if next_marker != previous_marker.saturating_add(1)
+            || sources[current_position].lines.is_empty()
+            || sources[current_position]
+                .lines
+                .iter()
+                .any(|line| !line.note_markers.is_empty())
+        {
+            continue;
+        }
+        let (Some(previous), Some(current_first), Some(current_last), Some(next)) = (
+            sources[previous_position].lines.last(),
+            sources[current_position].lines.first(),
+            sources[current_position].lines.last(),
+            sources[next_position].lines.first(),
+        ) else {
+            continue;
+        };
+        let physically_sandwiched = previous.page_index == current_first.page_index
+            && current_first.page_index == current_last.page_index
+            && current_last.page_index == next.page_index
+            && previous.line_index.saturating_add(1) == current_first.line_index
+            && current_last.line_index.saturating_add(1) == next.line_index;
+        let all_small_note_rows = sources[current_position].lines.iter().all(|line| {
+            line.id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+                .is_some_and(|deep| {
+                    deep.font_ratio_doc <= 0.90
+                        && !deep.in_ruled_cell
+                        && !deep.ruled_row_membership_exact
+                        && !deep.page_table_column_like
+                        && !deep.page_object_overlaps_image_bbox
+                })
+        });
+        if !physically_sandwiched || !all_small_note_rows {
+            continue;
+        }
+        blocks[block_index].role = LiquidBlockRole::Marginalia;
+        blocks[block_index].label = None;
+        for line in &mut sources[current_position].lines {
+            line.role = LiquidBlockRole::Marginalia;
+        }
+        repaired += 1;
+    }
+    repaired
+}
+
+/// Pair a flattened body callout with a bare physical definition row carrying
+/// the same number. This is stronger than local sequence distance: both ends
+/// of the link independently exist, while the definition still has to satisfy
+/// small-font footnote geometry. Plain ASCII body candidates are limited to
+/// punctuation/leading-callout shapes and are rewritten only by the separate
+/// monotone callout pass.
+fn apply_body_backed_bare_note_head_recovery(
+    blocks: &mut [LiquidBlock],
+    sources: &mut [LiquidBlockSourceLines],
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let mut body_markers = BTreeSet::new();
+    for block in blocks.iter().filter(|block| {
+        !matches!(
+            block.role,
+            LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote
+        )
+    }) {
+        body_markers.extend(sentineled_note_markers(&block.text));
+        body_markers.extend(
+            lm2_local_ascii_callout_candidates(&block.text)
+                .into_iter()
+                .map(|candidate| candidate.marker),
+        );
+        if let Some(marker) = attached_terminal_ascii_marker(&block.text) {
+            body_markers.insert(marker);
+        }
+    }
+    for source in sources.iter() {
+        for line_ref in &source.lines {
+            let Some(deep) = line_ref
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+            else {
+                continue;
+            };
+            if lm2_low_footnote_zone_evidence(deep)
+                || deep.in_ruled_cell
+                || deep.ruled_row_membership_exact
+                || deep.page_table_column_like
+                || deep.segment_block_table_like
+                || deep.page_object_overlaps_image_bbox
+                || deep.segment_block_furniture_like
+                || deep.font_ratio_doc < 0.78
+            {
+                continue;
+            }
+            body_markers.extend(sentineled_note_markers(&line_ref.text));
+            body_markers.extend(
+                lm2_local_ascii_callout_candidates(&line_ref.text)
+                    .into_iter()
+                    .map(|candidate| candidate.marker),
+            );
+        }
+    }
+    if body_markers.is_empty() {
+        return 0;
+    }
+
+    let mut touched_sources = BTreeSet::new();
+    let mut repaired = 0usize;
+    for (source_position, source) in sources.iter_mut().enumerate() {
+        for line_ref in &mut source.lines {
+            if !line_ref.note_markers.is_empty() {
+                continue;
+            }
+            let Some(marker) = line_ref
+                .text
+                .trim()
+                .parse::<u16>()
+                .ok()
+                .filter(|marker| body_markers.contains(marker))
+            else {
+                continue;
+            };
+            let physical = line_ref
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+                .is_some_and(|line| {
+                    lm2_physical_sequential_note_row(line)
+                        || (line_ref.role == LiquidBlockRole::Marginalia
+                            && lm2_body_paired_bare_note_row(line))
+                });
+            if !physical {
+                continue;
+            }
+            line_ref.role = LiquidBlockRole::Marginalia;
+            line_ref.note_markers.push(marker);
+            touched_sources.insert(source_position);
+            repaired += 1;
+        }
+    }
+    for source_position in touched_sources {
+        let all_note_rows = sources[source_position].lines.iter().all(|line| {
+            line.id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+                .is_some_and(lm2_physical_sequential_note_row)
+        });
+        if !all_note_rows {
+            continue;
+        }
+        for line in &mut sources[source_position].lines {
+            line.role = LiquidBlockRole::Marginalia;
+        }
+        if let Some(block) = blocks.get_mut(sources[source_position].block_index) {
+            block.role = LiquidBlockRole::Marginalia;
+            block.label = None;
+        }
+    }
+    repaired
+}
+
+#[derive(Clone, Copy)]
+struct Lm2AsciiCalloutCandidate {
+    start: usize,
+    end: usize,
+    marker: u16,
+    leading: bool,
+}
+
+fn lm2_local_ascii_callout_candidates(text: &str) -> Vec<Lm2AsciiCalloutCandidate> {
+    let bytes = text.as_bytes();
+    let mut candidates = Vec::new();
+    let mut position = 0usize;
+    while position < bytes.len() {
+        if !bytes[position].is_ascii_digit()
+            || position > 0 && !bytes[position - 1].is_ascii_whitespace()
+        {
+            position += 1;
+            continue;
+        }
+        let start = position;
+        while position < bytes.len() && bytes[position].is_ascii_digit() && position - start < 3 {
+            position += 1;
+        }
+        let end = position;
+        if position < bytes.len() && bytes[position].is_ascii_digit() {
+            continue;
+        }
+        let Ok(marker) = text[start..end].parse::<u16>() else {
+            continue;
+        };
+        if !(1..=LM2_MAX_NOTE_MARKER).contains(&marker)
+            || bytes
+                .get(end)
+                .is_some_and(|byte| !byte.is_ascii_whitespace())
+        {
+            continue;
+        }
+        let leading = text[..start].trim().is_empty();
+        let punctuated = text[..start]
+            .trim_end()
+            .chars()
+            .next_back()
+            .is_some_and(|ch| matches!(ch, '.' | '?' | '!' | ';' | ':' | ',' | ')' | ']'));
+        let remainder_is_prose = text[end..]
+            .trim_start()
+            .chars()
+            .next()
+            .is_some_and(char::is_alphabetic);
+        if (leading && remainder_is_prose) || punctuated {
+            candidates.push(Lm2AsciiCalloutCandidate {
+                start,
+                end,
+                marker,
+                leading,
+            });
+        }
+    }
+    candidates
+}
+
+/// Recover one whitespace-separated body callout only when accepted note-head
+/// provenance and the nearest already-sentineled body callouts bracket it as
+/// `N-1, N, N+1`. A leading candidate additionally needs same-row geometry
+/// with the preceding body fragment. Only the exact digit token is rewritten.
+fn apply_local_monotone_ascii_callout_recovery(
+    blocks: &mut [LiquidBlock],
+    sources: &mut [LiquidBlockSourceLines],
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let accepted_heads = sources
+        .iter()
+        .flat_map(|source| source.lines.iter())
+        .flat_map(|line| line.note_markers.iter().copied())
+        .collect::<BTreeSet<_>>();
+
+    #[derive(Clone)]
+    struct Occurrence {
+        page: usize,
+        line: usize,
+        offset: usize,
+        marker: u16,
+        candidate: Option<(usize, usize, bool)>,
+    }
+    let mut occurrences = Vec::<Occurrence>::new();
+    for (source_position, source) in sources.iter().enumerate() {
+        for (line_position, line_ref) in source.lines.iter().enumerate() {
+            let Some(deep) = line_ref
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+            else {
+                continue;
+            };
+            if !line_ref.note_markers.is_empty()
+                || lm2_low_footnote_zone_evidence(deep)
+                || deep.in_ruled_cell
+                || deep.ruled_row_membership_exact
+                || deep.page_table_column_like
+                || deep.segment_block_table_like
+                || deep.page_object_overlaps_image_bbox
+                || deep.segment_block_furniture_like
+                || deep.font_ratio_doc < 0.78
+            {
+                continue;
+            }
+            let mut cursor = 0usize;
+            while let Some(relative) = line_ref.text[cursor..].find(CALLOUT_START) {
+                let start = cursor + relative;
+                let marker_start = start + CALLOUT_START.len_utf8();
+                let Some(relative_end) = line_ref.text[marker_start..].find(CALLOUT_END) else {
+                    break;
+                };
+                let marker_end = marker_start + relative_end;
+                if let Ok(marker) = line_ref.text[marker_start..marker_end].parse::<u16>() {
+                    occurrences.push(Occurrence {
+                        page: line_ref.page_index,
+                        line: line_ref.line_index,
+                        offset: start,
+                        marker,
+                        candidate: None,
+                    });
+                }
+                cursor = marker_end + CALLOUT_END.len_utf8();
+            }
+            for candidate in lm2_local_ascii_callout_candidates(&line_ref.text) {
+                if accepted_heads.contains(&candidate.marker) {
+                    occurrences.push(Occurrence {
+                        page: line_ref.page_index,
+                        line: line_ref.line_index,
+                        offset: candidate.start,
+                        marker: candidate.marker,
+                        candidate: Some((source_position, line_position, candidate.leading)),
+                    });
+                }
+            }
+        }
+    }
+    occurrences.sort_by_key(|item| (item.page, item.line, item.offset));
+
+    let mut operations = Vec::<(usize, usize, usize, usize, u16)>::new();
+    for (position, occurrence) in occurrences.iter().enumerate() {
+        let Some((source_position, line_position, leading)) = occurrence.candidate else {
+            continue;
+        };
+        let previous = occurrences[..position]
+            .iter()
+            .rev()
+            .find(|item| item.candidate.is_none());
+        let next = occurrences[position + 1..]
+            .iter()
+            .find(|item| item.candidate.is_none());
+        if previous.map(|item| item.marker) != Some(occurrence.marker.saturating_sub(1))
+            || next.map(|item| item.marker) != Some(occurrence.marker.saturating_add(1))
+        {
+            continue;
+        }
+        if leading {
+            let current_ref = &sources[source_position].lines[line_position];
+            let Some(current) = current_ref
+                .id
+                .as_deref()
+                .and_then(|id| line_by_id.get(id).copied())
+            else {
+                continue;
+            };
+            let preceding = sources
+                .iter()
+                .flat_map(|source| source.lines.iter())
+                .filter(|line| {
+                    line.page_index == current_ref.page_index
+                        && line.line_index < current_ref.line_index
+                })
+                .max_by_key(|line| line.line_index)
+                .and_then(|line| {
+                    line.id
+                        .as_deref()
+                        .and_then(|id| line_by_id.get(id).copied())
+                });
+            if preceding.is_none_or(|previous| {
+                !same_visual_baseline_fragment(previous, current)
+                    && !lm2_same_row_leading_callout_with_prose(
+                        previous,
+                        current,
+                        occurrence.marker,
+                    )
+            }) {
+                continue;
+            }
+        }
+        let candidate =
+            lm2_local_ascii_callout_candidates(&sources[source_position].lines[line_position].text)
+                .into_iter()
+                .find(|candidate| {
+                    candidate.marker == occurrence.marker && candidate.start == occurrence.offset
+                });
+        if let Some(candidate) = candidate {
+            operations.push((
+                source_position,
+                line_position,
+                candidate.start,
+                candidate.end,
+                candidate.marker,
+            ));
+        }
+    }
+
+    let mut repaired = 0usize;
+    for (source_position, line_position, start, end, marker) in operations.into_iter().rev() {
+        let source = &mut sources[source_position];
+        let original = source.lines[line_position].text.clone();
+        let mut rewritten = original.clone();
+        rewritten.replace_range(start..end, &format!("{CALLOUT_START}{marker}{CALLOUT_END}"));
+        source.lines[line_position].text = rewritten.clone();
+        source.lines[line_position].role = LiquidBlockRole::Paragraph;
+        source.lines[line_position].note_markers.clear();
+        let promote_whole_block = source.lines.iter().all(|line| {
+            matches!(
+                line.role,
+                LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+            )
+        });
+        if let Some(block) = blocks.get_mut(source.block_index)
+            && block.text.contains(&original)
+        {
+            block.text = block.text.replacen(&original, &rewritten, 1);
+            if promote_whole_block {
+                block.role = LiquidBlockRole::Paragraph;
+                block.label = None;
+            }
+            repaired += 1;
+        }
+    }
+    repaired
+}
+
+/// Recover ASCII footnote callouts flattened into body text anywhere on a
+/// source line, but only when the complete note-head sequence on that page can
+/// be matched in reading order. The all-or-nothing page gate prevents a legal
+/// section number or year from becoming a link merely because it ends in the
+/// same digits as one note. A special case accepts a four-digit year followed
+/// immediately by its superscript (`19891` = `1989` + note 1).
+fn apply_page_sequence_ascii_callout_recovery(
+    blocks: &mut [LiquidBlock],
+    sources: &mut [LiquidBlockSourceLines],
+) -> usize {
+    #[derive(Clone)]
+    struct BodyLine<'a> {
+        block_index: usize,
+        line_index: usize,
+        text: &'a str,
+    }
+
+    let mut repaired = apply_sentineled_marginalia_page_zone_recovery(blocks, sources);
+
+    // PDF text layers sometimes place two short footnotes on the same visual
+    // row (`19. ... 20. ...`). The ordinary source marker records only the
+    // first head, so recover the later head before both callout alignment and
+    // final Markdown linking consume this provenance.
+    for source in sources.iter_mut() {
+        for line in &mut source.lines {
+            if !matches!(
+                line.role,
+                LiquidBlockRole::Footnote | LiquidBlockRole::Marginalia
+            ) {
+                continue;
+            }
+            let contextual = embedded_numeric_note_head_markers(&line.text);
+            if contextual.is_empty() && line.note_markers.is_empty() {
+                continue;
+            }
+            // A page-break continuation can begin with the preceding note's
+            // pincite immediately before the real, sentineled next head:
+            // `630. <46> 539 U.S. ...`.  Keep the contextual head and discard
+            // the wildly nonsequential bare number from provenance.
+            if let Some(leading) = leading_numeric_token_marker(&line.text)
+                && contextual
+                    .iter()
+                    .copied()
+                    .any(|marker| leading > marker.saturating_add(3))
+            {
+                line.note_markers.retain(|marker| *marker != leading);
+            }
+            line.note_markers.extend(contextual);
+            line.note_markers.sort_unstable();
+            line.note_markers.dedup();
+        }
+        repaired += enrich_sequential_note_heads_within_block(source);
+    }
+
+    let mut note_markers_by_page: BTreeMap<usize, Vec<(usize, u16)>> = BTreeMap::new();
+    let mut body_lines_by_page: BTreeMap<usize, Vec<BodyLine<'_>>> = BTreeMap::new();
+    for source in sources {
+        for line in &source.lines {
+            if matches!(
+                line.role,
+                LiquidBlockRole::Footnote | LiquidBlockRole::Marginalia
+            ) {
+                for marker in &line.note_markers {
+                    note_markers_by_page
+                        .entry(line.page_index)
+                        .or_default()
+                        .push((line.line_index, *marker));
+                }
+            } else if matches!(
+                line.role,
+                LiquidBlockRole::Paragraph
+                    | LiquidBlockRole::Lead
+                    | LiquidBlockRole::Quote
+                    | LiquidBlockRole::ListItem
+            ) {
+                body_lines_by_page
+                    .entry(line.page_index)
+                    .or_default()
+                    .push(BodyLine {
+                        block_index: source.block_index,
+                        line_index: line.line_index,
+                        text: &line.text,
+                    });
+            }
+        }
+    }
+
+    for (page_index, marker_rows) in note_markers_by_page {
+        let mut marker_rows = marker_rows;
+        marker_rows.sort_unstable();
+        let mut markers = Vec::new();
+        for (_, marker) in marker_rows {
+            if markers.last() != Some(&marker) {
+                markers.push(marker);
+            }
+        }
+        if markers.is_empty()
+            || (markers.len() >= 2
+                && !markers
+                    .windows(2)
+                    .all(|pair| pair[1] > pair[0] && pair[1] <= pair[0].saturating_add(3)))
+        {
+            continue;
+        }
+        let Some(mut body_lines) = body_lines_by_page.remove(&page_index) else {
+            continue;
+        };
+        body_lines.sort_by_key(|line| line.line_index);
+
+        let singleton_page = markers.len() == 1;
+        let mut matches = Vec::<(usize, usize, usize, usize, u16, PageSequenceMatchKind)>::new();
+        let mut cleanup_lines = Vec::<(usize, String)>::new();
+        let mut body_position = 0usize;
+        let mut byte_position = 0usize;
+        let mut complete = true;
+        for marker in markers {
+            let mut found: Option<(usize, usize, usize, usize, PageSequenceMatchKind)> = None;
+            for matched_body_position in body_position..body_lines.len() {
+                let line = &body_lines[matched_body_position];
+                let from = if matched_body_position == body_position {
+                    byte_position
+                } else {
+                    0
+                };
+                if let Some((start, end, kind)) =
+                    page_sequence_callout_range(line.text, marker, from)
+                {
+                    if singleton_page && !kind.singleton_safe() {
+                        continue;
+                    }
+                    let candidate = (matched_body_position, line.block_index, start, end, kind);
+                    if found.as_ref().is_none_or(
+                        |(best_position, _, best_start, best_end, best_kind)| {
+                            (
+                                sequence_selection_priority(kind, line.text, start, end),
+                                matched_body_position,
+                                start,
+                            ) < (
+                                sequence_selection_priority(
+                                    *best_kind,
+                                    body_lines[*best_position].text,
+                                    *best_start,
+                                    *best_end,
+                                ),
+                                *best_position,
+                                *best_start,
+                            )
+                        },
+                    ) {
+                        found = Some(candidate);
+                    }
+                }
+            }
+            let Some((line_position, block_index, start, end, kind)) = found else {
+                complete = false;
+                break;
+            };
+            body_position = line_position;
+            if kind == PageSequenceMatchKind::InferredQuoteBoundary {
+                body_position += 1;
+                byte_position = 0;
+            } else {
+                byte_position = end;
+            }
+            if kind.replaces_text() {
+                if kind == PageSequenceMatchKind::PartialDigit
+                    && let Some(next) = body_lines.get(line_position + 1)
+                    && next.line_index == body_lines[line_position].line_index.saturating_add(1)
+                    && split_callout_fragment_completes_marker(
+                        &body_lines[line_position].text[start..end],
+                        next.text,
+                        marker,
+                    )
+                {
+                    cleanup_lines.push((next.block_index, clean_lm2_line_text(next.text)));
+                }
+                matches.push((block_index, line_position, start, end, marker, kind));
+            }
+        }
+        if !complete || matches.is_empty() {
+            continue;
+        }
+
+        // Rebuild each affected source line, then replace that exact line once
+        // inside its assembled block. This keeps offsets local even when many
+        // source lines were joined into one paragraph block.
+        let mut by_line = BTreeMap::<(usize, usize), Vec<(usize, usize, u16)>>::new();
+        for (block_index, line_position, start, end, marker, _) in matches {
+            by_line
+                .entry((block_index, line_position))
+                .or_default()
+                .push((start, end, marker));
+        }
+        for ((block_index, line_position), mut ranges) in by_line {
+            let Some(line) = body_lines.get(line_position) else {
+                continue;
+            };
+            let clean = clean_lm2_line_text(line.text);
+            if clean != line.text {
+                // Source cleaning can change byte offsets; leave this rare line
+                // to the existing terminal recovery rather than guessing.
+                continue;
+            }
+            ranges.sort_by_key(|(start, _, _)| *start);
+            let mut rewritten = clean.clone();
+            for (start, end, marker) in ranges.into_iter().rev() {
+                rewritten
+                    .replace_range(start..end, &format!("{CALLOUT_START}{marker}{CALLOUT_END}"));
+            }
+            let Some(block) = blocks.get_mut(block_index) else {
+                continue;
+            };
+            if block.text.contains(&clean) {
+                block.text = block.text.replacen(&clean, &rewritten, 1);
+                repaired += 1;
+            }
+        }
+        for (block_index, fragment) in cleanup_lines {
+            let Some(block) = blocks.get_mut(block_index) else {
+                continue;
+            };
+            remove_standalone_source_fragment(&mut block.text, &fragment);
+        }
+    }
+    repaired
+}
+
+/// Some journals place several superscript note heads on the same physical
+/// line and omit a divider that the geometric detector can trust. Once a
+/// source-Marginalia line contains a consecutive pair of sentineled heads, the
+/// rest of that page is a note zone. Restore body/table fragments in that
+/// trailing zone to Marginalia and retain every provenance-backed head.
+fn apply_sentineled_marginalia_page_zone_recovery(
+    blocks: &mut [LiquidBlock],
+    sources: &mut [LiquidBlockSourceLines],
+) -> usize {
+    let mut candidates = BTreeMap::<usize, Vec<(usize, u16)>>::new();
+    for source in sources.iter() {
+        for line in &source.lines {
+            if line.role != LiquidBlockRole::Marginalia {
+                continue;
+            }
+            for marker in sentineled_note_head_markers_in_context(&line.text) {
+                candidates
+                    .entry(line.page_index)
+                    .or_default()
+                    .push((line.line_index, marker));
+            }
+        }
+    }
+    let zone_start = candidates
+        .into_iter()
+        .filter_map(|(page_index, mut heads)| {
+            heads.sort_unstable();
+            heads.dedup();
+            let consecutive = heads
+                .windows(2)
+                .any(|pair| pair[1].1 == pair[0].1.saturating_add(1));
+            consecutive.then_some((page_index, heads[0].0))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if zone_start.is_empty() {
+        return 0;
+    }
+
+    let mut repaired = 0usize;
+    for source in sources.iter_mut() {
+        for line in &mut source.lines {
+            let Some(start) = zone_start.get(&line.page_index).copied() else {
+                continue;
+            };
+            if line.role == LiquidBlockRole::Marginalia && line.line_index >= start {
+                line.note_markers
+                    .extend(sentineled_note_head_markers_in_context(&line.text));
+                line.note_markers.sort_unstable();
+                line.note_markers.dedup();
+            }
+        }
+        let Some(first) = source.lines.first() else {
+            continue;
+        };
+        let Some(start) = zone_start.get(&first.page_index).copied() else {
+            continue;
+        };
+        if first.line_index < start
+            || source
+                .lines
+                .iter()
+                .any(|line| line.page_index != first.page_index)
+        {
+            continue;
+        }
+        let Some(block) = blocks.get_mut(source.block_index) else {
+            continue;
+        };
+        let provenance_backed_noise = block.role == LiquidBlockRole::Noise
+            && source
+                .lines
+                .iter()
+                .all(|line| line.role == LiquidBlockRole::Marginalia)
+            && source
+                .lines
+                .iter()
+                .any(|line| !line.note_markers.is_empty());
+        if matches!(
+            block.role,
+            LiquidBlockRole::Title
+                | LiquidBlockRole::AuthorInfo
+                | LiquidBlockRole::Heading
+                | LiquidBlockRole::Subheading
+                | LiquidBlockRole::Header
+                | LiquidBlockRole::Footer
+        ) || block.role == LiquidBlockRole::Noise && !provenance_backed_noise
+        {
+            continue;
+        }
+        if block.role != LiquidBlockRole::Marginalia {
+            block.role = LiquidBlockRole::Marginalia;
+            block.label = None;
+            repaired += 1;
+        }
+        for line in &mut source.lines {
+            line.role = LiquidBlockRole::Marginalia;
+            line.note_markers
+                .extend(sentineled_note_head_markers_in_context(&line.text));
+            line.note_markers.sort_unstable();
+            line.note_markers.dedup();
+        }
+    }
+    repaired
+}
+
+/// A PDF text block can contain the end of one footnote and the complete next
+/// note. The upstream detector marks only the block's first head. Recover the
+/// later head when it is exactly sequential, nearby on the same page, and
+/// follows a sentence-ending continuation line.
+fn enrich_sequential_note_heads_within_block(source: &mut LiquidBlockSourceLines) -> usize {
+    let mut repaired = 0usize;
+    let mut previous_marker: Option<(usize, usize, u16)> = None;
+    let mut previous_text = String::new();
+
+    for line in &mut source.lines {
+        if !matches!(
+            line.role,
+            LiquidBlockRole::Footnote | LiquidBlockRole::Marginalia
+        ) {
+            previous_marker = None;
+            previous_text.clear();
+            continue;
+        }
+
+        if let Some(marker) = line.note_markers.iter().copied().max() {
+            previous_marker = Some((line.page_index, line.line_index, marker));
+        } else if let Some((page_index, marker_line_index, marker)) = previous_marker
+            && line.page_index == page_index
+            && line.line_index <= marker_line_index.saturating_add(8)
+            && previous_text
+                .trim_end()
+                .chars()
+                .next_back()
+                .is_some_and(|ch| matches!(ch, '.' | '?' | '!' | ')' | ']'))
+            && let Some(candidate) = lm2_leading_numeric_or_bare_marker(&line.text)
+            && candidate == marker.saturating_add(1)
+        {
+            line.note_markers.push(candidate);
+            previous_marker = Some((line.page_index, line.line_index, candidate));
+            repaired += 1;
+        }
+        previous_text.clone_from(&line.text);
+    }
+
+    repaired
+}
+
+/// Later numbered heads embedded in a marginalia row. Requiring both the
+/// marker's own punctuation and sentence punctuation before an embedded head
+/// avoids treating reporter volumes or section numbers as new notes.
+fn embedded_numeric_note_head_markers(text: &str) -> Vec<u16> {
+    let chars = text.char_indices().collect::<Vec<_>>();
+    let mut markers = Vec::new();
+    let mut position = 0usize;
+    while position < chars.len() {
+        if !chars[position].1.is_ascii_digit()
+            || position > 0 && !chars[position - 1].1.is_whitespace()
+        {
+            position += 1;
+            continue;
+        }
+        let start_position = position;
+        let start = chars[position].0;
+        while position < chars.len()
+            && chars[position].1.is_ascii_digit()
+            && position - start_position < 3
+        {
+            position += 1;
+        }
+        let end = chars
+            .get(position)
+            .map(|(offset, _)| *offset)
+            .unwrap_or(text.len());
+        let Some(punctuation) = chars.get(position).map(|(_, ch)| *ch) else {
+            continue;
+        };
+        if !matches!(punctuation, '.' | ')' | ']')
+            || chars
+                .get(position + 1)
+                .is_some_and(|(_, ch)| !ch.is_whitespace())
+        {
+            continue;
+        }
+        let at_start = text[..start].trim().is_empty();
+        let after_punctuation = chars
+            .get(position + 1)
+            .map(|(offset, _)| *offset)
+            .unwrap_or(text.len());
+        if !at_start && text[after_punctuation..].trim().is_empty() {
+            // A terminal reporter, clause, or docket number (`... cl. 2.` or
+            // `Dkt. No. 176.`) is not a later note head.
+            continue;
+        }
+        let embedded_after_sentence = text[..start]
+            .trim_end()
+            .chars()
+            .next_back()
+            .is_some_and(|ch| matches!(ch, '.' | '?' | '!' | ')' | ']'));
+        if !(at_start || embedded_after_sentence) {
+            continue;
+        }
+        if let Ok(marker) = text[start..end].parse::<u16>()
+            && (1..=LM2_MAX_NOTE_MARKER).contains(&marker)
+        {
+            markers.push(marker);
+        }
+    }
+    markers.extend(sentineled_note_head_markers_in_context(text));
+    markers.sort_unstable();
+    markers.dedup();
+    markers
+}
+
+fn sentineled_note_head_markers_in_context(text: &str) -> Vec<u16> {
+    let mut markers = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(relative_start) = text[cursor..].find(CALLOUT_START) {
+        let start = cursor + relative_start;
+        let tail_start = start + CALLOUT_START.len_utf8();
+        let Some(relative_end) = text[tail_start..].find(CALLOUT_END) else {
+            break;
+        };
+        let end = tail_start + relative_end;
+        let after_end = end + CALLOUT_END.len_utf8();
+        let marker = text[tail_start..end].parse::<u16>().ok();
+        let before_is_boundary = text[..start].trim().is_empty()
+            || text[..start]
+                .trim_end()
+                .chars()
+                .next_back()
+                .is_some_and(|ch| matches!(ch, '.' | '?' | '!' | ')' | ']'));
+        let after_is_space = text[after_end..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace);
+        if before_is_boundary
+            && after_is_space
+            && let Some(marker) = marker
+            && (1..=LM2_MAX_NOTE_MARKER).contains(&marker)
+        {
+            markers.push(marker);
+        }
+        cursor = after_end;
+    }
+    markers
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageSequenceMatchKind {
+    Existing,
+    SplitExisting,
+    ExactAscii,
+    OcrDigits,
+    PartialExisting,
+    PartialDigit,
+    Placeholder,
+    InferredQuoteBoundary,
+}
+
+impl PageSequenceMatchKind {
+    fn replaces_text(self) -> bool {
+        self != Self::Existing
+    }
+
+    fn singleton_safe(self) -> bool {
+        matches!(
+            self,
+            Self::Existing | Self::SplitExisting | Self::ExactAscii | Self::OcrDigits
+        )
+    }
+}
+
+/// `(start, end, replace)` for an existing sentinel or an attached ASCII
+/// callout. Existing sentinels advance sequence matching but need no rewrite.
+fn page_sequence_callout_range(
+    text: &str,
+    marker: u16,
+    from: usize,
+) -> Option<(usize, usize, PageSequenceMatchKind)> {
+    let digits = marker.to_string();
+    let sentinel = format!("{CALLOUT_START}{marker}{CALLOUT_END}");
+    let cursor = from.min(text.len());
+    let sentinel_match = text[cursor..].find(&sentinel).map(|offset| {
+        (
+            cursor + offset,
+            sentinel.len(),
+            PageSequenceMatchKind::Existing,
+        )
+    });
+    let split_existing_match = split_existing_sentinel_range(text, &digits, cursor)
+        .map(|(start, end)| (start, end - start, PageSequenceMatchKind::SplitExisting));
+    let ascii_match = attached_page_sequence_ascii_range(text, &digits, cursor)
+        .map(|(start, end)| (start, end - start, PageSequenceMatchKind::ExactAscii));
+    let ocr_match = ocr_digit_sequence_range(text, &digits, cursor)
+        .map(|(start, end)| (start, end - start, PageSequenceMatchKind::OcrDigits));
+    let partial_existing_match = partial_existing_sentinel_range(text, &digits, cursor)
+        .map(|(start, end)| (start, end - start, PageSequenceMatchKind::PartialExisting));
+    let partial_match = partial_page_sequence_digit_range(text, &digits, cursor)
+        .map(|(start, end)| (start, end - start, PageSequenceMatchKind::PartialDigit));
+    let placeholder_match = page_sequence_placeholder_range(text, cursor)
+        .map(|(start, end)| (start, end - start, PageSequenceMatchKind::Placeholder));
+    let inferred_match = inferred_quote_boundary_range(text, cursor)
+        .map(|position| (position, 0, PageSequenceMatchKind::InferredQuoteBoundary));
+
+    let mut candidates = [
+        sentinel_match,
+        split_existing_match,
+        ascii_match,
+        ocr_match,
+        partial_existing_match,
+        partial_match,
+        placeholder_match,
+        inferred_match,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    candidates.sort_by_key(|(start, _, kind)| (match_priority(*kind), *start));
+    let (start, len, kind) = candidates.into_iter().next()?;
+    Some((start, start + len, kind))
+}
+
+fn match_priority(kind: PageSequenceMatchKind) -> u8 {
+    match kind {
+        PageSequenceMatchKind::Existing => 0,
+        PageSequenceMatchKind::SplitExisting => 1,
+        PageSequenceMatchKind::ExactAscii => 2,
+        PageSequenceMatchKind::OcrDigits => 3,
+        PageSequenceMatchKind::PartialExisting => 4,
+        PageSequenceMatchKind::PartialDigit => 5,
+        PageSequenceMatchKind::Placeholder => 6,
+        PageSequenceMatchKind::InferredQuoteBoundary => 7,
+    }
+}
+
+/// Prefer explicit sentinels and demote only the two genuinely weak
+/// fallbacks: an alphabetic OCR substitution (`s` -> `8`) and a wholly
+/// inferred quote-boundary marker. Other candidates retain reading-order
+/// priority, so a later legal number cannot displace an earlier flattened
+/// callout.
+fn sequence_selection_priority(
+    kind: PageSequenceMatchKind,
+    text: &str,
+    start: usize,
+    end: usize,
+) -> u8 {
+    match kind {
+        PageSequenceMatchKind::Existing | PageSequenceMatchKind::SplitExisting => 0,
+        PageSequenceMatchKind::OcrDigits
+            if text
+                .get(start..end)
+                .is_some_and(|value| value.chars().any(char::is_alphabetic)) =>
+        {
+            2
+        }
+        PageSequenceMatchKind::InferredQuoteBoundary => 2,
+        _ => 1,
+    }
+}
+
+/// Match a multi-digit callout that an earlier permissive pass encoded as one
+/// sentinel per glyph (`26` -> `[^2] [^6]`). The complete page-level note
+/// sequence is the confidence gate for collapsing the fragments.
+fn split_existing_sentinel_range(text: &str, digits: &str, from: usize) -> Option<(usize, usize)> {
+    if digits.len() < 2 {
+        return None;
+    }
+    let fragments = digits
+        .chars()
+        .map(|digit| format!("{CALLOUT_START}{digit}{CALLOUT_END}"))
+        .collect::<Vec<_>>();
+    let first = fragments.first()?;
+    let mut cursor = from.min(text.len());
+    while let Some(offset) = text.get(cursor..)?.find(first) {
+        let start = cursor + offset;
+        let mut end = start + first.len();
+        let mut complete = true;
+        for fragment in fragments.iter().skip(1) {
+            let whitespace = text[end..]
+                .chars()
+                .take_while(|ch| ch.is_whitespace())
+                .map(char::len_utf8)
+                .sum::<usize>();
+            end += whitespace;
+            if !text[end..].starts_with(fragment) {
+                complete = false;
+                break;
+            }
+            end += fragment.len();
+        }
+        if complete {
+            return Some((start, end));
+        }
+        cursor = start + first.len();
+    }
+    None
+}
+
+/// Match the one surviving digit of a multi-digit callout after that glyph was
+/// already encoded as a one-digit sentinel by a permissive local pass.
+fn partial_existing_sentinel_range(
+    text: &str,
+    digits: &str,
+    from: usize,
+) -> Option<(usize, usize)> {
+    if digits.len() != 2 {
+        return None;
+    }
+    digits
+        .chars()
+        .filter_map(|digit| {
+            let sentinel = format!("{CALLOUT_START}{digit}{CALLOUT_END}");
+            text.get(from.min(text.len())..)?
+                .find(&sentinel)
+                .map(|offset| {
+                    let start = from.min(text.len()) + offset;
+                    (start, start + sentinel.len())
+                })
+        })
+        .min_by_key(|(start, _)| *start)
+}
+
+/// Match a complete multi-digit callout even when the text layer separated its
+/// glyphs (`26` -> `2 6`) or confused a superscript glyph (`28` -> `2s`).
+fn ocr_digit_sequence_range(text: &str, digits: &str, from: usize) -> Option<(usize, usize)> {
+    let chars = text.char_indices().collect::<Vec<_>>();
+    for start_position in 0..chars.len() {
+        let start = chars[start_position].0;
+        if start < from || !ocr_digit_matches(chars[start_position].1, digits.as_bytes()[0]) {
+            continue;
+        }
+        if !callout_left_boundary(text, start) {
+            continue;
+        }
+        let mut position = start_position;
+        let mut matched = true;
+        for (digit_index, digit) in digits.as_bytes().iter().enumerate() {
+            if digit_index > 0 {
+                while position < chars.len() && chars[position].1.is_whitespace() {
+                    position += 1;
+                }
+            }
+            if position >= chars.len() || !ocr_digit_matches(chars[position].1, *digit) {
+                matched = false;
+                break;
+            }
+            position += 1;
+        }
+        if !matched {
+            continue;
+        }
+        let end = chars
+            .get(position)
+            .map(|(offset, _)| *offset)
+            .unwrap_or(text.len());
+        if text[end..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric())
+        {
+            continue;
+        }
+        return Some((start, end));
+    }
+    None
+}
+
+fn ocr_digit_matches(ch: char, digit: u8) -> bool {
+    ch as u32 == digit as u32
+        || matches!(
+            (digit, ch),
+            (b'0', 'o' | 'O') | (b'1', 'l' | 'I' | '|' | '\'') | (b'8', 's' | 'S')
+        )
+}
+
+/// Match the one surviving glyph of a two-digit superscript. This is admitted
+/// only inside a complete local note-head sequence.
+fn partial_page_sequence_digit_range(
+    text: &str,
+    digits: &str,
+    from: usize,
+) -> Option<(usize, usize)> {
+    if digits.len() != 2 {
+        return None;
+    }
+    for (start, ch) in text.char_indices() {
+        if start < from || !ch.is_ascii_digit() {
+            continue;
+        }
+        if ch as u8 != digits.as_bytes()[0] && ch as u8 != digits.as_bytes()[1] {
+            continue;
+        }
+        let end = start + ch.len_utf8();
+        if !callout_left_boundary(text, start)
+            || text[end..]
+                .chars()
+                .next()
+                .is_some_and(|next| next.is_ascii_alphanumeric())
+        {
+            continue;
+        }
+        return Some((start, end));
+    }
+    None
+}
+
+fn callout_left_boundary(text: &str, start: usize) -> bool {
+    let left = &text[..start];
+    let immediate = left.chars().next_back();
+    if immediate.is_some_and(|ch| !ch.is_whitespace()) {
+        return immediate.is_some_and(|ch| {
+            !ch.is_ascii_alphanumeric()
+                && !matches!(ch, '\u{00A7}' | '-' | '*' | CALLOUT_START | CALLOUT_END)
+        });
+    }
+    left.trim_end()
+        .chars()
+        .next_back()
+        .is_some_and(|ch| matches!(ch, '.' | '?' | '!' | ':' | ';' | ')' | ']' | '"' | '\''))
+}
+
+/// A lone apostrophe after sentence or quotation punctuation is a recurring
+/// superscript-font extraction artifact in older law-review PDFs.
+fn page_sequence_placeholder_range(text: &str, from: usize) -> Option<(usize, usize)> {
+    for (start, ch) in text.char_indices() {
+        if start < from || ch != '\'' {
+            continue;
+        }
+        let before = text[..start].chars().next_back();
+        let after = text[start + ch.len_utf8()..].chars().next();
+        if before.is_some_and(|ch| matches!(ch, '.' | '?' | '!' | '"'))
+            && after.is_none_or(|ch| ch.is_whitespace() || ch.is_ascii_punctuation())
+        {
+            return Some((start, start + ch.len_utf8()));
+        }
+    }
+    None
+}
+
+/// Last-resort recovery for a callout whose glyph vanished completely after a
+/// sentence-ending quotation. The page-level all-or-nothing sequence is the
+/// confidence gate; ordinary quoted prose on singleton pages cannot enter.
+fn inferred_quote_boundary_range(text: &str, from: usize) -> Option<usize> {
+    let trimmed = text.trim_end();
+    let end = trimmed.len();
+    (end >= from
+        && (trimmed.ends_with(".\"") || trimmed.ends_with("?\"") || trimmed.ends_with("!\"")))
+    .then_some(end)
+}
+
+fn split_callout_fragment_completes_marker(current: &str, next: &str, marker: u16) -> bool {
+    let current = current.trim();
+    let next = next.trim();
+    current.len() == 1
+        && next.len() == 1
+        && current.chars().all(|ch| ch.is_ascii_digit())
+        && next.chars().all(|ch| ch.is_ascii_digit())
+        && format!("{current}{next}") == marker.to_string()
+}
+
+fn remove_standalone_source_fragment(block_text: &mut String, fragment: &str) {
+    let fragment = fragment.trim();
+    if fragment.is_empty() {
+        return;
+    }
+    let trimmed = block_text.trim_start();
+    if let Some(remainder) = trimmed.strip_prefix(fragment)
+        && remainder.chars().next().is_none_or(|ch| ch.is_whitespace())
+    {
+        *block_text = remainder.trim_start().to_owned();
+    }
+}
+
+fn attached_page_sequence_ascii_range(
+    text: &str,
+    digits: &str,
+    from: usize,
+) -> Option<(usize, usize)> {
+    let mut cursor = from.min(text.len());
+    while let Some(offset) = text.get(cursor..)?.find(digits) {
+        let start = cursor + offset;
+        let end = start + digits.len();
+        let before = text[..start].chars().next_back();
+        let after = text[end..].chars().next();
+        let mut accepted = before.is_some_and(|before| {
+            !before.is_whitespace()
+                && !matches!(before, '\u{00A7}' | '-' | '*' | CALLOUT_START | CALLOUT_END)
+                && !after.is_some_and(|ch| ch.is_ascii_digit())
+        });
+        if accepted && before.is_some_and(|ch| ch.is_ascii_digit()) {
+            let prefix_digits = text[..start]
+                .chars()
+                .rev()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>();
+            let plausible_year = prefix_digits.len() == 4
+                && prefix_digits
+                    .parse::<u16>()
+                    .is_ok_and(|year| (1500..=2200).contains(&year));
+            accepted = plausible_year;
+        }
+        if accepted {
+            return Some((start, end));
+        }
+        cursor = end;
+    }
+    None
 }
 
 fn apply_in_block_standalone_callout_recovery(
@@ -11451,17 +21056,6 @@ fn apply_in_block_standalone_callout_recovery(
     sources: &[LiquidBlockSourceLines],
     decoded: &[(DeepLiquidSourceLine, Lm2Action)],
 ) -> usize {
-    let mut definition_markers: BTreeMap<usize, HashSet<u16>> = BTreeMap::new();
-    for (line, _) in decoded {
-        if (line.in_footnote_zone || line.below_footnote_divider)
-            && let Some(marker) = leading_numeric_token_marker(&line.text)
-        {
-            definition_markers
-                .entry(line.page_index)
-                .or_default()
-                .insert(marker);
-        }
-    }
     let block_by_line_id = sources
         .iter()
         .flat_map(|source| {
@@ -11470,38 +21064,81 @@ fn apply_in_block_standalone_callout_recovery(
             })
         })
         .collect::<HashMap<_, _>>();
+    // Decoder storage order is not a reading-order contract.  Superscript
+    // fragments must be paired with the preceding physical source line, not
+    // merely the preceding element in `decoded`.
+    let line_by_coordinate = decoded
+        .iter()
+        .map(|(line, _)| ((line.page_index, line.line_index), line))
+        .collect::<HashMap<_, _>>();
+    let accepted_note_pages = sources
+        .iter()
+        .flat_map(|source| {
+            source.lines.iter().flat_map(|line| {
+                line.note_markers
+                    .iter()
+                    .map(move |marker| (line.page_index, *marker))
+            })
+        })
+        .collect::<HashSet<_>>();
 
     let mut repaired = 0usize;
-    for index in 1..decoded.len() {
-        let marker_line = &decoded[index].0;
+    for (marker_line, _) in decoded {
         let Some(marker) = marker_line.text.trim().parse::<u16>().ok() else {
             continue;
         };
-        if !(1..=500).contains(&marker)
-            || marker_line.in_footnote_zone
-            || marker_line.below_footnote_divider
-            || !definition_markers
-                .get(&marker_line.page_index)
-                .is_some_and(|markers| markers.contains(&marker))
-        {
+        if !(1..=LM2_MAX_NOTE_MARKER).contains(&marker) {
             continue;
         }
-        let previous = &decoded[index - 1].0;
-        if !lm2_marker_can_attach_to_previous_line(marker_line, previous) {
+        let Some(previous_line_index) = marker_line.line_index.checked_sub(1) else {
             continue;
-        }
+        };
+        let Some(previous) = line_by_coordinate
+            .get(&(marker_line.page_index, previous_line_index))
+            .copied()
+        else {
+            continue;
+        };
         let Some(marker_block) = block_by_line_id.get(marker_line.id.as_str()) else {
             continue;
         };
         let Some(previous_block) = block_by_line_id.get(previous.id.as_str()) else {
             continue;
         };
+        let strict_geometry = lm2_marker_can_attach_to_previous_line(marker_line, previous);
+        // Some PDF text layers collapse two visual body rows into one source
+        // line.  Its bounding box then reaches the page margin even though the
+        // superscript follows the final glyph on the lower row.  For a
+        // small-font numeric fragment, an accepted same-page note definition
+        // plus vertical overlap is a safer contract than the collapsed line's
+        // misleading `right` edge.
+        let note_backed_overlap = accepted_note_pages.contains(&(marker_line.page_index, marker))
+            && marker_line.page_index == previous.page_index
+            && marker_line.font_height <= previous.font_height * 0.80
+            && marker_line.bottom <= previous.top
+            && marker_line.top >= previous.bottom
+            && marker_line.left >= previous.left - 2.0
+            && marker_line.left <= previous.right + 4.0;
+        if !strict_geometry && !note_backed_overlap {
+            continue;
+        }
         if previous_block != marker_block {
             if *previous_block >= blocks.len()
                 || *marker_block >= blocks.len()
                 || blocks[*previous_block].role != LiquidBlockRole::Paragraph
-                || blocks[*marker_block].text.trim() != marker.to_string()
             {
+                continue;
+            }
+            let marker_text = marker.to_string();
+            let marker_block_text = blocks[*marker_block].text.trim_start();
+            let exact_marker_block = marker_block_text == marker_text;
+            let leading_marker_before_note = marker_block_text
+                .strip_prefix(&marker_text)
+                .filter(|remainder| remainder.chars().next().is_some_and(char::is_whitespace))
+                .map(str::trim_start)
+                .filter(|remainder| !remainder.is_empty())
+                .map(str::to_owned);
+            if !exact_marker_block && leading_marker_before_note.is_none() {
                 continue;
             }
             blocks[*previous_block].text = format!(
@@ -11511,8 +21148,12 @@ fn apply_in_block_standalone_callout_recovery(
                 marker,
                 CALLOUT_END
             );
-            blocks[*marker_block].role = LiquidBlockRole::Noise;
-            blocks[*marker_block].label = None;
+            if exact_marker_block {
+                blocks[*marker_block].role = LiquidBlockRole::Noise;
+                blocks[*marker_block].label = None;
+            } else if let Some(remainder) = leading_marker_before_note {
+                blocks[*marker_block].text = remainder;
+            }
             repaired += 1;
             continue;
         }
@@ -11532,6 +21173,1150 @@ fn apply_in_block_standalone_callout_recovery(
     repaired
 }
 
+/// Some text layers combine a superscript with the first words after it and
+/// emit that fragment as the next physical line (`346 At that`). When the
+/// fragment shares the preceding line's baseline, move the marker backward and
+/// rejoin the prose.
+fn apply_same_row_leading_callout_reflow(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    if blocks.len() < 2 {
+        return 0;
+    }
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let note_pages = sources
+        .iter()
+        .flat_map(|source| {
+            source.lines.iter().flat_map(|line| {
+                line.note_markers
+                    .iter()
+                    .map(move |marker| (line.page_index, *marker))
+            })
+        })
+        .collect::<HashSet<_>>();
+    let mut repaired = 0usize;
+    for source in sources.iter() {
+        let Some(block) = blocks.get_mut(source.block_index) else {
+            continue;
+        };
+        let ordinary_body_role = matches!(
+            block.role,
+            LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+        );
+        let unmarked_body_candidate =
+            matches!(
+                block.role,
+                LiquidBlockRole::Noise | LiquidBlockRole::Marginalia
+            ) && source.lines.iter().all(|line| line.note_markers.is_empty());
+        if !ordinary_body_role && !unmarked_body_candidate {
+            continue;
+        }
+        for pair in source.lines.windows(2) {
+            let (previous_ref, current_ref) = (&pair[0], &pair[1]);
+            let (Some(previous_id), Some(current_id)) =
+                (previous_ref.id.as_deref(), current_ref.id.as_deref())
+            else {
+                continue;
+            };
+            let (Some(previous_line), Some(current_line)) =
+                (line_by_id.get(previous_id), line_by_id.get(current_id))
+            else {
+                continue;
+            };
+            let Some(marker) = leading_numeric_token_marker(&current_ref.text)
+                .or_else(|| leading_sentineled_marker(&current_ref.text))
+            else {
+                continue;
+            };
+            if !lm2_same_row_leading_callout(previous_line, current_line)
+                && !(note_pages.contains(&(current_ref.page_index, marker))
+                    && lm2_same_row_leading_callout_with_prose(previous_line, current_line, marker))
+            {
+                continue;
+            }
+            let clean = clean_lm2_line_text(&current_ref.text);
+            let Some(remainder) = lm2_strip_leading_ascii_or_decoded_callout(&clean, marker) else {
+                continue;
+            };
+            if let Some(position) = block.text.find(&clean) {
+                let replacement = format!("{CALLOUT_START}{marker}{CALLOUT_END} {remainder}");
+                let mut start = position;
+                while start > 0
+                    && block.text[..start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_whitespace)
+                {
+                    start -= block.text[..start]
+                        .chars()
+                        .next_back()
+                        .map(char::len_utf8)
+                        .unwrap_or(0);
+                }
+                block
+                    .text
+                    .replace_range(start..position + clean.len(), &replacement);
+                if unmarked_body_candidate {
+                    block.role = LiquidBlockRole::Paragraph;
+                    block.label = None;
+                }
+                repaired += 1;
+            }
+        }
+    }
+    let mut source_by_block = sources
+        .iter()
+        .map(|source| (source.block_index, source.lines.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let old_blocks = std::mem::take(blocks);
+    let mut rebuilt_blocks = Vec::with_capacity(old_blocks.len());
+    let mut rebuilt_sources = Vec::with_capacity(sources.len());
+    let mut index = 0usize;
+
+    while index < old_blocks.len() {
+        let can_try = index + 1 < old_blocks.len()
+            && (matches!(
+                old_blocks[index].role,
+                LiquidBlockRole::Paragraph | LiquidBlockRole::Lead | LiquidBlockRole::Quote
+            ) || matches!(
+                old_blocks[index].role,
+                LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+            ) && lm2_numbered_run_in_body(&old_blocks[index].text).is_some())
+            && matches!(
+                old_blocks[index + 1].role,
+                LiquidBlockRole::Paragraph | LiquidBlockRole::Noise | LiquidBlockRole::Marginalia
+            );
+        let mut merged = None;
+        if can_try {
+            let previous_refs = source_by_block.get(&index).cloned().unwrap_or_default();
+            let current_refs = source_by_block
+                .get(&(index + 1))
+                .cloned()
+                .unwrap_or_default();
+            if let (Some(previous_ref), Some(current_ref)) =
+                (previous_refs.last(), current_refs.first())
+                && current_refs.iter().all(|line| line.note_markers.is_empty())
+                && let (Some(previous_id), Some(current_id)) =
+                    (previous_ref.id.as_deref(), current_ref.id.as_deref())
+                && let (Some(previous_line), Some(current_line)) =
+                    (line_by_id.get(previous_id), line_by_id.get(current_id))
+                && let Some(marker) = leading_numeric_token_marker(&current_ref.text)
+                    .or_else(|| leading_sentineled_marker(&current_ref.text))
+                && (lm2_same_row_leading_callout(previous_line, current_line)
+                    || (note_pages.contains(&(current_ref.page_index, marker))
+                        && lm2_same_row_leading_callout_with_prose(
+                            previous_line,
+                            current_line,
+                            marker,
+                        )))
+                && let Some(remainder) =
+                    lm2_strip_leading_ascii_or_decoded_callout(&old_blocks[index + 1].text, marker)
+            {
+                let mut block = old_blocks[index].clone();
+                block.text = format!(
+                    "{}{}{}{}",
+                    block.text.trim_end(),
+                    CALLOUT_START,
+                    marker,
+                    CALLOUT_END
+                );
+                append_line(&mut block.text, remainder);
+                let mut refs = previous_refs.clone();
+                refs.extend(current_refs.clone());
+                merged = Some((block, refs));
+            }
+        }
+
+        // A same-baseline callout can already have been moved into the
+        // preceding Paragraph while the following physical body row remains a
+        // separate Paragraph. Join that one adjacent row only when the prior
+        // source ends in a Noise callout fragment, the accepted note exists on
+        // the page, and the next row returns to the base row's body margin.
+        if merged.is_none()
+            && index + 1 < old_blocks.len()
+            && old_blocks[index].role == LiquidBlockRole::Paragraph
+            && old_blocks[index + 1].role == LiquidBlockRole::Paragraph
+        {
+            let previous_refs = source_by_block.get(&index).cloned().unwrap_or_default();
+            let current_refs = source_by_block
+                .get(&(index + 1))
+                .cloned()
+                .unwrap_or_default();
+            if previous_refs.len() >= 2
+                && !current_refs.is_empty()
+                && current_refs.iter().all(|line| line.note_markers.is_empty())
+            {
+                let base_ref = &previous_refs[previous_refs.len() - 2];
+                let marker_ref = &previous_refs[previous_refs.len() - 1];
+                let current_ref = &current_refs[0];
+                if marker_ref.role == LiquidBlockRole::Noise
+                    && marker_ref.note_markers.is_empty()
+                    && let Some(marker) = leading_numeric_token_marker(&marker_ref.text)
+                        .or_else(|| leading_sentineled_marker(&marker_ref.text))
+                    && note_pages.contains(&(marker_ref.page_index, marker))
+                    && old_blocks[index]
+                        .text
+                        .contains(&format!("{CALLOUT_START}{marker}{CALLOUT_END}"))
+                    && lm2_reflow_paragraph_is_visibly_open(&old_blocks[index].text)
+                    && lm2_reflow_starts_like_continuation(&old_blocks[index + 1].text)
+                    && let (Some(base_id), Some(marker_id), Some(current_id)) = (
+                        base_ref.id.as_deref(),
+                        marker_ref.id.as_deref(),
+                        current_ref.id.as_deref(),
+                    )
+                    && let (Some(base_line), Some(marker_line), Some(current_line)) = (
+                        line_by_id.get(base_id).copied(),
+                        line_by_id.get(marker_id).copied(),
+                        line_by_id.get(current_id).copied(),
+                    )
+                    && base_line.page_index == marker_line.page_index
+                    && marker_line.page_index == current_line.page_index
+                    && base_line.line_index.checked_add(1) == Some(marker_line.line_index)
+                    && marker_line.line_index.checked_add(1) == Some(current_line.line_index)
+                    && lm2_same_row_leading_callout_with_prose(base_line, marker_line, marker)
+                    && lm2_body_sized_reflow_line(current_line)
+                    && !current_line.doc_repeated_edge_text
+                    && (current_line.left - base_line.left).abs()
+                        <= (current_line.page_width.max(base_line.page_width) * 0.008).max(2.5)
+                {
+                    let mut block = old_blocks[index].clone();
+                    append_line(&mut block.text, &old_blocks[index + 1].text);
+                    let mut refs = previous_refs;
+                    if let Some(marker_ref) = refs.last_mut() {
+                        // The source row is now proven to be inline body prose,
+                        // not standalone furniture. Preserve that conclusion
+                        // through the late source-backed paragraph splitter.
+                        marker_ref.role = LiquidBlockRole::Paragraph;
+                    }
+                    refs.extend(current_refs);
+                    merged = Some((block, refs));
+                }
+            }
+        }
+
+        let block_index = rebuilt_blocks.len();
+        if let Some((block, refs)) = merged {
+            rebuilt_blocks.push(block);
+            source_by_block.remove(&index);
+            source_by_block.remove(&(index + 1));
+            if !refs.is_empty() {
+                rebuilt_sources.push(LiquidBlockSourceLines {
+                    block_index,
+                    lines: refs,
+                });
+            }
+            repaired += 1;
+            index += 2;
+        } else {
+            rebuilt_blocks.push(old_blocks[index].clone());
+            if let Some(lines) = source_by_block.remove(&index)
+                && !lines.is_empty()
+            {
+                rebuilt_sources.push(LiquidBlockSourceLines { block_index, lines });
+            }
+            index += 1;
+        }
+    }
+
+    *blocks = rebuilt_blocks;
+    *sources = rebuilt_sources;
+    repaired
+}
+
+fn lm2_same_row_leading_callout(
+    previous: &DeepLiquidSourceLine,
+    current: &DeepLiquidSourceLine,
+) -> bool {
+    if previous.page_index != current.page_index
+        || previous.line_index.checked_add(1) != Some(current.line_index)
+        || lm2_low_footnote_zone_evidence(current)
+        || current.font_height > previous.font_height * 0.96
+    {
+        return false;
+    }
+    let previous_center = (previous.top + previous.bottom) * 0.5;
+    let current_center = (current.top + current.bottom) * 0.5;
+    let vertically_aligned = current.bottom <= previous.top
+        && current.top >= previous.bottom
+        && (current_center - previous_center).abs() <= previous.font_height * 0.45;
+    let horizontal_tolerance = (previous.page_width.max(current.page_width) * 0.008).max(2.5);
+    let horizontally_contiguous = current.left >= previous.right - 2.0
+        && current.left <= previous.right + horizontal_tolerance;
+    vertically_aligned && horizontally_contiguous
+}
+
+/// A superscript extracted together with the following body word inherits the
+/// body's font height, so the ordinary small-fragment test cannot recognize
+/// it.  Require exact same-row attachment plus a same-page accepted definition
+/// before treating `153 However,` as callout 153 followed by prose.
+fn lm2_same_row_leading_callout_with_prose(
+    previous: &DeepLiquidSourceLine,
+    current: &DeepLiquidSourceLine,
+    marker: u16,
+) -> bool {
+    if previous.page_index != current.page_index
+        || previous.line_index.checked_add(1) != Some(current.line_index)
+    {
+        return false;
+    }
+    let Some(remainder) = lm2_strip_leading_ascii_or_decoded_callout(&current.text, marker) else {
+        return false;
+    };
+    if !remainder
+        .chars()
+        .find(|ch| ch.is_alphanumeric())
+        .is_some_and(char::is_alphabetic)
+    {
+        return false;
+    }
+    let previous_center = (previous.top + previous.bottom) * 0.5;
+    let current_center = (current.top + current.bottom) * 0.5;
+    let vertically_aligned = (current_center - previous_center).abs()
+        <= previous.font_height.max(current.font_height) * 0.35;
+    let horizontal_tolerance = (previous.page_width.max(current.page_width) * 0.008).max(2.5);
+    let horizontally_contiguous = current.left >= previous.right - 2.0
+        && current.left <= previous.right + horizontal_tolerance;
+    let previous_bbox_height = (previous.top - previous.bottom).max(0.0);
+    let collapsed_multiline_tail = previous_bbox_height >= previous.font_height * 1.8
+        && current.font_height <= previous.font_height * 0.95
+        && current.bottom <= previous.top
+        && current.top >= previous.bottom
+        && current.left >= previous.left - 2.0
+        && (current.right - previous.right).abs() <= horizontal_tolerance;
+    let previous_can_host_marker = previous.text.trim_end().chars().last().is_some_and(|ch| {
+        ch.is_ascii_alphabetic()
+            || matches!(
+                ch,
+                '.' | '?'
+                    | '!'
+                    | ','
+                    | ';'
+                    | ':'
+                    | '"'
+                    | '\''
+                    | '\u{2019}'
+                    | '\u{201d}'
+                    | ')'
+                    | ']'
+            )
+    });
+    (vertically_aligned && horizontally_contiguous || collapsed_multiline_tail)
+        && previous_can_host_marker
+}
+
+/// Learned footnote state can briefly extend upward into body content on pages
+/// with dense notes or tables. Require the line to be physically in the lower
+/// half as well before using that state to veto body reflow and callout repair.
+fn lm2_low_footnote_zone_evidence(line: &DeepLiquidSourceLine) -> bool {
+    let physically_low = line.page_height > 0.0 && line.top <= line.page_height * 0.50;
+    if line.page_has_footnote_divider {
+        line.below_footnote_divider
+    } else {
+        physically_low && (line.in_footnote_zone || line.doc_footnote_state)
+    }
+}
+
+fn lm2_strip_leading_ascii_or_decoded_callout(text: &str, marker: u16) -> Option<&str> {
+    if let Some(end) = leading_callout_marker_end(text) {
+        let decoded = text[CALLOUT_START.len_utf8()..end - CALLOUT_END.len_utf8()]
+            .parse::<u16>()
+            .ok()?;
+        return (decoded == marker)
+            .then(|| text[end..].trim_start())
+            .filter(|remainder| !remainder.is_empty());
+    }
+    let digits = marker.to_string();
+    let trimmed = text.trim_start();
+    let remainder = trimmed.strip_prefix(&digits)?;
+    if !remainder.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let remainder = remainder.trim_start();
+    (!remainder.is_empty()).then_some(remainder)
+}
+
+/// Route blocks backed by ruled cells, repeated table columns, or figure
+/// objects away from Heading/Marginalia before Markdown assembly.  This is a
+/// layout decision, not a lexical one: labels such as `Evidence`, `Example`,
+/// and `1.` are legitimate table cells and should neither become navigation
+/// headings nor leak into the detached Notes fallback.
+fn apply_table_figure_block_role_routing(
+    blocks: &mut [LiquidBlock],
+    sources: &[LiquidBlockSourceLines],
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let decoded_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let mut explicit_caption_line_by_page = BTreeMap::<usize, usize>::new();
+    let mut table_figure_anchor_line_by_page = BTreeMap::<usize, usize>::new();
+    for (line, _) in decoded {
+        if lm2_explicit_numbered_table_figure_caption(&line.text) {
+            explicit_caption_line_by_page
+                .entry(line.page_index)
+                .and_modify(|first| *first = (*first).min(line.line_index))
+                .or_insert(line.line_index);
+        }
+        if lm2_numbered_table_figure_page_anchor(&line.text) {
+            table_figure_anchor_line_by_page
+                .entry(line.page_index)
+                .and_modify(|first| *first = (*first).min(line.line_index))
+                .or_insert(line.line_index);
+        }
+    }
+    let short_label_count_by_page = decoded
+        .iter()
+        .filter(|(line, _)| {
+            table_figure_anchor_line_by_page
+                .get(&line.page_index)
+                .is_some_and(|caption_line| line.line_index > *caption_line)
+                && lm2_short_figure_table_label(&line.text)
+        })
+        .fold(BTreeMap::<usize, usize>::new(), |mut counts, (line, _)| {
+            *counts.entry(line.page_index).or_default() += 1;
+            counts
+        });
+    let any_short_label_count_by_page = decoded
+        .iter()
+        .filter(|(line, _)| lm2_short_figure_table_label(&line.text))
+        .fold(BTreeMap::<usize, usize>::new(), |mut counts, (line, _)| {
+            *counts.entry(line.page_index).or_default() += 1;
+            counts
+        });
+    let existing_table_count_by_page = sources
+        .iter()
+        .filter_map(|source| {
+            (blocks.get(source.block_index)?.role == LiquidBlockRole::Table)
+                .then_some(source.lines.first()?.page_index)
+        })
+        .fold(BTreeMap::<usize, usize>::new(), |mut counts, page_index| {
+            *counts.entry(page_index).or_default() += 1;
+            counts
+        });
+    let mut repaired = 0usize;
+    for source in sources {
+        let Some(block) = blocks.get_mut(source.block_index) else {
+            continue;
+        };
+        if !matches!(
+            block.role,
+            LiquidBlockRole::Heading
+                | LiquidBlockRole::Subheading
+                | LiquidBlockRole::Paragraph
+                | LiquidBlockRole::ListItem
+                | LiquidBlockRole::Marginalia
+        ) || source
+            .lines
+            .iter()
+            .any(|line| !line.note_markers.is_empty())
+        {
+            continue;
+        }
+        let deep_lines = source
+            .lines
+            .iter()
+            .filter_map(|line| {
+                line.id
+                    .as_deref()
+                    .and_then(|id| decoded_by_id.get(id).copied())
+            })
+            .collect::<Vec<_>>();
+        let caption = lm2_explicit_numbered_table_figure_caption(&block.text);
+        if caption {
+            block.role = LiquidBlockRole::Caption;
+            block.label = None;
+            repaired += 1;
+            continue;
+        }
+        let source_backed_outline_heading = lm2_outline_heading_role(&block.text).is_some()
+            && word_count(&block.text) <= 24
+            && source.lines.iter().any(|line| {
+                matches!(
+                    line.role,
+                    LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+                )
+            });
+        if source_backed_outline_heading {
+            continue;
+        }
+        let short_figure_label_cluster = !deep_lines.is_empty()
+            && deep_lines.first().is_some_and(|line| {
+                let anchored_cluster = table_figure_anchor_line_by_page
+                    .get(&line.page_index)
+                    .is_some_and(|caption_line| {
+                        line.line_index > *caption_line
+                            && short_label_count_by_page
+                                .get(&line.page_index)
+                                .is_some_and(|count| *count >= 2)
+                    });
+                let continuation_cluster = existing_table_count_by_page
+                    .get(&line.page_index)
+                    .is_some_and(|count| *count >= 2)
+                    || (existing_table_count_by_page
+                        .get(&line.page_index)
+                        .is_some_and(|count| *count >= 1)
+                        && any_short_label_count_by_page
+                            .get(&line.page_index)
+                            .is_some_and(|count| *count >= 2));
+                anchored_cluster || continuation_cluster
+            })
+            && deep_lines
+                .iter()
+                .all(|line| line.page_index == deep_lines[0].page_index)
+            && source.lines.iter().all(|line| line.note_markers.is_empty())
+            && source
+                .lines
+                .iter()
+                .all(|line| lm2_short_figure_table_label(&line.text));
+        if short_figure_label_cluster {
+            block.role = LiquidBlockRole::Table;
+            block.label = Some("Table/Figure".to_owned());
+            repaired += 1;
+            continue;
+        }
+        if deep_lines.is_empty()
+            || deep_lines
+                .iter()
+                .any(|line| line.page_has_footnote_divider && line.below_footnote_divider)
+        {
+            continue;
+        }
+        let table_votes = deep_lines
+            .iter()
+            .filter(|line| {
+                line.in_ruled_cell
+                    || line.ruled_row_membership_exact
+                    || line.page_object_ruled_row_membership
+                    || line.page_table_column_like
+                    || line.segment_block_table_like
+                    || line.page_object_overlaps_image_bbox
+            })
+            .count();
+        let hard_table = deep_lines.iter().any(|line| {
+            line.in_ruled_cell
+                || line.ruled_row_membership_exact
+                || line.page_object_ruled_row_membership
+        });
+        if !hard_table && table_votes * 2 < deep_lines.len() {
+            continue;
+        }
+        block.role = LiquidBlockRole::Table;
+        block.label = (block.role == LiquidBlockRole::Table).then(|| "Table/Figure".to_owned());
+        repaired += 1;
+    }
+
+    // The narrow label column of a two-column table can contain a lowercase
+    // connector (`and Motions`) that fails the ordinary title-case cell test.
+    // Exact source-line adjacency between two already-established table cells
+    // is stronger evidence and keeps that one label out of body prose.
+    let source_by_block = sources
+        .iter()
+        .map(|source| (source.block_index, source))
+        .collect::<HashMap<_, _>>();
+    let sandwiched = (1..blocks.len().saturating_sub(1))
+        .filter(|index| {
+            if blocks[*index - 1].role != LiquidBlockRole::Table
+                || blocks[*index + 1].role != LiquidBlockRole::Table
+                || !matches!(
+                    blocks[*index].role,
+                    LiquidBlockRole::Heading
+                        | LiquidBlockRole::Subheading
+                        | LiquidBlockRole::Paragraph
+                        | LiquidBlockRole::ListItem
+                )
+                || word_count(&blocks[*index].text) > 6
+            {
+                return false;
+            }
+            let (Some(previous), Some(current), Some(next)) = (
+                source_by_block.get(&(*index - 1)).copied(),
+                source_by_block.get(index).copied(),
+                source_by_block.get(&(*index + 1)).copied(),
+            ) else {
+                return false;
+            };
+            if current
+                .lines
+                .iter()
+                .any(|line| !line.note_markers.is_empty())
+            {
+                return false;
+            }
+            let (Some(previous_line), Some(current_first), Some(current_last), Some(next_line)) = (
+                previous.lines.last(),
+                current.lines.first(),
+                current.lines.last(),
+                next.lines.first(),
+            ) else {
+                return false;
+            };
+            previous_line.page_index == current_first.page_index
+                && current_first.page_index == current_last.page_index
+                && current_last.page_index == next_line.page_index
+                && previous_line.line_index.checked_add(1) == Some(current_first.line_index)
+                && current_last.line_index.checked_add(1) == Some(next_line.line_index)
+        })
+        .collect::<Vec<_>>();
+    for index in sandwiched {
+        blocks[index].role = LiquidBlockRole::Table;
+        blocks[index].label = Some("Table/Figure".to_owned());
+        repaired += 1;
+    }
+    repaired
+}
+
+fn lm2_short_figure_table_label(text: &str) -> bool {
+    let text = clean_lm2_line_text(text);
+    (1..=6).contains(&word_count(&text))
+        && text.len() <= 60
+        && text
+            .chars()
+            .last()
+            .is_none_or(|ch| !matches!(ch, '.' | ';' | ':'))
+        && title_case_ratio(&text) >= 0.55
+}
+
+fn lm2_numbered_table_figure_page_anchor(text: &str) -> bool {
+    let normalized = normalize_text(text);
+    let words = normalized.split_whitespace().collect::<Vec<_>>();
+    words.windows(2).any(|pair| {
+        if !matches!(
+            pair[0].trim_matches(|ch: char| !ch.is_alphabetic()),
+            "table" | "figure" | "fig"
+        ) {
+            return false;
+        }
+        let marker = pair[1].trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
+        !marker.is_empty()
+            && marker.len() <= 8
+            && (marker.chars().all(|ch| ch.is_ascii_digit())
+                || marker.chars().all(|ch| {
+                    matches!(
+                        ch.to_ascii_lowercase(),
+                        'i' | 'v' | 'x' | 'l' | 'c' | 'd' | 'm'
+                    )
+                }))
+    })
+}
+
+/// Last-resort block-level counterpart to the line guard above.  A later
+/// grouping decision can preserve a recovered `N. Id.` line as Noise even
+/// though its source geometry is an unambiguous note head.  Restore both the
+/// block role and its source marker so the linker can use the definition.
+fn apply_hidden_numbered_note_block_recovery(
+    blocks: &mut [LiquidBlock],
+    sources: &mut [LiquidBlockSourceLines],
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let decoded_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let owner_by_coordinate = sources
+        .iter()
+        .enumerate()
+        .flat_map(|(source_position, source)| {
+            source
+                .lines
+                .iter()
+                .enumerate()
+                .map(move |(line_position, line)| {
+                    (
+                        (line.page_index, line.line_index),
+                        (source_position, line_position),
+                    )
+                })
+        })
+        .collect::<HashMap<_, _>>();
+    // A missed footnote divider can leave a complete, tiny numbered note head
+    // as a Paragraph immediately above the correctly recovered note band.  Do
+    // not infer from typography alone: require the markerless physical
+    // continuation on the next source row and its sequential N+1 head in the
+    // same Marginalia block.  This is the boundary shape in which the first
+    // rows of note N were grouped as body while the rest of N and note N+1
+    // remained in the footnote band.
+    let boundary_paragraph_notes = sources
+        .iter()
+        .filter_map(|source| {
+            let block = blocks.get(source.block_index)?;
+            if block.role != LiquidBlockRole::Paragraph
+                || source.lines.is_empty()
+                || source
+                    .lines
+                    .iter()
+                    .any(|line| !line.note_markers.is_empty())
+            {
+                return None;
+            }
+            let marker = leading_sentineled_marker(&block.text)
+                .or_else(|| leading_numeric_token_marker(&block.text))?;
+            let deep_lines = source
+                .lines
+                .iter()
+                .map(|line| {
+                    line.id
+                        .as_deref()
+                        .and_then(|id| decoded_by_id.get(id).copied())
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let first = deep_lines.first()?;
+            if deep_lines.iter().any(|line| {
+                line.page_index != first.page_index
+                    || line.segment_block_id != first.segment_block_id
+                    || line.in_ruled_cell
+                    || line.ruled_row_membership_exact
+                    || line.page_table_column_like
+                    || line.page_object_overlaps_image_bbox
+                    || line.segment_block_table_like
+                    || [
+                        line.font_ratio_page_ref,
+                        line.font_ratio_page,
+                        line.font_ratio_doc,
+                    ]
+                    .into_iter()
+                    .filter(|ratio| *ratio <= 0.88)
+                    .count()
+                        < 2
+            }) {
+                return None;
+            }
+            let last_ref = source.lines.last()?;
+            let next_coordinate = (last_ref.page_index, last_ref.line_index.checked_add(1)?);
+            let (next_source_position, next_line_position) =
+                owner_by_coordinate.get(&next_coordinate).copied()?;
+            let next_source = sources.get(next_source_position)?;
+            let next_block = blocks.get(next_source.block_index)?;
+            if !matches!(
+                next_block.role,
+                LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote
+            ) {
+                return None;
+            }
+            let next_ref = next_source.lines.get(next_line_position)?;
+            let next_deep = next_ref
+                .id
+                .as_deref()
+                .and_then(|id| decoded_by_id.get(id).copied())?;
+            if !next_ref.note_markers.is_empty()
+                || !(next_deep.in_footnote_zone
+                    || next_deep.below_footnote_divider
+                    || next_deep.doc_footnote_state)
+                || !next_deep.segment_block_footnote_like
+                || next_deep.in_ruled_cell
+                || next_deep.ruled_row_membership_exact
+                || next_deep.page_table_column_like
+                || next_deep.page_object_overlaps_image_bbox
+            {
+                return None;
+            }
+            let next_marker = marker.checked_add(1)?;
+            next_source.lines[next_line_position + 1..]
+                .iter()
+                .any(|line| line.note_markers.contains(&next_marker))
+                .then_some((source.block_index, marker))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut repaired = 0usize;
+    for source in sources.iter_mut() {
+        let Some(block) = blocks.get_mut(source.block_index) else {
+            continue;
+        };
+        if let Some(marker) = boundary_paragraph_notes.get(&source.block_index).copied() {
+            block.role = LiquidBlockRole::Marginalia;
+            block.label = None;
+            for line in &mut source.lines {
+                line.role = LiquidBlockRole::Marginalia;
+                line.note_markers.clear();
+            }
+            if let Some(first) = source.lines.first_mut() {
+                first.note_markers.push(marker);
+            }
+            repaired += 1;
+            continue;
+        }
+        if !matches!(
+            block.role,
+            LiquidBlockRole::Noise | LiquidBlockRole::Table | LiquidBlockRole::Marginalia
+        ) || source.lines.len() != 1
+        {
+            continue;
+        }
+        let Some(line) = source.lines[0]
+            .id
+            .as_deref()
+            .and_then(|id| decoded_by_id.get(id).copied())
+        else {
+            continue;
+        };
+        let provenance_marker = (source.lines[0].role == LiquidBlockRole::Marginalia)
+            .then(|| {
+                let block_marker = leading_numeric_token_marker(&clean_lm2_line_text(&block.text));
+                source.lines[0]
+                    .note_markers
+                    .iter()
+                    .copied()
+                    .find(|marker| Some(*marker) == block_marker)
+            })
+            .flatten();
+        let Some(marker) = provenance_marker.or_else(|| lm2_hidden_numbered_note_line_marker(line))
+        else {
+            continue;
+        };
+        block.role = LiquidBlockRole::Marginalia;
+        block.label = None;
+        source.lines[0].role = LiquidBlockRole::Marginalia;
+        if !source.lines[0].note_markers.contains(&marker) {
+            source.lines[0].note_markers.push(marker);
+            source.lines[0].note_markers.sort_unstable();
+        }
+        repaired += 1;
+    }
+    repaired
+}
+
+fn lm2_hidden_numbered_note_line_marker(line: &DeepLiquidSourceLine) -> Option<u16> {
+    let physical_note = if line.page_has_footnote_divider {
+        line.below_footnote_divider
+    } else {
+        line.in_footnote_zone || line.doc_footnote_state
+    };
+    let small_font = line.font_ratio_page_ref <= 0.94
+        || line.font_ratio_page <= 0.94
+        || line.font_ratio_doc <= 0.94;
+    if !physical_note
+        || !small_font
+        || line.in_ruled_cell
+        || line.ruled_row_membership_exact
+        || (line.page_table_column_like && !line.in_footnote_zone)
+        || (line.doc_repeated_edge_text
+            && !line.in_footnote_zone
+            && !line.page_has_footnote_divider)
+    {
+        return None;
+    }
+    leading_explicit_numbered_note_marker(&line.text)
+}
+
+/// A grouping model can merge several terse `N. Id.` definitions into one
+/// Noise block. Split only provenance-backed, explicitly punctuated small-font
+/// note lines; reporter volumes and table rows remain Noise.
+fn apply_hidden_numbered_note_block_split_recovery(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let decoded_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let source_by_block = sources
+        .iter()
+        .map(|source| (source.block_index, source))
+        .collect::<HashMap<_, _>>();
+    let mut rebuilt_blocks = Vec::with_capacity(blocks.len());
+    let mut rebuilt_sources = Vec::with_capacity(sources.len());
+    let mut repaired = 0usize;
+
+    for (old_index, block) in blocks.iter().enumerate() {
+        let Some(source) = source_by_block.get(&old_index).copied() else {
+            let block_index = rebuilt_blocks.len();
+            rebuilt_blocks.push(block.clone());
+            rebuilt_sources.push(LiquidBlockSourceLines {
+                block_index,
+                lines: Vec::new(),
+            });
+            continue;
+        };
+        let candidates = if matches!(
+            block.role,
+            LiquidBlockRole::Noise | LiquidBlockRole::Table | LiquidBlockRole::Marginalia
+        ) && source.lines.len() > 1
+        {
+            source
+                .lines
+                .iter()
+                .map(|line_ref| {
+                    line_ref
+                        .id
+                        .as_deref()
+                        .and_then(|id| decoded_by_id.get(id).copied())
+                        .and_then(lm2_hidden_numbered_note_line_marker)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if candidates.iter().all(Option::is_none) {
+            let block_index = rebuilt_blocks.len();
+            rebuilt_blocks.push(block.clone());
+            let mut cloned = (*source).clone();
+            cloned.block_index = block_index;
+            rebuilt_sources.push(cloned);
+            continue;
+        }
+
+        let mut segment_role = LiquidBlockRole::Noise;
+        let mut segment_refs = Vec::<LiquidSourceLineRef>::new();
+        let flush_segment =
+            |role: LiquidBlockRole,
+             refs: &mut Vec<LiquidSourceLineRef>,
+             rebuilt_blocks: &mut Vec<LiquidBlock>,
+             rebuilt_sources: &mut Vec<LiquidBlockSourceLines>| {
+                if refs.is_empty() {
+                    return;
+                }
+                let mut text = String::new();
+                for line in refs.iter() {
+                    append_line(&mut text, &clean_lm2_line_text(&line.text));
+                }
+                let block_index = rebuilt_blocks.len();
+                rebuilt_blocks.push(LiquidBlock {
+                    role,
+                    text: collapse_whitespace(&text).trim().to_owned(),
+                    label: None,
+                });
+                rebuilt_sources.push(LiquidBlockSourceLines {
+                    block_index,
+                    lines: std::mem::take(refs),
+                });
+            };
+
+        for (mut line_ref, marker) in source.lines.iter().cloned().zip(candidates) {
+            if let Some(marker) = marker {
+                flush_segment(
+                    segment_role,
+                    &mut segment_refs,
+                    &mut rebuilt_blocks,
+                    &mut rebuilt_sources,
+                );
+                segment_role = LiquidBlockRole::Marginalia;
+                line_ref.role = LiquidBlockRole::Marginalia;
+                if !line_ref.note_markers.contains(&marker) {
+                    line_ref.note_markers.push(marker);
+                    line_ref.note_markers.sort_unstable();
+                }
+                repaired += 1;
+            } else if segment_role == LiquidBlockRole::Marginalia {
+                line_ref.role = LiquidBlockRole::Marginalia;
+            }
+            segment_refs.push(line_ref);
+        }
+        flush_segment(
+            segment_role,
+            &mut segment_refs,
+            &mut rebuilt_blocks,
+            &mut rebuilt_sources,
+        );
+    }
+
+    if repaired > 0 {
+        *blocks = rebuilt_blocks;
+        *sources = rebuilt_sources;
+    }
+    repaired
+}
+
+/// A page-level footnote-state estimate can extend upward through the last body
+/// paragraph on a dense page.  Recover body-sized marginalia that appears
+/// before the page's first provenance-backed note head.  The typography and
+/// object-shape gates preserve true carryover notes, author notes, contents,
+/// and figure/table material.
+fn apply_above_note_body_marginalia_rescue(
+    blocks: &mut [LiquidBlock],
+    sources: &[LiquidBlockSourceLines],
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let decoded_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+    let protected_note_continuations =
+        physical_open_note_continuation_blocks(blocks, sources, decoded);
+    let mut first_note_line_by_page = BTreeMap::<usize, usize>::new();
+    for source in sources {
+        for line in &source.lines {
+            if line.note_markers.is_empty()
+                || leading_numeric_token_marker(&line.text)
+                    .is_none_or(|marker| !line.note_markers.contains(&marker))
+            {
+                continue;
+            }
+            first_note_line_by_page
+                .entry(line.page_index)
+                .and_modify(|first| *first = (*first).min(line.line_index))
+                .or_insert(line.line_index);
+        }
+    }
+
+    let mut repaired = 0usize;
+    for source in sources {
+        let Some(block) = blocks.get_mut(source.block_index) else {
+            continue;
+        };
+        if block.role != LiquidBlockRole::Marginalia
+            || source.lines.is_empty()
+            || source
+                .lines
+                .iter()
+                .any(|line| !line.note_markers.is_empty())
+        {
+            continue;
+        }
+        let Some(page_index) = source.lines.first().map(|line| line.page_index) else {
+            continue;
+        };
+        if source
+            .lines
+            .iter()
+            .any(|line| line.page_index != page_index)
+        {
+            continue;
+        }
+        let Some(first_note_line) = first_note_line_by_page.get(&page_index).copied() else {
+            continue;
+        };
+        if source
+            .lines
+            .iter()
+            .map(|line| line.line_index)
+            .max()
+            .is_none_or(|last| last >= first_note_line)
+        {
+            continue;
+        }
+        let deep_lines = source
+            .lines
+            .iter()
+            .filter_map(|line| {
+                line.id
+                    .as_deref()
+                    .and_then(|id| decoded_by_id.get(id).copied())
+            })
+            .collect::<Vec<_>>();
+        // Body-size rescue is vetoed only when sequential note ownership is
+        // proven across the page boundary. Geometry alone is too coarse: a
+        // bottom-page body block can also be labeled as a footnote segment.
+        if protected_note_continuations.contains(&source.block_index) {
+            continue;
+        }
+        if deep_lines.is_empty()
+            || deep_lines.iter().any(|line| {
+                line.segment_block_toc_like
+                    || line.segment_block_table_like
+                    || line.page_table_column_like
+                    || line.in_ruled_cell
+                    || line.page_object_overlaps_image_bbox
+            })
+        {
+            continue;
+        }
+        let body_sized = deep_lines
+            .iter()
+            .filter(|line| {
+                line.font_ratio_page_ref >= 0.94
+                    || line.font_ratio_page >= 0.94
+                    || line.font_ratio_doc >= 0.94
+            })
+            .count();
+        if body_sized * 4 < deep_lines.len() * 3 {
+            continue;
+        }
+        let normalized = normalize_text(&strip_callout_sentinels_lm2(&block.text));
+        if word_count(&normalized) < 6
+            || normalized.starts_with("author.")
+            || normalized.starts_with("copyright ")
+            || normalized.starts_with("doi:")
+            || block
+                .text
+                .trim_start()
+                .chars()
+                .next()
+                .is_some_and(|ch| matches!(ch, '*' | '\u{2217}' | '\u{2020}' | '\u{2021}'))
+            || lm2_toc_dotleader_line(&block.text)
+        {
+            continue;
+        }
+        block.role = LiquidBlockRole::Paragraph;
+        block.label = None;
+        repaired += 1;
+    }
+    repaired
+}
+
+/// Table cells and short indented labels can be misclassified as Marginalia.
+/// If such a block is physically in the body and already carries a nonleading
+/// callout, keep it in body flow so the reference and cell text are not
+/// stranded in the Notes tail. A same-page definition remains sufficient for
+/// leading callouts, whose role is more ambiguous.
+fn apply_body_callout_marginalia_rescue(
+    blocks: &mut [LiquidBlock],
+    sources: &[LiquidBlockSourceLines],
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let line_by_id = decoded
+        .iter()
+        .map(|(line, _)| (line.id.as_str(), line))
+        .collect::<HashMap<_, _>>();
+
+    let mut repaired = 0usize;
+    for source in sources {
+        let Some(block) = blocks.get_mut(source.block_index) else {
+            continue;
+        };
+        if !matches!(
+            block.role,
+            LiquidBlockRole::Marginalia | LiquidBlockRole::Noise
+        ) || source.lines.is_empty()
+            || source.lines.iter().any(|line| {
+                line.id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id))
+                    .is_none_or(|decoded_line| lm2_low_footnote_zone_evidence(decoded_line))
+            })
+        {
+            continue;
+        }
+        let markers = sentineled_note_markers(&block.text);
+        if markers.is_empty() {
+            continue;
+        }
+        // Accepted source heads are authoritative.  A note region can occupy
+        // more than half a dense page, so a genuine definition is not body
+        // merely because the midpoint-based low-zone guard is false.
+        if source
+            .lines
+            .iter()
+            .any(|line| !line.note_markers.is_empty())
+        {
+            continue;
+        }
+        let nonleading_body_callout = leading_callout_marker_end(block.text.trim_start()).is_none();
+        let leading_body_callout = leading_sentineled_marker(&block.text).is_some_and(|marker| {
+            let first_line = source.lines.first().and_then(|line| {
+                line.id
+                    .as_deref()
+                    .and_then(|id| line_by_id.get(id).copied())
+            });
+            first_line.is_some_and(|line| !lm2_note_head_zone_evidence(line))
+                && lm2_strip_leading_ascii_or_decoded_callout(&block.text, marker)
+                    .and_then(|remainder| remainder.chars().find(|ch| ch.is_alphanumeric()))
+                    .is_some_and(char::is_alphabetic)
+        });
+        if nonleading_body_callout || leading_body_callout {
+            block.role = LiquidBlockRole::Paragraph;
+            block.label = None;
+            repaired += 1;
+        }
+    }
+    repaired
+}
+
 fn apply_numeric_footer_furniture_suppression(
     blocks: &mut [LiquidBlock],
     sources: &[LiquidBlockSourceLines],
@@ -11547,8 +22332,34 @@ fn apply_numeric_footer_furniture_suppression(
         .collect::<HashMap<_, _>>();
     let mut repaired = 0usize;
     for (line, _) in decoded {
-        if line.text.trim().parse::<u16>().is_err()
-            || line.page_height <= 0.0
+        let Some(block_index) = block_by_line_id.get(line.id.as_str()).copied() else {
+            continue;
+        };
+        let Some(block) = blocks.get_mut(block_index) else {
+            continue;
+        };
+        if lm2_law_review_running_header_furniture(line) {
+            block.role = LiquidBlockRole::Noise;
+            block.label = None;
+            repaired += 1;
+            continue;
+        }
+        let Ok(number) = line.text.trim().parse::<u16>() else {
+            continue;
+        };
+        if block.text.trim() != line.text.trim() {
+            continue;
+        }
+        let out_of_range_furniture = number > LM2_MAX_NOTE_MARKER
+            && line.segment_block_furniture_like
+            && (line.line_index == 0 || line.segment_block_table_like);
+        if out_of_range_furniture {
+            block.role = LiquidBlockRole::Noise;
+            block.label = None;
+            repaired += 1;
+            continue;
+        }
+        if line.page_height <= 0.0
             || line.bottom / line.page_height > 0.10
             || !line.centered
             || !line.segment_block_furniture_like
@@ -11559,18 +22370,53 @@ fn apply_numeric_footer_furniture_suppression(
         if (horizontal_center - line.page_width * 0.5).abs() / line.page_width.max(1.0) > 0.06 {
             continue;
         }
-        let Some(block_index) = block_by_line_id.get(line.id.as_str()).copied() else {
-            continue;
-        };
-        let Some(block) = blocks.get_mut(block_index) else {
-            continue;
-        };
-        if block.text.trim() != line.text.trim() {
-            continue;
-        }
         block.role = LiquidBlockRole::Noise;
         block.label = None;
         repaired += 1;
+    }
+    repaired
+}
+
+fn lm2_law_review_running_header_furniture(line: &DeepLiquidSourceLine) -> bool {
+    if line.line_index > 1 {
+        return false;
+    }
+    let text = strip_callout_sentinels_lm2(&line.text);
+    let normalized = normalize_text(&text);
+    let words = word_count(&normalized);
+    let journal = normalized.contains("law review") || normalized.contains("law journal");
+    let volume_folio = normalized.contains("[vol.")
+        || normalized.contains("[vol ")
+        || normalized.contains(" volume ")
+        || normalized
+            .split_whitespace()
+            .next()
+            .is_some_and(|word| word.chars().all(|ch| ch.is_ascii_digit()));
+    journal
+        && volume_folio
+        && words <= 16
+        && (line.doc_repeated_edge_text
+            || line.segment_block_furniture_like
+            || line.role_hint == Some(LiquidBlockRole::Noise))
+}
+
+fn apply_adjacent_duplicate_callout_suppression(blocks: &mut [LiquidBlock]) -> usize {
+    let mut repaired = 0usize;
+    for block in blocks {
+        let markers = sentineled_note_markers(&block.text)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        for marker in markers {
+            let sentinel = format!("{CALLOUT_START}{marker}{CALLOUT_END}");
+            for separator in ["", " "] {
+                let duplicate = format!("{sentinel}{separator}{sentinel}");
+                while let Some(position) = block.text.find(&duplicate) {
+                    let end = position + duplicate.len();
+                    block.text.replace_range(position..end, &sentinel);
+                    repaired += 1;
+                }
+            }
+        }
     }
     repaired
 }
@@ -11640,6 +22486,77 @@ fn leading_callout_marker_end(text: &str) -> Option<usize> {
         return None;
     }
     Some(CALLOUT_START.len_utf8() + end_in_tail + CALLOUT_END.len_utf8())
+}
+
+fn leading_sentineled_note_head_marker(line: &DeepLiquidSourceLine) -> Option<u16> {
+    let marker = leading_sentineled_marker(&line.text)?;
+    (lm2_note_head_zone_evidence(line)
+        || lm2_explicit_small_font_sentineled_note_head(line, marker))
+    .then_some(marker)
+}
+
+/// Journals with unusually deep note regions can defeat both the divider and
+/// learned-zone detectors.  An encoded leading number immediately followed by
+/// printed note punctuation in unmistakably smaller type is still strong head
+/// evidence.  Body callouts use a space after the sentinel, not `.`/`)`/`]`.
+fn lm2_explicit_small_font_sentineled_note_head(line: &DeepLiquidSourceLine, marker: u16) -> bool {
+    let trimmed = line.text.trim_start();
+    let Some(end) = leading_callout_marker_end(trimmed) else {
+        return false;
+    };
+    let encoded = &trimmed[CALLOUT_START.len_utf8()..end - CALLOUT_END.len_utf8()];
+    if encoded.parse::<u16>().ok() != Some(marker) {
+        return false;
+    }
+    let mut tail = trimmed[end..].chars();
+    if !matches!(tail.next(), Some('.') | Some(')') | Some(']'))
+        || tail.next().is_some_and(|ch| !ch.is_whitespace())
+    {
+        return false;
+    }
+    let small_font = line.font_ratio_page_ref <= 0.90
+        || line.font_ratio_doc <= 0.90
+        || line.font_ratio_page <= 0.86;
+    small_font
+        && line.role_hint != Some(LiquidBlockRole::Contents)
+        && !line.in_ruled_cell
+        && !line.page_table_column_like
+        && !line.doc_repeated_edge_text
+}
+
+/// Evidence that a leading marker is physically a definition head.  This is
+/// intentionally broader than `lm2_low_footnote_zone_evidence`: a dense page
+/// can devote more than half its height to notes, so a real head may sit above
+/// the page midpoint even when the divider detector misses the rule.  Small
+/// typography plus the extracted footnote-block shape is enough in that case;
+/// body superscripts do not have that combination.
+fn lm2_note_head_zone_evidence(line: &DeepLiquidSourceLine) -> bool {
+    if line.page_has_footnote_divider {
+        return line.below_footnote_divider;
+    }
+    if !(line.in_footnote_zone || line.doc_footnote_state) {
+        return false;
+    }
+    let physically_low = line.page_height > 0.0 && line.top <= line.page_height * 0.50;
+    let small_note_font = line.font_ratio_page_ref <= 0.94
+        || line.font_ratio_page <= 0.94
+        || line.font_ratio_doc <= 0.94;
+    physically_low
+        || (small_note_font
+            && line.segment_block_footnote_like
+            && !line.in_ruled_cell
+            && !line.page_table_column_like)
+}
+
+fn leading_sentineled_marker(text: &str) -> Option<u16> {
+    let trimmed = text.trim_start();
+    let end = leading_callout_marker_end(trimmed)?;
+    let marker = trimmed[CALLOUT_START.len_utf8()..end - CALLOUT_END.len_utf8()]
+        .parse::<u16>()
+        .ok()?;
+    (1..=LM2_MAX_NOTE_MARKER)
+        .contains(&marker)
+        .then_some(marker)
 }
 
 fn apply_deferred_marginalia_reflow_once(
@@ -11875,7 +22792,7 @@ fn lm2_blocksplit_should_split(
     }
     if !matches!(
         role,
-        LiquidBlockRole::Paragraph | LiquidBlockRole::Marginalia
+        LiquidBlockRole::Paragraph | LiquidBlockRole::Abstract | LiquidBlockRole::Marginalia
     ) {
         return false;
     }
@@ -11899,15 +22816,70 @@ fn lm2_blocksplit_should_split(
         .unwrap_or_default();
     let indent_increase = left - previous_left;
 
-    if role == LiquidBlockRole::Paragraph
+    if matches!(role, LiquidBlockRole::Paragraph | LiquidBlockRole::Abstract)
         && indent_increase >= 8.0
         && lm2_blocksplit_ends_like_paragraph(&previous_ref.text)
+    {
+        return true;
+    }
+    if role == LiquidBlockRole::Paragraph
+        && lm2_blocksplit_tall_row_paragraph_start(previous_ref, line_ref, line_by_id)
     {
         return true;
     }
     role == LiquidBlockRole::Marginalia
         && indent_increase >= 8.0
         && lm2_blocksplit_numbered_marginalia_start(&line_ref.text)
+}
+
+/// Some born-digital law-review PDFs expose two visual lines as one text row.
+/// When that happens, the second (flush-left) visual line hides the first-line
+/// indent in the row's bounding box. Recover the paragraph break only when the
+/// previous visual line is demonstrably short and sentence-final and the new
+/// row is tall enough to contain multiple visual lines.
+fn lm2_blocksplit_tall_row_paragraph_start(
+    previous_ref: &LiquidSourceLineRef,
+    line_ref: &LiquidSourceLineRef,
+    line_by_id: &HashMap<&str, &DeepLiquidSourceLine>,
+) -> bool {
+    let (Some(previous), Some(current)) = (
+        previous_ref.id.as_deref().and_then(|id| line_by_id.get(id)),
+        line_ref.id.as_deref().and_then(|id| line_by_id.get(id)),
+    ) else {
+        return false;
+    };
+    lm2_tall_row_paragraph_start(previous, current)
+}
+
+fn lm2_tall_row_paragraph_start(
+    previous: &DeepLiquidSourceLine,
+    current: &DeepLiquidSourceLine,
+) -> bool {
+    if previous.page_index != current.page_index
+        || current.synthetic_text_geometry
+        || current.font_height <= 0.0
+        || (current.top - current.bottom).abs() < current.font_height * 1.8
+        || !lm2_blocksplit_ends_like_paragraph(&strip_callout_sentinels_lm2(&previous.text))
+        || !lm2_blocksplit_starts_like_sentence(&current.text)
+    {
+        return false;
+    }
+
+    let previous_width = (previous.right - previous.left).abs();
+    let visibly_short = previous.page_width > 0.0 && previous_width < previous.page_width * 0.55;
+    let soft_wrap_tail_words = previous
+        .text
+        .rsplit_once('\u{0002}')
+        .map(|(_, tail)| tail.split_whitespace().count())
+        .unwrap_or(usize::MAX);
+    visibly_short || soft_wrap_tail_words <= 6
+}
+
+fn lm2_blocksplit_starts_like_sentence(text: &str) -> bool {
+    text.trim_start()
+        .chars()
+        .find(|ch| !matches!(ch, '"' | '\'' | '\u{2018}' | '\u{201c}' | '(' | '['))
+        .is_some_and(char::is_uppercase)
 }
 
 fn lm2_blocksplit_ends_like_paragraph(text: &str) -> bool {
@@ -11970,6 +22942,7 @@ fn grouping_line_group_index(
 struct Lm2RecoveredTitle {
     title: String,
     lines: Vec<DeepLiquidSourceLine>,
+    authoritative_display: bool,
 }
 
 fn flush_block(
@@ -12014,6 +22987,13 @@ fn append_line(text: &mut String, line: &str) {
             while text.ends_with(char::is_whitespace) {
                 text.pop();
             }
+        } else if text.trim_end().ends_with(['\u{2013}', '\u{2014}']) {
+            // Em/en dashes are closed up in the source typography. If PDF line
+            // extraction breaks immediately after one, a generic inter-line
+            // space would manufacture `word— next`.
+            while text.ends_with(char::is_whitespace) {
+                text.pop();
+            }
         } else {
             text.push(' ');
         }
@@ -12027,7 +23007,7 @@ fn append_standalone_marker_to_line(text: &mut String, marker: &str) {
         return;
     }
     if let Ok(number) = marker.parse::<u16>()
-        && (1..=500).contains(&number)
+        && (1..=LM2_MAX_NOTE_MARKER).contains(&number)
     {
         while text.ends_with(char::is_whitespace) {
             text.pop();
@@ -12087,10 +23067,295 @@ fn lm2_marker_can_attach_to_previous_line(
         ch.is_ascii_alphabetic()
             || matches!(
                 ch,
-                '.' | '?' | '!' | ',' | ';' | ':' | '"' | '\'' | ')' | ']'
+                '.' | '?'
+                    | '!'
+                    | ','
+                    | ';'
+                    | ':'
+                    | '"'
+                    | '\''
+                    | '\u{2019}'
+                    | '\u{201d}'
+                    | ')'
+                    | ']'
             )
     });
     plausible_superscript_offset && horizontal_close && previous_can_host_marker
+}
+
+/// Repair PDFium's U+0002 line-end-hyphen glyph when extraction has folded two
+/// visual rows into one source line. Repeated intact spellings elsewhere in the
+/// document are authoritative; the existing conservative compound heuristic is
+/// only a fallback when the document supplies no unambiguous evidence.
+fn apply_document_discretionary_hyphen_repairs(
+    decoded: &mut [(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let token_evidence = decoded
+        .iter()
+        .flat_map(|(line, _)| line.text.split_whitespace())
+        .filter(|token| !token.contains('\u{0002}'))
+        .filter_map(lm2_hyphen_evidence_token)
+        .collect::<HashSet<_>>();
+    let mut repaired = 0usize;
+    for (line, _) in decoded {
+        let (text, count) = repair_internal_discretionary_hyphens(&line.text, &token_evidence);
+        if count > 0 {
+            line.text = text;
+            repaired += count;
+        }
+    }
+    repaired
+}
+
+fn lm2_ascii_alpha_core(token: &str) -> Option<(usize, usize, &str)> {
+    let start = token
+        .char_indices()
+        .find_map(|(index, ch)| ch.is_ascii_alphabetic().then_some(index))?;
+    let end = token
+        .char_indices()
+        .rev()
+        .find_map(|(index, ch)| ch.is_ascii_alphabetic().then_some(index + ch.len_utf8()))?;
+    let core = &token[start..end];
+    core.chars()
+        .all(|ch| ch.is_ascii_alphabetic())
+        .then_some((start, end, core))
+}
+
+/// Repair a fused token only when the same document repeatedly supplies the
+/// exact two-word spelling. This avoids dictionary guesses while fixing font-
+/// span joins such as `Modelclauses` when `Model clauses` occurs throughout the
+/// article. Small-font citation rows also get two narrow typography repairs:
+/// `SeeSurname` and a missing space after a single-letter initial.
+fn apply_document_fused_word_spacing_repairs(
+    decoded: &mut [(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let mut token_counts = HashMap::<String, usize>::new();
+    let mut bigram_splits = HashMap::<String, HashMap<usize, usize>>::new();
+    for (line, _) in decoded.iter() {
+        let words = line
+            .text
+            .split_whitespace()
+            .filter_map(|token| lm2_ascii_alpha_core(token).map(|(_, _, core)| core))
+            .filter(|core| core.len() >= 2)
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        for word in &words {
+            *token_counts.entry(word.clone()).or_default() += 1;
+        }
+        for pair in words.windows(2) {
+            if pair[0].len() < 3 || pair[1].len() < 3 {
+                continue;
+            }
+            let key = format!("{}{}", pair[0], pair[1]);
+            *bigram_splits
+                .entry(key)
+                .or_default()
+                .entry(pair[0].len())
+                .or_default() += 1;
+        }
+    }
+
+    let mut repaired = 0usize;
+    for (line, _) in decoded {
+        let note_like =
+            line.in_footnote_zone || line.below_footnote_divider || line.font_ratio_doc <= 0.88;
+        let mut tokens = line
+            .text
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        for token in &mut tokens {
+            let Some((start, end, core)) = lm2_ascii_alpha_core(token) else {
+                continue;
+            };
+            let lower = core.to_ascii_lowercase();
+            let evidence_split = (token_counts.get(&lower).copied().unwrap_or_default() == 1)
+                .then(|| bigram_splits.get(&lower))
+                .flatten()
+                .and_then(|splits| {
+                    let supported = splits
+                        .iter()
+                        .filter_map(|(split, count)| (*count >= 2).then_some(*split))
+                        .collect::<Vec<_>>();
+                    (supported.len() == 1).then(|| supported[0])
+                });
+            let see_split = note_like
+                && core.len() > 3
+                && core[..3].eq_ignore_ascii_case("see")
+                && core.as_bytes()[3].is_ascii_uppercase();
+            let split = evidence_split.or_else(|| see_split.then_some(3));
+            if let Some(split) = split
+                && split < core.len()
+            {
+                token.insert(start + split, ' ');
+                repaired += 1;
+                let _ = end;
+            }
+        }
+
+        if note_like {
+            for index in 0..tokens.len() {
+                let next_is_of = tokens
+                    .get(index + 1)
+                    .and_then(|token| lm2_ascii_alpha_core(token))
+                    .is_some_and(|(_, _, core)| core.eq_ignore_ascii_case("of"));
+                let Some((start, _, core)) = lm2_ascii_alpha_core(&tokens[index]) else {
+                    continue;
+                };
+                if next_is_of
+                    && core.len() >= 5
+                    && core.starts_with('A')
+                    && core.chars().all(|ch| ch.is_ascii_uppercase())
+                {
+                    tokens[index].insert(start + 1, ' ');
+                    repaired += 1;
+                }
+            }
+        }
+
+        let mut text = tokens.join(" ");
+        if note_like {
+            let chars = text.char_indices().collect::<Vec<_>>();
+            let mut insertions = Vec::new();
+            for window in chars.windows(3) {
+                let (before_index, before) = window[0];
+                let (punct_index, punct) = window[1];
+                let (_, after) = window[2];
+                if punct == ',' && before.is_alphabetic() && after.is_ascii_uppercase() {
+                    insertions.push(punct_index + punct.len_utf8());
+                    continue;
+                }
+                if punct != '.' || !before.is_ascii_uppercase() || !after.is_ascii_uppercase() {
+                    continue;
+                }
+                let before_is_initial = text[..before_index]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|ch| !ch.is_alphabetic());
+                let uppercase_run = text[punct_index + 1..]
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_uppercase())
+                    .count();
+                if before_is_initial && uppercase_run >= 3 {
+                    insertions.push(punct_index + 1);
+                }
+            }
+            for index in insertions.into_iter().rev() {
+                text.insert(index, ' ');
+                repaired += 1;
+            }
+            let mut spaced_tokens = text
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            for index in 0..spaced_tokens.len() {
+                let next_is_of = spaced_tokens
+                    .get(index + 1)
+                    .and_then(|token| lm2_ascii_alpha_core(token))
+                    .is_some_and(|(_, _, core)| core.eq_ignore_ascii_case("of"));
+                let Some((start, _, core)) = lm2_ascii_alpha_core(&spaced_tokens[index]) else {
+                    continue;
+                };
+                if next_is_of
+                    && core.len() >= 5
+                    && core.starts_with('A')
+                    && core.chars().all(|ch| ch.is_ascii_uppercase())
+                {
+                    spaced_tokens[index].insert(start + 1, ' ');
+                    repaired += 1;
+                }
+            }
+            text = spaced_tokens.join(" ");
+        }
+        line.text = text;
+    }
+    repaired
+}
+
+fn lm2_hyphen_evidence_token(token: &str) -> Option<String> {
+    let token = token.trim_matches(|ch: char| !ch.is_ascii_alphabetic() && ch != '-');
+    let token = token.trim_matches('-');
+    (!token.is_empty() && token.chars().any(|ch| ch.is_ascii_alphabetic()))
+        .then(|| token.to_ascii_lowercase())
+}
+
+fn repair_internal_discretionary_hyphens(
+    text: &str,
+    token_evidence: &HashSet<String>,
+) -> (String, usize) {
+    if !text.contains('\u{0002}') {
+        return (text.to_owned(), 0);
+    }
+    let mut output = String::with_capacity(text.len());
+    let mut remainder = text;
+    let mut repaired = 0usize;
+    while let Some(marker_index) = remainder.find('\u{0002}') {
+        output.push_str(&remainder[..marker_index]);
+        let after_marker = &remainder[marker_index + '\u{0002}'.len_utf8()..];
+        let Some(left) = terminal_hyphen_component(&output) else {
+            output.push('\u{0002}');
+            remainder = after_marker;
+            continue;
+        };
+        let Some(right) = leading_hyphen_component(after_marker) else {
+            // Preserve a terminal marker so `append_line` can make the
+            // cross-source-line decision with the following physical row.
+            output.push('\u{0002}');
+            remainder = after_marker;
+            continue;
+        };
+        if !right
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_lowercase())
+        {
+            output.push('\u{0002}');
+            remainder = after_marker;
+            continue;
+        }
+
+        let joined = format!("{left}{right}").to_ascii_lowercase();
+        let hyphenated = format!("{left}-{right}").to_ascii_lowercase();
+        let joined_seen = token_evidence.contains(&joined);
+        let hyphenated_seen = token_evidence.contains(&hyphenated);
+        let preserve = match (joined_seen, hyphenated_seen) {
+            (true, false) => false,
+            (false, true) => true,
+            // Pass the complete continuation so contextual compounds (for
+            // example `abortion-rights group`) can inspect the following word.
+            _ => should_preserve_terminal_hyphen(&format!("{left}-"), after_marker),
+        };
+        if preserve {
+            output.push('-');
+        }
+        repaired += 1;
+        remainder = after_marker;
+    }
+    output.push_str(remainder);
+    (output, repaired)
+}
+
+fn terminal_hyphen_component(text: &str) -> Option<&str> {
+    let trimmed = text.trim_end();
+    let start = trimmed
+        .char_indices()
+        .rev()
+        .find_map(|(index, ch)| {
+            (!ch.is_ascii_alphabetic() && ch != '-').then_some(index + ch.len_utf8())
+        })
+        .unwrap_or(0);
+    let component = trimmed[start..].trim_matches('-');
+    (!component.is_empty()).then_some(component)
+}
+
+fn leading_hyphen_component(text: &str) -> Option<&str> {
+    let trimmed = text.trim_start();
+    let end = trimmed
+        .char_indices()
+        .find_map(|(index, ch)| (!ch.is_ascii_alphabetic() && ch != '-').then_some(index))
+        .unwrap_or(trimmed.len());
+    let component = trimmed[..end].trim_matches('-');
+    (!component.is_empty()).then_some(component)
 }
 
 fn clean_lm2_line_text(line: &str) -> String {
@@ -12112,20 +23377,29 @@ fn should_join_preserved_hyphen(existing: &str, next: &str) -> bool {
 
 fn paragraph_boundary(previous: &DeepLiquidSourceLine, line: &DeepLiquidSourceLine) -> bool {
     if previous.page_index != line.page_index {
-        let previous_sentence_end = lm2_blocksplit_ends_like_paragraph(&previous.text);
+        let previous_sentence_end =
+            lm2_blocksplit_ends_like_paragraph(&strip_callout_sentinels_lm2(&previous.text));
         let indent = (line.left - previous.left) / line.page_width.max(1.0);
         return previous_sentence_end && indent > 0.025;
     }
     if same_visual_row_fragment(previous, line) {
         return false;
     }
+    if lm2_tall_row_paragraph_start(previous, line) {
+        return true;
+    }
     let gap = vertical_gap(previous, line);
     let page_width = line.page_width.max(1.0);
-    let left_delta = ((line.left - previous.left).abs() / page_width).max(0.0);
+    let visual_line_start = if line.first_visual_left > 0.0 {
+        line.first_visual_left
+    } else {
+        line.left
+    };
+    let left_delta = ((visual_line_start - previous.left).abs() / page_width).max(0.0);
     // Signed, so a line that starts further right than its predecessor counts
     // as a first-line indent while a line returning to the body margin (the
     // line after a block quote) does not.
-    let first_line_indent = (line.left - previous.left) / page_width;
+    let first_line_indent = (visual_line_start - previous.left) / page_width;
     let previous_sentence_end = previous
         .text
         .trim_end()
@@ -12161,6 +23435,52 @@ fn same_visual_row_fragment(previous: &DeepLiquidSourceLine, line: &DeepLiquidSo
     if previous.page_index != line.page_index || line.line_index != previous.line_index + 1 {
         return false;
     }
+    same_visual_row_geometry(previous, line)
+}
+
+fn same_visual_row_after_standalone_callout(
+    previous: &DeepLiquidSourceLine,
+    line: &DeepLiquidSourceLine,
+) -> bool {
+    previous.page_index == line.page_index
+        && line.line_index == previous.line_index.saturating_add(2)
+        && same_visual_row_geometry(previous, line)
+}
+
+fn same_visual_row_leading_callout_fragment(
+    previous: &DeepLiquidSourceLine,
+    line: &DeepLiquidSourceLine,
+) -> bool {
+    if previous.page_index != line.page_index
+        || line.line_index != previous.line_index.saturating_add(1)
+    {
+        return false;
+    }
+    let page_height = line.page_height.max(previous.page_height).max(1.0);
+    let shared_top = (line.top - previous.top).abs() / page_height <= 0.003;
+    let shared_baseline = (line.bottom - previous.bottom).abs() / page_height <= 0.003;
+    let font_ratio = previous.font_height.max(line.font_height)
+        / previous.font_height.min(line.font_height).max(1.0);
+    let page_width = line.page_width.max(previous.page_width).max(1.0);
+    let first_left = if line.first_visual_left > 0.0 {
+        line.first_visual_left
+    } else {
+        line.left
+    };
+    let last_right = if previous.last_visual_right > 0.0 {
+        previous.last_visual_right
+    } else {
+        previous.right
+    };
+    let horizontal_gap = first_left - last_right;
+    (shared_top || shared_baseline)
+        && font_ratio <= 1.20
+        && horizontal_gap >= -2.0
+        && horizontal_gap <= page_width * 0.04
+        && line.text.chars().any(char::is_alphabetic)
+}
+
+fn same_visual_row_geometry(previous: &DeepLiquidSourceLine, line: &DeepLiquidSourceLine) -> bool {
     let page_height = line.page_height.max(previous.page_height).max(1.0);
     let baseline_delta = (line.bottom - previous.bottom).abs() / page_height;
     let top_delta = (line.top - previous.top).abs() / page_height;
@@ -12201,7 +23521,8 @@ fn role_for_decoded_line(
                                 || (line.font_ratio_page >= 0.98
                                     && (line.bold
                                         || line.centered
-                                        || line.font_ratio_page > 1.10)))
+                                        || line.font_ratio_page > 1.10
+                                            && line.font_ratio_doc > 1.08)))
                             && !line.text.trim_end().ends_with('.') =>
                     {
                         role
@@ -12233,7 +23554,9 @@ fn role_for_decoded_line(
             if first_visible_block && line.centered && words <= 18 {
                 LiquidBlockRole::Title
             } else if words <= 14
-                && (line.bold || line.centered || line.font_ratio_page > 1.12)
+                && (line.bold
+                    || line.centered
+                    || line.font_ratio_page > 1.12 && line.font_ratio_doc > 1.08)
                 && heading_text_like(&line.text)
                 && !line.text.trim_end().ends_with('.')
             {
@@ -12268,6 +23591,8 @@ fn line_ref_with_note_start(
             LiquidBlockRole::Footnote | LiquidBlockRole::Marginalia
         )
         && let Some(marker) = leading_numeric_token_marker(&line.text)
+            .or_else(|| leading_sentineled_note_head_marker(line))
+            .or_else(|| (line.doc_note_marker > 0).then_some(line.doc_note_marker))
         && !reference.note_markers.contains(&marker)
     {
         reference.note_markers.push(marker);
@@ -12277,23 +23602,23 @@ fn line_ref_with_note_start(
 }
 
 fn source_line_note_markers(line: &DeepLiquidSourceLine, role: LiquidBlockRole) -> Vec<u16> {
+    let hidden_marker = lm2_hidden_numbered_note_line_marker(line);
+    if let Some(marker) = hidden_marker {
+        return vec![marker];
+    }
     if !matches!(
         role,
         LiquidBlockRole::Footnote | LiquidBlockRole::Marginalia
     ) {
         return Vec::new();
     }
-    let mut markers = Vec::new();
-    if line.doc_note_marker > 0 {
-        markers.push(line.doc_note_marker);
-    }
-    if let Some(marker) = note_head_marker(&line.text) {
-        markers.push(marker);
-    }
-    markers.extend(sentineled_note_markers(&line.text));
-    markers.sort_unstable();
-    markers.dedup();
-    markers
+    // Raw decoder hints and bare leading numbers remain candidates only.  An
+    // explicitly punctuated, small-font line in the physical note region is a
+    // stronger provenance contract, however, and must survive grouping even
+    // when a table prior later tries to route the block away from Marginalia.
+    // Reporter volumes (`119 Colum. L. Rev.`) do not satisfy the punctuation
+    // gate in `lm2_hidden_numbered_note_line_marker`.
+    Vec::new()
 }
 
 /// Leading note number of a footnote definition, accepting both the bare
@@ -12320,7 +23645,7 @@ fn note_head_marker(text: &str) -> Option<u16> {
             return None;
         }
     }
-    (digits > 0 && (1..=500).contains(&value)).then_some(value as u16)
+    (digits > 0 && (1..=u32::from(LM2_MAX_NOTE_MARKER)).contains(&value)).then_some(value as u16)
 }
 
 fn sentineled_note_markers(text: &str) -> Vec<u16> {
@@ -12334,7 +23659,7 @@ fn sentineled_note_markers(text: &str) -> Vec<u16> {
         } else if ch == CALLOUT_END {
             if inside
                 && let Ok(marker) = digits.parse::<u16>()
-                && (1..=500).contains(&marker)
+                && (1..=LM2_MAX_NOTE_MARKER).contains(&marker)
             {
                 markers.push(marker);
             }
@@ -13085,7 +24410,7 @@ fn looks_like_marginalia_note_block_start(text: &str) -> bool {
             return false;
         }
     }
-    if digits == 0 || !(1..=500).contains(&value) {
+    if digits == 0 || !(1..=u32::from(LM2_MAX_NOTE_MARKER)).contains(&value) {
         return false;
     }
     if !chars.next().is_some_and(|ch| matches!(ch, '.' | ')' | ']')) {
@@ -13209,7 +24534,7 @@ fn lm2_fallback_title_from_blocks(blocks: &[LiquidBlock]) -> Option<String> {
 
 fn lm2_leading_title_from_blocks(blocks: &[LiquidBlock]) -> Option<String> {
     let mut parts = Vec::new();
-    for block in blocks.iter().take(16) {
+    for (index, block) in blocks.iter().take(16).enumerate() {
         let text = block.text.trim();
         if text.is_empty() {
             continue;
@@ -13219,6 +24544,9 @@ fn lm2_leading_title_from_blocks(blocks: &[LiquidBlock]) -> Option<String> {
                 break;
             }
             continue;
+        }
+        if !parts.is_empty() && lm2_substantive_section_heading(text) {
+            break;
         }
         if lm2_generic_title_label(text) {
             if !parts.is_empty() {
@@ -13230,6 +24558,9 @@ fn lm2_leading_title_from_blocks(blocks: &[LiquidBlock]) -> Option<String> {
             if !parts.is_empty() {
                 break;
             }
+            continue;
+        }
+        if lm2_probable_author_before_copyright(block, blocks.get(index + 1)) {
             continue;
         }
         if lm2_leading_title_candidate(block) {
@@ -13244,12 +24575,123 @@ fn lm2_leading_title_from_blocks(blocks: &[LiquidBlock]) -> Option<String> {
     (!parts.is_empty()).then(|| collapse_whitespace(&parts.join(" ")))
 }
 
+fn lm2_probable_author_before_copyright(block: &LiquidBlock, next: Option<&LiquidBlock>) -> bool {
+    if !matches!(
+        block.role,
+        LiquidBlockRole::Paragraph | LiquidBlockRole::Heading | LiquidBlockRole::AuthorInfo
+    ) || !(2..=6).contains(&word_count(&block.text))
+        || title_case_ratio(&block.text) < 0.75
+    {
+        return false;
+    }
+    let Some(next) = next else {
+        return false;
+    };
+    let next = normalize_text(&next.text);
+    let name = normalize_text(&block.text);
+    next.starts_with("copyright ") && next.contains(&name)
+}
+
 fn lm2_recover_leading_source_title(
     decoded: &[(DeepLiquidSourceLine, Lm2Action)],
 ) -> Option<Lm2RecoveredTitle> {
-    (0..=1)
+    let repository_covers = repository_cover_pages(decoded);
+    let mut recovered = (0..=1)
+        .filter(|page_index| !repository_covers.contains(page_index))
         .filter_map(|page_index| lm2_recover_source_title_on_page(decoded, page_index))
-        .max_by_key(|recovered| word_count(&recovered.title))
+        .max_by_key(|recovered| word_count(&recovered.title))?;
+    if let Some(mut metadata_title) = repository_citation_title(decoded, &repository_covers)
+        && title_word_overlap(&metadata_title, &recovered.title) >= 0.70
+    {
+        // The repository citation is often a cleaner text object than the
+        // display title rendered in an old embedded font. Keep the real title
+        // lines as provenance, but use the cleaner metadata spelling.
+        if recovered.title.trim_end().ends_with('?')
+            && !metadata_title
+                .trim_end()
+                .chars()
+                .next_back()
+                .is_some_and(|ch| matches!(ch, '?' | '!' | '.'))
+        {
+            metadata_title.push('?');
+        }
+        recovered.title = metadata_title;
+    }
+    Some(recovered)
+}
+
+fn repository_citation_title(
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+    cover_pages: &HashSet<usize>,
+) -> Option<String> {
+    for page_index in cover_pages {
+        let mut lines = decoded
+            .iter()
+            .filter(|(line, _)| line.page_index == *page_index)
+            .map(|(line, _)| line)
+            .collect::<Vec<_>>();
+        lines.sort_by_key(|line| line.line_index);
+        let Some(heading) = lines.iter().position(|line| {
+            normalize_text(&collapse_whitespace(&line.text)) == "recommended citation"
+        }) else {
+            continue;
+        };
+        let mut citation_lines = Vec::new();
+        for line in lines.iter().skip(heading + 1).take(6) {
+            let normalized = normalize_text(&line.text);
+            if normalized.starts_with("available at")
+                || normalized.starts_with("follow this")
+                || normalized.starts_with("this article")
+            {
+                break;
+            }
+            citation_lines.push(clean_lm2_line_text(&line.text));
+        }
+        let citation = collapse_whitespace(&citation_lines.join(" "));
+        let Some(suffix_comma) = citation.char_indices().rev().find_map(|(index, ch)| {
+            if ch != ',' {
+                return None;
+            }
+            citation[index + 1..]
+                .trim_start()
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_digit())
+                .then_some(index)
+        }) else {
+            continue;
+        };
+        let title_and_author = citation[..suffix_comma].trim();
+        // Repository citations commonly list several authors separated by
+        // commas before the article title.  The title is the final citation
+        // field before the volume/page suffix, not the field after the first
+        // author.
+        let Some(author_comma) = title_and_author.rfind(',') else {
+            continue;
+        };
+        let title = collapse_whitespace(title_and_author[author_comma + 1..].trim());
+        if (4..=40).contains(&word_count(&title)) && !title.contains("http") {
+            return Some(title);
+        }
+    }
+    None
+}
+
+fn title_word_overlap(left: &str, right: &str) -> f32 {
+    let words = |value: &str| {
+        normalize_text(value)
+            .split_whitespace()
+            .filter(|word| word.len() >= 2)
+            .map(str::to_owned)
+            .collect::<HashSet<_>>()
+    };
+    let left = words(left);
+    let right = words(right);
+    let denominator = left.len().min(right.len());
+    if denominator == 0 {
+        return 0.0;
+    }
+    left.intersection(&right).count() as f32 / denominator as f32
 }
 
 fn lm2_recover_source_title_on_page(
@@ -13259,6 +24701,7 @@ fn lm2_recover_source_title_on_page(
     let mut parts = Vec::new();
     let mut lines = Vec::new();
     let mut has_hidden_part = false;
+    let mut article_label_seen = false;
 
     for (line, action) in decoded.iter().take(128) {
         if line.page_index < page_index {
@@ -13271,24 +24714,66 @@ fn lm2_recover_source_title_on_page(
             break;
         }
 
-        let text = clean_lm2_line_text(&line.text);
+        let mut text = clean_lm2_line_text(&line.text);
         if text.is_empty() || looks_like_production_slug_boilerplate(&text) {
             continue;
         }
         if lm2_front_matter_stop_text(&text) || lm2_generic_title_label(&text) {
+            if matches!(normalize_text(&text).as_str(), "article" | "articles") {
+                parts.clear();
+                lines.clear();
+                has_hidden_part = false;
+                article_label_seen = true;
+                continue;
+            }
+            let preceding_run = normalize_text(&parts.join(" "));
+            let journal_masthead_before_article_label = lm2_generic_title_label(&text)
+                && (preceding_run.ends_with(" law review")
+                    || preceding_run.ends_with(" law journal"));
+            if journal_masthead_before_article_label {
+                parts.clear();
+                lines.clear();
+                has_hidden_part = false;
+                continue;
+            }
             if !parts.is_empty() {
                 break;
             }
             continue;
         }
-        if looks_like_lm2_author_heading(&text) || lm2_source_title_author_like(line, &text) {
+        let post_article_uppercase_title = article_label_seen
+            && line.page_index == 0
+            && line.line_index <= 8
+            && (2..=16).contains(&word_count(&text))
+            && uppercase_ratio(&text) >= 0.82
+            && !text.contains('&')
+            && !text.trim_end().ends_with('.')
+            && lm2_title_candidate(&text);
+        let symbolic_title_continuation =
+            !parts.is_empty() && (text.ends_with('*') || text.ends_with('\u{2217}')) && {
+                let without_symbol = text
+                    .trim_end_matches(|ch| matches!(ch, '*' | '\u{2217}'))
+                    .trim_end();
+                lm2_leading_source_title_candidate(line, without_symbol)
+                    && (uppercase_ratio(without_symbol) >= 0.72
+                        || !lm2_source_title_author_like(line, without_symbol))
+            };
+        if symbolic_title_continuation {
+            text = text
+                .trim_end_matches(|ch| matches!(ch, '*' | '\u{2217}'))
+                .trim_end()
+                .to_owned();
+        }
+        if !symbolic_title_continuation
+            && !post_article_uppercase_title
+            && (looks_like_lm2_author_heading(&text) || lm2_source_title_author_like(line, &text))
+        {
             if !parts.is_empty() {
                 break;
             }
             continue;
         }
-
-        if lm2_leading_source_title_candidate(line, &text) {
+        if lm2_leading_source_title_candidate(line, &text) || post_article_uppercase_title {
             if *action == Lm2Action::HideNoise {
                 has_hidden_part = true;
             }
@@ -13305,17 +24790,159 @@ fn lm2_recover_source_title_on_page(
         }
     }
 
-    if !has_hidden_part || parts.is_empty() {
+    if parts.is_empty() {
         return None;
     }
-    let title = collapse_whitespace(&parts.join(" "));
+    let title = join_lm2_title_parts(&parts);
     let title_words = word_count(&title);
+    let leading_uppercase_paragraph_title = lines.first().is_some_and(|line| {
+        line.page_index == 0
+            && line.line_index <= 8
+            && uppercase_ratio(&title) >= 0.82
+            && lines.iter().all(|line| {
+                line.page_index == 0
+                    && line.line_index <= 8
+                    && matches!(
+                        line.role_hint,
+                        None | Some(
+                            LiquidBlockRole::Title
+                                | LiquidBlockRole::Heading
+                                | LiquidBlockRole::Paragraph
+                        )
+                    )
+            })
+    });
+    let authoritative_display = leading_uppercase_paragraph_title
+        || lines.first().is_some_and(|line| {
+            line.page_index <= 1
+                && line.line_index <= 8
+                && line.centered
+                && (line.font_ratio_page >= 1.18 || line.font_ratio_page_ref >= 1.18)
+                && (uppercase_ratio(&title) >= 0.50 || title_case_ratio(&title) >= 0.55)
+        }) && (2..=32).contains(&title_words);
     let strong_short_title = lines.len() == 1
         && lines[0].centered
         && lines[0].font_ratio_page >= 1.25
         && (lines[0].bold || uppercase_ratio(&lines[0].text) >= 0.72);
-    (title_words >= 4 || title_words >= 2 && strong_short_title)
-        .then_some(Lm2RecoveredTitle { title, lines })
+    (has_hidden_part || authoritative_display)
+        .then_some(())
+        .filter(|_| title_words >= 4 || title_words >= 2 && strong_short_title)
+        .map(|_| Lm2RecoveredTitle {
+            title,
+            lines,
+            authoritative_display,
+        })
+}
+
+/// Join physical title lines without inventing a space after a discretionary
+/// line-end hyphen.  The source lines distinguish `Court-` + `Defying` from a
+/// deliberate in-line `word - word`, so this is safer than a global Markdown
+/// replacement.
+fn join_lm2_title_parts(parts: &[String]) -> String {
+    let mut joined = String::new();
+    for part in parts {
+        if !joined.is_empty() && !joined.trim_end().ends_with('-') {
+            joined.push(' ');
+        }
+        joined.push_str(part.trim());
+    }
+    collapse_whitespace(&joined)
+}
+
+/// Recover a journal byline whose display letterspacing was flattened into
+/// short lowercase chunks (`na di a banteka`).  This is restricted to a
+/// first-page Noise block immediately before the recovered title and allows
+/// only a bare folio alongside it.
+fn apply_leading_letterspaced_author_recovery(
+    blocks: &mut [LiquidBlock],
+    sources: &mut [LiquidBlockSourceLines],
+) -> usize {
+    let title_line = sources
+        .iter()
+        .filter(|source| {
+            blocks
+                .get(source.block_index)
+                .is_some_and(|block| block.role == LiquidBlockRole::Title)
+        })
+        .flat_map(|source| source.lines.iter())
+        .filter(|line| line.page_index == 0)
+        .map(|line| line.line_index)
+        .min()
+        .unwrap_or(usize::MAX);
+
+    for source in sources.iter_mut() {
+        let Some(block) = blocks.get_mut(source.block_index) else {
+            continue;
+        };
+        if block.role != LiquidBlockRole::Noise
+            || !source.lines.iter().all(|line| {
+                line.page_index == 0
+                    && (line.text.trim().chars().all(|ch| ch.is_ascii_digit())
+                        || compact_letterspaced_author_name(&line.text).is_some())
+            })
+        {
+            continue;
+        }
+        let Some((line_position, author)) =
+            source
+                .lines
+                .iter()
+                .enumerate()
+                .find_map(|(position, line)| {
+                    (line.line_index < title_line)
+                        .then(|| compact_letterspaced_author_name(&line.text))
+                        .flatten()
+                        .map(|author| (position, author))
+                })
+        else {
+            continue;
+        };
+        let mut author_line = source.lines[line_position].clone();
+        author_line.text.clone_from(&author);
+        author_line.role = LiquidBlockRole::AuthorInfo;
+        block.role = LiquidBlockRole::AuthorInfo;
+        block.text = author;
+        block.label = None;
+        source.lines = vec![author_line];
+        return 1;
+    }
+    0
+}
+
+fn compact_letterspaced_author_name(text: &str) -> Option<String> {
+    let tokens = text.split_whitespace().collect::<Vec<_>>();
+    if !(3..=6).contains(&tokens.len())
+        || !tokens
+            .iter()
+            .all(|token| token.chars().all(|ch| ch.is_ascii_alphabetic()))
+        || !tokens[..tokens.len() - 1]
+            .iter()
+            .all(|token| token.len() <= 2)
+        || !(3..=20).contains(&tokens.last()?.len())
+    {
+        return None;
+    }
+    let first = tokens[..tokens.len() - 1].join("");
+    if !(3..=12).contains(&first.len()) {
+        return None;
+    }
+    let title_case = |word: &str| {
+        let mut chars = word.chars();
+        chars
+            .next()
+            .map(|first| {
+                first
+                    .to_uppercase()
+                    .chain(chars.flat_map(char::to_lowercase))
+                    .collect::<String>()
+            })
+            .unwrap_or_default()
+    };
+    Some(format!(
+        "{} {}",
+        title_case(&first),
+        title_case(tokens.last().copied().unwrap_or_default())
+    ))
 }
 
 fn lm2_leading_source_title_candidate(line: &DeepLiquidSourceLine, text: &str) -> bool {
@@ -13362,27 +24989,36 @@ fn lm2_source_title_author_like(line: &DeepLiquidSourceLine, text: &str) -> bool
     let words = word_count(text);
     let punctuated_name = (text.contains('.') || text.contains('\'') || text.contains('’'))
         && title_case_ratio(text) >= 0.55;
+    let conjoined_names = text.split_once('&').is_some_and(|(left, right)| {
+        [left, right].iter().all(|part| {
+            let words = word_count(part);
+            (2..=4).contains(&words) && title_case_ratio(part) >= 0.72
+        })
+    });
     words >= 2
-        && words <= 4
-        && (punctuated_name
+        && ((words <= 4 && punctuated_name)
+            || words <= 8 && conjoined_names
             || line.font_ratio_page < 1.12
+                && words <= 4
                 && (uppercase_ratio(text) >= 0.85 || title_case_ratio(text) >= 0.85))
 }
 
 fn lm2_recovered_title_is_better(recovered: &str, current: &str) -> bool {
     let recovered = recovered.trim();
     let current = current.trim();
-    let current_appends_author =
-        current
-            .strip_prefix(recovered)
-            .map(str::trim)
-            .is_some_and(|suffix| {
-                !suffix.is_empty()
-                    && word_count(suffix) <= 5
-                    && (looks_like_lm2_author_heading(suffix) || title_case_ratio(suffix) >= 0.50)
-            });
+    let recovered_normalized = normalize_text(recovered);
+    let current_normalized = normalize_text(current);
+    let current_appends_author = current_normalized
+        .strip_prefix(&recovered_normalized)
+        .map(str::trim)
+        .is_some_and(|suffix| !suffix.is_empty() && word_count(suffix) <= 8);
     !current.is_empty()
         && (current_appends_author
+            || (title_word_overlap(recovered, current) >= 0.80
+                && title_case_ratio(recovered) >= 0.55
+                && uppercase_ratio(current) >= 0.70)
+            || (word_count(recovered) >= word_count(current) + 2
+                && normalize_text(recovered).starts_with(&normalize_text(current)))
             || word_count(recovered) >= word_count(current) + 3
                 && normalize_text(recovered).ends_with(&normalize_text(current)))
 }
@@ -13422,7 +25058,7 @@ fn lm2_leading_title_candidate(block: &LiquidBlock) -> bool {
     }
     let lower = normalize_text(text);
     let words = word_count(text);
-    words <= 16
+    (words <= 16 || words <= 24 && uppercase_ratio(text) >= 0.62)
         && !text.trim_end().ends_with('.')
         && !lower.starts_with("abstract:")
         && !lower.starts_with("copyright ")
@@ -13434,10 +25070,26 @@ fn lm2_leading_title_candidate(block: &LiquidBlock) -> bool {
             ))
 }
 
+fn lm2_substantive_section_heading(text: &str) -> bool {
+    let lower = normalize_text(text);
+    lower == "introduction"
+        || lower == "conclusion"
+        || ["i. ", "ii. ", "iii. ", "iv. ", "v. ", "vi. "]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+}
+
 fn lm2_generic_title_label(text: &str) -> bool {
     matches!(
         normalize_text(text).as_str(),
-        "notes" | "note" | "article" | "abstract" | "introduction"
+        "notes"
+            | "note"
+            | "article"
+            | "articles"
+            | "abstract"
+            | "contents"
+            | "table of contents"
+            | "introduction"
     )
 }
 
@@ -14332,7 +25984,7 @@ fn leading_note_marker(text: &str) -> Option<u16> {
             break;
         }
     }
-    (digits > 0 && (1..=500).contains(&value)).then_some(value as u16)
+    (digits > 0 && (1..=u32::from(LM2_MAX_NOTE_MARKER)).contains(&value)).then_some(value as u16)
 }
 
 #[cfg(any(feature = "devtools", test))]
@@ -14358,6 +26010,8 @@ fn eval_source_line(row: &Lm2EvalRow, use_example_role_hints: bool) -> DeepLiqui
         bottom,
         right,
         top,
+        first_visual_left: left,
+        last_visual_right: right,
         page_index_norm: 0.0,
         lines_from_doc_start: 0,
         left_margin_ratio: 0.0,
@@ -14681,6 +26335,8 @@ mod tests {
             bottom: 0.9 - (line_index as f32 * 0.02),
             right: 0.9,
             top: 0.92 - (line_index as f32 * 0.02),
+            first_visual_left: 0.1,
+            last_visual_right: 0.9,
             page_index_norm: 0.0,
             lines_from_doc_start: line_index,
             left_margin_ratio: 0.0,
@@ -14957,6 +26613,1089 @@ mod tests {
     }
 
     #[test]
+    fn heading_continuation_reflow_unites_mixed_model_roles() {
+        let (mut blocks, mut sources, decoded) = heading_reflow_fixture(
+            "B. Question No. 2: May a Customer Choose a Security Procedure",
+            "That May Not Be Commercially Reasonable?",
+        );
+        blocks[1].role = LiquidBlockRole::Paragraph;
+        sources[1].lines[0].role = LiquidBlockRole::Paragraph;
+
+        assert_eq!(
+            apply_heading_continuation_reflow(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Heading);
+        assert!(blocks[0].text.ends_with("Commercially Reasonable?"));
+    }
+
+    #[test]
+    fn heading_continuation_split_moves_only_leading_case_name_row() {
+        let mut heading = lm2_test_source_line(
+            "p45:l17",
+            17,
+            "E. Another Look at Party Presentation: New York State Rifle & Pistol Assâ€™n,",
+            1.0,
+            true,
+            Some(LiquidBlockRole::Heading),
+        );
+        heading.segment_block_id = 4;
+        let mut continuation = lm2_test_source_line(
+            "p45:l18",
+            18,
+            "Inc. v. Bruen",
+            1.0,
+            true,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        continuation.segment_block_id = 5;
+        let mut body = lm2_test_source_line(
+            "p45:l19",
+            19,
+            "In Bruen, Justice Breyer argued in dissent that the text and history approach was difficult.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        body.segment_block_id = 6;
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Heading,
+                text: heading.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: format!("{} {}", continuation.text, body.text),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&heading, LiquidBlockRole::Heading)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![
+                    line_ref(&continuation, LiquidBlockRole::Paragraph),
+                    line_ref(&body, LiquidBlockRole::Paragraph),
+                ],
+            },
+        ];
+        let decoded = vec![
+            (heading, Lm2Action::Keep),
+            (continuation, Lm2Action::Keep),
+            (body, Lm2Action::Keep),
+        ];
+
+        assert_eq!(
+            apply_heading_leading_source_continuation_split(&mut blocks, &mut sources, &decoded,),
+            1
+        );
+        assert!(blocks[0].text.ends_with("Inc. v. Bruen"));
+        assert!(blocks[1].text.starts_with("In Bruen, Justice Breyer"));
+        assert_eq!(sources[0].lines.len(), 2);
+        assert_eq!(sources[1].lines.len(), 1);
+    }
+
+    #[test]
+    fn source_gap_reflow_restores_displaced_callout_bearing_body_row() {
+        let previous = lm2_test_source_line(
+            "p30:l50",
+            50,
+            "dominates current scholarly",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let mut displaced = lm2_test_source_line(
+            "p30:l51",
+            51,
+            &format!(
+                "discussions.{CALLOUT_START}191{CALLOUT_END} In these cases, courts intervene by"
+            ),
+            1.0,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        displaced.doc_note_marker = 191;
+        let current = lm2_test_source_line(
+            "p30:l52",
+            52,
+            "unilaterally providing an amount that is easy to calculate.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let mut definition = lm2_test_source_line(
+            "p30:l60",
+            60,
+            "191. See the accompanying discussion.",
+            0.75,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        definition.in_footnote_zone = true;
+        definition.doc_note_marker = 191;
+
+        let mut displaced_ref = line_ref(&displaced, LiquidBlockRole::Marginalia);
+        displaced_ref.note_markers = vec![191];
+        let mut definition_ref = line_ref(&definition, LiquidBlockRole::Marginalia);
+        definition_ref.note_markers = vec![191];
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: format!("{} {}", previous.text, current.text),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: displaced.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: definition.text.clone(),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![
+                    line_ref(&previous, LiquidBlockRole::Paragraph),
+                    line_ref(&current, LiquidBlockRole::Paragraph),
+                ],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![displaced_ref],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![definition_ref],
+            },
+        ];
+        let decoded = vec![
+            (previous, Lm2Action::Keep),
+            (displaced, Lm2Action::Marginalia),
+            (current, Lm2Action::Keep),
+            (definition, Lm2Action::Marginalia),
+        ];
+
+        assert_eq!(
+            apply_source_gap_body_line_reflow(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].text.contains(&format!(
+            "scholarly discussions.{CALLOUT_START}191{CALLOUT_END} In these cases"
+        )));
+        assert!(blocks[0].text.contains("by unilaterally providing"));
+        assert_eq!(
+            sources[0]
+                .lines
+                .iter()
+                .map(|line| line.line_index)
+                .collect::<Vec<_>>(),
+            vec![50, 51, 52]
+        );
+        assert_eq!(sources[1].block_index, 1);
+        assert_eq!(blocks[1].text, "191. See the accompanying discussion.");
+    }
+
+    #[test]
+    fn sandwiched_body_noise_reflow_restores_false_furniture_row() {
+        let mut previous = lm2_test_source_line(
+            "p58:l7",
+            7,
+            "the challenges of advancing ambitious statutory programs in modern times, the",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        previous.segment_block_id = 3;
+        let mut candidate = lm2_test_source_line(
+            "p58:l8",
+            8,
+            "urgency of these remedial shortcomings demands—and seems to have secured—",
+            1.05,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        candidate.segment_block_id = 3;
+        candidate.centered = true;
+        let mut next = lm2_test_source_line(
+            "p58:l9",
+            9,
+            "Congress’s attention.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        next.segment_block_id = 4;
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: previous.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: candidate.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: next.text.clone(),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&previous, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&candidate, LiquidBlockRole::Noise)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&next, LiquidBlockRole::Paragraph)],
+            },
+        ];
+        let decoded = vec![
+            (previous, Lm2Action::Keep),
+            (candidate, Lm2Action::HideNoise),
+            (next, Lm2Action::Keep),
+        ];
+
+        assert_eq!(
+            apply_sandwiched_body_noise_reflow(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Paragraph);
+        assert!(blocks[0].text.contains(
+                "the urgency of these remedial shortcomings demands—and seems to have secured—Congress’s attention."
+        ));
+        assert_eq!(sources.len(), 1);
+        assert_eq!(
+            sources[0]
+                .lines
+                .iter()
+                .map(|line| line.line_index)
+                .collect::<Vec<_>>(),
+            vec![7, 8, 9]
+        );
+        assert!(
+            sources[0]
+                .lines
+                .iter()
+                .all(|line| line.role == LiquidBlockRole::Paragraph)
+        );
+    }
+
+    #[test]
+    fn sandwiched_body_noise_reflow_repairs_terminal_dehyphen_without_role_hint() {
+        let mut previous = lm2_test_source_line(
+            "p14:l20",
+            20,
+            "Even as Congress expanded the federal criminal code through statutes like",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        previous.page_width = 612.0;
+        previous.left = 74.46;
+        let mut candidate = lm2_test_source_line(
+            "p14:l21",
+            21,
+            "the Mann Act, the Volstead Act, and later the Gun Control Act and the Con\u{0002}",
+            1.0,
+            false,
+            None,
+        );
+        candidate.page_width = 612.0;
+        candidate.left = 57.96;
+        let mut next = lm2_test_source_line(
+            "p14:l22",
+            22,
+            "trolled Substances Act, federal criminal enforcement continued to expand.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        next.page_width = 612.0;
+        next.left = 57.96;
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: previous.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: candidate.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: next.text.clone(),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&previous, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&candidate, LiquidBlockRole::Noise)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&next, LiquidBlockRole::Paragraph)],
+            },
+        ];
+        let decoded = vec![
+            (previous, Lm2Action::Keep),
+            (candidate, Lm2Action::HideNoise),
+            (next, Lm2Action::Keep),
+        ];
+
+        assert_eq!(
+            apply_sandwiched_body_noise_reflow(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].text.contains("Controlled Substances Act"));
+    }
+
+    #[test]
+    fn sandwiched_body_noise_dehyphen_bridge_requires_body_margin_alignment() {
+        let mut previous = lm2_test_source_line(
+            "p14:l20",
+            20,
+            "Congress expanded the federal criminal code through statutes like",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        previous.page_width = 612.0;
+        let mut candidate = lm2_test_source_line(
+            "p14:l21",
+            21,
+            "the Mann Act and later the Gun Control Act and the Con\u{0002}",
+            1.0,
+            false,
+            None,
+        );
+        candidate.page_width = 612.0;
+        candidate.left = 57.96;
+        let mut next = lm2_test_source_line(
+            "p14:l22",
+            22,
+            "trolled Substances Act continued the expansion.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        next.page_width = 612.0;
+        next.left = 120.0;
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: previous.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: candidate.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: next.text.clone(),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&previous, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&candidate, LiquidBlockRole::Noise)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&next, LiquidBlockRole::Paragraph)],
+            },
+        ];
+        let decoded = vec![
+            (previous, Lm2Action::Keep),
+            (candidate, Lm2Action::HideNoise),
+            (next, Lm2Action::Keep),
+        ];
+
+        assert_eq!(
+            apply_sandwiched_body_noise_reflow(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(blocks.len(), 3);
+    }
+
+    #[test]
+    fn embedded_small_font_note_suffix_is_split_from_body_paragraph() {
+        let body_one = lm2_test_source_line(
+            "p78:l32",
+            32,
+            "The argument proceeds from the cases and I intend to",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let body_two = lm2_test_source_line(
+            "p78:l33",
+            33,
+            "return to that claim below.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let mut continuation = lm2_test_source_line(
+            "p78:l35",
+            35,
+            "modality in a technical sense used by the preceding note.",
+            0.78,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        continuation.font_ratio_page = 0.78;
+        continuation.font_ratio_doc = 0.78;
+        continuation.in_footnote_zone = true;
+        let mut next_note = lm2_test_source_line(
+            "p78:l36",
+            36,
+            "341. See the cited source.",
+            0.78,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        next_note.in_footnote_zone = true;
+
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: format!("{} {} {}", body_one.text, body_two.text, continuation.text),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: next_note.text.clone(),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![
+                    line_ref(&body_one, LiquidBlockRole::Paragraph),
+                    line_ref(&body_two, LiquidBlockRole::Paragraph),
+                    line_ref(&continuation, LiquidBlockRole::Paragraph),
+                ],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&next_note, LiquidBlockRole::Marginalia)],
+            },
+        ];
+        let decoded = vec![
+            (body_one, Lm2Action::Keep),
+            (body_two, Lm2Action::Keep),
+            (continuation, Lm2Action::Keep),
+            (next_note, Lm2Action::Marginalia),
+        ];
+
+        assert_eq!(
+            apply_embedded_small_font_note_continuation_split(&mut blocks, &mut sources, &decoded,),
+            1
+        );
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Paragraph);
+        assert!(!blocks[0].text.contains("modality in a technical sense"));
+        assert_eq!(blocks[1].role, LiquidBlockRole::Marginalia);
+        assert!(blocks[1].text.starts_with("modality in a technical sense"));
+        assert_eq!(blocks[2].text, "341. See the cited source.");
+        assert_eq!(sources[1].lines[0].role, LiquidBlockRole::Marginalia);
+    }
+
+    #[test]
+    fn small_font_body_quote_with_stale_marginalia_refs_is_not_split() {
+        let mut quote_one = lm2_test_source_line(
+            "p67:l11",
+            11,
+            "To maintain Congress’ intent, the Board and Special Counsel must function",
+            0.87,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        quote_one.font_ratio_page = 0.86;
+        quote_one.font_ratio_doc = 0.87;
+        quote_one.segment_block_shape = "body".to_owned();
+        let mut quote_two = lm2_test_source_line(
+            "p67:l12",
+            12,
+            "such that they fulfill the roles prescribed by Congress.",
+            0.87,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        quote_two.font_ratio_page = 0.86;
+        quote_two.font_ratio_doc = 0.87;
+        quote_two.segment_block_shape = "body".to_owned();
+        let mut blocks = vec![LiquidBlock {
+            role: LiquidBlockRole::Paragraph,
+            text: format!("{} {}", quote_one.text, quote_two.text),
+            label: None,
+        }];
+        let mut sources = vec![LiquidBlockSourceLines {
+            block_index: 0,
+            lines: vec![
+                line_ref(&quote_one, LiquidBlockRole::Marginalia),
+                line_ref(&quote_two, LiquidBlockRole::Marginalia),
+            ],
+        }];
+        let decoded = vec![
+            (quote_one, Lm2Action::Marginalia),
+            (quote_two, Lm2Action::Marginalia),
+        ];
+
+        assert_eq!(
+            apply_embedded_small_font_note_continuation_split(&mut blocks, &mut sources, &decoded,),
+            0
+        );
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Paragraph);
+        assert!(blocks[0].text.contains("roles prescribed by Congress"));
+    }
+
+    #[test]
+    fn late_small_font_body_quote_is_rescued_before_note_reflow() {
+        let mut quote = lm2_test_source_line(
+            "p67:l11",
+            11,
+            "To maintain Congress' intent, the Board and Special Counsel must function.",
+            0.87,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        quote.font_ratio_page = 1.0;
+        quote.font_ratio_page_ref = 0.86;
+        quote.font_ratio_doc = 0.87;
+        quote.segment_block_shape = "body".to_owned();
+        let mut note = lm2_test_source_line(
+            "p67:l32",
+            32,
+            "408. Id.",
+            0.81,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        note.in_footnote_zone = true;
+        note.below_footnote_divider = true;
+        note.doc_note_marker = 408;
+        let decoded = vec![
+            (quote.clone(), Lm2Action::Marginalia),
+            (note.clone(), Lm2Action::Marginalia),
+        ];
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: quote.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: note.text.clone(),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&quote, LiquidBlockRole::Marginalia)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref_with_note_start(
+                    &note,
+                    LiquidBlockRole::Marginalia,
+                    true,
+                )],
+            },
+        ];
+
+        assert_eq!(
+            apply_embedded_small_font_note_continuation_split(&mut blocks, &mut sources, &decoded,),
+            0
+        );
+        assert_eq!(
+            apply_above_note_body_marginalia_rescue(&mut blocks, &sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[0].role, LiquidBlockRole::Paragraph);
+        assert_eq!(blocks[1].role, LiquidBlockRole::Marginalia);
+        assert_eq!(
+            apply_final_physical_footnote_segment_guard(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(blocks[0].role, LiquidBlockRole::Paragraph);
+    }
+
+    #[test]
+    fn body_sized_physical_footnote_segment_is_not_rescued_as_body() {
+        let mut previous_note = lm2_test_source_line(
+            "p56:l46",
+            46,
+            "See Press Release, Padilla, Blumenthal Intro-",
+            0.80,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        previous_note.page_index = 56;
+        previous_note.in_footnote_zone = true;
+        let mut continuation = (18..=21)
+            .map(|line_index| {
+                let ratio = if line_index == 18 { 0.80 } else { 0.96 };
+                let mut line = lm2_test_source_line(
+                    &format!("p57:l{line_index}"),
+                    line_index,
+                    match line_index {
+                        18 => "duce Bill to Provide Victims of Abuse (Dec. 15,",
+                        19 => "2025), https://www.padilla.senate.gov/newsroom/press-releases/",
+                        20 => "padilla-blumenthal-introduce-bill-to-provide-victims",
+                        _ => "[https://perma.cc/3MG9-9HQB].",
+                    },
+                    ratio,
+                    false,
+                    Some(LiquidBlockRole::Marginalia),
+                );
+                line.page_index = 57;
+                line.font_ratio_page_ref = ratio;
+                line.font_ratio_page = ratio;
+                line.font_ratio_doc = ratio;
+                line.in_footnote_zone = true;
+                line.segment_block_id = 2;
+                line.segment_block_shape = "footnote".to_owned();
+                line.segment_block_footnote_like = true;
+                line
+            })
+            .collect::<Vec<_>>();
+        let mut next_note = lm2_test_source_line(
+            "p57:l22",
+            22,
+            "288. H.R. 6091, 119th Cong. (2025).",
+            0.80,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        next_note.page_index = 57;
+        next_note.in_footnote_zone = true;
+        let continuation_text = continuation
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!(
+                    "{CALLOUT_START}287{CALLOUT_END} See Press Release, Padilla, Blumenthal Intro-"
+                ),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: continuation_text,
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!("{CALLOUT_START}288{CALLOUT_END} H.R. 6091, 119th Cong. (2025)."),
+                label: None,
+            },
+        ];
+        let mut previous_ref = line_ref(&previous_note, LiquidBlockRole::Marginalia);
+        previous_ref.note_markers = vec![287];
+        let mut next_ref = line_ref(&next_note, LiquidBlockRole::Marginalia);
+        next_ref.note_markers = vec![288];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![previous_ref],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: continuation
+                    .iter()
+                    // The role sidecar can still carry an earlier Paragraph
+                    // decision when this rescue first runs; physical segment
+                    // provenance is the stable evidence.
+                    .map(|line| line_ref(line, LiquidBlockRole::Paragraph))
+                    .collect(),
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![next_ref],
+            },
+        ];
+        let mut decoded = vec![(previous_note, Lm2Action::Marginalia)];
+        decoded.extend(
+            continuation
+                .drain(..)
+                .map(|line| (line, Lm2Action::Marginalia))
+                .collect::<Vec<_>>(),
+        );
+        decoded.push((next_note, Lm2Action::Marginalia));
+
+        // Geometry by itself is insufficient: without the open previous-page
+        // note, ordinary body rescue must win and the late guard must abstain.
+        blocks[0].text = format!(
+            "{CALLOUT_START}287{CALLOUT_END} See Press Release, Padilla, Blumenthal Intro."
+        );
+        assert_eq!(
+            apply_above_note_body_marginalia_rescue(&mut blocks, &sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[1].role, LiquidBlockRole::Paragraph);
+        assert_eq!(
+            apply_final_physical_footnote_segment_guard(&mut blocks, &mut sources, &decoded),
+            0
+        );
+
+        blocks[0].text = format!(
+            "{CALLOUT_START}287{CALLOUT_END} See Press Release, Padilla, Blumenthal Intro-"
+        );
+        blocks[1].role = LiquidBlockRole::Marginalia;
+        assert_eq!(
+            apply_above_note_body_marginalia_rescue(&mut blocks, &sources, &decoded),
+            0
+        );
+
+        // Model the final block-role drift directly: the block was promoted,
+        // but its source refs still say Marginalia and all deep rows retain the
+        // same physical footnote provenance.
+        blocks[1].role = LiquidBlockRole::Paragraph;
+        for line in &mut sources[1].lines {
+            line.role = LiquidBlockRole::Marginalia;
+        }
+        assert_eq!(
+            apply_final_physical_footnote_segment_guard(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[1].role, LiquidBlockRole::Marginalia);
+    }
+
+    #[test]
+    fn open_clause_physical_footnote_segment_spans_adjacent_blocks() {
+        let mut previous_note = lm2_test_source_line(
+            "p5:l53",
+            53,
+            "The viability of this alternative legal",
+            0.81,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        previous_note.page_index = 5;
+        previous_note.in_footnote_zone = true;
+        let continuation_texts = [
+            "procedure for blocking federal policies on a nationwide basis really depends upon just",
+            "how available nationwide class actions turn out to be in practice-not just in general, but",
+            "at the outset of litigation, as well.\").",
+        ];
+        let continuation = continuation_texts
+            .iter()
+            .enumerate()
+            .map(|(offset, text)| {
+                let line_index = 21 + offset;
+                let mut line = lm2_test_source_line(
+                    &format!("p6:l{line_index}"),
+                    line_index,
+                    text,
+                    0.81,
+                    false,
+                    Some(LiquidBlockRole::Marginalia),
+                );
+                line.page_index = 6;
+                line.font_ratio_page_ref = 0.81;
+                line.font_ratio_doc = 0.81;
+                line.in_footnote_zone = true;
+                line.below_footnote_divider = true;
+                line.ruled_row_membership_exact = offset == 0;
+                line.segment_block_id = 2;
+                line.segment_block_line_index = offset;
+                line.segment_block_line_count = continuation_texts.len();
+                line.segment_block_shape = "footnote".to_owned();
+                line.segment_block_footnote_like = true;
+                line
+            })
+            .collect::<Vec<_>>();
+        let mut next_note = lm2_test_source_line(
+            "p6:l24",
+            24,
+            "25. The next authority.",
+            0.81,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        next_note.page_index = 6;
+        next_note.in_footnote_zone = true;
+
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!(
+                    "{CALLOUT_START}24{CALLOUT_END} The viability of this alternative legal"
+                ),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: continuation[0].text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: continuation[1..]
+                    .iter()
+                    .map(|line| line.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!("{CALLOUT_START}25{CALLOUT_END} The next authority."),
+                label: None,
+            },
+        ];
+        let mut previous_ref = line_ref(&previous_note, LiquidBlockRole::Marginalia);
+        previous_ref.note_markers = vec![24];
+        let mut next_ref = line_ref(&next_note, LiquidBlockRole::Marginalia);
+        next_ref.note_markers = vec![25];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![previous_ref],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&continuation[0], LiquidBlockRole::Marginalia)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: continuation[1..]
+                    .iter()
+                    .map(|line| line_ref(line, LiquidBlockRole::Marginalia))
+                    .collect(),
+            },
+            LiquidBlockSourceLines {
+                block_index: 3,
+                lines: vec![next_ref],
+            },
+        ];
+        let mut decoded = vec![(previous_note, Lm2Action::Marginalia)];
+        decoded.extend(
+            continuation
+                .into_iter()
+                .map(|line| (line, Lm2Action::Marginalia)),
+        );
+        decoded.push((next_note, Lm2Action::Marginalia));
+
+        assert_eq!(
+            apply_final_physical_footnote_segment_guard(&mut blocks, &mut sources, &decoded),
+            2
+        );
+        assert_eq!(blocks[1].role, LiquidBlockRole::Marginalia);
+        assert_eq!(blocks[2].role, LiquidBlockRole::Marginalia);
+
+        // A sentence-closed note owns no continuation on the next page even
+        // when the following segment has the same coarse physical geometry.
+        blocks[0].text =
+            format!("{CALLOUT_START}24{CALLOUT_END} The viability of this alternative legal.");
+        blocks[1].role = LiquidBlockRole::Paragraph;
+        blocks[2].role = LiquidBlockRole::Paragraph;
+        assert_eq!(
+            apply_final_physical_footnote_segment_guard(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(blocks[1].role, LiquidBlockRole::Paragraph);
+        assert_eq!(blocks[2].role, LiquidBlockRole::Paragraph);
+    }
+
+    #[test]
+    fn closed_citation_suffix_owns_columbia_cross_page_note_segment() {
+        let mut previous_note = lm2_test_source_line(
+            "p48:l52",
+            52,
+            "285. See Stein v. Buccaneers Ltd.",
+            0.81,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        previous_note.page_index = 48;
+        previous_note.in_footnote_zone = true;
+        let continuation_texts = [
+            "P\u{2019}ship, 772 F.3d 698, 707 (11th Cir. 2014), acts",
+            "diligently when it reviews the complete record",
+            "and applies the governing standard.",
+        ];
+        let continuation = continuation_texts
+            .iter()
+            .enumerate()
+            .map(|(offset, text)| {
+                let line_index = 18 + offset;
+                let mut line = lm2_test_source_line(
+                    &format!("p49:l{line_index}"),
+                    line_index,
+                    text,
+                    0.81,
+                    false,
+                    Some(LiquidBlockRole::Marginalia),
+                );
+                line.page_index = 49;
+                line.font_ratio_page_ref = 0.81;
+                line.font_ratio_doc = 0.81;
+                line.in_footnote_zone = true;
+                line.below_footnote_divider = false;
+                line.ruled_row_membership_exact = offset == 0;
+                line.segment_block_id = 2;
+                line.segment_block_line_index = offset;
+                line.segment_block_line_count = continuation_texts.len();
+                line.segment_block_shape = "footnote".to_owned();
+                line.segment_block_footnote_like = true;
+                line
+            })
+            .collect::<Vec<_>>();
+        let mut next_note = lm2_test_source_line(
+            "p49:l21",
+            21,
+            "286. The next authority.",
+            0.81,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        next_note.page_index = 49;
+        next_note.in_footnote_zone = true;
+
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!("{CALLOUT_START}285{CALLOUT_END} See Stein v. Buccaneers Ltd."),
+                label: None,
+            },
+            paragraph_block(&continuation[0].text),
+            paragraph_block(
+                &continuation[1..]
+                    .iter()
+                    .map(|line| line.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!("{CALLOUT_START}286{CALLOUT_END} The next authority."),
+                label: None,
+            },
+        ];
+        let mut previous_ref = line_ref(&previous_note, LiquidBlockRole::Marginalia);
+        previous_ref.note_markers = vec![285];
+        let mut next_ref = line_ref(&next_note, LiquidBlockRole::Marginalia);
+        next_ref.note_markers = vec![286];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![previous_ref],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&continuation[0], LiquidBlockRole::Marginalia)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: continuation[1..]
+                    .iter()
+                    .map(|line| line_ref(line, LiquidBlockRole::Marginalia))
+                    .collect(),
+            },
+            LiquidBlockSourceLines {
+                block_index: 3,
+                lines: vec![next_ref],
+            },
+        ];
+        let mut decoded = vec![(previous_note, Lm2Action::Marginalia)];
+        decoded.extend(
+            continuation
+                .into_iter()
+                .map(|line| (line, Lm2Action::Marginalia)),
+        );
+        decoded.push((next_note, Lm2Action::Marginalia));
+
+        assert_eq!(
+            apply_final_physical_footnote_segment_guard(&mut blocks, &mut sources, &decoded),
+            2
+        );
+        assert_eq!(blocks[1].role, LiquidBlockRole::Marginalia);
+        assert_eq!(blocks[2].role, LiquidBlockRole::Marginalia);
+    }
+
+    #[test]
+    fn heading_continuation_reflow_promotes_paragraph_outline_anchor() {
+        let (mut blocks, mut sources, decoded) = heading_reflow_fixture(
+            "C. Question No. 3: What Must the Bank Show",
+            "to Prove Good Faith?",
+        );
+        blocks[0].role = LiquidBlockRole::Paragraph;
+        sources[0].lines[0].role = LiquidBlockRole::Paragraph;
+
+        assert_eq!(
+            apply_heading_continuation_reflow(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[0].role, LiquidBlockRole::Subheading);
+    }
+
+    #[test]
+    fn heading_continuation_reflow_demotes_prose_split_at_sentence_fragment() {
+        let (mut blocks, mut sources, mut decoded) = heading_reflow_fixture(
+            "Customer's Acknowledgment. Customer acknowledges",
+            "that it was offered a commercially reasonable procedure.",
+        );
+        blocks[1].role = LiquidBlockRole::Paragraph;
+        sources[1].lines[0].role = LiquidBlockRole::Paragraph;
+        decoded[0].0.segment_block_id = 3;
+        decoded[0].0.segment_block_line_index = 0;
+        decoded[0].0.segment_block_line_count = 2;
+        decoded[1].0.segment_block_id = 3;
+        decoded[1].0.segment_block_line_index = 1;
+        decoded[1].0.segment_block_line_count = 2;
+
+        assert_eq!(
+            apply_heading_continuation_reflow(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[0].role, LiquidBlockRole::Paragraph);
+        assert!(blocks[0].text.contains("acknowledges that it was offered"));
+    }
+
+    #[test]
     fn decoded_role_trusts_normal_size_structured_heading_hint() {
         let mut line = lm2_test_source_line(
             "p17:l18",
@@ -14980,8 +27719,28 @@ mod tests {
     }
 
     #[test]
+    fn page_relative_font_inflation_does_not_promote_body_prose() {
+        let mut line = lm2_test_source_line(
+            "p6:l7",
+            7,
+            "Third, some scholars—notably Jack Balkin, Katharine Bartlett, Felipe",
+            1.18,
+            false,
+            Some(LiquidBlockRole::Heading),
+        );
+        line.font_ratio_doc = 1.0;
+        line.bold = false;
+        line.centered = false;
+
+        assert_eq!(
+            role_for_decoded_line(&line, Lm2Action::Keep, false),
+            LiquidBlockRole::Paragraph
+        );
+    }
+
+    #[test]
     fn heading_outline_split_separates_nested_markers_grouped_together() {
-        let (mut blocks, mut sources, _) = heading_reflow_fixture(
+        let (mut blocks, mut sources, decoded) = heading_reflow_fixture(
             "I. WRESTLING A SQUARE PEG",
             "A. Increasingly Artificial Governance",
         );
@@ -14990,7 +27749,10 @@ mod tests {
         let second_refs = sources.pop().unwrap().lines;
         sources[0].lines.extend(second_refs);
 
-        assert_eq!(apply_heading_outline_splits(&mut blocks, &mut sources), 1);
+        assert_eq!(
+            apply_heading_outline_splits(&mut blocks, &mut sources, &decoded),
+            1
+        );
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].text, "I. WRESTLING A SQUARE PEG");
         assert_eq!(blocks[1].text, "A. Increasingly Artificial Governance");
@@ -15000,17 +27762,311 @@ mod tests {
 
     #[test]
     fn heading_outline_split_separates_canonical_intro_from_front_matter() {
-        let (mut blocks, mut sources, _) =
+        let (mut blocks, mut sources, decoded) =
             heading_reflow_fixture("WHAT IS A TORT? Ketan Ramakrishnan", "INTRODUCTION");
         blocks[0].text = format!("{} {}", blocks[0].text, blocks[1].text);
         blocks.truncate(1);
         let second_refs = sources.pop().unwrap().lines;
         sources[0].lines.extend(second_refs);
 
-        assert_eq!(apply_heading_outline_splits(&mut blocks, &mut sources), 1);
+        assert_eq!(
+            apply_heading_outline_splits(&mut blocks, &mut sources, &decoded),
+            1
+        );
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].text, "WHAT IS A TORT? Ketan Ramakrishnan");
         assert_eq!(blocks[1].text, "INTRODUCTION");
+    }
+
+    #[test]
+    fn heading_outline_split_extracts_short_anchor_from_paragraph() {
+        let (mut blocks, mut sources, mut decoded) = heading_reflow_fixture(
+            "A. The Common-Law Right to Cancel a Wire Transfer",
+            "Prior to Article 4A, the leading source of law was a federal opinion.",
+        );
+        blocks[0].role = LiquidBlockRole::Paragraph;
+        blocks[0].text = format!("{} {}", blocks[0].text, blocks[1].text);
+        blocks.truncate(1);
+        let second_refs = sources.pop().unwrap().lines;
+        sources[0].lines.extend(second_refs);
+        decoded[0].0.right = 0.45;
+        decoded[1].0.right = 0.92;
+        decoded[1].0.role_hint = Some(LiquidBlockRole::Paragraph);
+
+        assert_eq!(
+            apply_heading_outline_splits(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Subheading);
+        assert_eq!(blocks[1].role, LiquidBlockRole::Paragraph);
+        assert_eq!(sources[0].lines.len(), 1);
+        assert_eq!(sources[1].lines.len(), 1);
+    }
+
+    #[test]
+    fn heading_outline_split_extracts_terse_numeric_anchor_without_width_cue() {
+        let (mut blocks, mut sources, mut decoded) = heading_reflow_fixture(
+            "3. Voting rules",
+            "Quorum rules and voting rules operate together.",
+        );
+        blocks[0].role = LiquidBlockRole::Paragraph;
+        blocks[0].text = format!("{} {}", blocks[0].text, blocks[1].text);
+        blocks.truncate(1);
+        let second_refs = sources.pop().unwrap().lines;
+        sources[0].lines.extend(second_refs);
+        decoded[0].0.right = 0.92;
+        decoded[0].0.role_hint = Some(LiquidBlockRole::Paragraph);
+        decoded[1].0.right = 0.92;
+        decoded[1].0.role_hint = Some(LiquidBlockRole::Paragraph);
+
+        assert_eq!(
+            apply_heading_outline_splits(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Subheading);
+        assert_eq!(blocks[0].text, "3. Voting rules");
+        assert_eq!(blocks[1].role, LiquidBlockRole::Paragraph);
+    }
+
+    #[test]
+    fn heading_outline_split_extracts_lowercase_lettered_anchor() {
+        let (mut blocks, mut sources, decoded) = heading_reflow_fixture(
+            "c. Coordination and Competition Across Jurisdictions",
+            "Unlike bankruptcy, MDL does not completely aggregate all claims.",
+        );
+        blocks[0].role = LiquidBlockRole::Paragraph;
+        blocks[0].text = format!("{} {}", blocks[0].text, blocks[1].text);
+        blocks.truncate(1);
+        let second_refs = sources.pop().unwrap().lines;
+        sources[0].lines.extend(second_refs);
+
+        assert_eq!(
+            apply_heading_outline_splits(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Subheading);
+        assert_eq!(
+            blocks[0].text,
+            "c. Coordination and Competition Across Jurisdictions"
+        );
+        assert_eq!(blocks[1].role, LiquidBlockRole::Paragraph);
+    }
+
+    #[test]
+    fn sandwiched_numbered_outline_recovers_heading_above_footnotes() {
+        let previous = lm2_test_source_line(
+            "p47:l24",
+            24,
+            "The preceding body paragraph ends here.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let heading = lm2_test_source_line(
+            "p47:l25",
+            25,
+            "2. Allocation of Voting Rights.",
+            0.82,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        let next = lm2_test_source_line(
+            "p47:l26",
+            26,
+            "Even if claimants have a fair opportunity to participate, the allocation matters.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let mut blocks = [&previous, &heading, &next]
+            .into_iter()
+            .map(|line| LiquidBlock {
+                role: line.role_hint.unwrap(),
+                text: line.text.clone(),
+                label: None,
+            })
+            .collect::<Vec<_>>();
+        let mut sources = [&previous, &heading, &next]
+            .into_iter()
+            .enumerate()
+            .map(|(block_index, line)| LiquidBlockSourceLines {
+                block_index,
+                lines: vec![line_ref(line, line.role_hint.unwrap())],
+            })
+            .collect::<Vec<_>>();
+        sources[1].lines[0].note_markers = vec![2];
+
+        assert_eq!(
+            apply_sandwiched_numbered_outline_recovery(&mut blocks, &mut sources),
+            1
+        );
+        assert_eq!(blocks[1].role, LiquidBlockRole::Subheading);
+        assert!(sources[1].lines[0].note_markers.is_empty());
+    }
+
+    #[test]
+    fn heading_outline_split_extracts_wrapped_and_internal_numeric_anchor() {
+        let first = lm2_test_source_line(
+            "p7:l33",
+            33,
+            "The preceding paragraph ends here.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let heading = lm2_test_source_line(
+            "p7:l34",
+            34,
+            "3. Exception for variation by agreement in favor of the customer",
+            1.0,
+            true,
+            None,
+        );
+        let body = lm2_test_source_line(
+            "p7:l35",
+            35,
+            "Under the first exception, the parties may vary the rule.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let mut blocks = vec![LiquidBlock {
+            role: LiquidBlockRole::Paragraph,
+            text: format!("{} {} {}", first.text, heading.text, body.text),
+            label: None,
+        }];
+        let mut sources = vec![LiquidBlockSourceLines {
+            block_index: 0,
+            lines: vec![
+                line_ref(&first, LiquidBlockRole::Paragraph),
+                line_ref(&heading, LiquidBlockRole::Paragraph),
+                line_ref(&body, LiquidBlockRole::Paragraph),
+            ],
+        }];
+        let decoded = vec![
+            (first, Lm2Action::Keep),
+            (heading, Lm2Action::Keep),
+            (body, Lm2Action::Keep),
+        ];
+
+        assert_eq!(
+            apply_heading_outline_splits(&mut blocks, &mut sources, &decoded),
+            2
+        );
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Paragraph);
+        assert_eq!(blocks[1].role, LiquidBlockRole::Subheading);
+        assert_eq!(
+            blocks[1].text,
+            "3. Exception for variation by agreement in favor of the customer"
+        );
+        assert_eq!(blocks[2].role, LiquidBlockRole::Paragraph);
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source.lines.len())
+                .sum::<usize>(),
+            3
+        );
+    }
+
+    #[test]
+    fn heading_outline_split_keeps_lowercase_wrapped_heading_line() {
+        let (mut blocks, mut sources, mut decoded) = heading_reflow_fixture(
+            "1. Exception when customer chooses a security",
+            "procedure that may not be commercially reasonable",
+        );
+        let body = lm2_test_source_line(
+            "p17:l11",
+            11,
+            "The first exception applies when the customer agrees.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        blocks[0].role = LiquidBlockRole::Paragraph;
+        blocks[0].text = format!("{} {} {}", blocks[0].text, blocks[1].text, body.text);
+        blocks.truncate(1);
+        let second_refs = sources.pop().unwrap().lines;
+        sources[0].lines.extend(second_refs);
+        sources[0]
+            .lines
+            .push(line_ref(&body, LiquidBlockRole::Paragraph));
+        decoded.push((body, Lm2Action::Keep));
+
+        assert_eq!(
+            apply_heading_outline_splits(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Subheading);
+        assert!(
+            blocks[0]
+                .text
+                .ends_with("procedure that may not be commercially reasonable")
+        );
+        assert_eq!(blocks[1].role, LiquidBlockRole::Paragraph);
+    }
+
+    #[test]
+    fn heading_outline_split_rejects_names_large_numbers_and_part_prose() {
+        for candidate in [
+            "C. Ring, Jr., discusses the drafting process in detail",
+            "203. The proviso would be enforceable against Bank.",
+            "Part IV evaluates the cancellation rules and provides recommendations",
+            "1. Defining Co-Governance. — Broadly, co-governance describes many models",
+            "I. JUSTICE AND THE COST DISEASE ................................ 25",
+        ] {
+            let (mut blocks, mut sources, mut decoded) =
+                heading_reflow_fixture("Ordinary body prose introduces the point.", candidate);
+            if candidate.starts_with("C. Ring") {
+                decoded[1].0.right = 0.76;
+            }
+            blocks[0].role = LiquidBlockRole::Paragraph;
+            blocks[0].text = format!("{} {}", blocks[0].text, blocks[1].text);
+            blocks.truncate(1);
+            let second_refs = sources.pop().unwrap().lines;
+            sources[0].lines.extend(second_refs);
+
+            assert_eq!(
+                apply_heading_outline_splits(&mut blocks, &mut sources, &decoded),
+                0,
+                "false outline anchor: {candidate}"
+            );
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].role, LiquidBlockRole::Paragraph);
+        }
+    }
+
+    #[test]
+    fn heading_outline_recognizes_westlaw_pagination_prefix() {
+        assert_eq!(
+            lm2_outline_heading_role("*759 IV. Evaluation and Recommendations"),
+            Some(LiquidBlockRole::Heading)
+        );
+        assert_eq!(lm2_outline_heading_role("*7 IV. Not Pagination"), None);
+    }
+
+    #[test]
+    fn heading_outline_rejects_lowercase_page_wrap_fragments() {
+        assert_eq!(lm2_outline_heading_role("introduction."), None);
+        assert_eq!(
+            lm2_outline_heading_role(
+                "(2) to require subsequent purchasers to do the same. These servitudes"
+            ),
+            None
+        );
+        assert_eq!(
+            lm2_outline_heading_role("Introduction"),
+            Some(LiquidBlockRole::Heading)
+        );
+        assert_eq!(
+            lm2_outline_heading_role("2. Cancellation After Acceptance"),
+            Some(LiquidBlockRole::Subheading)
+        );
     }
 
     #[test]
@@ -15216,6 +28272,745 @@ mod tests {
     }
 
     #[test]
+    fn table_cell_attached_ascii_callout_is_recovered() {
+        let mut table_line = lm2_test_source_line(
+            "p12:l20",
+            20,
+            "02/24/2025 Removal78",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        table_line.page_index = 12;
+        let mut note = lm2_test_source_line(
+            "p12:l41",
+            41,
+            "78. Brehm v. Marocco.",
+            0.75,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        note.page_index = 12;
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Table,
+                text: table_line.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: note.text.clone(),
+                label: None,
+            },
+        ];
+        let mut note_ref = line_ref(&note, LiquidBlockRole::Marginalia);
+        note_ref.note_markers = vec![78];
+        let sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&table_line, LiquidBlockRole::Marginalia)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![note_ref],
+            },
+        ];
+
+        assert_eq!(
+            apply_attached_terminal_callout_recovery(&mut blocks, &sources),
+            1
+        );
+        assert_eq!(
+            blocks[0].text,
+            format!("02/24/2025 Removal{CALLOUT_START}78{CALLOUT_END}")
+        );
+        assert_eq!(blocks[0].role, LiquidBlockRole::Table);
+    }
+
+    #[test]
+    fn table_cell_internal_ascii_callout_is_recovered() {
+        let mut table_line = lm2_test_source_line(
+            "p12:l23",
+            23,
+            "The commission is classified as major.80 An asterisk indicates removal.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        table_line.page_index = 12;
+        let mut note = lm2_test_source_line(
+            "p12:l43",
+            43,
+            "80. Throughout, we use the definition of major commission.",
+            0.75,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        note.page_index = 12;
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Table,
+                text: table_line.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: note.text.clone(),
+                label: None,
+            },
+        ];
+        let mut note_ref = line_ref(&note, LiquidBlockRole::Marginalia);
+        note_ref.note_markers = vec![80];
+        let sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&table_line, LiquidBlockRole::Marginalia)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![note_ref],
+            },
+        ];
+
+        assert_eq!(
+            apply_attached_terminal_callout_recovery(&mut blocks, &sources),
+            1
+        );
+        assert_eq!(
+            blocks[0].text,
+            format!(
+                "The commission is classified as major.{CALLOUT_START}80{CALLOUT_END} An asterisk indicates removal."
+            )
+        );
+    }
+
+    #[test]
+    fn page_sequence_recovers_inline_ascii_callouts_and_year_suffix() {
+        let mut blocks = vec![LiquidBlock {
+            role: LiquidBlockRole::Paragraph,
+            text: "Approved in 19891 and immediately applied the rule.2".to_owned(),
+            label: None,
+        }];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![LiquidSourceLineRef {
+                    id: Some("p0:l1".to_owned()),
+                    page_index: 0,
+                    line_index: 1,
+                    text: blocks[0].text.clone(),
+                    role: LiquidBlockRole::Paragraph,
+                    note_markers: Vec::new(),
+                }],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![LiquidSourceLineRef {
+                    id: Some("p0:l20".to_owned()),
+                    page_index: 0,
+                    line_index: 20,
+                    text: "1 First note.".to_owned(),
+                    role: LiquidBlockRole::Marginalia,
+                    note_markers: vec![1],
+                }],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![LiquidSourceLineRef {
+                    id: Some("p0:l21".to_owned()),
+                    page_index: 0,
+                    line_index: 21,
+                    text: "2 Second note.".to_owned(),
+                    role: LiquidBlockRole::Marginalia,
+                    note_markers: vec![2],
+                }],
+            },
+        ];
+
+        assert_eq!(
+            apply_page_sequence_ascii_callout_recovery(&mut blocks, &mut sources),
+            1
+        );
+        assert_eq!(
+            blocks[0].text,
+            format!(
+                "Approved in 1989{CALLOUT_START}1{CALLOUT_END} and immediately applied the rule.{CALLOUT_START}2{CALLOUT_END}"
+            )
+        );
+
+        let mut incomplete = vec![LiquidBlock {
+            role: LiquidBlockRole::Paragraph,
+            text: "Approved in 19891 and immediately applied the rule.2".to_owned(),
+            label: None,
+        }];
+        let mut incomplete_sources = sources.clone();
+        incomplete_sources.push(LiquidBlockSourceLines {
+            block_index: 3,
+            lines: vec![LiquidSourceLineRef {
+                id: Some("p0:l22".to_owned()),
+                page_index: 0,
+                line_index: 22,
+                text: "3 Third note.".to_owned(),
+                role: LiquidBlockRole::Marginalia,
+                note_markers: vec![3],
+            }],
+        });
+        assert_eq!(
+            apply_page_sequence_ascii_callout_recovery(&mut incomplete, &mut incomplete_sources,),
+            0
+        );
+        assert_eq!(
+            incomplete[0].text,
+            "Approved in 19891 and immediately applied the rule.2"
+        );
+    }
+
+    #[test]
+    fn page_sequence_recovers_flattened_two_digit_law_review_callouts() {
+        fn source(
+            block_index: usize,
+            page_index: usize,
+            line_index: usize,
+            text: &str,
+            role: LiquidBlockRole,
+            note_markers: Vec<u16>,
+        ) -> LiquidBlockSourceLines {
+            LiquidBlockSourceLines {
+                block_index,
+                lines: vec![LiquidSourceLineRef {
+                    id: Some(format!("p{page_index}:l{line_index}")),
+                    page_index,
+                    line_index,
+                    text: text.to_owned(),
+                    role,
+                    note_markers,
+                }],
+            }
+        }
+
+        let body = [
+            "Instruction.10",
+            "agency principles.\"",
+            "order is not authorized. 12",
+            "customer's payment orders. 3",
+            "Bank.19 Customer.20 Order.21",
+            "customer. 2",
+            "2 Article 4A.3",
+            "proviso is enforceable.2s",
+        ];
+        let mut blocks = body
+            .iter()
+            .map(|text| LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: (*text).to_owned(),
+                label: None,
+            })
+            .collect::<Vec<_>>();
+        let mut sources = body
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                let (page, line) = match index {
+                    0..=3 => (0, index),
+                    4 => (1, 1),
+                    5 => (1, 2),
+                    6 => (1, 3),
+                    _ => (2, 1),
+                };
+                source(
+                    index,
+                    page,
+                    line,
+                    text,
+                    LiquidBlockRole::Paragraph,
+                    Vec::new(),
+                )
+            })
+            .collect::<Vec<_>>();
+        // The split `22` artifact occupies a standalone source line before the
+        // source line containing note 23, but both were assembled together.
+        sources[6].lines = vec![
+            LiquidSourceLineRef {
+                id: Some("p1:l3".to_owned()),
+                page_index: 1,
+                line_index: 3,
+                text: "2".to_owned(),
+                role: LiquidBlockRole::Paragraph,
+                note_markers: Vec::new(),
+            },
+            LiquidSourceLineRef {
+                id: Some("p1:l4".to_owned()),
+                page_index: 1,
+                line_index: 4,
+                text: "Article 4A.3".to_owned(),
+                role: LiquidBlockRole::Paragraph,
+                note_markers: Vec::new(),
+            },
+        ];
+        for (offset, marker) in (10u16..=13).enumerate() {
+            sources.push(source(
+                8 + offset,
+                0,
+                20 + offset,
+                &format!("{marker}. Note."),
+                LiquidBlockRole::Marginalia,
+                vec![marker],
+            ));
+        }
+        sources.push(source(
+            12,
+            1,
+            20,
+            "19. Nineteen. 20. Twenty.",
+            LiquidBlockRole::Marginalia,
+            vec![19],
+        ));
+        sources.push(source(
+            13,
+            1,
+            21,
+            "21. Twenty-one. 22. Twenty-two.",
+            LiquidBlockRole::Marginalia,
+            vec![21],
+        ));
+        sources.push(source(
+            14,
+            1,
+            22,
+            "23. Twenty-three.",
+            LiquidBlockRole::Marginalia,
+            vec![23],
+        ));
+        sources.push(source(
+            15,
+            2,
+            20,
+            "28. Twenty-eight.",
+            LiquidBlockRole::Marginalia,
+            vec![28],
+        ));
+
+        let repaired = apply_page_sequence_ascii_callout_recovery(&mut blocks, &mut sources);
+        assert_eq!(repaired, 8);
+        for (index, marker) in (10u16..=13).enumerate() {
+            assert!(
+                blocks[index]
+                    .text
+                    .contains(&format!("{CALLOUT_START}{marker}{CALLOUT_END}")),
+                "{}",
+                blocks[index].text
+            );
+        }
+        for marker in 19u16..=23 {
+            assert!(
+                blocks[4..=6].iter().any(|block| block
+                    .text
+                    .contains(&format!("{CALLOUT_START}{marker}{CALLOUT_END}"))),
+                "missing marker {marker}: {:?}",
+                &blocks[4..=6]
+            );
+        }
+        assert!(blocks[6].text.starts_with("Article 4A."));
+        assert!(
+            blocks[7]
+                .text
+                .contains(&format!("{CALLOUT_START}28{CALLOUT_END}"))
+        );
+        assert!(
+            sources
+                .iter()
+                .flat_map(|source| &source.lines)
+                .any(|line| line.note_markers == [19, 20])
+        );
+        assert!(
+            sources
+                .iter()
+                .flat_map(|source| &source.lines)
+                .any(|line| line.note_markers == [21, 22])
+        );
+    }
+
+    #[test]
+    fn block_page_sequence_prefers_existing_marker_over_earlier_ocr_letter() {
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: "Mr. Ring's statement applies.".to_owned(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: format!("The point is in the public interest.{CALLOUT_START}8{CALLOUT_END}"),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: format!("The revision follows.{CALLOUT_START}9{CALLOUT_END}"),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: "8. First note.".to_owned(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: "9. Second note.".to_owned(),
+                label: None,
+            },
+        ];
+        let source =
+            |block_index, line_index, text: &str, role, note_markers| LiquidBlockSourceLines {
+                block_index,
+                lines: vec![LiquidSourceLineRef {
+                    id: Some(format!("p4:l{line_index}")),
+                    page_index: 4,
+                    line_index,
+                    text: text.to_owned(),
+                    role,
+                    note_markers,
+                }],
+            };
+        let mut sources = vec![
+            source(
+                0,
+                2,
+                "Mr. Ring's statement applies.",
+                LiquidBlockRole::Paragraph,
+                Vec::new(),
+            ),
+            source(
+                1,
+                10,
+                &blocks[1].text,
+                LiquidBlockRole::Paragraph,
+                Vec::new(),
+            ),
+            source(
+                2,
+                12,
+                &blocks[2].text,
+                LiquidBlockRole::Paragraph,
+                Vec::new(),
+            ),
+            source(
+                3,
+                30,
+                "8. First note.",
+                LiquidBlockRole::Marginalia,
+                vec![8],
+            ),
+            source(
+                4,
+                31,
+                "9. Second note.",
+                LiquidBlockRole::Marginalia,
+                vec![9],
+            ),
+        ];
+
+        assert_eq!(
+            apply_page_sequence_ascii_callout_recovery(&mut blocks, &mut sources),
+            0
+        );
+        assert_eq!(blocks[0].text, "Mr. Ring's statement applies.");
+    }
+
+    #[test]
+    fn block_page_sequence_keeps_reading_order_for_flattened_markers() {
+        let body = [
+            "The bank does not have to show.'",
+            "D. Question No. 4. Are the Rules Fair?",
+            "The rule applies under the procedure. 5",
+            "The parties chose either one.3 6",
+        ];
+        let mut blocks = body
+            .iter()
+            .map(|text| LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: (*text).to_owned(),
+                label: None,
+            })
+            .chain((34u16..=36).map(|marker| LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!("{marker}. Note."),
+                label: None,
+            }))
+            .collect::<Vec<_>>();
+        let line_indices = [9usize, 10, 22, 31];
+        let mut sources = body
+            .iter()
+            .enumerate()
+            .map(|(index, text)| LiquidBlockSourceLines {
+                block_index: index,
+                lines: vec![LiquidSourceLineRef {
+                    id: Some(format!("p14:l{}", line_indices[index])),
+                    page_index: 14,
+                    line_index: line_indices[index],
+                    text: (*text).to_owned(),
+                    role: LiquidBlockRole::Paragraph,
+                    note_markers: Vec::new(),
+                }],
+            })
+            .collect::<Vec<_>>();
+        sources.extend(
+            (34u16..=36)
+                .enumerate()
+                .map(|(offset, marker)| LiquidBlockSourceLines {
+                    block_index: 4 + offset,
+                    lines: vec![LiquidSourceLineRef {
+                        id: Some(format!("p14:l{}", 34 + offset)),
+                        page_index: 14,
+                        line_index: 34 + offset,
+                        text: format!("{marker}. Note."),
+                        role: LiquidBlockRole::Marginalia,
+                        note_markers: vec![marker],
+                    }],
+                }),
+        );
+
+        assert_eq!(
+            apply_page_sequence_ascii_callout_recovery(&mut blocks, &mut sources),
+            3
+        );
+        assert!(
+            blocks[0]
+                .text
+                .ends_with(&format!("{CALLOUT_START}34{CALLOUT_END}"))
+        );
+        assert_eq!(blocks[1].text, body[1]);
+        assert!(
+            blocks[2]
+                .text
+                .ends_with(&format!("{CALLOUT_START}35{CALLOUT_END}"))
+        );
+        assert!(
+            blocks[3]
+                .text
+                .contains(&format!("{CALLOUT_START}36{CALLOUT_END}"))
+        );
+    }
+
+    #[test]
+    fn decoded_page_sequence_preempts_one_digit_callout_guessing() {
+        let mut first = lm2_test_source_line(
+            "p10:l4",
+            4,
+            "The conflict should be resolved.2 6",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        first.page_index = 10;
+        // This is the real failure mode: the line model hid the dehyphenated
+        // continuation even though final assembly later restored it as body.
+        first.role_hint = Some(LiquidBlockRole::Noise);
+        let mut second = lm2_test_source_line(
+            "p10:l5",
+            5,
+            "The procedure was chosen.27",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        second.page_index = 10;
+        let mut note_26 = lm2_test_source_line(
+            "p10:l30",
+            30,
+            "26. First note.",
+            0.7,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        note_26.page_index = 10;
+        note_26.in_footnote_zone = true;
+        let mut note_27 = lm2_test_source_line(
+            "p10:l31",
+            31,
+            "27. Second note.",
+            0.7,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        note_27.page_index = 10;
+        note_27.in_footnote_zone = true;
+
+        let mut decoded = vec![
+            (first, Lm2Action::HideNoise),
+            (second, Lm2Action::Keep),
+            (note_26, Lm2Action::Marginalia),
+            (note_27, Lm2Action::Marginalia),
+        ];
+
+        assert_eq!(
+            apply_decoded_page_sequence_callout_recovery(&mut decoded),
+            2
+        );
+        assert!(
+            decoded[0]
+                .0
+                .text
+                .contains(&format!("{CALLOUT_START}26{CALLOUT_END}"))
+        );
+        assert_eq!(decoded[0].1, Lm2Action::Keep);
+        assert!(
+            !decoded[0]
+                .0
+                .text
+                .contains(&format!("{CALLOUT_START}2{CALLOUT_END}"))
+        );
+        assert!(
+            !decoded[0]
+                .0
+                .text
+                .contains(&format!("{CALLOUT_START}6{CALLOUT_END}"))
+        );
+        assert!(
+            decoded[1]
+                .0
+                .text
+                .contains(&format!("{CALLOUT_START}27{CALLOUT_END}"))
+        );
+    }
+
+    #[test]
+    fn decoded_page_sequence_collapses_premature_one_digit_sentinels() {
+        let mut first = lm2_test_source_line(
+            "p10:l6",
+            6,
+            &format!(
+                "The conflict should be resolved.{CALLOUT_START}2{CALLOUT_END} {CALLOUT_START}6{CALLOUT_END}"
+            ),
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        first.page_index = 10;
+        let mut second = lm2_test_source_line(
+            "p10:l17",
+            17,
+            &format!("The procedure was chosen.{CALLOUT_START}27{CALLOUT_END}"),
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        second.page_index = 10;
+        let mut note_26 = lm2_test_source_line(
+            "p10:l27",
+            27,
+            "26. First note.",
+            0.7,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        note_26.page_index = 10;
+        note_26.in_footnote_zone = true;
+        let mut note_27 = lm2_test_source_line(
+            "p10:l43",
+            43,
+            "27. Second note.",
+            0.7,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        note_27.page_index = 10;
+        note_27.in_footnote_zone = true;
+        let mut decoded = vec![
+            (first, Lm2Action::Keep),
+            (second, Lm2Action::Keep),
+            (note_26, Lm2Action::Marginalia),
+            (note_27, Lm2Action::Marginalia),
+        ];
+
+        assert_eq!(
+            apply_decoded_page_sequence_callout_recovery(&mut decoded),
+            1
+        );
+        assert!(
+            decoded[0]
+                .0
+                .text
+                .ends_with(&format!("{CALLOUT_START}26{CALLOUT_END}"))
+        );
+        assert!(
+            !decoded[0]
+                .0
+                .text
+                .contains(&format!("{CALLOUT_START}2{CALLOUT_END}"))
+        );
+        assert!(
+            !decoded[0]
+                .0
+                .text
+                .contains(&format!("{CALLOUT_START}6{CALLOUT_END}"))
+        );
+    }
+
+    #[test]
+    fn decoded_page_sequence_prefers_real_existing_marker_over_earlier_ocr_letter() {
+        let mut surname = lm2_test_source_line(
+            "p4:l2",
+            2,
+            "Mr. Ring's statement applies.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        surname.page_index = 4;
+        let mut actual_8 = lm2_test_source_line(
+            "p4:l10",
+            10,
+            &format!("The point is in the public interest.{CALLOUT_START}8{CALLOUT_END}"),
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        actual_8.page_index = 4;
+        let mut actual_9 = lm2_test_source_line(
+            "p4:l12",
+            12,
+            &format!("The revision follows.{CALLOUT_START}9{CALLOUT_END}"),
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        actual_9.page_index = 4;
+        let mut note_8 = lm2_test_source_line(
+            "p4:l30",
+            30,
+            "8. First note.",
+            0.7,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        note_8.page_index = 4;
+        note_8.in_footnote_zone = true;
+        let mut note_9 = lm2_test_source_line(
+            "p4:l31",
+            31,
+            "9. Second note.",
+            0.7,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        note_9.page_index = 4;
+        note_9.in_footnote_zone = true;
+        let mut decoded = vec![
+            (surname, Lm2Action::Keep),
+            (actual_8, Lm2Action::Keep),
+            (actual_9, Lm2Action::Keep),
+            (note_8, Lm2Action::Marginalia),
+            (note_9, Lm2Action::Marginalia),
+        ];
+
+        assert_eq!(
+            apply_decoded_page_sequence_callout_recovery(&mut decoded),
+            0
+        );
+        assert_eq!(decoded[0].0.text, "Mr. Ring's statement applies.");
+    }
+
+    #[test]
     fn same_page_body_callout_restores_isolated_citation_note_head() {
         let mut body = lm2_test_source_line(
             "p3:l25",
@@ -15258,6 +29053,47 @@ mod tests {
     }
 
     #[test]
+    fn same_page_body_callout_prefers_contextual_sentineled_note_head() {
+        let mut body = lm2_test_source_line(
+            "p40:l8",
+            8,
+            &format!("The argument continues.{CALLOUT_START}176{CALLOUT_END}"),
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        body.page_index = 40;
+        let mut false_pincite = lm2_test_source_line(
+            "p40:l35",
+            35,
+            "176 (“[L]essons Learned”).",
+            0.7,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        false_pincite.page_index = 40;
+        false_pincite.in_footnote_zone = true;
+        let mut actual = lm2_test_source_line(
+            "p40:l38",
+            38,
+            &format!("Prior citation. {CALLOUT_START}176{CALLOUT_END} Actual note."),
+            0.7,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        actual.page_index = 40;
+        actual.in_footnote_zone = true;
+        let decoded = vec![
+            (body, Lm2Action::Keep),
+            (false_pincite, Lm2Action::Marginalia),
+            (actual, Lm2Action::Marginalia),
+        ];
+
+        let starts = same_page_body_referenced_note_heads(&decoded);
+        assert!(!starts.contains("p40:l35"));
+    }
+
+    #[test]
     fn same_page_callout_overlay_recovers_detached_leading_and_terminal_markers() {
         let mut previous = lm2_test_source_line(
             "p17:l3",
@@ -15269,6 +29105,7 @@ mod tests {
         );
         previous.page_index = 17;
         previous.page_width = 612.0;
+        previous.page_height = 792.0;
         previous.left = 137.52;
         previous.right = 272.03;
         previous.bottom = 646.81;
@@ -15516,10 +29353,11 @@ mod tests {
         );
         definition.page_index = 24;
         definition.in_footnote_zone = true;
+        // Deliberately shuffled: decoder storage order is not reading order.
         let decoded = vec![
-            (previous.clone(), Lm2Action::Keep),
             (marker.clone(), Lm2Action::Keep),
             (definition, Lm2Action::Marginalia),
+            (previous.clone(), Lm2Action::Keep),
         ];
         let mut blocks = vec![LiquidBlock {
             role: LiquidBlockRole::Paragraph,
@@ -15547,6 +29385,96 @@ mod tests {
     }
 
     #[test]
+    fn in_block_standalone_callout_accepts_collapsed_multiline_bbox() {
+        let mut previous = lm2_test_source_line(
+            "p6:l14",
+            14,
+            "Employers have tools to keep workers on message.\u{201d}",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        previous.page_index = 6;
+        previous.page_width = 612.0;
+        previous.left = 126.0;
+        previous.right = 412.0;
+        previous.bottom = 396.1;
+        previous.top = 422.5;
+        previous.font_height = 9.2;
+        let mut marker = lm2_test_source_line(
+            "p6:l15",
+            15,
+            "26",
+            0.6,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        marker.page_index = 6;
+        marker.page_width = 612.0;
+        marker.left = 381.0;
+        marker.right = 393.0;
+        marker.bottom = 401.0;
+        marker.top = 409.9;
+        marker.font_height = 6.47;
+        let mut definition = lm2_test_source_line(
+            "p6:l40",
+            40,
+            "26 See Roberts v. Jaycees.",
+            0.7,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        definition.page_index = 6;
+        definition.in_footnote_zone = true;
+        let decoded = vec![
+            (marker.clone(), Lm2Action::Keep),
+            (definition.clone(), Lm2Action::Marginalia),
+            (previous.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: "Employers have tools to keep workers on message.\u{201d} 26 Next sentence."
+                    .to_owned(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: definition.text.clone(),
+                label: None,
+            },
+        ];
+        let sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![
+                    line_ref(&previous, LiquidBlockRole::Paragraph),
+                    line_ref(&marker, LiquidBlockRole::Paragraph),
+                ],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![LiquidSourceLineRef {
+                    id: Some(definition.id.clone()),
+                    page_index: definition.page_index,
+                    line_index: definition.line_index,
+                    text: definition.text.clone(),
+                    role: LiquidBlockRole::Marginalia,
+                    note_markers: vec![26],
+                }],
+            },
+        ];
+
+        assert_eq!(
+            apply_in_block_standalone_callout_recovery(&mut blocks, &sources, &decoded),
+            1
+        );
+        assert!(blocks[0].text.contains(&format!(
+            "message.\u{201d}{CALLOUT_START}26{CALLOUT_END} Next"
+        )));
+    }
+
+    #[test]
     fn cross_block_superscript_rejoins_prior_paragraph() {
         let mut previous = lm2_test_source_line(
             "p41:l22",
@@ -15558,6 +29486,7 @@ mod tests {
         );
         previous.page_index = 41;
         previous.page_width = 612.0;
+        previous.page_height = 792.0;
         previous.left = 152.52;
         previous.right = 271.71;
         previous.bottom = 437.90;
@@ -15573,11 +29502,13 @@ mod tests {
         );
         marker.page_index = 41;
         marker.page_width = 612.0;
+        marker.page_height = 792.0;
         marker.left = 271.74;
         marker.right = 283.63;
         marker.bottom = 441.46;
         marker.top = 447.13;
         marker.font_height = 6.48;
+        marker.in_footnote_zone = true;
         let mut definition =
             lm2_test_source_line("p41:l46", 46, "306 Id. at 589.", 0.7, false, None);
         definition.page_index = 41;
@@ -15623,6 +29554,131 @@ mod tests {
     }
 
     #[test]
+    fn body_table_cell_with_real_callout_is_not_stranded_as_marginalia() {
+        let mut cell = lm2_test_source_line(
+            "p71:l11",
+            11,
+            "Unenforceable495 /",
+            0.9,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        cell.page_index = 71;
+        cell.page_height = 792.0;
+        cell.bottom = 593.56;
+        cell.top = 602.89;
+        cell.in_footnote_zone = true;
+        let mut note = lm2_test_source_line(
+            "p71:l44",
+            44,
+            "495 See Estate of Cawiezell.",
+            0.7,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        note.page_index = 71;
+        note.page_height = 792.0;
+        note.bottom = 224.63;
+        note.top = 235.43;
+        note.in_footnote_zone = true;
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!("Unenforceable{CALLOUT_START}495{CALLOUT_END} /"),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: note.text.clone(),
+                label: None,
+            },
+        ];
+        let mut cell_ref = line_ref(&cell, LiquidBlockRole::Marginalia);
+        cell_ref.note_markers.clear();
+        let mut note_ref = line_ref(&note, LiquidBlockRole::Marginalia);
+        note_ref.note_markers = vec![495];
+        let sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![cell_ref],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![note_ref],
+            },
+        ];
+        let decoded = vec![(cell, Lm2Action::Marginalia), (note, Lm2Action::Marginalia)];
+
+        assert_eq!(
+            apply_body_callout_marginalia_rescue(&mut blocks, &sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[0].role, LiquidBlockRole::Paragraph);
+        assert_eq!(blocks[1].role, LiquidBlockRole::Marginalia);
+    }
+
+    #[test]
+    fn body_table_cell_with_nonleading_callout_does_not_require_definition_match() {
+        let mut cell = lm2_test_source_line(
+            "p71:l11",
+            11,
+            "Unenforceable495 /",
+            0.9,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        cell.page_index = 71;
+        cell.page_height = 792.0;
+        cell.bottom = 593.56;
+        cell.top = 602.89;
+        cell.in_footnote_zone = true;
+        let mut blocks = vec![LiquidBlock {
+            role: LiquidBlockRole::Marginalia,
+            text: format!("Unenforceable{CALLOUT_START}495{CALLOUT_END} /"),
+            label: None,
+        }];
+        let mut cell_ref = line_ref(&cell, LiquidBlockRole::Marginalia);
+        cell_ref.note_markers.clear();
+        let sources = vec![LiquidBlockSourceLines {
+            block_index: 0,
+            lines: vec![cell_ref],
+        }];
+        let decoded = vec![(cell, Lm2Action::Marginalia)];
+
+        assert_eq!(
+            apply_body_callout_marginalia_rescue(&mut blocks, &sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[0].role, LiquidBlockRole::Paragraph);
+    }
+
+    #[test]
+    fn learned_footnote_zone_requires_low_page_geometry_for_body_veto() {
+        let mut body_callout = lm2_test_source_line("p41:l23", 23, "306", 0.6, false, None);
+        body_callout.page_height = 792.0;
+        body_callout.top = 447.13;
+        body_callout.in_footnote_zone = true;
+        assert!(!lm2_low_footnote_zone_evidence(&body_callout));
+
+        let mut note_continuation = lm2_test_source_line(
+            "p43:l23",
+            23,
+            "emergent capabilities in GPT-4",
+            0.7,
+            false,
+            None,
+        );
+        note_continuation.page_height = 792.0;
+        note_continuation.top = 358.24;
+        note_continuation.page_has_footnote_divider = true;
+        note_continuation.below_footnote_divider = true;
+        assert!(lm2_low_footnote_zone_evidence(&note_continuation));
+
+        note_continuation.top = 520.0;
+        assert!(lm2_low_footnote_zone_evidence(&note_continuation));
+    }
+
+    #[test]
     fn centered_bottom_numeric_furniture_is_suppressed() {
         let mut footer = lm2_test_source_line(
             "p7:l0",
@@ -15657,6 +29713,87 @@ mod tests {
             1
         );
         assert_eq!(blocks[0].role, LiquidBlockRole::Noise);
+    }
+
+    #[test]
+    fn out_of_note_range_page_zero_furniture_number_is_suppressed() {
+        let mut folio = lm2_test_source_line(
+            "p0:l0",
+            0,
+            "1760",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        folio.page_index = 0;
+        folio.page_height = 792.0;
+        folio.bottom = 119.18;
+        folio.top = 129.83;
+        folio.centered = false;
+        folio.segment_block_furniture_like = true;
+        folio.segment_block_table_like = true;
+        folio.in_footnote_zone = true;
+        let decoded = vec![(folio.clone(), Lm2Action::Marginalia)];
+        let mut blocks = vec![LiquidBlock {
+            role: LiquidBlockRole::Marginalia,
+            text: "1760".to_owned(),
+            label: None,
+        }];
+        let sources = vec![LiquidBlockSourceLines {
+            block_index: 0,
+            lines: vec![line_ref(&folio, LiquidBlockRole::Marginalia)],
+        }];
+
+        assert_eq!(
+            apply_numeric_footer_furniture_suppression(&mut blocks, &sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[0].role, LiquidBlockRole::Noise);
+    }
+
+    #[test]
+    fn sentineled_law_review_running_header_is_suppressed() {
+        let mut header = lm2_test_source_line(
+            "p2:l0",
+            0,
+            &format!(
+                "978 Michigan Law Review [Vol. {CALLOUT_START}124{CALLOUT_END}:{CALLOUT_START}977{CALLOUT_END}"
+            ),
+            0.9,
+            false,
+            Some(LiquidBlockRole::Noise),
+        );
+        header.page_index = 2;
+        header.doc_repeated_edge_text = true;
+        let decoded = vec![(header.clone(), Lm2Action::Keep)];
+        let mut blocks = vec![LiquidBlock {
+            role: LiquidBlockRole::Paragraph,
+            text: header.text.clone(),
+            label: None,
+        }];
+        let sources = vec![LiquidBlockSourceLines {
+            block_index: 0,
+            lines: vec![line_ref(&header, LiquidBlockRole::Noise)],
+        }];
+
+        assert_eq!(
+            apply_numeric_footer_furniture_suppression(&mut blocks, &sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[0].role, LiquidBlockRole::Noise);
+    }
+
+    #[test]
+    fn adjacent_duplicate_callout_sentinels_collapse_to_one() {
+        let marker = format!("{CALLOUT_START}249{CALLOUT_END}");
+        let mut blocks = vec![LiquidBlock {
+            role: LiquidBlockRole::Paragraph,
+            text: format!("pensions,{marker}{marker}"),
+            label: None,
+        }];
+
+        assert_eq!(apply_adjacent_duplicate_callout_suppression(&mut blocks), 1);
+        assert_eq!(blocks[0].text, format!("pensions,{marker}"));
     }
 
     #[test]
@@ -15932,6 +30069,47 @@ mod tests {
             HashSet::from([0, 1, 3, 4])
         );
         assert_eq!(longest_ascending_run(&[1, 2, 3, 4]).len(), 4);
+    }
+
+    #[test]
+    fn authoritative_document_markers_reject_citation_shaped_false_head() {
+        let mut decoded = Vec::new();
+        // Deliberately store the lines out of reading order; source coordinates
+        // are authoritative for the document marker sequence.
+        for marker in [1, 3, 2, 4] {
+            let mut line = lm2_test_source_line(
+                &format!("p14:l{marker}"),
+                marker,
+                &marker.to_string(),
+                0.8,
+                false,
+                Some(LiquidBlockRole::Marginalia),
+            );
+            line.page_index = 14;
+            line.doc_note_marker = marker as u16;
+            decoded.push((line, Lm2Action::Marginalia));
+            if marker == 2 {
+                let mut false_head = lm2_test_source_line(
+                    "p14:l20",
+                    20,
+                    "55 Fed. Reg. 40791, 40791 (1990).",
+                    0.8,
+                    false,
+                    Some(LiquidBlockRole::Marginalia),
+                );
+                false_head.page_index = 14;
+                false_head.doc_footnote_state = true;
+                decoded.push((false_head, Lm2Action::Marginalia));
+            }
+        }
+
+        let starts = note_start_line_ids_for_scope(&decoded, &[]);
+
+        assert_eq!(starts.len(), 4);
+        assert!(!starts.contains("p14:l20"));
+        for marker in 1..=4 {
+            assert!(starts.contains(&format!("p14:l{marker}")));
+        }
     }
 
     #[test]
@@ -16389,6 +30567,196 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["p0:l0", "p0:l1"]
         );
+    }
+
+    #[test]
+    fn action_neutral_blocksplit_splits_indented_abstract_paragraph() {
+        let mut first = lm2_test_source_line(
+            "p0:l0",
+            0,
+            "The opening abstract paragraph ends here.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Abstract),
+        );
+        first.left = 58.0;
+        first.page_width = 468.0;
+        let mut second = lm2_test_source_line(
+            "p0:l1",
+            1,
+            "This Article begins a second abstract paragraph.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Abstract),
+        );
+        second.left = 74.5;
+        second.page_width = 468.0;
+        let decoded = vec![(first, Lm2Action::Keep), (second, Lm2Action::Keep)];
+
+        let (_, mut blocks, mut sources) = build_lm2_blocks("", &decoded);
+        apply_action_neutral_blocksplit(&mut blocks, &mut sources, &decoded);
+
+        assert_eq!(blocks.len(), 2);
+        assert!(
+            blocks
+                .iter()
+                .all(|block| block.role == LiquidBlockRole::Abstract)
+        );
+    }
+
+    #[test]
+    fn action_neutral_blocksplit_recovers_indent_hidden_by_tall_source_row() {
+        let mut first = lm2_test_source_line(
+            "p0:l0",
+            0,
+            "The previous paragraph ends cleanly.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        first.page_width = 612.0;
+        first.left = 73.4;
+        first.right = 178.0;
+        first.bottom = 468.1;
+        first.top = 482.5;
+        first.font_height = 9.4;
+        let mut second = lm2_test_source_line(
+            "p0:l1",
+            1,
+            "Voluntarism starts a new paragraph and then soft\u{0002}wraps.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        second.page_width = 612.0;
+        second.left = 73.4;
+        second.right = 397.3;
+        second.bottom = 444.1;
+        second.top = 470.5;
+        second.font_height = 9.4;
+        let decoded = vec![(first, Lm2Action::Keep), (second, Lm2Action::Keep)];
+
+        let (_, mut blocks, mut sources) = build_lm2_blocks("", &decoded);
+        apply_action_neutral_blocksplit(&mut blocks, &mut sources, &decoded);
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].text, "The previous paragraph ends cleanly.");
+        assert_eq!(
+            blocks[1].text,
+            "Voluntarism starts a new paragraph and then soft-wraps."
+        );
+    }
+
+    #[test]
+    fn final_source_backed_split_preserves_recovered_callout_sentinels() {
+        let sentinel = format!("{CALLOUT_START}5{CALLOUT_END}");
+        let first_text = format!("The previous paragraph ends cleanly.{sentinel}");
+        let mut first = lm2_test_source_line(
+            "p0:l0",
+            0,
+            &first_text,
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        first.page_width = 612.0;
+        first.left = 73.4;
+        first.right = 178.0;
+        first.bottom = 468.1;
+        first.top = 482.5;
+        first.font_height = 9.4;
+        let mut second = lm2_test_source_line(
+            "p0:l1",
+            1,
+            "Voluntarism starts a new paragraph and soft\u{0002}wraps.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        second.page_width = 612.0;
+        second.left = 73.4;
+        second.right = 397.3;
+        second.bottom = 444.1;
+        second.top = 470.5;
+        second.font_height = 9.4;
+        let decoded = vec![
+            (first.clone(), Lm2Action::Keep),
+            (second.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![LiquidBlock {
+            role: LiquidBlockRole::Paragraph,
+            text: format!(
+                "The previous paragraph ends cleanly.{sentinel} Voluntarism starts a new paragraph and soft-wraps."
+            ),
+            label: None,
+        }];
+        let mut sources = vec![LiquidBlockSourceLines {
+            block_index: 0,
+            lines: vec![
+                line_ref(&first, LiquidBlockRole::Paragraph),
+                line_ref(&second, LiquidBlockRole::Paragraph),
+            ],
+        }];
+
+        let repaired =
+            apply_final_source_backed_paragraph_splits(&mut blocks, &mut sources, &decoded);
+
+        assert_eq!(repaired, 1);
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].text.ends_with(&sentinel));
+        assert!(blocks[1].text.starts_with("Voluntarism"));
+        assert_eq!(sources[0].block_index, 0);
+        assert_eq!(sources[1].block_index, 1);
+    }
+
+    #[test]
+    fn final_source_backed_split_never_slices_inside_callout_sentinel() {
+        let mut previous = lm2_test_source_line(
+            "p0:l0",
+            0,
+            "Prior body text.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        previous.page_width = 612.0;
+        previous.left = 73.4;
+        previous.right = 178.0;
+        let mut marker = lm2_test_source_line(
+            "p0:l1",
+            1,
+            "279",
+            0.7,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        marker.page_width = 612.0;
+        marker.left = 220.0;
+        marker.right = 235.0;
+        let decoded = vec![
+            (previous.clone(), Lm2Action::Keep),
+            (marker.clone(), Lm2Action::Keep),
+        ];
+        let sentinel = format!("{CALLOUT_START}279{CALLOUT_END}");
+        let mut blocks = vec![LiquidBlock {
+            role: LiquidBlockRole::Paragraph,
+            text: format!("Prior body text.{sentinel} Regulators continue the paragraph."),
+            label: None,
+        }];
+        let mut sources = vec![LiquidBlockSourceLines {
+            block_index: 0,
+            lines: vec![
+                line_ref(&previous, LiquidBlockRole::Paragraph),
+                line_ref(&marker, LiquidBlockRole::Paragraph),
+            ],
+        }];
+
+        let repaired =
+            apply_final_source_backed_paragraph_splits(&mut blocks, &mut sources, &decoded);
+
+        assert_eq!(repaired, 0);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].text.contains(&sentinel));
     }
 
     #[test]
@@ -16937,6 +31305,980 @@ mod tests {
     }
 
     #[test]
+    fn strict_no_dot_toc_guard_is_bounded_before_real_body() {
+        let texts = [
+            "article contents",
+            "introduction 2958",
+            "i. from police federalism to cross-sovereign enforcement 2966",
+            "A. The Construction of Police Federalism 2967",
+            "1. Authority Attribution and the Reclamation of section 1983 3003",
+            "This real article paragraph begins after the contents run.",
+        ];
+        let mut decoded = texts
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                let mut line =
+                    lm2_test_source_line(&format!("p2:l{index}"), index, text, 1.0, false, None);
+                line.page_index = 2;
+                (line, Lm2Action::Keep)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(apply_strict_no_dot_toc_page_guard(&mut decoded), 5);
+        assert!(decoded[..5].iter().all(|(line, action)| {
+            *action == Lm2Action::HideNoise && line.role_hint == Some(LiquidBlockRole::Contents)
+        }));
+        assert_eq!(decoded[5].1, Lm2Action::Keep);
+        assert_eq!(apply_hidden_numbered_note_head_recovery(&mut decoded), 0);
+        assert_eq!(decoded[4].1, Lm2Action::HideNoise);
+    }
+
+    #[test]
+    fn article_span_filter_rejects_numbered_figure_boundary() {
+        let mut caption = lm2_test_source_line(
+            "p10:l1",
+            1,
+            "FIGURE 2. STRATEGIC MOOTNESS GAP TACTICS",
+            1.2,
+            true,
+            None,
+        );
+        caption.page_index = 10;
+        let decoded = vec![(caption, Lm2Action::Keep)];
+        let detected = vec![
+            ArticleSpan {
+                article_index: 0,
+                start_page_index: 0,
+                start_line_index: 0,
+                end_page_index: 10,
+                end_line_index: 0,
+                confidence: 1.0,
+                title_hint: Some("Opening article".to_owned()),
+                evidence: Vec::new(),
+            },
+            ArticleSpan {
+                article_index: 1,
+                start_page_index: 10,
+                start_line_index: 0,
+                end_page_index: 20,
+                end_line_index: 0,
+                confidence: 0.5,
+                title_hint: Some("FIGURE 2. STRATEGIC MOOTNESS GAP TACTICS".to_owned()),
+                evidence: Vec::new(),
+            },
+        ];
+
+        let filtered = filter_lm2_false_article_spans(detected, &decoded, 20);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].end_page_index, 20);
+    }
+
+    #[test]
+    fn isolated_body_noise_tail_recovers_same_font_sentence_end() {
+        let previous = lm2_test_source_line(
+            "p10:l29",
+            29,
+            "Entries with a single date indicate that the commission remained inquorate as of",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let mut tail = lm2_test_source_line(
+            "p10:l30",
+            30,
+            "October 7, 2025.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Table),
+        );
+        tail.segment_block_shape = "table".to_owned();
+        tail.segment_block_table_like = true;
+        let mut decoded = vec![(previous, Lm2Action::Keep), (tail, Lm2Action::HideNoise)];
+
+        assert_eq!(apply_isolated_body_noise_tail_recovery(&mut decoded), 1);
+        assert_eq!(decoded[1].1, Lm2Action::Keep);
+        assert_eq!(decoded[1].0.role_hint, Some(LiquidBlockRole::Paragraph));
+    }
+
+    #[test]
+    fn numbered_table_caption_and_cross_page_cells_survive_real_note_dividers() {
+        let mut header = lm2_test_source_line(
+            "p11:l0",
+            0,
+            "Commission Quorums",
+            0.8,
+            false,
+            Some(LiquidBlockRole::Noise),
+        );
+        header.page_index = 11;
+        header.doc_repeated_text_count = 6;
+        let mut folio = lm2_test_source_line(
+            "p11:l1",
+            1,
+            "1136",
+            0.8,
+            false,
+            Some(LiquidBlockRole::Noise),
+        );
+        folio.page_index = 11;
+        let mut caption = lm2_test_source_line(
+            "p11:l3",
+            3,
+            "Table 1",
+            1.0,
+            true,
+            Some(LiquidBlockRole::Noise),
+        );
+        caption.page_index = 11;
+        let mut subtitle = lm2_test_source_line(
+            "p11:l4",
+            4,
+            "Commissions Without Quorums, January-October 7, 2025",
+            1.0,
+            true,
+            Some(LiquidBlockRole::Noise),
+        );
+        subtitle.page_index = 11;
+        let mut table_header = lm2_test_source_line(
+            "p11:l5",
+            5,
+            "Commission Dates Without Quorum",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        table_header.page_index = 11;
+        table_header.page_object_path_stroke_near_line_count = 1;
+        let mut row = lm2_test_source_line(
+            "p11:l6",
+            6,
+            "Defense Nuclear Facilities Safety Board",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        row.page_index = 11;
+        row.page_object_path_stroke_near_line_count = 1;
+        let mut note = lm2_test_source_line(
+            "p11:l7",
+            7,
+            "65. Press Release describing the quorum loss.",
+            0.8,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        note.page_index = 11;
+        note.in_footnote_zone = true;
+
+        let mut next_header = lm2_test_source_line(
+            "p12:l0",
+            0,
+            "Commission Quorums",
+            0.8,
+            false,
+            Some(LiquidBlockRole::Noise),
+        );
+        next_header.page_index = 12;
+        next_header.doc_repeated_text_count = 6;
+        let mut next_folio = lm2_test_source_line(
+            "p12:l1",
+            1,
+            "1137",
+            0.8,
+            false,
+            Some(LiquidBlockRole::Noise),
+        );
+        next_folio.page_index = 12;
+        let mut continued = lm2_test_source_line(
+            "p12:l3",
+            3,
+            "Internal Revenue Service Oversight",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Noise),
+        );
+        continued.page_index = 12;
+        continued.page_object_path_stroke_near_line_count = 1;
+        let mut continued_row = lm2_test_source_line(
+            "p12:l4",
+            4,
+            "Board 11/2013 Term Expiration",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        continued_row.page_index = 12;
+        continued_row.page_object_path_stroke_near_line_count = 1;
+        let mut next_note = lm2_test_source_line(
+            "p12:l5",
+            5,
+            "72. Treasury Inspector General report.",
+            0.8,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        next_note.page_index = 12;
+        next_note.in_footnote_zone = true;
+
+        let mut decoded = vec![
+            (header, Lm2Action::HideNoise),
+            (folio, Lm2Action::HideNoise),
+            (caption, Lm2Action::HideNoise),
+            (subtitle, Lm2Action::HideNoise),
+            (table_header, Lm2Action::Keep),
+            (row, Lm2Action::Keep),
+            (note, Lm2Action::Marginalia),
+            (next_header, Lm2Action::HideNoise),
+            (next_folio, Lm2Action::HideNoise),
+            (continued, Lm2Action::HideNoise),
+            (continued_row, Lm2Action::Keep),
+            (next_note, Lm2Action::Marginalia),
+        ];
+
+        apply_numbered_table_figure_band_role_hints(&mut decoded);
+
+        assert_eq!(decoded[2].0.role_hint, Some(LiquidBlockRole::Caption));
+        assert_eq!(decoded[3].0.role_hint, Some(LiquidBlockRole::Caption));
+        assert!(decoded[4..6].iter().all(|(line, action)| {
+            *action == Lm2Action::HideNoise && line.role_hint == Some(LiquidBlockRole::Table)
+        }));
+        assert!(decoded[9..11].iter().all(|(line, action)| {
+            *action == Lm2Action::HideNoise && line.role_hint == Some(LiquidBlockRole::Table)
+        }));
+        assert_eq!(decoded[6].1, Lm2Action::Marginalia);
+        assert_eq!(decoded[11].1, Lm2Action::Marginalia);
+    }
+
+    #[test]
+    fn numbered_table_band_stops_before_indented_body_return() {
+        let mut caption = lm2_test_source_line("p49:l3", 3, "Table 4", 1.0, true, None);
+        caption.page_width = 1000.0;
+        let mut subtitle =
+            lm2_test_source_line("p49:l4", 4, "Preventive Structures", 1.0, true, None);
+        subtitle.page_width = 1000.0;
+        let mut row = lm2_test_source_line(
+            "p49:l5",
+            5,
+            "Holdover The ability of members to serve after term expiration",
+            1.0,
+            false,
+            None,
+        );
+        row.page_width = 1000.0;
+        row.left = 250.0;
+        row.right = 900.0;
+        row.page_object_path_stroke_near_line_count = 1;
+        let mut final_row = lm2_test_source_line(
+            "p49:l6",
+            6,
+            "The requirement that vacancies be filled within a fixed period",
+            1.0,
+            false,
+            None,
+        );
+        final_row.page_width = 1000.0;
+        final_row.left = 300.0;
+        final_row.right = 800.0;
+        final_row.page_object_path_stroke_near_line_count = 1;
+        let mut body_first = lm2_test_source_line(
+            "p49:l7",
+            7,
+            "Two preventive structures are especially important in limiting",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        body_first.page_width = 1000.0;
+        body_first.left = 250.0;
+        body_first.right = 930.0;
+        let mut body_next = lm2_test_source_line(
+            "p49:l8",
+            8,
+            "commissions' quorum losses and preserving institutional authority",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        body_next.page_width = 1000.0;
+        body_next.left = 220.0;
+        body_next.right = 940.0;
+        let mut decoded = vec![
+            (caption, Lm2Action::Keep),
+            (subtitle, Lm2Action::Keep),
+            (row, Lm2Action::Keep),
+            (final_row, Lm2Action::Keep),
+            (body_first, Lm2Action::Keep),
+            (body_next, Lm2Action::Keep),
+        ];
+
+        apply_numbered_table_figure_band_role_hints(&mut decoded);
+
+        assert!(decoded[2..4].iter().all(|(line, action)| {
+            *action == Lm2Action::HideNoise && line.role_hint == Some(LiquidBlockRole::Table)
+        }));
+        assert!(decoded[4..].iter().all(|(line, action)| {
+            *action == Lm2Action::Keep && line.role_hint == Some(LiquidBlockRole::Paragraph)
+        }));
+    }
+
+    #[test]
+    fn numbered_figure_band_stops_before_body_below_false_divider() {
+        let texts = [
+            "FIGURE 1. MOOTNESS EXCEPTIONS",
+            "Inherent Mootness Strategic Mootness",
+            "Example: Pregnancy litigation",
+            "This Article identifies and addresses the strategic mootness gap.",
+        ];
+        let mut decoded = texts
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                let mut line =
+                    lm2_test_source_line(&format!("p4:l{index}"), index, text, 1.0, false, None);
+                line.page_index = 4;
+                if index == 3 {
+                    line.page_has_footnote_divider = true;
+                    line.below_footnote_divider = true;
+                }
+                (line, Lm2Action::Keep)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(apply_numbered_table_figure_band_role_hints(&mut decoded), 3);
+        assert_eq!(decoded[0].0.role_hint, Some(LiquidBlockRole::Caption));
+        assert!(decoded[1..3].iter().all(|(line, action)| {
+            *action == Lm2Action::HideNoise && line.role_hint == Some(LiquidBlockRole::Table)
+        }));
+        assert_eq!(decoded[3].1, Lm2Action::Keep);
+        assert_eq!(decoded[3].0.role_hint, None);
+    }
+
+    #[test]
+    fn numbered_table_reference_in_note_zone_is_not_routed_as_caption() {
+        let mut reference = lm2_test_source_line(
+            "p9:l35",
+            35,
+            "Table 4",
+            0.8,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        reference.in_footnote_zone = true;
+        reference.doc_footnote_state = true;
+        let mut decoded = vec![(reference, Lm2Action::Marginalia)];
+
+        assert_eq!(apply_numbered_table_figure_band_role_hints(&mut decoded), 0);
+        assert_eq!(decoded[0].1, Lm2Action::Marginalia);
+        assert_eq!(decoded[0].0.role_hint, Some(LiquidBlockRole::Marginalia));
+    }
+
+    #[test]
+    fn table_router_hides_short_heading_labels_below_embedded_table_caption() {
+        let anchor = lm2_test_source_line(
+            "p11:l0",
+            0,
+            "Commission Quorums 1136 Table 1 Commissions Without Quorums",
+            0.9,
+            false,
+            Some(LiquidBlockRole::Noise),
+        );
+        let label = lm2_test_source_line(
+            "p11:l9",
+            9,
+            "Defense Nuclear Facilities Safety",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Heading),
+        );
+        let second_label = lm2_test_source_line(
+            "p11:l12",
+            12,
+            "Equal Employment Opportunity Commission",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Heading),
+        );
+        let decoded = vec![
+            (anchor, Lm2Action::HideNoise),
+            (label.clone(), Lm2Action::Keep),
+            (second_label, Lm2Action::Keep),
+        ];
+        let mut blocks = vec![LiquidBlock {
+            role: LiquidBlockRole::Heading,
+            text: label.text.clone(),
+            label: None,
+        }];
+        let sources = vec![LiquidBlockSourceLines {
+            block_index: 0,
+            lines: vec![line_ref(&label, LiquidBlockRole::Heading)],
+        }];
+
+        assert!(lm2_numbered_table_figure_page_anchor(&decoded[0].0.text));
+        assert_eq!(
+            apply_table_figure_block_role_routing(&mut blocks, &sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[0].role, LiquidBlockRole::Table);
+    }
+
+    #[test]
+    fn table_router_preserves_a_source_backed_roman_outline_heading() {
+        let mut first = lm2_test_source_line(
+            "p52:l2",
+            2,
+            "IV. FROM LEGALISTIC NONCOMPLIANCE TO LEGALIZED",
+            1.2,
+            true,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        first.in_ruled_cell = true;
+        let mut second = lm2_test_source_line(
+            "p52:l3",
+            3,
+            "NONCOMPLIANCE?",
+            1.2,
+            true,
+            Some(LiquidBlockRole::Heading),
+        );
+        second.in_ruled_cell = true;
+        let decoded = vec![
+            (first.clone(), Lm2Action::Keep),
+            (second.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![LiquidBlock {
+            role: LiquidBlockRole::Heading,
+            text: format!("{} {}", first.text, second.text),
+            label: None,
+        }];
+        let sources = vec![LiquidBlockSourceLines {
+            block_index: 0,
+            lines: vec![
+                line_ref(&first, LiquidBlockRole::Paragraph),
+                line_ref(&second, LiquidBlockRole::Heading),
+            ],
+        }];
+
+        assert_eq!(
+            apply_table_figure_block_role_routing(&mut blocks, &sources, &decoded),
+            0
+        );
+        assert_eq!(blocks[0].role, LiquidBlockRole::Heading);
+    }
+
+    #[test]
+    fn lowercase_bold_conclusion_splits_from_its_paragraph_body() {
+        let mut heading = lm2_test_source_line(
+            "p79:l17",
+            17,
+            "conclusion",
+            1.08,
+            true,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        heading.bold = true;
+        heading.segment_block_shape = "heading".to_owned();
+        let body = lm2_test_source_line(
+            "p79:l18",
+            18,
+            "Cross-sovereign policing is a constitutional anomaly.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let decoded = vec![
+            (heading.clone(), Lm2Action::Keep),
+            (body.clone(), Lm2Action::Keep),
+        ];
+        let line_by_id = decoded
+            .iter()
+            .map(|(line, _)| (line.id.as_str(), line))
+            .collect::<HashMap<_, _>>();
+        let refs = vec![
+            line_ref(&heading, LiquidBlockRole::Paragraph),
+            line_ref(&body, LiquidBlockRole::Paragraph),
+        ];
+
+        let groups = lm2_paragraph_outline_groups(&refs, &line_by_id).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, LiquidBlockRole::Heading);
+        assert_eq!(groups[0].1[0].text, "conclusion");
+    }
+
+    #[test]
+    fn source_note_markers_require_an_accepted_note_start() {
+        let mut head = lm2_test_source_line(
+            "p4:l16",
+            16,
+            &format!("{CALLOUT_START}12{CALLOUT_END}. Authority."),
+            0.82,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        head.in_footnote_zone = true;
+        head.segment_block_footnote_like = true;
+        let body = lm2_test_source_line(
+            "p4:l17",
+            17,
+            &format!("Body prose continues{CALLOUT_START}12{CALLOUT_END} here."),
+            1.0,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        let mut explicit = lm2_test_source_line(
+            "p4:l18",
+            18,
+            "12. Authority.",
+            0.82,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        explicit.in_footnote_zone = true;
+        explicit.font_ratio_page_ref = 0.82;
+        explicit.font_ratio_page = 0.82;
+        explicit.font_ratio_doc = 0.82;
+
+        assert!(source_line_note_markers(&head, LiquidBlockRole::Marginalia).is_empty());
+        assert!(source_line_note_markers(&body, LiquidBlockRole::Marginalia).is_empty());
+        assert_eq!(
+            source_line_note_markers(&explicit, LiquidBlockRole::Marginalia),
+            vec![12]
+        );
+        assert_eq!(
+            line_ref_with_note_start(&head, LiquidBlockRole::Marginalia, true).note_markers,
+            vec![12]
+        );
+        assert!(
+            line_ref_with_note_start(&body, LiquidBlockRole::Marginalia, false)
+                .note_markers
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dense_page_note_head_can_sit_above_page_midpoint() {
+        let mut note = lm2_test_source_line(
+            "p71:l16",
+            16,
+            &format!("{CALLOUT_START}353{CALLOUT_END}. Authority."),
+            0.82,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        note.page_height = 720.0;
+        note.top = 444.5;
+        note.bottom = 433.1;
+        note.in_footnote_zone = true;
+        note.segment_block_footnote_like = true;
+        note.font_ratio_page_ref = 0.82;
+
+        let mut body = note.clone();
+        body.id = "p71:l15".to_owned();
+        body.line_index = 15;
+        body.text = format!("{CALLOUT_START}356{CALLOUT_END} What begins as");
+        body.in_footnote_zone = false;
+        body.segment_block_footnote_like = false;
+        body.font_ratio_page_ref = 0.91;
+
+        assert!(lm2_note_head_zone_evidence(&note));
+        assert_eq!(leading_sentineled_note_head_marker(&note), Some(353));
+        assert!(!lm2_note_head_zone_evidence(&body));
+        assert_eq!(leading_sentineled_note_head_marker(&body), None);
+
+        let mut missed_zone = note.clone();
+        missed_zone.id = "p4:l16".to_owned();
+        missed_zone.text = format!("{CALLOUT_START}4{CALLOUT_END}. See authority.");
+        missed_zone.in_footnote_zone = false;
+        missed_zone.segment_block_footnote_like = false;
+        missed_zone.segment_block_shape = "body".to_owned();
+        missed_zone.font_ratio_page_ref = 0.81;
+        assert!(!lm2_note_head_zone_evidence(&missed_zone));
+        assert_eq!(leading_sentineled_note_head_marker(&missed_zone), Some(4));
+    }
+
+    #[test]
+    fn same_row_callout_with_following_prose_uses_definition_evidence() {
+        let mut previous = lm2_test_source_line(
+            "p30:l36",
+            36,
+            "on the ground that the local agents acted under color of federal law.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        previous.page_index = 30;
+        previous.page_width = 486.0;
+        previous.left = 57.96;
+        previous.right = 351.72;
+        previous.bottom = 250.24;
+        previous.top = 261.20;
+        previous.font_height = 9.24;
+        let mut current = lm2_test_source_line(
+            "p30:l37",
+            37,
+            "153 However,",
+            0.97,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        current.page_index = 30;
+        current.page_width = 486.0;
+        current.left = 351.84;
+        current.right = 407.82;
+        current.bottom = 250.24;
+        current.top = 261.82;
+        current.font_height = 9.02;
+        current.in_footnote_zone = true;
+
+        assert!(lm2_same_row_leading_callout_with_prose(
+            &previous, &current, 153
+        ));
+
+        previous.id = "p13:l13".to_owned();
+        previous.page_index = 13;
+        previous.line_index = 13;
+        previous.text = "independent review will infringe on that organizationâ€™s expressive association rights."
+            .to_owned();
+        previous.left = 73.4;
+        previous.right = 397.4;
+        previous.bottom = 456.1;
+        previous.top = 482.5;
+        previous.font_height = 9.36;
+        current.id = "p13:l14".to_owned();
+        current.page_index = 13;
+        current.line_index = 14;
+        current.text = "78 A close".to_owned();
+        current.left = 358.7;
+        current.right = 397.5;
+        current.bottom = 456.1;
+        current.top = 470.5;
+        current.font_height = 7.82;
+        current.in_footnote_zone = false;
+        assert!(lm2_same_row_leading_callout_with_prose(
+            &previous, &current, 78
+        ));
+    }
+
+    #[test]
+    fn mixed_marginalia_moves_only_body_callout_line_back_to_paragraph() {
+        let mut previous = lm2_test_source_line(
+            "p8:l21",
+            21,
+            "ory—renders such public coercion reviewable and legitimate.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        previous.page_index = 8;
+        previous.page_width = 486.0;
+        previous.left = 57.96;
+        previous.right = 325.95;
+        previous.bottom = 408.22;
+        previous.top = 419.15;
+        previous.font_height = 9.97;
+        let mut callout = lm2_test_source_line(
+            "p8:l22",
+            22,
+            &format!("{CALLOUT_START}29{CALLOUT_END} If sovereign ide-"),
+            0.91,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        callout.page_index = 8;
+        callout.page_width = 486.0;
+        callout.left = 326.04;
+        callout.right = 407.77;
+        callout.bottom = 408.22;
+        callout.top = 419.54;
+        callout.font_height = 9.03;
+        let mut continuation = lm2_test_source_line(
+            "p8:l23",
+            23,
+            "Common Law, Cooperative Federalism, and the Enforcement of the Telecom Act.",
+            0.82,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        continuation.page_index = 8;
+        continuation.page_height = 720.0;
+        continuation.top = 190.0;
+        continuation.in_footnote_zone = true;
+        continuation.segment_block_footnote_like = true;
+        let mut definition = continuation.clone();
+        definition.id = "p8:l38".to_owned();
+        definition.line_index = 38;
+        definition.text = format!("{CALLOUT_START}29{CALLOUT_END}. Definition.");
+
+        let decoded = vec![
+            (previous.clone(), Lm2Action::Keep),
+            (callout.clone(), Lm2Action::Marginalia),
+            (continuation.clone(), Lm2Action::Marginalia),
+            (definition.clone(), Lm2Action::Marginalia),
+        ];
+        let mut definition_ref = line_ref(&definition, LiquidBlockRole::Marginalia);
+        definition_ref.note_markers.push(29);
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: previous.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!("{} {}", callout.text, continuation.text),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: definition.text.clone(),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&previous, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![
+                    line_ref(&callout, LiquidBlockRole::Marginalia),
+                    line_ref(&continuation, LiquidBlockRole::Marginalia),
+                ],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![definition_ref],
+            },
+        ];
+
+        assert_eq!(
+            apply_mixed_marginalia_leading_body_callout_split(&mut blocks, &mut sources, &decoded,),
+            1
+        );
+        assert!(blocks[0].text.contains(&format!(
+            "legitimate.{CALLOUT_START}29{CALLOUT_END} If sovereign ide-"
+        )));
+        assert_eq!(blocks[1].text, continuation.text);
+        assert_eq!(sources[0].lines.len(), 2);
+        assert_eq!(sources[1].lines.len(), 1);
+    }
+
+    #[test]
+    fn abstract_continuation_and_author_label_leave_marginalia() {
+        let abstract_line = lm2_test_source_line(
+            "p0:l10",
+            10,
+            "The abstract begins here.",
+            0.9,
+            false,
+            Some(LiquidBlockRole::Abstract),
+        );
+        let mut continuation = lm2_test_source_line(
+            "p1:l2",
+            2,
+            "committed under color of federal law.",
+            0.85,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        continuation.page_index = 1;
+        let mut author = continuation.clone();
+        author.id = "p1:l7".to_owned();
+        author.line_index = 7;
+        author.text = "author. Gary & Sallyn Pajcic Professor.".to_owned();
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Abstract,
+                text: abstract_line.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!("{} {}", continuation.text, author.text),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&abstract_line, LiquidBlockRole::Abstract)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![
+                    line_ref(&continuation, LiquidBlockRole::Marginalia),
+                    line_ref(&author, LiquidBlockRole::Marginalia),
+                ],
+            },
+        ];
+
+        assert_eq!(
+            apply_front_matter_abstract_author_reflow(&mut blocks, &mut sources),
+            1
+        );
+        assert_eq!(blocks[1].role, LiquidBlockRole::AuthorInfo);
+        assert!(blocks[0].text.ends_with(&continuation.text));
+        assert!(blocks[1].text.starts_with("author."));
+    }
+
+    #[test]
+    fn starred_byline_is_split_from_unlabelled_cross_page_abstract() {
+        let mut byline = lm2_test_source_line(
+            "p0:l7",
+            7,
+            "Rachel Bayefsky*",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        byline.page_index = 0;
+        let mut opening = lm2_test_source_line(
+            "p0:l8",
+            8,
+            "In recent years, tradition has been influentially invoked in constitutional rights adjudication.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        opening.page_index = 0;
+        let mut author_note = lm2_test_source_line(
+            "p0:l20",
+            20,
+            "* Associate Professor of Law. Thanks to the editors.",
+            0.8,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        author_note.page_index = 0;
+        let mut header = lm2_test_source_line(
+            "p1:l0",
+            0,
+            "866 Virginia Law Review [Vol. 112:865",
+            0.8,
+            false,
+            Some(LiquidBlockRole::Noise),
+        );
+        header.page_index = 1;
+        let mut continuation = lm2_test_source_line(
+            "p1:l2",
+            2,
+            "subordination? Yet the relationship between feminism and traditionalism depends on the form that traditionalism takes.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        continuation.page_index = 1;
+        let mut contents = lm2_test_source_line(
+            "p1:l24",
+            24,
+            "I. TRADITION 875 A. DOCTRINE 876 B. MEANING 883 II. AN ACCOUNT 889 CONCLUSION 945",
+            0.8,
+            false,
+            Some(LiquidBlockRole::Noise),
+        );
+        contents.page_index = 1;
+        let mut introduction = lm2_test_source_line(
+            "p2:l14",
+            14,
+            "INTRODUCTION",
+            1.1,
+            false,
+            Some(LiquidBlockRole::Heading),
+        );
+        introduction.page_index = 2;
+
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Title,
+                text: "TRADITION AND FEMINISM IN CONSTITUTIONAL RIGHTS ADJUDICATION".to_owned(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: format!("{} {}", byline.text, opening.text),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: author_note.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: header.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: continuation.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: contents.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Heading,
+                text: introduction.text.clone(),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![
+                    line_ref(&byline, LiquidBlockRole::Paragraph),
+                    line_ref(&opening, LiquidBlockRole::Paragraph),
+                ],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&author_note, LiquidBlockRole::Marginalia)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 3,
+                lines: vec![line_ref(&header, LiquidBlockRole::Noise)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 4,
+                lines: vec![line_ref(&continuation, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 5,
+                lines: vec![line_ref(&contents, LiquidBlockRole::Noise)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 6,
+                lines: vec![line_ref(&introduction, LiquidBlockRole::Heading)],
+            },
+        ];
+
+        assert_eq!(
+            apply_front_matter_byline_abstract_split(&mut blocks, &mut sources),
+            2
+        );
+        assert_eq!(blocks[1].role, LiquidBlockRole::AuthorInfo);
+        assert_eq!(blocks[1].text, "Rachel Bayefsky*");
+        assert_eq!(blocks[2].role, LiquidBlockRole::Abstract);
+        assert!(blocks[2].text.starts_with("In recent years"));
+        assert_eq!(blocks[5].role, LiquidBlockRole::Abstract);
+        assert!(blocks[5].text.starts_with("subordination?"));
+        assert_eq!(blocks[6].role, LiquidBlockRole::Noise);
+        assert_eq!(blocks[7].role, LiquidBlockRole::Heading);
+        assert_eq!(sources[0].block_index, 1);
+        assert_eq!(sources[0].lines[0].role, LiquidBlockRole::AuthorInfo);
+        assert_eq!(sources[1].block_index, 2);
+        assert!(
+            sources[1]
+                .lines
+                .iter()
+                .all(|line| line.role == LiquidBlockRole::Abstract)
+        );
+    }
+
+    #[test]
     fn toc_overlay_recovers_matching_section_heading() {
         let dotleader = lm2_test_source_line(
             "p0:l0",
@@ -17267,6 +32609,188 @@ mod tests {
         let mut case_specific = "case-".to_owned();
         append_line(&mut case_specific, "specific inquiry");
         assert_eq!(case_specific, "case-specific inquiry");
+
+        let mut conflict_of_laws = "conflict-".to_owned();
+        append_line(&mut conflict_of_laws, "of-laws analysis");
+        assert_eq!(conflict_of_laws, "conflict-of-laws analysis");
+
+        let mut conflicting = "conflict-".to_owned();
+        append_line(&mut conflicting, "ing decisions");
+        assert_eq!(conflicting, "conflicting decisions");
+
+        let mut abortion_rights_group = "an abortion-".to_owned();
+        append_line(&mut abortion_rights_group, "rights group would object");
+        assert_eq!(
+            abortion_rights_group,
+            "an abortion-rights group would object"
+        );
+    }
+
+    #[test]
+    fn append_line_does_not_add_space_after_terminal_typographic_dash() {
+        let mut em_dash = "rights are secured\u{2014}".to_owned();
+        append_line(&mut em_dash, "Congress's response");
+        assert_eq!(em_dash, "rights are secured\u{2014}Congress's response");
+
+        let mut en_dash = "the state\u{2013}".to_owned();
+        append_line(&mut en_dash, "federal divide");
+        assert_eq!(en_dash, "the state\u{2013}federal divide");
+    }
+
+    #[test]
+    fn document_hyphen_evidence_repairs_internal_pdf_markers() {
+        let evidence_joined = lm2_test_source_line(
+            "p0:l0",
+            0,
+            "Authority and statement are intact elsewhere.",
+            1.0,
+            false,
+            None,
+        );
+        let evidence_hyphenated = lm2_test_source_line(
+            "p0:l1",
+            1,
+            "The conflict-of-laws framework is repeated.",
+            1.0,
+            false,
+            None,
+        );
+        let authority = lm2_test_source_line(
+            "p0:l2",
+            2,
+            "reliance on coercive au\u{0002}thority",
+            1.0,
+            false,
+            None,
+        );
+        let statement = lm2_test_source_line(
+            "p0:l3",
+            3,
+            "the state\u{0002}ment remains",
+            1.0,
+            false,
+            None,
+        );
+        let conflict = lm2_test_source_line(
+            "p0:l4",
+            4,
+            "a conflict\u{0002}of-laws analysis",
+            1.0,
+            false,
+            None,
+        );
+        let abortion_rights = lm2_test_source_line(
+            "p0:l5",
+            5,
+            "an abortion\u{0002}rights group would object",
+            1.0,
+            false,
+            None,
+        );
+        let mut decoded = vec![
+            (evidence_joined, Lm2Action::Keep),
+            (evidence_hyphenated, Lm2Action::Keep),
+            (authority, Lm2Action::Keep),
+            (statement, Lm2Action::Keep),
+            (conflict, Lm2Action::Keep),
+            (abortion_rights, Lm2Action::Keep),
+        ];
+
+        assert_eq!(apply_document_discretionary_hyphen_repairs(&mut decoded), 4);
+        assert_eq!(decoded[2].0.text, "reliance on coercive authority");
+        // Document evidence overrides the broad `state-` compound fallback.
+        assert_eq!(decoded[3].0.text, "the statement remains");
+        assert_eq!(decoded[4].0.text, "a conflict-of-laws analysis");
+        assert_eq!(decoded[5].0.text, "an abortion-rights group would object");
+    }
+
+    #[test]
+    fn terminal_pdf_hyphen_marker_remains_for_cross_line_joining() {
+        let evidence = HashSet::new();
+        let (text, repaired) =
+            repair_internal_discretionary_hyphens("a conflict\u{0002}", &evidence);
+
+        assert_eq!(repaired, 0);
+        assert_eq!(text, "a conflict\u{0002}");
+    }
+
+    #[test]
+    fn document_spacing_repairs_require_repeated_phrase_or_narrow_note_cue() {
+        let evidence_one = lm2_test_source_line(
+            "p0:l0",
+            0,
+            "Choice of Model clauses govern the protocol.",
+            1.0,
+            false,
+            None,
+        );
+        let evidence_two = lm2_test_source_line(
+            "p0:l1",
+            1,
+            "Choice of Model clauses remain contestable.",
+            1.0,
+            false,
+            None,
+        );
+        let fused = lm2_test_source_line(
+            "p0:l2",
+            2,
+            "Choice of Modelclauses would specify a model.",
+            1.0,
+            false,
+            None,
+        );
+        let weak_bigram = lm2_test_source_line(
+            "p0:l3",
+            3,
+            "Some thing happened only once.",
+            1.0,
+            false,
+            None,
+        );
+        let ordinary_word = lm2_test_source_line(
+            "p0:l4",
+            4,
+            "Something remains an ordinary word.",
+            1.0,
+            false,
+            None,
+        );
+        let mut note = lm2_test_source_line(
+            "p0:l5",
+            5,
+            "161 SeeConstellation Power; but cf. KENNETH A.ADAMS,AMANUAL OF STYLE.",
+            0.75,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        note.in_footnote_zone = true;
+        note.below_footnote_divider = true;
+        let mut decoded = vec![
+            (evidence_one, Lm2Action::Keep),
+            (evidence_two, Lm2Action::Keep),
+            (fused, Lm2Action::Keep),
+            (weak_bigram, Lm2Action::Keep),
+            (ordinary_word, Lm2Action::Keep),
+            (note, Lm2Action::Marginalia),
+        ];
+
+        assert!(apply_document_fused_word_spacing_repairs(&mut decoded) >= 5);
+        assert!(decoded[2].0.text.contains("Model clauses"));
+        assert!(decoded[4].0.text.contains("Something remains"));
+        assert!(decoded[5].0.text.contains("See Constellation"));
+        assert!(decoded[5].0.text.contains("A. ADAMS, A MANUAL OF STYLE"));
+    }
+
+    #[test]
+    fn append_line_preserves_url_and_scenario_hyphens() {
+        let mut url = "https://example.test/qualify-as-".to_owned();
+        append_line(&mut url, "sandwiches/.");
+        assert_eq!(url, "https://example.test/qualify-as-sandwiches/.");
+
+        let mut scenario = "The scenario-".to_owned();
+        append_line(&mut scenario, "balanced result held.");
+        assert_eq!(scenario, "The scenario-balanced result held.");
     }
 
     #[test]
@@ -17312,6 +32836,2131 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["p0:l10", "p0:l11"]
         );
+    }
+
+    #[test]
+    fn same_row_leading_callout_moves_marker_back_and_rejoins_prose() {
+        let mut previous = lm2_test_source_line(
+            "p0:l24",
+            24,
+            "thereby triggering the right of first purchase for $10.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        previous.page_width = 612.0;
+        previous.page_height = 792.0;
+        previous.left = 137.5;
+        previous.right = 420.6;
+        previous.bottom = 417.3;
+        previous.top = 432.2;
+        previous.font_height = 10.98;
+
+        let mut marker_and_prose = lm2_test_source_line(
+            "p0:l25",
+            25,
+            "346 At that",
+            0.90,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        marker_and_prose.page_width = 612.0;
+        marker_and_prose.page_height = 792.0;
+        marker_and_prose.left = 420.6;
+        marker_and_prose.right = 477.3;
+        marker_and_prose.bottom = 417.8;
+        marker_and_prose.top = 427.4;
+        marker_and_prose.font_height = 9.85;
+        marker_and_prose.in_footnote_zone = true;
+
+        let continuation = lm2_test_source_line(
+            "p0:l26",
+            26,
+            "point, the creditor would have a lien.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let mut note = lm2_test_source_line(
+            "p0:l40",
+            40,
+            "346 Id. at 814.",
+            0.65,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        note.in_footnote_zone = true;
+
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: previous.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: "346 At that point, the creditor would have a lien.".to_owned(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: note.text.clone(),
+                label: None,
+            },
+        ];
+        let mut note_ref = line_ref(&note, LiquidBlockRole::Marginalia);
+        note_ref.note_markers = vec![346];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&previous, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![
+                    line_ref(&marker_and_prose, LiquidBlockRole::Paragraph),
+                    line_ref(&continuation, LiquidBlockRole::Paragraph),
+                ],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![note_ref],
+            },
+        ];
+        let decoded = vec![
+            (previous, Lm2Action::Keep),
+            (marker_and_prose, Lm2Action::Keep),
+            (continuation, Lm2Action::Keep),
+            (note, Lm2Action::Marginalia),
+        ];
+
+        assert_eq!(
+            apply_same_row_leading_callout_reflow(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(
+            blocks[0].text,
+            format!(
+                "thereby triggering the right of first purchase for $10.{CALLOUT_START}346{CALLOUT_END} At that point, the creditor would have a lien."
+            )
+        );
+        assert_eq!(sources[0].lines.len(), 3);
+        assert_eq!(sources[1].block_index, 1);
+    }
+
+    #[test]
+    fn same_block_leading_callout_moves_marker_before_prose_fragment() {
+        let mut previous = lm2_test_source_line(
+            "p26:l1",
+            1,
+            "reason for augmenting discovery was to make litigation less expensive.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        previous.page_index = 26;
+        previous.page_width = 612.0;
+        previous.left = 108.0;
+        previous.right = 455.64;
+        previous.bottom = 668.796;
+        previous.top = 684.96;
+        previous.font_height = 12.0;
+
+        let mut current = lm2_test_source_line(
+            "p26:l2",
+            2,
+            "126 Today,",
+            0.9,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        current.page_index = 26;
+        current.page_width = 612.0;
+        current.left = 456.24;
+        current.right = 507.0;
+        current.bottom = 668.796;
+        current.top = 684.96;
+        current.font_height = 9.63;
+
+        let mut note = lm2_test_source_line(
+            "p26:l22",
+            22,
+            "126 See generally the authority.",
+            0.7,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        note.page_index = 26;
+        note.in_footnote_zone = true;
+
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: format!("{} {}", previous.text, current.text),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: note.text.clone(),
+                label: None,
+            },
+        ];
+        let mut note_ref = line_ref(&note, LiquidBlockRole::Marginalia);
+        note_ref.note_markers = vec![126];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![
+                    line_ref(&previous, LiquidBlockRole::Paragraph),
+                    line_ref(&current, LiquidBlockRole::Paragraph),
+                ],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![note_ref],
+            },
+        ];
+        let decoded = vec![
+            (previous, Lm2Action::Keep),
+            (current, Lm2Action::Keep),
+            (note, Lm2Action::Marginalia),
+        ];
+
+        assert_eq!(
+            apply_same_row_leading_callout_reflow(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert!(
+            blocks[0]
+                .text
+                .contains(&format!("expensive.{CALLOUT_START}126{CALLOUT_END} Today,"))
+        );
+        assert_eq!(blocks.len(), 2);
+    }
+
+    #[test]
+    fn same_row_callout_bridge_joins_adjacent_body_paragraph() {
+        let fixture = |continuation_left: f32| {
+            let mut base = lm2_test_source_line(
+                "p30:l1",
+                1,
+                "workers it represents.",
+                1.0,
+                false,
+                Some(LiquidBlockRole::Paragraph),
+            );
+            base.page_index = 30;
+            base.page_width = 612.0;
+            base.left = 57.96;
+            base.right = 178.756;
+            base.bottom = 700.0;
+            base.top = 712.0;
+            base.font_height = 12.0;
+            let mut marker = lm2_test_source_line(
+                "p30:l2",
+                2,
+                "196 Workers remain free to speak against the bargaining",
+                1.0,
+                false,
+                None,
+            );
+            marker.page_index = 30;
+            marker.page_width = 612.0;
+            marker.left = 178.824;
+            marker.right = 480.0;
+            marker.bottom = 700.0;
+            marker.top = 712.0;
+            marker.font_height = 12.0;
+            let mut continuation = lm2_test_source_line(
+                "p30:l3",
+                3,
+                "positions of their unions.",
+                1.0,
+                false,
+                Some(LiquidBlockRole::Paragraph),
+            );
+            continuation.page_index = 30;
+            continuation.page_width = 612.0;
+            continuation.left = continuation_left;
+            let mut stray = lm2_test_source_line("p30:l4", 4, "197", 0.7, false, None);
+            stray.page_index = 30;
+            let mut note = lm2_test_source_line(
+                "p30:l20",
+                20,
+                "196 See the relevant authority.",
+                0.75,
+                false,
+                Some(LiquidBlockRole::Marginalia),
+            );
+            note.page_index = 30;
+            note.in_footnote_zone = true;
+            let mut note_ref = line_ref(&note, LiquidBlockRole::Marginalia);
+            note_ref.note_markers = vec![196];
+            let blocks = vec![
+                LiquidBlock {
+                    role: LiquidBlockRole::Paragraph,
+                    text: format!(
+                        "{}{}{}{} Workers remain free to speak against the bargaining",
+                        base.text, CALLOUT_START, 196, CALLOUT_END
+                    ),
+                    label: None,
+                },
+                LiquidBlock {
+                    role: LiquidBlockRole::Paragraph,
+                    text: continuation.text.clone(),
+                    label: None,
+                },
+                LiquidBlock {
+                    role: LiquidBlockRole::Noise,
+                    text: stray.text.clone(),
+                    label: None,
+                },
+                LiquidBlock {
+                    role: LiquidBlockRole::Marginalia,
+                    text: format!("{CALLOUT_START}196{CALLOUT_END} See the relevant authority."),
+                    label: None,
+                },
+            ];
+            let sources = vec![
+                LiquidBlockSourceLines {
+                    block_index: 0,
+                    lines: vec![
+                        line_ref(&base, LiquidBlockRole::Paragraph),
+                        line_ref(&marker, LiquidBlockRole::Noise),
+                    ],
+                },
+                LiquidBlockSourceLines {
+                    block_index: 1,
+                    lines: vec![line_ref(&continuation, LiquidBlockRole::Paragraph)],
+                },
+                LiquidBlockSourceLines {
+                    block_index: 2,
+                    lines: vec![line_ref(&stray, LiquidBlockRole::Noise)],
+                },
+                LiquidBlockSourceLines {
+                    block_index: 3,
+                    lines: vec![note_ref],
+                },
+            ];
+            let decoded = vec![
+                (base, Lm2Action::Keep),
+                (marker, Lm2Action::HideNoise),
+                (continuation, Lm2Action::Keep),
+                (stray, Lm2Action::HideNoise),
+                (note, Lm2Action::Marginalia),
+            ];
+            (blocks, sources, decoded)
+        };
+
+        let (mut blocks, mut sources, decoded) = fixture(57.96);
+        assert_eq!(
+            apply_same_row_leading_callout_reflow(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 3);
+        assert!(
+            blocks[0]
+                .text
+                .contains("bargaining positions of their unions.")
+        );
+        assert_eq!(blocks[1].role, LiquidBlockRole::Noise);
+        assert_eq!(blocks[1].text, "197");
+        assert_eq!(
+            sources[0]
+                .lines
+                .iter()
+                .map(|line| line.line_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(sources[0].lines[1].role, LiquidBlockRole::Paragraph);
+
+        let (mut blocks, mut sources, decoded) = fixture(120.0);
+        assert_eq!(
+            apply_same_row_leading_callout_reflow(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(blocks.len(), 4);
+    }
+
+    #[test]
+    fn markerless_table_row_is_not_absorbed_into_interleaved_note_flow() {
+        let mut before = lm2_test_source_line(
+            "p39:l40",
+            40,
+            "example, if the party argues for original meaning solely",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        before.page_index = 39;
+        before.in_footnote_zone = true;
+        let mut false_note = lm2_test_source_line(
+            "p39:l41",
+            41,
+            "on the basis of Federalist No. 10, the court may not",
+            0.95,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        false_note.page_index = 39;
+        false_note.in_footnote_zone = true;
+        let mut after = lm2_test_source_line(
+            "p39:l42",
+            42,
+            "consider the ratification debates or Federalist No. 12",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        after.page_index = 39;
+        after.in_footnote_zone = true;
+
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: format!("{} {}", before.text, after.text),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: false_note.text.clone(),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![
+                    line_ref(&before, LiquidBlockRole::Paragraph),
+                    line_ref(&after, LiquidBlockRole::Paragraph),
+                ],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&false_note, LiquidBlockRole::Marginalia)],
+            },
+        ];
+        let decoded = vec![
+            (before, Lm2Action::Keep),
+            (false_note, Lm2Action::Marginalia),
+            (after, Lm2Action::Keep),
+        ];
+
+        assert_eq!(
+            apply_interleaved_note_continuation_reflow(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert!(blocks[0].text.contains("ratification debates"));
+        assert!(!blocks[1].text.contains("ratification debates"));
+    }
+
+    #[test]
+    fn interleaved_note_continuation_leaves_body_and_restores_table_tail() {
+        let body = lm2_test_source_line(
+            "p3:l21",
+            21,
+            "a civil remedy for constitutional and statutory",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let mut misplaced = lm2_test_source_line(
+            "p3:l36",
+            36,
+            "bnews.org/item [https://perma.cc/AE2F",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        misplaced.font_ratio_page_ref = 0.93;
+        misplaced.font_ratio_doc = 0.95;
+        misplaced.in_footnote_zone = true;
+        let mut note = lm2_test_source_line(
+            "p3:l35",
+            35,
+            "3 Citation ending at https://capital-",
+            0.82,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        note.in_footnote_zone = true;
+        let mut tail = lm2_test_source_line(
+            "p3:l37",
+            37,
+            "-ELDB] and the rest of the citation.",
+            0.82,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        tail.in_footnote_zone = true;
+
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: format!("{} {}", body.text, misplaced.text),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!("{CALLOUT_START}3{CALLOUT_END}. Citation ending at https://capital-"),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Table,
+                text: tail.text.clone(),
+                label: Some("table".to_owned()),
+            },
+        ];
+        let mut note_ref = line_ref(&note, LiquidBlockRole::Marginalia);
+        note_ref.note_markers = vec![3];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![
+                    line_ref(&body, LiquidBlockRole::Paragraph),
+                    line_ref(&misplaced, LiquidBlockRole::Paragraph),
+                ],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![note_ref],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&tail, LiquidBlockRole::Marginalia)],
+            },
+        ];
+        let decoded = vec![
+            (body, Lm2Action::Keep),
+            (note, Lm2Action::Marginalia),
+            (misplaced, Lm2Action::Keep),
+            (tail, Lm2Action::Marginalia),
+        ];
+
+        assert_eq!(
+            apply_interleaved_note_continuation_reflow(&mut blocks, &mut sources, &decoded),
+            2
+        );
+        assert!(!blocks[0].text.contains("bnews.org"));
+        assert!(blocks[1].text.contains("bnews.org"));
+        assert_eq!(blocks[2].role, LiquidBlockRole::Marginalia);
+        assert!(blocks[2].label.is_none());
+    }
+
+    #[test]
+    fn cross_page_year_citation_table_returns_to_previous_note() {
+        let mut previous_note = lm2_test_source_line(
+            "p0:l40",
+            40,
+            "383 Consent decree, 35 F. Supp. 3d 788 (E.D. La.",
+            0.8,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        previous_note.in_footnote_zone = true;
+        let mut carryover = lm2_test_source_line(
+            "p1:l27",
+            27,
+            "2013) (No. 12-1924); Consent Decree at 29.",
+            0.8,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        carryover.page_index = 1;
+        carryover.in_footnote_zone = true;
+        carryover.font_ratio_page_ref = 0.8;
+        carryover.font_ratio_doc = 0.82;
+        let mut next_note = lm2_test_source_line(
+            "p1:l28",
+            28,
+            "384 See N.Y.C. Charter.",
+            0.8,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        next_note.page_index = 1;
+        next_note.in_footnote_zone = true;
+
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!(
+                    "{CALLOUT_START}383{CALLOUT_END}. Consent decree, 35 F. Supp. 3d 788 (E.D. La."
+                ),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Table,
+                text: carryover.text.clone(),
+                label: Some("table".to_owned()),
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!("{CALLOUT_START}384{CALLOUT_END}. See N.Y.C. Charter."),
+                label: None,
+            },
+        ];
+        let mut previous_ref = line_ref(&previous_note, LiquidBlockRole::Marginalia);
+        previous_ref.note_markers = vec![383];
+        let mut next_ref = line_ref(&next_note, LiquidBlockRole::Marginalia);
+        next_ref.note_markers = vec![384];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![previous_ref],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&carryover, LiquidBlockRole::Marginalia)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![next_ref],
+            },
+        ];
+        let decoded = vec![
+            (previous_note, Lm2Action::Marginalia),
+            (carryover, Lm2Action::Marginalia),
+            (next_note, Lm2Action::Marginalia),
+        ];
+
+        assert_eq!(
+            apply_interleaved_note_continuation_reflow(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[1].role, LiquidBlockRole::Marginalia);
+        assert!(blocks[1].label.is_none());
+    }
+
+    #[test]
+    fn cross_page_footnote_segment_paragraph_returns_to_previous_note() {
+        let mut previous_note = lm2_test_source_line(
+            "p56:l46",
+            46,
+            "287 Press Release, Padilla, Blumenthal Intro-",
+            0.83,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        previous_note.page_index = 56;
+        previous_note.in_footnote_zone = true;
+        let mut first_carryover = lm2_test_source_line(
+            "p57:l18",
+            18,
+            "duce Bill to Provide Victims of Abuse (Dec. 15,",
+            0.80,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        first_carryover.page_index = 57;
+        first_carryover.in_footnote_zone = true;
+        first_carryover.segment_block_id = 2;
+        first_carryover.segment_block_shape = "footnote".to_owned();
+        first_carryover.segment_block_footnote_like = true;
+        let mut carryover_two = lm2_test_source_line(
+            "p57:l19",
+            19,
+            "2025), https://www.padilla.senate.gov/newsroom/press-releases/",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        carryover_two.page_index = 57;
+        carryover_two.in_footnote_zone = true;
+        carryover_two.segment_block_id = 2;
+        carryover_two.segment_block_shape = "footnote".to_owned();
+        carryover_two.segment_block_footnote_like = true;
+        let mut carryover_three = carryover_two.clone();
+        carryover_three.id = "p57:l20".to_owned();
+        carryover_three.line_index = 20;
+        carryover_three.text = "padilla-blumenthal-introduce-bill-to-provide-victims".to_owned();
+        let mut carryover_four = carryover_two.clone();
+        carryover_four.id = "p57:l21".to_owned();
+        carryover_four.line_index = 21;
+        carryover_four.text = "[https://perma.cc/3MG9-9HQB].".to_owned();
+        let mut next_note = lm2_test_source_line(
+            "p57:l22",
+            22,
+            "288 H.R. 6091, 119th Cong. (2025).",
+            0.80,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        next_note.page_index = 57;
+        next_note.in_footnote_zone = true;
+        let mut later_note = next_note.clone();
+        later_note.id = "p57:l23".to_owned();
+        later_note.line_index = 23;
+        later_note.text = "289 See sources cited supra note 288.".to_owned();
+
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!(
+                    "{CALLOUT_START}287{CALLOUT_END} Press Release, Padilla, Blumenthal Intro-"
+                ),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: first_carryover.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: format!(
+                    "{} {} {}",
+                    carryover_two.text, carryover_three.text, carryover_four.text
+                ),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!(
+                    "{CALLOUT_START}288{CALLOUT_END} H.R. 6091, 119th Cong. (2025). {CALLOUT_START}289{CALLOUT_END} See sources cited supra note 288."
+                ),
+                label: None,
+            },
+        ];
+        let mut previous_ref = line_ref(&previous_note, LiquidBlockRole::Marginalia);
+        previous_ref.note_markers = vec![287];
+        let mut next_ref = line_ref(&next_note, LiquidBlockRole::Marginalia);
+        next_ref.note_markers = vec![288];
+        let mut later_ref = line_ref(&later_note, LiquidBlockRole::Marginalia);
+        later_ref.note_markers = vec![289];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![previous_ref],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&first_carryover, LiquidBlockRole::Marginalia)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![
+                    line_ref(&carryover_two, LiquidBlockRole::Paragraph),
+                    line_ref(&carryover_three, LiquidBlockRole::Paragraph),
+                    line_ref(&carryover_four, LiquidBlockRole::Paragraph),
+                ],
+            },
+            LiquidBlockSourceLines {
+                block_index: 3,
+                lines: vec![next_ref, later_ref],
+            },
+        ];
+        let decoded = vec![
+            (previous_note, Lm2Action::Marginalia),
+            (first_carryover, Lm2Action::Marginalia),
+            (carryover_two, Lm2Action::Keep),
+            (carryover_three, Lm2Action::Keep),
+            (carryover_four, Lm2Action::Keep),
+            (next_note, Lm2Action::Marginalia),
+            (later_note, Lm2Action::Marginalia),
+        ];
+
+        assert_eq!(
+            apply_interleaved_note_continuation_reflow(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[2].role, LiquidBlockRole::Marginalia);
+        assert!(blocks[2].label.is_none());
+        assert!(
+            sources[2]
+                .lines
+                .iter()
+                .all(|line| line.role == LiquidBlockRole::Marginalia)
+        );
+        assert_eq!(blocks[3].role, LiquidBlockRole::Marginalia);
+        assert_eq!(sources[3].lines[0].note_markers, vec![288]);
+    }
+
+    fn inverted_note_continuation_fixture(
+        next_marker: u16,
+    ) -> (
+        Vec<LiquidBlock>,
+        Vec<LiquidBlockSourceLines>,
+        Vec<(DeepLiquidSourceLine, Lm2Action)>,
+    ) {
+        let mut head = lm2_test_source_line(
+            "p78:l34",
+            34,
+            "341 The term modalities is associated with Bobbitt, who defined a",
+            0.76,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        head.page_index = 78;
+        head.font_ratio_page_ref = 0.76;
+        head.font_ratio_page = 0.76;
+        head.font_ratio_doc = 0.76;
+        head.segment_block_id = 3;
+        head.segment_block_shape = "body".to_owned();
+        let mut candidate = lm2_test_source_line(
+            "p78:l35",
+            35,
+            "modality in a technical sense as the way we characterize expression as",
+            0.78,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        candidate.page_index = 78;
+        candidate.font_ratio_page_ref = 0.78;
+        candidate.font_ratio_page = 0.78;
+        candidate.font_ratio_doc = 0.78;
+        candidate.segment_block_id = 3;
+        candidate.segment_block_shape = "body".to_owned();
+        let mut tail = lm2_test_source_line(
+            "p78:l36",
+            36,
+            "true. Bobbitt, supra note 118, at 11.",
+            0.79,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        tail.page_index = 78;
+        tail.in_footnote_zone = true;
+        tail.segment_block_id = 4;
+        tail.segment_block_shape = "footnote".to_owned();
+        tail.segment_block_footnote_like = true;
+        let mut following = tail.clone();
+        following.id = "p78:l37".to_owned();
+        following.line_index = 37;
+        following.text = format!("{next_marker} Griffin, supra note 23, at 1753.");
+
+        let blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: candidate.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!(
+                    "{CALLOUT_START}341{CALLOUT_END} The term modalities is associated with Bobbitt, who defined a"
+                ),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!(
+                    "{} {CALLOUT_START}{next_marker}{CALLOUT_END} Griffin, supra note 23, at 1753.",
+                    tail.text
+                ),
+                label: None,
+            },
+        ];
+        let mut head_ref = line_ref(&head, LiquidBlockRole::Marginalia);
+        head_ref.note_markers = vec![341];
+        let mut following_ref = line_ref(&following, LiquidBlockRole::Marginalia);
+        following_ref.note_markers = vec![next_marker];
+        let sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&candidate, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![head_ref],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&tail, LiquidBlockRole::Marginalia), following_ref],
+            },
+        ];
+        let decoded = vec![
+            (head, Lm2Action::Marginalia),
+            (candidate, Lm2Action::Keep),
+            (tail, Lm2Action::Marginalia),
+            (following, Lm2Action::Marginalia),
+        ];
+        (blocks, sources, decoded)
+    }
+
+    #[test]
+    fn inverted_small_font_note_continuation_returns_to_numbered_head() {
+        let (mut blocks, mut sources, decoded) = inverted_note_continuation_fixture(342);
+
+        assert_eq!(
+            apply_inverted_numbered_note_continuation_reflow(&mut blocks, &mut sources, &decoded,),
+            1
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Marginalia);
+        assert!(
+            blocks[0]
+                .text
+                .contains("Bobbitt, who defined a modality in a technical sense")
+        );
+        assert_eq!(
+            sources[0]
+                .lines
+                .iter()
+                .map(|line| line.line_index)
+                .collect::<Vec<_>>(),
+            vec![34, 35]
+        );
+        assert!(
+            sources[0]
+                .lines
+                .iter()
+                .all(|line| line.role == LiquidBlockRole::Marginalia)
+        );
+        assert_eq!(sources[1].lines[1].note_markers, vec![342]);
+    }
+
+    #[test]
+    fn inverted_small_font_note_continuation_requires_sequential_next_head() {
+        let (mut blocks, mut sources, decoded) = inverted_note_continuation_fixture(343);
+
+        assert_eq!(
+            apply_inverted_numbered_note_continuation_reflow(&mut blocks, &mut sources, &decoded,),
+            0
+        );
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Paragraph);
+        assert_eq!(sources[0].lines[0].role, LiquidBlockRole::Paragraph);
+    }
+
+    #[test]
+    fn cross_page_footnote_segment_paragraph_requires_sequential_boundary_heads() {
+        let mut previous_note = lm2_test_source_line(
+            "p0:l40",
+            40,
+            "287 Previous note.",
+            0.8,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        previous_note.in_footnote_zone = true;
+        let mut first = lm2_test_source_line(
+            "p1:l18",
+            18,
+            "markerless continuation",
+            0.8,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        first.page_index = 1;
+        first.in_footnote_zone = true;
+        first.segment_block_id = 2;
+        first.segment_block_shape = "footnote".to_owned();
+        first.segment_block_footnote_like = true;
+        let mut paragraph = first.clone();
+        paragraph.id = "p1:l19".to_owned();
+        paragraph.line_index = 19;
+        paragraph.text = "body-sized but footnote-segment text".to_owned();
+        let mut nonsequential = first.clone();
+        nonsequential.id = "p1:l20".to_owned();
+        nonsequential.line_index = 20;
+        nonsequential.text = "289 A nonsequential note.".to_owned();
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: previous_note.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: first.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: paragraph.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: nonsequential.text.clone(),
+                label: None,
+            },
+        ];
+        let mut previous_ref = line_ref(&previous_note, LiquidBlockRole::Marginalia);
+        previous_ref.note_markers = vec![287];
+        let mut nonsequential_ref = line_ref(&nonsequential, LiquidBlockRole::Marginalia);
+        nonsequential_ref.note_markers = vec![289];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![previous_ref],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&first, LiquidBlockRole::Marginalia)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&paragraph, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 3,
+                lines: vec![nonsequential_ref],
+            },
+        ];
+        let decoded = vec![
+            (previous_note, Lm2Action::Marginalia),
+            (first, Lm2Action::Marginalia),
+            (paragraph, Lm2Action::Keep),
+            (nonsequential, Lm2Action::Marginalia),
+        ];
+
+        assert_eq!(
+            apply_interleaved_note_continuation_reflow(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(blocks[2].role, LiquidBlockRole::Paragraph);
+        assert_eq!(sources[2].lines[0].role, LiquidBlockRole::Paragraph);
+    }
+
+    #[test]
+    fn cross_page_footnote_segment_paragraph_requires_open_previous_note() {
+        let mut previous_note = lm2_test_source_line(
+            "p0:l40",
+            40,
+            "287 A complete previous note.",
+            0.8,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        previous_note.in_footnote_zone = true;
+        let mut first = lm2_test_source_line(
+            "p1:l18",
+            18,
+            "markerless continuation-looking text",
+            0.8,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        first.page_index = 1;
+        first.in_footnote_zone = true;
+        first.segment_block_id = 2;
+        first.segment_block_shape = "footnote".to_owned();
+        first.segment_block_footnote_like = true;
+        let mut paragraph = first.clone();
+        paragraph.id = "p1:l19".to_owned();
+        paragraph.line_index = 19;
+        paragraph.text = "body-sized but footnote-segment text".to_owned();
+        let mut next_note = first.clone();
+        next_note.id = "p1:l20".to_owned();
+        next_note.line_index = 20;
+        next_note.text = "288 The exactly sequential note.".to_owned();
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: previous_note.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: first.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: paragraph.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: next_note.text.clone(),
+                label: None,
+            },
+        ];
+        let mut previous_ref = line_ref(&previous_note, LiquidBlockRole::Marginalia);
+        previous_ref.note_markers = vec![287];
+        let mut next_ref = line_ref(&next_note, LiquidBlockRole::Marginalia);
+        next_ref.note_markers = vec![288];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![previous_ref],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&first, LiquidBlockRole::Marginalia)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&paragraph, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 3,
+                lines: vec![next_ref],
+            },
+        ];
+        let decoded = vec![
+            (previous_note, Lm2Action::Marginalia),
+            (first, Lm2Action::Marginalia),
+            (paragraph, Lm2Action::Keep),
+            (next_note, Lm2Action::Marginalia),
+        ];
+
+        assert_eq!(
+            apply_interleaved_note_continuation_reflow(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(blocks[2].role, LiquidBlockRole::Paragraph);
+        assert_eq!(sources[2].lines[0].role, LiquidBlockRole::Paragraph);
+    }
+
+    #[test]
+    fn cross_page_source_marginalia_paragraph_returns_without_open_hyphen() {
+        let mut previous_note = lm2_test_source_line(
+            "p14:l44",
+            44,
+            "83 Prior authority rests on the fact",
+            0.8,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        previous_note.page_index = 14;
+        previous_note.in_footnote_zone = true;
+        let mut carryover_one = lm2_test_source_line(
+            "p15:l21",
+            21,
+            "that neither side had supplied a contrary record",
+            0.8,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        carryover_one.page_index = 15;
+        carryover_one.in_footnote_zone = true;
+        carryover_one.segment_block_id = 7;
+        carryover_one.segment_block_shape = "footnote".to_owned();
+        carryover_one.segment_block_footnote_like = true;
+        let mut carryover_two = carryover_one.clone();
+        carryover_two.id = "p15:l22".to_owned();
+        carryover_two.line_index = 22;
+        carryover_two.text = "or identified a basis for another conclusion.".to_owned();
+        let mut next_note = carryover_one.clone();
+        next_note.id = "p15:l23".to_owned();
+        next_note.line_index = 23;
+        next_note.text = "84 See the following authority.".to_owned();
+
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!("{CALLOUT_START}83{CALLOUT_END} Prior authority rests on the fact"),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: format!("{} {}", carryover_one.text, carryover_two.text),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!("{CALLOUT_START}84{CALLOUT_END} See the following authority."),
+                label: None,
+            },
+        ];
+        let mut previous_ref = line_ref(&previous_note, LiquidBlockRole::Marginalia);
+        previous_ref.note_markers = vec![83];
+        let mut next_ref = line_ref(&next_note, LiquidBlockRole::Marginalia);
+        next_ref.note_markers = vec![84];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![previous_ref],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![
+                    line_ref(&carryover_one, LiquidBlockRole::Marginalia),
+                    line_ref(&carryover_two, LiquidBlockRole::Marginalia),
+                ],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![next_ref],
+            },
+        ];
+        let decoded = vec![
+            (previous_note, Lm2Action::Marginalia),
+            (carryover_one, Lm2Action::Marginalia),
+            (carryover_two, Lm2Action::Marginalia),
+            (next_note, Lm2Action::Marginalia),
+        ];
+
+        assert_eq!(
+            apply_interleaved_note_continuation_reflow(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[1].role, LiquidBlockRole::Marginalia);
+        assert!(
+            sources[1]
+                .lines
+                .iter()
+                .all(|line| line.role == LiquidBlockRole::Marginalia)
+        );
+    }
+
+    #[test]
+    fn gapped_numbered_note_tail_reflow_orders_inverted_donors() {
+        let fixture = |final_left: f32| {
+            let mut note_head = lm2_test_source_line(
+                "p15:l37",
+                37,
+                "61 The federal enforcement program depended on",
+                0.78,
+                false,
+                Some(LiquidBlockRole::Marginalia),
+            );
+            note_head.page_index = 15;
+            note_head.page_width = 612.0;
+            note_head.in_footnote_zone = true;
+            note_head.segment_block_id = 5;
+            note_head.segment_block_shape = "footnote".to_owned();
+            note_head.segment_block_footnote_like = true;
+            let mut note_last = note_head.clone();
+            note_last.id = "p15:l45".to_owned();
+            note_last.line_index = 45;
+            note_last.text = "state and local".to_owned();
+            let mut candidate_first = note_head.clone();
+            candidate_first.id = "p15:l46".to_owned();
+            candidate_first.line_index = 46;
+            candidate_first.text = "enforcement efforts, with relationships".to_owned();
+            let mut donor = note_head.clone();
+            donor.id = "p15:l47".to_owned();
+            donor.line_index = 47;
+            donor.text = "that reflected a practical accommodation of".to_owned();
+            let mut candidate_final = lm2_test_source_line(
+                "p15:l48",
+                48,
+                "cooperative federalism).",
+                1.0,
+                false,
+                Some(LiquidBlockRole::Paragraph),
+            );
+            candidate_final.page_index = 15;
+            candidate_final.page_width = 612.0;
+            candidate_final.left = final_left;
+            candidate_final.segment_block_id = 6;
+            candidate_final.segment_block_shape = "body".to_owned();
+            let mut head_ref = line_ref(&note_head, LiquidBlockRole::Marginalia);
+            head_ref.note_markers = vec![61];
+            let blocks = vec![
+                LiquidBlock {
+                    role: LiquidBlockRole::Paragraph,
+                    text: format!("{} {}", candidate_first.text, candidate_final.text),
+                    label: None,
+                },
+                LiquidBlock {
+                    role: LiquidBlockRole::Marginalia,
+                    text: format!(
+                        "{CALLOUT_START}61{CALLOUT_END} The federal enforcement program depended on state and local"
+                    ),
+                    label: None,
+                },
+                LiquidBlock {
+                    role: LiquidBlockRole::Marginalia,
+                    text: donor.text.clone(),
+                    label: None,
+                },
+            ];
+            let sources = vec![
+                LiquidBlockSourceLines {
+                    block_index: 0,
+                    lines: vec![
+                        line_ref(&candidate_first, LiquidBlockRole::Paragraph),
+                        line_ref(&candidate_final, LiquidBlockRole::Paragraph),
+                    ],
+                },
+                LiquidBlockSourceLines {
+                    block_index: 1,
+                    lines: vec![head_ref, line_ref(&note_last, LiquidBlockRole::Marginalia)],
+                },
+                LiquidBlockSourceLines {
+                    block_index: 2,
+                    lines: vec![line_ref(&donor, LiquidBlockRole::Marginalia)],
+                },
+            ];
+            let decoded = vec![
+                (note_head, Lm2Action::Marginalia),
+                (note_last, Lm2Action::Marginalia),
+                (candidate_first, Lm2Action::Keep),
+                (donor, Lm2Action::Marginalia),
+                (candidate_final, Lm2Action::Keep),
+            ];
+            (blocks, sources, decoded)
+        };
+
+        let (mut blocks, mut sources, decoded) = fixture(0.1);
+        assert_eq!(
+            apply_gapped_numbered_note_tail_reflow(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].text.contains(
+            "state and local enforcement efforts, with relationships that reflected a practical accommodation of cooperative federalism)."
+        ));
+        assert_eq!(
+            sources[0]
+                .lines
+                .iter()
+                .map(|line| line.line_index)
+                .collect::<Vec<_>>(),
+            vec![37, 45, 46, 47, 48]
+        );
+
+        let (mut blocks, mut sources, decoded) = fixture(120.0);
+        assert_eq!(
+            apply_gapped_numbered_note_tail_reflow(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(blocks.len(), 3);
+    }
+
+    #[test]
+    fn plain_numeric_inline_callout_rejoins_preceding_body() {
+        let previous = lm2_test_source_line(
+            "p50:l20",
+            20,
+            "widely condemned decisions such as Dred Scott,",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let mut inline = lm2_test_source_line(
+            "p50:l21",
+            21,
+            "260 Plessy,",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        inline.in_footnote_zone = true;
+        let mut definition = lm2_test_source_line(
+            "p50:l40",
+            40,
+            "260. Dred Scott v. Sandford.",
+            0.8,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        definition.in_footnote_zone = true;
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: previous.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: inline.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!("{CALLOUT_START}260{CALLOUT_END}. Dred Scott v. Sandford."),
+                label: None,
+            },
+        ];
+        let mut inline_ref = line_ref(&inline, LiquidBlockRole::Marginalia);
+        inline_ref.note_markers = vec![260];
+        let mut definition_ref = line_ref(&definition, LiquidBlockRole::Marginalia);
+        definition_ref.note_markers = vec![260];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&previous, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![inline_ref],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![definition_ref],
+            },
+        ];
+        let decoded = vec![
+            (previous, Lm2Action::Keep),
+            (inline, Lm2Action::Marginalia),
+            (definition, Lm2Action::Marginalia),
+        ];
+
+        assert_eq!(
+            apply_inline_body_callout_marginalia_reflow(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].text.contains(&format!(
+            "Dred Scott, {CALLOUT_START}260{CALLOUT_END} Plessy,"
+        )));
+    }
+
+    #[test]
+    fn contiguous_indented_quote_fragments_rejoin_body_paragraph() {
+        let source = |block_index, line_index, text: &str, role| LiquidBlockSourceLines {
+            block_index,
+            lines: vec![LiquidSourceLineRef {
+                id: Some(format!("p40:l{line_index}")),
+                page_index: 40,
+                line_index,
+                text: text.to_owned(),
+                role,
+                note_markers: Vec::new(),
+            }],
+        };
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: "(1) that the manufacturer's packaging sufficed to convey a valid offer"
+                    .to_owned(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: "of contract terms and purchase terms on the homeowners' behalf. The court later continued: Moreover, consumers accept the accompanying terms and".to_owned(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: "conditions.295".to_owned(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: "The court even said the expectation had been building.".to_owned(),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            source(0, 1, &blocks[0].text, LiquidBlockRole::Marginalia),
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![
+                    LiquidSourceLineRef {
+                        id: Some("p40:l2".to_owned()),
+                        page_index: 40,
+                        line_index: 2,
+                        text: "of contract terms and purchase terms on the homeowners' behalf."
+                            .to_owned(),
+                        role: LiquidBlockRole::Paragraph,
+                        note_markers: Vec::new(),
+                    },
+                    LiquidSourceLineRef {
+                        id: Some("p40:l14".to_owned()),
+                        page_index: 40,
+                        line_index: 14,
+                        text: "consumers accept the accompanying terms and".to_owned(),
+                        role: LiquidBlockRole::Paragraph,
+                        note_markers: Vec::new(),
+                    },
+                ],
+            },
+            source(2, 15, &blocks[2].text, LiquidBlockRole::Marginalia),
+            source(3, 16, &blocks[3].text, LiquidBlockRole::Paragraph),
+        ];
+
+        assert_eq!(
+            apply_contiguous_body_marginalia_reflow(&mut blocks, &mut sources, &[]),
+            2
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Paragraph);
+        assert!(blocks[0].text.starts_with("(1) that the manufacturer's"));
+        assert!(blocks[0].text.ends_with("terms and conditions.295"));
+        assert_eq!(sources[0].lines.len(), 4);
+        assert_eq!(sources[1].block_index, 1);
+    }
+
+    #[test]
+    fn contiguous_footnote_zone_continuation_does_not_merge_into_body() {
+        let mut body = lm2_test_source_line(
+            "p43:l22",
+            22,
+            "a model focused especially on financial information and data.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        body.page_index = 43;
+        let mut continuation = lm2_test_source_line(
+            "p43:l23",
+            23,
+            "emergent capabilities in GPT-4, focusing particularly on skills that could not be explained merely",
+            0.7,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        continuation.page_index = 43;
+        continuation.in_footnote_zone = true;
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: body.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: continuation.text.clone(),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&body, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&continuation, LiquidBlockRole::Marginalia)],
+            },
+        ];
+        let decoded = vec![
+            (body, Lm2Action::Keep),
+            (continuation, Lm2Action::Marginalia),
+        ];
+
+        assert_eq!(
+            apply_contiguous_body_marginalia_reflow(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Paragraph);
+        assert_eq!(blocks[1].role, LiquidBlockRole::Marginalia);
+    }
+
+    #[test]
+    fn false_marginalia_note_head_rejoins_split_pdf_filename() {
+        let previous = lm2_test_source_line(
+            "p0:l40",
+            40,
+            "14 See https://example.org/archive/10-5-",
+            0.65,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        let false_head = lm2_test_source_line(
+            "p0:l41",
+            41,
+            "15.pdf [https://perma.cc/ABCD-1234].",
+            0.65,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        let next = lm2_test_source_line(
+            "p0:l42",
+            42,
+            "15 See U.C.C. section 4A-211.",
+            0.65,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: previous.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: false_head.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: next.text.clone(),
+                label: None,
+            },
+        ];
+        let mut previous_ref = line_ref(&previous, LiquidBlockRole::Marginalia);
+        previous_ref.note_markers = vec![14];
+        let mut false_ref = line_ref(&false_head, LiquidBlockRole::Marginalia);
+        false_ref.note_markers = vec![15];
+        let mut next_ref = line_ref(&next, LiquidBlockRole::Marginalia);
+        next_ref.note_markers = vec![15];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![previous_ref],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![false_ref],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![next_ref],
+            },
+        ];
+
+        assert_eq!(
+            apply_false_marginalia_note_head_reflow(&mut blocks, &mut sources),
+            1
+        );
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].text.contains("10-5-15.pdf"));
+        assert!(sources[0].lines[1].note_markers.is_empty());
+        assert_eq!(sources[1].block_index, 1);
+        assert_eq!(sources[1].lines[0].note_markers, vec![15]);
+    }
+
+    #[test]
+    fn false_marginalia_note_head_rejoins_citation_page_and_year() {
+        let previous = lm2_test_source_line(
+            "p0:l40",
+            40,
+            "97 See 45 LAW REV.",
+            0.65,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        let false_head = lm2_test_source_line(
+            "p0:l41",
+            41,
+            "99 (2020).",
+            0.65,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        let next = lm2_test_source_line(
+            "p0:l42",
+            42,
+            "98 See U.C.C. section 4A-211.",
+            0.65,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: previous.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: false_head.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: next.text.clone(),
+                label: None,
+            },
+        ];
+        let mut previous_ref = line_ref(&previous, LiquidBlockRole::Marginalia);
+        previous_ref.note_markers = vec![97];
+        let mut false_ref = line_ref(&false_head, LiquidBlockRole::Marginalia);
+        false_ref.note_markers = vec![99];
+        let mut next_ref = line_ref(&next, LiquidBlockRole::Marginalia);
+        next_ref.note_markers = vec![98];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![previous_ref],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![false_ref],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![next_ref],
+            },
+        ];
+
+        assert_eq!(
+            apply_false_marginalia_note_head_reflow(&mut blocks, &mut sources),
+            1
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].text, "97 See 45 LAW REV. 99 (2020).");
+        assert!(sources[0].lines[1].note_markers.is_empty());
+        assert_eq!(sources[1].lines[0].note_markers, vec![98]);
+    }
+
+    #[test]
+    fn false_marginalia_note_head_rejoins_compare_pincite() {
+        let previous = lm2_test_source_line(
+            "p46:l39",
+            39,
+            "380 See Ortiz v. Fibreboard Corp., 527 U.S. 815, 842 (1999), discussed in Nagareda, supra note 179, at",
+            0.78,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        let false_head = lm2_test_source_line(
+            "p46:l40",
+            40,
+            "232. Compare FED. R. CIV. P. 23(b)(2).",
+            0.78,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        let next = lm2_test_source_line(
+            "p46:l41",
+            41,
+            "381 See 28 U.S.C. § 2243.",
+            0.78,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        let mut blocks = [&previous, &false_head, &next]
+            .into_iter()
+            .map(|line| LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: line.text.clone(),
+                label: None,
+            })
+            .collect::<Vec<_>>();
+        let mut sources = [&previous, &false_head, &next]
+            .into_iter()
+            .enumerate()
+            .map(|(block_index, line)| {
+                let mut line = line_ref(line, LiquidBlockRole::Marginalia);
+                line.note_markers = vec![[380, 232, 381][block_index]];
+                LiquidBlockSourceLines {
+                    block_index,
+                    lines: vec![line],
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            apply_false_marginalia_note_head_reflow(&mut blocks, &mut sources),
+            1
+        );
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].text.contains("at 232. Compare"));
+        assert!(sources[0].lines[1].note_markers.is_empty());
+        assert_eq!(sources[1].lines[0].note_markers, vec![381]);
+    }
+
+    #[test]
+    fn false_marginalia_note_head_rejoins_standalone_supra_pincite() {
+        let previous = lm2_test_source_line(
+            "p48:l29",
+            29,
+            "305 See Rave, supra note",
+            0.78,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        let false_head = lm2_test_source_line(
+            "p48:l30",
+            30,
+            "285.",
+            0.78,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        let next = lm2_test_source_line(
+            "p48:l31",
+            31,
+            "306 See D. Theodore Rave, Two Problems.",
+            0.78,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        let mut blocks = [&previous, &false_head, &next]
+            .into_iter()
+            .map(|line| LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: line.text.clone(),
+                label: None,
+            })
+            .collect::<Vec<_>>();
+        let mut sources = [&previous, &false_head, &next]
+            .into_iter()
+            .enumerate()
+            .map(|(block_index, line)| {
+                let mut line = line_ref(line, LiquidBlockRole::Marginalia);
+                line.note_markers = vec![[305, 285, 306][block_index]];
+                LiquidBlockSourceLines {
+                    block_index,
+                    lines: vec![line],
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            apply_false_marginalia_note_head_reflow(&mut blocks, &mut sources),
+            1
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].text, "305 See Rave, supra note 285.");
+        assert!(sources[0].lines[1].note_markers.is_empty());
+        assert_eq!(sources[1].lines[0].note_markers, vec![306]);
+    }
+
+    #[test]
+    fn false_marginalia_note_head_rejoins_standalone_page_pincite() {
+        let previous = lm2_test_source_line(
+            "p7:l44",
+            44,
+            "49 Others argue against the exclusion. See Yang & Dobbie, supra note 7, at",
+            0.78,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        let false_head = lm2_test_source_line(
+            "p7:l45",
+            45,
+            "351.",
+            0.78,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        let next = lm2_test_source_line(
+            "p7:l46",
+            46,
+            "50 See Mayson, supra note 3, at 2225.",
+            0.78,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        let mut blocks = [&previous, &false_head, &next]
+            .into_iter()
+            .enumerate()
+            .map(|(block_index, line)| LiquidBlock {
+                role: if block_index == 0 {
+                    LiquidBlockRole::Noise
+                } else {
+                    LiquidBlockRole::Marginalia
+                },
+                text: line.text.clone(),
+                label: None,
+            })
+            .collect::<Vec<_>>();
+        let mut sources = [&previous, &false_head, &next]
+            .into_iter()
+            .enumerate()
+            .map(|(block_index, line)| {
+                let mut line = line_ref(line, LiquidBlockRole::Marginalia);
+                line.note_markers = vec![[49, 351, 50][block_index]];
+                LiquidBlockSourceLines {
+                    block_index,
+                    lines: vec![line],
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            apply_false_marginalia_note_head_reflow(&mut blocks, &mut sources),
+            1
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Marginalia);
+        assert!(blocks[0].text.ends_with("at 351."));
+        assert!(sources[0].lines[1].note_markers.is_empty());
+        assert_eq!(sources[1].lines[0].note_markers, vec![50]);
+    }
+
+    #[test]
+    fn false_marginalia_note_head_rejoins_standalone_docket_number() {
+        let previous = lm2_test_source_line(
+            "p34:l28",
+            28,
+            "165. Order, Dkt. No.",
+            0.78,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        let false_head = lm2_test_source_line(
+            "p34:l29",
+            29,
+            "88.",
+            0.78,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        let next = lm2_test_source_line(
+            "p34:l30",
+            30,
+            "166. Per Curiam Order.",
+            0.78,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        let mut blocks = [&previous, &false_head, &next]
+            .into_iter()
+            .map(|line| LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: line.text.clone(),
+                label: None,
+            })
+            .collect::<Vec<_>>();
+        let mut sources = [&previous, &false_head, &next]
+            .into_iter()
+            .enumerate()
+            .map(|(block_index, line)| {
+                let mut line = line_ref(line, LiquidBlockRole::Marginalia);
+                line.note_markers = vec![[165, 88, 166][block_index]];
+                LiquidBlockSourceLines {
+                    block_index,
+                    lines: vec![line],
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            apply_false_marginalia_note_head_reflow(&mut blocks, &mut sources),
+            1
+        );
+        assert_eq!(blocks[0].text, "165. Order, Dkt. No. 88.");
+        assert_eq!(blocks.len(), 2);
+    }
+
+    #[test]
+    fn embedded_note_heads_reject_terminal_clause_and_docket_numbers() {
+        assert_eq!(
+            embedded_numeric_note_head_markers(
+                "1. U.S. CONST. art. III, § 2, cl. 2. 2. See infra subpart I(C)."
+            ),
+            vec![1, 2]
+        );
+        assert_eq!(
+            embedded_numeric_note_head_markers("178. Order, Dkt. No. 176."),
+            vec![178]
+        );
+        assert_eq!(
+            embedded_numeric_note_head_markers("19. Nineteen. 20. Twenty."),
+            vec![19, 20]
+        );
+        assert_eq!(
+            embedded_numeric_note_head_markers(&format!(
+                "(2024) (speech). {CALLOUT_START}3{CALLOUT_END} Marc O. DeGirolami"
+            )),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn sentineled_note_pair_recovers_trailing_page_note_zone() {
+        let pair = format!(
+            "{CALLOUT_START}1{CALLOUT_END} First authority. {CALLOUT_START}2{CALLOUT_END} Second authority."
+        );
+        let later = format!(
+            "Second note continues. {CALLOUT_START}3{CALLOUT_END} Third authority. {CALLOUT_START}4{CALLOUT_END} Fourth authority."
+        );
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: pair.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: "citation continuation".to_owned(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Table,
+                text: later.clone(),
+                label: Some("Table/Figure".to_owned()),
+            },
+        ];
+        let make_ref = |block_index, line_index, text: String, role| LiquidBlockSourceLines {
+            block_index,
+            lines: vec![LiquidSourceLineRef {
+                id: Some(format!("p2:l{line_index}")),
+                page_index: 2,
+                line_index,
+                text,
+                role,
+                note_markers: Vec::new(),
+            }],
+        };
+        let mut sources = vec![
+            make_ref(0, 29, pair, LiquidBlockRole::Marginalia),
+            make_ref(
+                1,
+                30,
+                "citation continuation".to_owned(),
+                LiquidBlockRole::Paragraph,
+            ),
+            make_ref(2, 31, later, LiquidBlockRole::Paragraph),
+        ];
+
+        assert_eq!(
+            apply_sentineled_marginalia_page_zone_recovery(&mut blocks, &mut sources),
+            3
+        );
+        assert!(
+            blocks
+                .iter()
+                .all(|block| block.role == LiquidBlockRole::Marginalia)
+        );
+        assert_eq!(sources[0].lines[0].note_markers, vec![1, 2]);
+        assert_eq!(sources[2].lines[0].note_markers, vec![3, 4]);
+    }
+
+    #[test]
+    fn sentineled_page_zone_enriches_carryover_and_provenance_noise_blocks() {
+        let pair =
+            format!("{CALLOUT_START}49{CALLOUT_END} First. {CALLOUT_START}50{CALLOUT_END} Second.");
+        let carryover = format!("citation continues. {CALLOUT_START}51{CALLOUT_END} Third note.");
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: pair.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: carryover.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: "45. Hidden definition.".to_owned(),
+                label: None,
+            },
+        ];
+        let make_ref = |line_index, text: String, note_markers| LiquidSourceLineRef {
+            id: Some(format!("p14:l{line_index}")),
+            page_index: 14,
+            line_index,
+            text,
+            role: LiquidBlockRole::Marginalia,
+            note_markers,
+        };
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![make_ref(29, pair, vec![])],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![
+                    make_ref(28, "earlier continuation".to_owned(), vec![]),
+                    make_ref(31, carryover, vec![]),
+                ],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![make_ref(32, "45. Hidden definition.".to_owned(), vec![45])],
+            },
+        ];
+
+        assert_eq!(
+            apply_sentineled_marginalia_page_zone_recovery(&mut blocks, &mut sources),
+            1
+        );
+        assert_eq!(sources[1].lines[1].note_markers, vec![51]);
+        assert_eq!(blocks[2].role, LiquidBlockRole::Marginalia);
+    }
+
+    #[test]
+    fn sequential_note_head_inside_prior_marginalia_block_is_recovered() {
+        let make_ref = |line_index, text: &str, note_markers| LiquidSourceLineRef {
+            id: Some(format!("p68:l{line_index}")),
+            page_index: 68,
+            line_index,
+            text: text.to_owned(),
+            role: LiquidBlockRole::Marginalia,
+            note_markers,
+        };
+        let mut source = LiquidBlockSourceLines {
+            block_index: 682,
+            lines: vec![
+                make_ref(
+                    27,
+                    "308 See, e.g., Colleen McCullough, 164 U. PA. L.",
+                    vec![308],
+                ),
+                make_ref(
+                    28,
+                    "REV. 779, 801 (2016) (suggesting that contracts",
+                    vec![],
+                ),
+                make_ref(
+                    29,
+                    "costs avoided exceed the value of the vindicated rights).",
+                    vec![],
+                ),
+                make_ref(
+                    30,
+                    "309 350 F.2d 445 (1965) (invalidating a contract term",
+                    vec![],
+                ),
+                make_ref(
+                    31,
+                    "installment contracts to all items purchased so far",
+                    vec![],
+                ),
+            ],
+        };
+
+        assert_eq!(enrich_sequential_note_heads_within_block(&mut source), 1);
+        assert_eq!(source.lines[3].note_markers, vec![309]);
+        assert!(source.lines[1].note_markers.is_empty());
+        assert!(source.lines[2].note_markers.is_empty());
+        assert!(source.lines[4].note_markers.is_empty());
+    }
+
+    #[test]
+    fn sequential_note_head_recovery_rejects_nonterminal_citation_continuation() {
+        let mut source = LiquidBlockSourceLines {
+            block_index: 10,
+            lines: vec![
+                LiquidSourceLineRef {
+                    id: Some("p1:l10".to_owned()),
+                    page_index: 1,
+                    line_index: 10,
+                    text: "308 See a discussion in volume".to_owned(),
+                    role: LiquidBlockRole::Marginalia,
+                    note_markers: vec![308],
+                },
+                LiquidSourceLineRef {
+                    id: Some("p1:l11".to_owned()),
+                    page_index: 1,
+                    line_index: 11,
+                    text: "309 F.3d 400, 410 (2020).".to_owned(),
+                    role: LiquidBlockRole::Marginalia,
+                    note_markers: vec![],
+                },
+            ],
+        };
+
+        assert_eq!(enrich_sequential_note_heads_within_block(&mut source), 0);
+        assert!(source.lines[1].note_markers.is_empty());
+    }
+
+    #[test]
+    fn sequential_note_head_recovery_supports_notes_above_five_hundred() {
+        let mut source = LiquidBlockSourceLines {
+            block_index: 939,
+            lines: vec![
+                LiquidSourceLineRef {
+                    id: Some("p71:l50".to_owned()),
+                    page_index: 71,
+                    line_index: 50,
+                    text: "500 Crecelius v. Smith, 125 N.W.2d 786 (Iowa 1964).".to_owned(),
+                    role: LiquidBlockRole::Marginalia,
+                    note_markers: vec![500],
+                },
+                LiquidSourceLineRef {
+                    id: Some("p71:l51".to_owned()),
+                    page_index: 71,
+                    line_index: 51,
+                    text: "501 958 N.W.2d 842 (Iowa 2021).".to_owned(),
+                    role: LiquidBlockRole::Marginalia,
+                    note_markers: vec![],
+                },
+                LiquidSourceLineRef {
+                    id: Some("p71:l52".to_owned()),
+                    page_index: 71,
+                    line_index: 52,
+                    text: "502 Id. at 845.".to_owned(),
+                    role: LiquidBlockRole::Marginalia,
+                    note_markers: vec![],
+                },
+            ],
+        };
+
+        assert_eq!(enrich_sequential_note_heads_within_block(&mut source), 2);
+        assert_eq!(source.lines[1].note_markers, vec![501]);
+        assert_eq!(source.lines[2].note_markers, vec![502]);
+        assert_eq!(leading_numeric_token_marker("999 Last note."), Some(999));
+        assert_eq!(leading_numeric_token_marker("1000 Not a note."), None);
     }
 
     #[test]
@@ -17826,6 +35475,22 @@ mod tests {
     }
 
     #[test]
+    fn recovered_title_can_complete_a_truncated_metadata_title() {
+        assert!(lm2_recovered_title_is_better(
+            "The UCC Drafting Process and Six Questions about Article 4A: Is There a Need for Revisions",
+            "The UCC Drafting Process and Six Questions about Article 4A: Is"
+        ));
+    }
+
+    #[test]
+    fn repository_title_can_correct_uppercase_display_ocr() {
+        assert!(lm2_recovered_title_is_better(
+            "The UCC Drafting Process and Six Questions about Article 4A: Is There a Need for Revisions to the Uniform Funds Transfers Law?",
+            "THE UCC DRAFJTING PROCESS AND SIX QUESTIONS ABOUT ARTICLE 4A: IS THERE A NEED FOR REVISIONS TO THE UNIFORM FUNDS TRANSFERS LAW?"
+        ));
+    }
+
+    #[test]
     fn lm2_fallback_title_skips_generic_heading_labels() {
         let blocks = vec![
             LiquidBlock {
@@ -17905,6 +35570,44 @@ mod tests {
         assert_eq!(
             lm2_fallback_title_from_blocks(&blocks).as_deref(),
             Some("RETHINKING ROBOT LIABILITY")
+        );
+    }
+
+    #[test]
+    fn lm2_fallback_title_accepts_long_caps_title_before_introduction() {
+        let blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Heading,
+                text: "Note".to_owned(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: "Roger Cowie".to_owned(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: "Copyright (c) 1992; Roger Cowie".to_owned(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: "CANCELLATION OF WIRE TRANSFERS UNDER ARTICLE 4A OF THE UNIFORM COMMERCIAL CODE: DELBRUECK REVISITED".to_owned(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Heading,
+                text: "I. Introduction".to_owned(),
+                label: None,
+            },
+        ];
+
+        assert_eq!(
+            lm2_fallback_title_from_blocks(&blocks).as_deref(),
+            Some(
+                "CANCELLATION OF WIRE TRANSFERS UNDER ARTICLE 4A OF THE UNIFORM COMMERCIAL CODE: DELBRUECK REVISITED"
+            )
         );
     }
 
@@ -19285,6 +36988,175 @@ mod tests {
     }
 
     #[test]
+    fn lm2_title_recovery_stops_before_starred_author_name() {
+        let mut title = lm2_test_source_line(
+            "p0:l1",
+            1,
+            "THE STRATEGIC MOOTNESS GAP",
+            1.48,
+            true,
+            Some(LiquidBlockRole::Title),
+        );
+        title.bold = true;
+        let author = lm2_test_source_line(
+            "p0:l2",
+            2,
+            "Brandi M. Lupo*",
+            1.0,
+            true,
+            Some(LiquidBlockRole::Title),
+        );
+        let decoded = vec![(title, Lm2Action::Keep), (author, Lm2Action::Keep)];
+
+        let (recovered, blocks, sources) = build_lm2_blocks("columbia-law-review.pdf", &decoded);
+
+        assert_eq!(recovered, "THE STRATEGIC MOOTNESS GAP");
+        assert_eq!(blocks[0].text, "THE STRATEGIC MOOTNESS GAP");
+        assert_eq!(sources[0].lines.len(), 1);
+        assert!(blocks.iter().any(|block| block.text == "Brandi M. Lupo*"));
+    }
+
+    #[test]
+    fn lm2_title_recovery_stops_before_conjoined_author_names() {
+        let mut title = lm2_test_source_line(
+            "p0:l4",
+            4,
+            "HABEAS CLASS ACTIONS",
+            1.48,
+            true,
+            Some(LiquidBlockRole::Title),
+        );
+        title.bold = true;
+        let author = lm2_test_source_line(
+            "p0:l5",
+            5,
+            "Lee Kovarsky & D. Theodore Rave",
+            1.0,
+            true,
+            Some(LiquidBlockRole::Title),
+        );
+        let decoded = vec![(title, Lm2Action::Keep), (author, Lm2Action::Keep)];
+
+        let (recovered, blocks, sources) = build_lm2_blocks("harvard-law-review.pdf", &decoded);
+
+        assert_eq!(recovered, "HABEAS CLASS ACTIONS");
+        assert_eq!(blocks[0].text, "HABEAS CLASS ACTIONS");
+        assert_eq!(sources[0].lines.len(), 1);
+    }
+
+    #[test]
+    fn lm2_recovers_left_aligned_uppercase_title_after_article_label() {
+        let label = lm2_test_source_line(
+            "p0:l4",
+            4,
+            "ARTICLES",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Heading),
+        );
+        let first = lm2_test_source_line(
+            "p0:l5",
+            5,
+            "TRADITION AND FEMINISM IN CONSTITUTIONAL",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let second = lm2_test_source_line(
+            "p0:l6",
+            6,
+            "RIGHTS ADJUDICATION",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let author = lm2_test_source_line(
+            "p0:l7",
+            7,
+            "Rachel Bayefsky*",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let decoded = vec![
+            (label, Lm2Action::Keep),
+            (first, Lm2Action::Keep),
+            (second, Lm2Action::Keep),
+            (author, Lm2Action::Keep),
+        ];
+
+        let (recovered, _, _) = build_lm2_blocks("virginia-law-review.pdf", &decoded);
+        assert_eq!(
+            recovered,
+            "TRADITION AND FEMINISM IN CONSTITUTIONAL RIGHTS ADJUDICATION"
+        );
+    }
+
+    #[test]
+    fn lm2_recovers_letterspaced_author_before_the_title() {
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Title,
+                text: "Cross-Sovereign Policing".to_owned(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: "2955 na di a banteka".to_owned(),
+                label: None,
+            },
+        ];
+        let source_ref = |line_index, text: &str, role| LiquidSourceLineRef {
+            id: Some(format!("p0:l{line_index}")),
+            page_index: 0,
+            line_index,
+            text: text.to_owned(),
+            role,
+            note_markers: Vec::new(),
+        };
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![source_ref(
+                    2,
+                    "Cross-Sovereign Policing",
+                    LiquidBlockRole::Title,
+                )],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![
+                    source_ref(0, "2955", LiquidBlockRole::Noise),
+                    source_ref(1, "na di a banteka", LiquidBlockRole::Noise),
+                ],
+            },
+        ];
+
+        assert_eq!(
+            apply_leading_letterspaced_author_recovery(&mut blocks, &mut sources),
+            1
+        );
+        assert_eq!(blocks[1].role, LiquidBlockRole::AuthorInfo);
+        assert_eq!(blocks[1].text, "Nadia Banteka");
+        assert_eq!(sources[1].lines.len(), 1);
+    }
+
+    #[test]
+    fn lm2_title_join_removes_only_a_physical_line_end_hyphen_space() {
+        assert_eq!(
+            join_lm2_title_parts(&[
+                "Court-Stripping, Court-Packing, and Court-".to_owned(),
+                "Defying: Judicial Reform and Constitutional Conflict".to_owned(),
+            ]),
+            "Court-Stripping, Court-Packing, and Court-Defying: Judicial Reform and Constitutional Conflict"
+        );
+        assert_eq!(
+            join_lm2_title_parts(&["Law - Politics".to_owned()]),
+            "Law - Politics"
+        );
+    }
+
+    #[test]
     fn lm2_recovers_title_from_hidden_leading_source_lines() {
         let decoded = vec![
             (
@@ -19359,9 +37231,7 @@ mod tests {
             "TESTING DOBBS'S DEMOCRACY PREMISE: CAN STATE CONSTITUTIONS BE AMENDED TO REFLECT POPULAR OPINION ON ABORTION?"
         );
         assert_eq!(blocks[0].role, LiquidBlockRole::Title);
-        assert_eq!(blocks[0].text, "TESTING DOBBS'S DEMOCRACY PREMISE: CAN");
-        assert_eq!(blocks[1].role, LiquidBlockRole::Heading);
-        assert_eq!(blocks[2].role, LiquidBlockRole::Heading);
+        assert_eq!(blocks[0].text, title);
         assert!(blocks.iter().all(|block| block.text != "ISABEL SPERBER†"));
         assert_eq!(
             blocks
@@ -19370,10 +37240,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(
-            sources[0].lines[0].text,
-            "TESTING DOBBS'S DEMOCRACY PREMISE: CAN"
-        );
+        assert_eq!(sources[0].lines.len(), 3);
     }
 
     #[test]
@@ -19435,19 +37302,10 @@ mod tests {
             "Book Review: Civil Justice Reconsidered: Toward a Less Costly, More Accessible Litigation System"
         );
         assert_eq!(blocks[0].role, LiquidBlockRole::Title);
-        assert_eq!(blocks[0].text, "Book Review: Civil Justice");
-        assert_eq!(blocks[1].role, LiquidBlockRole::Heading);
-        assert_eq!(blocks[2].role, LiquidBlockRole::Heading);
+        assert_eq!(blocks[0].text, title);
         assert!(blocks.iter().any(|block| block.text
             == "2018] Review: Civil Justice Reconsidered 509"
             && block.role == LiquidBlockRole::Noise));
-        assert_eq!(
-            blocks
-                .iter()
-                .filter(|block| block.text == "Book Review: Civil Justice")
-                .count(),
-            1
-        );
     }
 
     #[test]
@@ -19487,7 +37345,7 @@ mod tests {
     }
 
     #[test]
-    fn lm2_source_title_recovery_does_not_duplicate_visible_title() {
+    fn lm2_source_title_recovery_collapses_visible_multiline_title() {
         let decoded = vec![
             (
                 lm2_test_source_line(
@@ -19526,10 +37384,12 @@ mod tests {
 
         let (_, blocks, _) = build_lm2_blocks("", &decoded);
 
-        assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0].text, "TESTING DOBBS'S DEMOCRACY PREMISE: CAN");
-        assert_eq!(blocks[1].text, "STATE CONSTITUTIONS BE AMENDED TO");
-        assert_eq!(blocks[2].text, "REFLECT POPULAR OPINION ON ABORTION?");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Title);
+        assert_eq!(
+            blocks[0].text,
+            "TESTING DOBBS'S DEMOCRACY PREMISE: CAN STATE CONSTITUTIONS BE AMENDED TO REFLECT POPULAR OPINION ON ABORTION?"
+        );
     }
 
     #[test]
@@ -20748,6 +38608,406 @@ mod tests {
     }
 
     #[test]
+    fn hidden_short_numbered_note_head_is_restored_from_physical_note_zone() {
+        let mut hidden = lm2_test_source_line(
+            "p4:l53",
+            53,
+            "113. Id.",
+            0.81,
+            false,
+            Some(LiquidBlockRole::Noise),
+        );
+        hidden.font_ratio_page_ref = 0.81;
+        hidden.in_footnote_zone = true;
+        hidden.page_has_footnote_divider = true;
+        hidden.below_footnote_divider = true;
+        // `Id.` definitions repeat at the same edge position across pages;
+        // explicit divider geometry must outrank that furniture prior.
+        hidden.doc_repeated_edge_text = true;
+        let mut citation = hidden.clone();
+        citation.id = "p4:l54".to_owned();
+        citation.line_index = 54;
+        citation.text = "106 VA. L. REV. 611".to_owned();
+        let mut decoded = vec![
+            (hidden, Lm2Action::HideNoise),
+            (citation, Lm2Action::HideNoise),
+        ];
+
+        assert_eq!(apply_hidden_numbered_note_head_recovery(&mut decoded), 1);
+        assert_eq!(decoded[0].1, Lm2Action::Marginalia);
+        assert_eq!(decoded[0].0.doc_note_marker, 113);
+        assert_eq!(decoded[1].1, Lm2Action::HideNoise);
+    }
+
+    #[test]
+    fn hidden_short_numbered_note_block_is_restored_with_source_marker() {
+        let mut line = lm2_test_source_line(
+            "p18:l47",
+            47,
+            "113. Id.",
+            0.81,
+            false,
+            Some(LiquidBlockRole::Noise),
+        );
+        line.page_has_footnote_divider = true;
+        line.below_footnote_divider = true;
+        line.font_ratio_page_ref = 0.81;
+        line.doc_repeated_edge_text = true;
+        let decoded = vec![(line.clone(), Lm2Action::HideNoise)];
+        let mut blocks = vec![LiquidBlock {
+            role: LiquidBlockRole::Noise,
+            text: line.text.clone(),
+            label: None,
+        }];
+        let mut sources = vec![LiquidBlockSourceLines {
+            block_index: 0,
+            lines: vec![line_ref(&line, LiquidBlockRole::Noise)],
+        }];
+
+        assert_eq!(
+            apply_hidden_numbered_note_block_recovery(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[0].role, LiquidBlockRole::Marginalia);
+        assert_eq!(sources[0].lines[0].note_markers, vec![113]);
+    }
+
+    #[test]
+    fn hidden_note_block_trusts_matching_marginalia_provenance_marker() {
+        let mut line = lm2_test_source_line(
+            "p46:l39",
+            39,
+            "380 See Ortiz v. Fibreboard Corp., 527 U.S. 815, 842 (1999).",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Noise),
+        );
+        line.in_footnote_zone = false;
+        line.below_footnote_divider = false;
+        let decoded = vec![(line.clone(), Lm2Action::HideNoise)];
+        let mut blocks = vec![LiquidBlock {
+            role: LiquidBlockRole::Noise,
+            text: line.text.clone(),
+            label: None,
+        }];
+        let mut source_line = line_ref(&line, LiquidBlockRole::Marginalia);
+        source_line.note_markers = vec![380];
+        let mut sources = vec![LiquidBlockSourceLines {
+            block_index: 0,
+            lines: vec![source_line],
+        }];
+
+        assert_eq!(
+            apply_hidden_numbered_note_block_recovery(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[0].role, LiquidBlockRole::Marginalia);
+        assert_eq!(sources[0].lines[0].note_markers, vec![380]);
+    }
+
+    #[test]
+    fn tiny_boundary_paragraph_note_head_is_restored_before_sequential_note() {
+        let mut body = lm2_test_source_line(
+            "p78:l33",
+            33,
+            "and other modalities in depth. As part of this examination, I intend to",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        body.page_index = 78;
+        let mut note_head = lm2_test_source_line(
+            "p78:l34",
+            34,
+            "341 The term modalities is most associated with the work of Bobbitt, who defined a",
+            0.764,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        note_head.page_index = 78;
+        note_head.font_ratio_page_ref = 0.764;
+        note_head.font_ratio_doc = 0.764;
+        note_head.segment_block_id = 3;
+        note_head.segment_block_line_index = 0;
+        note_head.segment_block_line_count = 2;
+        note_head.segment_block_shape = "body".to_owned();
+        let mut note_head_tail = note_head.clone();
+        note_head_tail.id = "p78:l35".to_owned();
+        note_head_tail.line_index = 35;
+        note_head_tail.text =
+            "modality in a technical sense as the way in which we characterize expression as"
+                .to_owned();
+        note_head_tail.segment_block_line_index = 1;
+        let mut continuation = lm2_test_source_line(
+            "p78:l36",
+            36,
+            "true. Bobbitt, supra note 118, at 11.",
+            0.789,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        continuation.page_index = 78;
+        continuation.font_ratio_page_ref = 0.789;
+        continuation.font_ratio_doc = 0.789;
+        continuation.in_footnote_zone = true;
+        continuation.segment_block_id = 4;
+        continuation.segment_block_line_index = 0;
+        continuation.segment_block_line_count = 2;
+        continuation.segment_block_shape = "footnote".to_owned();
+        continuation.segment_block_footnote_like = true;
+        let mut next_note = continuation.clone();
+        next_note.id = "p78:l37".to_owned();
+        next_note.line_index = 37;
+        next_note.text = "342 Griffin, supra note 23, at 1753.".to_owned();
+        next_note.segment_block_line_index = 1;
+        let mut next_body = lm2_test_source_line(
+            "p79:l2",
+            2,
+            "argue that other modalities can help the interpreter.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        next_body.page_index = 79;
+
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: body.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: format!(
+                    "{CALLOUT_START}341{CALLOUT_END} The term modalities is most associated with the work of Bobbitt, who defined a modality in a technical sense as the way in which we characterize expression as"
+                ),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!(
+                    "true. Bobbitt, supra note 118, at 11. {CALLOUT_START}342{CALLOUT_END} Griffin, supra note 23, at 1753."
+                ),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: next_body.text.clone(),
+                label: None,
+            },
+        ];
+        let mut next_note_ref = line_ref(&next_note, LiquidBlockRole::Marginalia);
+        next_note_ref.note_markers = vec![342];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&body, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![
+                    line_ref(&note_head, LiquidBlockRole::Paragraph),
+                    line_ref(&note_head_tail, LiquidBlockRole::Paragraph),
+                ],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![
+                    line_ref(&continuation, LiquidBlockRole::Marginalia),
+                    next_note_ref,
+                ],
+            },
+            LiquidBlockSourceLines {
+                block_index: 3,
+                lines: vec![line_ref(&next_body, LiquidBlockRole::Paragraph)],
+            },
+        ];
+        let decoded = vec![
+            (body, Lm2Action::Keep),
+            (note_head, Lm2Action::Keep),
+            (note_head_tail, Lm2Action::Keep),
+            (continuation, Lm2Action::Marginalia),
+            (next_note, Lm2Action::Marginalia),
+            (next_body, Lm2Action::Keep),
+        ];
+
+        assert_eq!(
+            apply_hidden_numbered_note_block_recovery(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[0].role, LiquidBlockRole::Paragraph);
+        assert!(blocks[0].text.ends_with("I intend to"));
+        assert_eq!(blocks[1].role, LiquidBlockRole::Marginalia);
+        assert_eq!(sources[1].lines[0].note_markers, vec![341]);
+        assert!(sources[1].lines[1].note_markers.is_empty());
+        assert!(
+            sources[1]
+                .lines
+                .iter()
+                .all(|line| line.role == LiquidBlockRole::Marginalia)
+        );
+        assert_eq!(sources[2].lines[1].note_markers, vec![342]);
+        assert_eq!(blocks[3].role, LiquidBlockRole::Paragraph);
+    }
+
+    #[test]
+    fn tiny_numbered_body_paragraph_requires_markerless_prefix_and_next_marker() {
+        let mut candidate = lm2_test_source_line(
+            "p8:l20",
+            20,
+            "341 A numbered body paragraph that must remain body",
+            0.78,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        candidate.page_index = 8;
+        candidate.font_ratio_page_ref = 0.78;
+        candidate.font_ratio_doc = 0.78;
+        candidate.segment_block_id = 3;
+        let mut following = lm2_test_source_line(
+            "p8:l21",
+            21,
+            "343 A nonsequential footnote definition.",
+            0.78,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        following.page_index = 8;
+        following.font_ratio_page_ref = 0.78;
+        following.font_ratio_doc = 0.78;
+        following.in_footnote_zone = true;
+        following.segment_block_shape = "footnote".to_owned();
+        following.segment_block_footnote_like = true;
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: format!(
+                    "{CALLOUT_START}341{CALLOUT_END} A numbered body paragraph that must remain body"
+                ),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: format!(
+                    "{CALLOUT_START}343{CALLOUT_END} A nonsequential footnote definition."
+                ),
+                label: None,
+            },
+        ];
+        let mut following_ref = line_ref(&following, LiquidBlockRole::Marginalia);
+        following_ref.note_markers = vec![343];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&candidate, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![following_ref],
+            },
+        ];
+        let decoded = vec![
+            (candidate, Lm2Action::Keep),
+            (following, Lm2Action::Marginalia),
+        ];
+
+        assert_eq!(
+            apply_hidden_numbered_note_block_recovery(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(blocks[0].role, LiquidBlockRole::Paragraph);
+        assert!(sources[0].lines[0].note_markers.is_empty());
+    }
+
+    #[test]
+    fn body_sized_marginalia_above_first_note_head_returns_to_body() {
+        let mut body = lm2_test_source_line(
+            "p4:l42",
+            42,
+            "The class action remains the central vehicle for nationwide remedies.\u{E000}20\u{E001}",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        body.font_ratio_page_ref = 1.0;
+        body.in_footnote_zone = true;
+        body.doc_footnote_state = true;
+        body.page_has_footnote_divider = true;
+        body.below_footnote_divider = false;
+        let mut note = lm2_test_source_line(
+            "p4:l45",
+            45,
+            "20. 145 S. Ct. 2540, 2548 (2025).",
+            0.81,
+            false,
+            Some(LiquidBlockRole::Footnote),
+        );
+        note.font_ratio_page_ref = 0.81;
+        note.in_footnote_zone = true;
+        note.page_has_footnote_divider = true;
+        note.below_footnote_divider = true;
+        let decoded = vec![
+            (body.clone(), Lm2Action::Marginalia),
+            (note.clone(), Lm2Action::Marginalia),
+        ];
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: body.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: note.text.clone(),
+                label: None,
+            },
+        ];
+        let sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&body, LiquidBlockRole::Marginalia)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref_with_note_start(
+                    &note,
+                    LiquidBlockRole::Marginalia,
+                    true,
+                )],
+            },
+        ];
+
+        assert_eq!(
+            apply_above_note_body_marginalia_rescue(&mut blocks, &sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[0].role, LiquidBlockRole::Paragraph);
+        assert_eq!(blocks[1].role, LiquidBlockRole::Marginalia);
+    }
+
+    #[test]
+    fn explicit_divider_overrides_stale_learned_note_state_above_it() {
+        let mut body = lm2_test_source_line(
+            "p4:l42",
+            42,
+            "ordinary body line",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        body.page_height = 792.0;
+        body.top = 277.0;
+        body.page_has_footnote_divider = true;
+        body.below_footnote_divider = false;
+        body.in_footnote_zone = true;
+        body.doc_footnote_state = true;
+
+        assert!(!lm2_low_footnote_zone_evidence(&body));
+        body.below_footnote_divider = true;
+        assert!(lm2_low_footnote_zone_evidence(&body));
+    }
+
+    #[test]
     fn d1_runtime_footer_artifact_overlay_preserves_existing_hide_noise() {
         let candidate = lm2_test_source_line(
             "p0:l30",
@@ -20763,6 +39023,375 @@ mod tests {
 
         assert_eq!(decoded[0].1, Lm2Action::HideNoise);
         assert_eq!(decoded[0].0.role_hint, Some(LiquidBlockRole::Noise));
+    }
+
+    #[test]
+    fn final_assembly_guard_isolates_running_header_after_role_overlays() {
+        let mut line = lm2_test_source_line(
+            "p7:l0",
+            0,
+            "8 HARVARD LAW REVIEW FORUM [Vol. 139:1",
+            0.79,
+            false,
+            Some(LiquidBlockRole::Noise),
+        );
+        line.page_index = 7;
+        line.page_height = 792.0;
+        line.top = 710.8;
+        line.bottom = 695.9;
+        let mut decoded = vec![(line, Lm2Action::Marginalia)];
+
+        apply_final_assembly_safety_guards(&mut decoded);
+
+        assert_eq!(decoded[0].1, Lm2Action::HideNoise);
+        assert_eq!(decoded[0].0.role_hint, Some(LiquidBlockRole::Noise));
+    }
+
+    #[test]
+    fn final_assembly_guard_isolates_document_repeated_edge_text() {
+        let mut line =
+            lm2_test_source_line("p5:l0", 0, "JOURNAL OF PRIVATE LAW", 0.82, false, None);
+        line.page_index = 5;
+        line.doc_repeated_edge_text = true;
+        line.doc_repeated_top_edge = true;
+        let mut decoded = vec![(line, Lm2Action::Keep)];
+
+        apply_final_assembly_safety_guards(&mut decoded);
+
+        assert_eq!(decoded[0].1, Lm2Action::HideNoise);
+        assert_eq!(decoded[0].0.role_hint, Some(LiquidBlockRole::Noise));
+    }
+
+    #[test]
+    fn final_assembly_guard_isolates_repository_footer_at_page_edge() {
+        let mut line = lm2_test_source_line(
+            "p2:l45",
+            45,
+            "Electronic copy available at: https://ssrn.com/abstract=4543803",
+            0.84,
+            false,
+            Some(LiquidBlockRole::Noise),
+        );
+        line.page_index = 2;
+        line.page_height = 792.0;
+        line.top = 19.05;
+        line.bottom = 7.89;
+        let mut decoded = vec![(line, Lm2Action::Marginalia)];
+
+        apply_final_assembly_safety_guards(&mut decoded);
+
+        assert_eq!(decoded[0].1, Lm2Action::HideNoise);
+        assert_eq!(decoded[0].0.role_hint, Some(LiquidBlockRole::Noise));
+    }
+
+    #[test]
+    fn final_assembly_guard_isolates_footnote_divider() {
+        let line = lm2_test_source_line(
+            "p15:l30",
+            30,
+            &"\u{2013}".repeat(61),
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        let mut decoded = vec![(line, Lm2Action::Keep)];
+
+        apply_final_assembly_safety_guards(&mut decoded);
+
+        assert_eq!(decoded[0].1, Lm2Action::HideNoise);
+        assert_eq!(decoded[0].0.role_hint, Some(LiquidBlockRole::Noise));
+    }
+
+    #[test]
+    fn final_assembly_guard_restores_layout_confirmed_note_continuation() {
+        let mut line = lm2_test_source_line(
+            "p15:l48",
+            48,
+            "class); id. at 119 (discussing a related example).",
+            0.73,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        line.page_index = 15;
+        line.in_footnote_zone = true;
+        line.font_ratio_page_ref = 0.73;
+        let mut decoded = vec![(line, Lm2Action::Keep)];
+
+        apply_final_assembly_safety_guards(&mut decoded);
+
+        assert_eq!(decoded[0].1, Lm2Action::Marginalia);
+        assert_eq!(decoded[0].0.role_hint, Some(LiquidBlockRole::Footnote));
+    }
+
+    #[test]
+    fn final_assembly_guard_preserves_non_edge_available_at_citation() {
+        let mut line = lm2_test_source_line(
+            "p2:l20",
+            20,
+            "The appendix is available at: https://example.edu/report.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        line.page_height = 792.0;
+        line.top = 420.0;
+        line.bottom = 408.0;
+        let mut decoded = vec![(line, Lm2Action::Keep)];
+
+        apply_final_assembly_safety_guards(&mut decoded);
+
+        assert_eq!(decoded[0].1, Lm2Action::Keep);
+        assert_eq!(decoded[0].0.role_hint, Some(LiquidBlockRole::Paragraph));
+    }
+
+    #[test]
+    fn final_assembly_guard_restores_short_outline_heading() {
+        let mut line = lm2_test_source_line(
+            "p1:l12",
+            12,
+            "I. UCC ARTICLE 4A AND THE UCC DRAFTING PROCESS",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Noise),
+        );
+        line.page_index = 1;
+        line.page_height = 720.0;
+        line.top = 470.0;
+        line.bottom = 458.0;
+        let mut decoded = vec![(line, Lm2Action::HideNoise)];
+
+        apply_final_assembly_safety_guards(&mut decoded);
+
+        assert_eq!(decoded[0].1, Lm2Action::Keep);
+        assert_eq!(decoded[0].0.role_hint, Some(LiquidBlockRole::Heading));
+    }
+
+    #[test]
+    fn repository_cover_guard_drops_cover_and_preserves_spilled_article_title() {
+        let mut works = lm2_test_source_line(
+            "p0:l5",
+            5,
+            "Follow this and additional works at: https://example.edu/repository",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        works.page_index = 0;
+        let mut citation = lm2_test_source_line(
+            "p0:l6",
+            6,
+            "Recommended Citation Jane Scholar, Important Article",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        citation.page_index = 0;
+        let mut spill = lm2_test_source_line(
+            "p1:l0",
+            0,
+            "For more information, please contact repository@example.edu. THE IMPORTANT ARTICLE TITLE",
+            1.2,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        spill.page_index = 1;
+        let mut decoded = vec![
+            (works, Lm2Action::Keep),
+            (citation, Lm2Action::Keep),
+            (spill, Lm2Action::HideNoise),
+        ];
+
+        assert_eq!(apply_repository_cover_guard(&mut decoded), 3);
+        assert_eq!(decoded[0].1, Lm2Action::HideNoise);
+        assert_eq!(decoded[1].1, Lm2Action::HideNoise);
+        assert_eq!(decoded[2].1, Lm2Action::Keep);
+        assert_eq!(decoded[2].0.text, "THE IMPORTANT ARTICLE TITLE");
+        assert_eq!(decoded[2].0.role_hint, Some(LiquidBlockRole::Heading));
+    }
+
+    #[test]
+    fn repository_recommended_citation_supplies_clean_title_spelling() {
+        let mut works = lm2_test_source_line(
+            "p0:l5",
+            5,
+            "Follow this and additional works at: https://example.edu/repository",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        works.page_index = 0;
+        let mut label = lm2_test_source_line(
+            "p0:l14",
+            14,
+            "Recommended Citation",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        label.page_index = 0;
+        let mut citation_one = lm2_test_source_line(
+            "p0:l15",
+            15,
+            "Paul S. Turner, The UCC Drafting Process and Six Questions about Article 4A: Is There a Need for",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        citation_one.page_index = 0;
+        let mut citation_two = lm2_test_source_line(
+            "p0:l16",
+            16,
+            "Revisions to the Uniform Funds Transfers Law, 28 Loy. L.A. L. Rev. 351 (1994).",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        citation_two.page_index = 0;
+        let mut available = lm2_test_source_line(
+            "p0:l17",
+            17,
+            "Available at: https://example.edu/article",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        available.page_index = 0;
+        let decoded = vec![
+            (works, Lm2Action::Keep),
+            (label, Lm2Action::Keep),
+            (citation_one, Lm2Action::Keep),
+            (citation_two, Lm2Action::Keep),
+            (available, Lm2Action::Keep),
+        ];
+        let covers = repository_cover_pages(&decoded);
+
+        let title = repository_citation_title(&decoded, &covers).unwrap();
+
+        assert_eq!(
+            title,
+            "The UCC Drafting Process and Six Questions about Article 4A: Is There a Need for Revisions to the Uniform Funds Transfers Law"
+        );
+        assert!(
+            title_word_overlap(
+                &title,
+                "THE UCC DRAFJTING PROCESS AND SIX QUESTIONS ABOUT ARTICLE 4A: IS THERE A NEED FOR REVISIONS TO THE UNIFORM FUNDS TRANSFERS LAW?"
+            ) > 0.8
+        );
+    }
+
+    #[test]
+    fn explicit_endnote_section_guard_recovers_full_page_notes() {
+        let mut page_label =
+            lm2_test_source_line("p1:l0", 0, "14", 0.82, true, Some(LiquidBlockRole::Noise));
+        page_label.page_index = 1;
+        let mut note_one =
+            lm2_test_source_line("p1:l1", 1, "1", 1.0, false, Some(LiquidBlockRole::Noise));
+        note_one.page_index = 1;
+        let mut note_one_text = lm2_test_source_line(
+            "p1:l2",
+            2,
+            "See U.C.C. art. 4A prefatory note.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        note_one_text.page_index = 1;
+        note_one_text.doc_note_marker = 55;
+        let mut decoded = vec![
+            (
+                lm2_test_source_line(
+                    "p0:l0",
+                    0,
+                    "The article cites one.1 Then two.2 Then three.3 Then four.4",
+                    1.0,
+                    false,
+                    Some(LiquidBlockRole::Paragraph),
+                ),
+                Lm2Action::Keep,
+            ),
+            (
+                lm2_test_source_line("p0:l1", 1, "Footnotes", 1.0, false, None),
+                Lm2Action::Keep,
+            ),
+            (page_label, Lm2Action::HideNoise),
+            (note_one, Lm2Action::HideNoise),
+            (note_one_text, Lm2Action::Keep),
+        ];
+        for marker in 2..=4 {
+            let mut line = lm2_test_source_line(
+                &format!("p1:l{}", marker * 2),
+                marker * 2,
+                &marker.to_string(),
+                1.0,
+                false,
+                Some(LiquidBlockRole::Noise),
+            );
+            line.page_index = 1;
+            decoded.push((line, Lm2Action::HideNoise));
+            let mut text = lm2_test_source_line(
+                &format!("p1:l{}", marker * 2 + 1),
+                marker * 2 + 1,
+                "Id.",
+                1.0,
+                false,
+                Some(LiquidBlockRole::Paragraph),
+            );
+            text.page_index = 1;
+            decoded.push((text, Lm2Action::Keep));
+        }
+
+        let recovered = apply_explicit_endnote_section_guard(&mut decoded);
+
+        assert_eq!(recovered, 8);
+        assert_eq!(decoded[0].1, Lm2Action::Keep);
+        assert!(
+            decoded[0]
+                .0
+                .text
+                .contains(&format!("one.{CALLOUT_START}1{CALLOUT_END}"))
+        );
+        assert!(
+            decoded[0]
+                .0
+                .text
+                .contains(&format!("four.{CALLOUT_START}4{CALLOUT_END}"))
+        );
+        assert_eq!(decoded[1].1, Lm2Action::HideNoise);
+        assert_eq!(decoded[2].1, Lm2Action::HideNoise);
+        for row in decoded.iter().skip(3) {
+            assert_eq!(row.1, Lm2Action::Marginalia);
+            assert_eq!(row.0.role_hint, Some(LiquidBlockRole::Marginalia));
+        }
+        assert_eq!(decoded[4].0.doc_note_marker, 0);
+    }
+
+    #[test]
+    fn explicit_endnote_section_guard_requires_a_monotone_sequence() {
+        let mut decoded = vec![
+            (
+                lm2_test_source_line("p0:l0", 0, "Footnotes", 1.0, false, None),
+                Lm2Action::Keep,
+            ),
+            (
+                lm2_test_source_line("p0:l1", 1, "1", 1.0, false, None),
+                Lm2Action::HideNoise,
+            ),
+            (
+                lm2_test_source_line("p0:l2", 2, "200", 1.0, false, None),
+                Lm2Action::HideNoise,
+            ),
+            (
+                lm2_test_source_line("p0:l3", 3, "2", 1.0, false, None),
+                Lm2Action::HideNoise,
+            ),
+            (
+                lm2_test_source_line("p0:l4", 4, "3", 1.0, false, None),
+                Lm2Action::HideNoise,
+            ),
+        ];
+
+        assert_eq!(apply_explicit_endnote_section_guard(&mut decoded), 0);
+        assert_eq!(decoded[0].1, Lm2Action::Keep);
     }
 
     #[test]
@@ -21066,6 +39695,56 @@ mod tests {
 
         assert_eq!(decoded[1].1, Lm2Action::Marginalia);
         assert_eq!(decoded[1].0.role_hint, Some(LiquidBlockRole::Footnote));
+    }
+
+    #[test]
+    fn preceding_small_font_note_continuation_is_not_spliced_into_body() {
+        let mut decoded = Vec::new();
+        let mut body = lm2_test_source_line(
+            "p16:l32",
+            32,
+            "their customers as the drafters thought fair, and numerous provisions",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        body.page_index = 16;
+        decoded.push((body, Lm2Action::Keep));
+        for line_index in 33..=38 {
+            let mut continuation = lm2_test_source_line(
+                &format!("p16:l{line_index}"),
+                line_index,
+                "continued small-font note prose from the preceding page",
+                0.75,
+                false,
+                None,
+            );
+            continuation.page_index = 16;
+            decoded.push((continuation, Lm2Action::Keep));
+        }
+        let mut note = lm2_test_source_line(
+            "p16:l39",
+            39,
+            "39. U.C.C. section 4A-203(a)(1).",
+            0.75,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        note.page_index = 16;
+        note.in_footnote_zone = true;
+        decoded.push((note, Lm2Action::Marginalia));
+
+        assert_eq!(
+            apply_preceding_small_font_note_continuation_guard(&mut decoded),
+            6
+        );
+        assert_eq!(decoded[0].1, Lm2Action::Keep);
+        assert!(decoded[1..=6].iter().all(|(line, action)| {
+            *action == Lm2Action::Marginalia
+                && line.role_hint == Some(LiquidBlockRole::Footnote)
+                && line.in_footnote_zone
+                && line.doc_footnote_continuation
+        }));
     }
 
     #[test]
@@ -21582,5 +40261,3436 @@ mod tests {
             ),
             vec![127, 128]
         );
+    }
+
+    fn body_test_line(
+        id: &str,
+        page: usize,
+        line_index: usize,
+        text: &str,
+    ) -> DeepLiquidSourceLine {
+        let mut line = lm2_test_source_line(id, line_index, text, 1.0, false, None);
+        line.page_index = page;
+        line.page_width = 100.0;
+        line.page_height = 100.0;
+        line.left = 20.0;
+        line.right = 80.0;
+        line.font_height = 10.0;
+        line.font_ratio_page_ref = 1.0;
+        line.font_ratio_doc = 1.0;
+        line.segment_block_id = 7;
+        line.segment_block_line_count = 8;
+        line.segment_block_shape = "body".to_owned();
+        line
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gapfill_test_line(
+        id: &str,
+        page: usize,
+        line_index: usize,
+        text: &str,
+        left: f32,
+        right: f32,
+        bottom: f32,
+        top: f32,
+        font_height: f32,
+        segment_block_id: usize,
+        segment_line_index: usize,
+        segment_line_count: usize,
+        segment_shape: &str,
+    ) -> DeepLiquidSourceLine {
+        let mut line = body_test_line(id, page, line_index, text);
+        line.page_width = 442.8;
+        line.page_height = 686.88;
+        line.left = left;
+        line.right = right;
+        line.bottom = bottom;
+        line.top = top;
+        line.font_height = font_height;
+        line.font_ratio_doc = font_height / 11.67;
+        line.font_ratio_page_ref = font_height / 11.58;
+        line.segment_block_id = segment_block_id;
+        line.segment_block_line_index = segment_line_index;
+        line.segment_block_line_count = segment_line_count;
+        line.segment_block_shape = segment_shape.to_owned();
+        line
+    }
+
+    fn paragraph_block(text: &str) -> LiquidBlock {
+        LiquidBlock {
+            role: LiquidBlockRole::Paragraph,
+            text: text.to_owned(),
+            label: None,
+        }
+    }
+
+    #[test]
+    fn physical_sequential_note_heads_cross_blocks_and_reject_furniture() {
+        let note_line = |id: &str, line_index: usize, text: &str| {
+            let mut line = lm2_test_source_line(
+                id,
+                line_index,
+                text,
+                0.76,
+                false,
+                Some(LiquidBlockRole::Marginalia),
+            );
+            line.page_index = 21;
+            line.font_ratio_page_ref = 0.76;
+            line.font_ratio_doc = 0.76;
+            line.page_has_footnote_divider = true;
+            line.below_footnote_divider = true;
+            line.in_footnote_zone = true;
+            line.segment_block_id = 7;
+            line.segment_block_shape = "footnote".to_owned();
+            line.segment_block_footnote_like = true;
+            line
+        };
+        let note82 = note_line("p21:l27", 27, "82 Prior note ends.");
+        let note83 = note_line("p21:l28", 28, "83");
+        let prose83 = note_line("p21:l29", 29, "The next definition continues here.");
+        let note84 = note_line("p21:l33", 33, "84 Another definition.");
+        let mut page_number = note_line("p21:l34", 34, "85");
+        page_number.segment_block_furniture_like = true;
+        page_number.centered = true;
+
+        let mut ref82 = line_ref(&note82, LiquidBlockRole::Marginalia);
+        ref82.note_markers = vec![82];
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: note82.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: format!("{} {} {}", note83.text, prose83.text, note84.text),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: page_number.text.clone(),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![ref82],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![
+                    line_ref(&note83, LiquidBlockRole::Marginalia),
+                    line_ref(&prose83, LiquidBlockRole::Marginalia),
+                    line_ref(&note84, LiquidBlockRole::Marginalia),
+                ],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&page_number, LiquidBlockRole::Noise)],
+            },
+        ];
+        let decoded = vec![
+            (note82, Lm2Action::Marginalia),
+            (note83, Lm2Action::Marginalia),
+            (prose83, Lm2Action::Marginalia),
+            (note84, Lm2Action::Marginalia),
+            (page_number, Lm2Action::HideNoise),
+        ];
+
+        assert_eq!(
+            apply_physical_sequential_note_head_recovery(&mut blocks, &mut sources, &decoded),
+            2
+        );
+        assert_eq!(sources[1].lines[0].note_markers, vec![83]);
+        assert_eq!(sources[1].lines[2].note_markers, vec![84]);
+        assert!(sources[2].lines[0].note_markers.is_empty());
+        assert_eq!(blocks[1].role, LiquidBlockRole::Marginalia);
+        assert_eq!(blocks.len(), 3);
+    }
+
+    #[test]
+    fn local_monotone_ascii_callouts_recover_infix_and_same_row_leading_only() {
+        let body_line = |id: &str, line_index: usize, text: &str| {
+            let mut line = lm2_test_source_line(
+                id,
+                line_index,
+                text,
+                1.0,
+                false,
+                Some(LiquidBlockRole::Paragraph),
+            );
+            line.page_width = 612.0;
+            line.page_height = 792.0;
+            line.font_height = 12.0;
+            line.font_ratio_page_ref = 1.0;
+            line.font_ratio_doc = 1.0;
+            line.segment_block_id = 4;
+            line.segment_block_shape = "mixed".to_owned();
+            line
+        };
+        let mut body141 = body_line(
+            "p53:l11",
+            11,
+            &format!("A prior proposition.{CALLOUT_START}141{CALLOUT_END}"),
+        );
+        let mut body142 = body_line("p53:l12", 12, "That leaves the query. 142");
+        let body143 = body_line(
+            "p53:l13",
+            13,
+            &format!("The next proposition.{CALLOUT_START}143{CALLOUT_END}"),
+        );
+        body141.left = 54.0;
+        body141.right = 330.0;
+        body141.bottom = 500.0;
+        body141.top = 512.0;
+        body142.left = 330.5;
+        body142.right = 390.0;
+        body142.bottom = 500.0;
+        body142.top = 512.0;
+
+        let note_line = |marker: u16| {
+            let mut line = lm2_test_source_line(
+                &format!("p53:l{}", 30 + marker as usize % 10),
+                30 + marker as usize % 10,
+                &format!("{marker} Definition."),
+                0.76,
+                false,
+                Some(LiquidBlockRole::Marginalia),
+            );
+            line.page_index = 53;
+            line.in_footnote_zone = true;
+            line.page_has_footnote_divider = true;
+            line.below_footnote_divider = true;
+            line
+        };
+        let notes = [141u16, 142, 143]
+            .into_iter()
+            .map(note_line)
+            .collect::<Vec<_>>();
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: body141.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: body142.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: body143.text.clone(),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&body141, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&body142, LiquidBlockRole::Marginalia)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&body143, LiquidBlockRole::Paragraph)],
+            },
+        ];
+        for (offset, note) in notes.iter().enumerate() {
+            let marker = 141 + offset as u16;
+            blocks.push(LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: note.text.clone(),
+                label: None,
+            });
+            let mut note_ref = line_ref(note, LiquidBlockRole::Marginalia);
+            note_ref.note_markers = vec![marker];
+            sources.push(LiquidBlockSourceLines {
+                block_index: 3 + offset,
+                lines: vec![note_ref],
+            });
+        }
+        let mut decoded = vec![
+            (body141, Lm2Action::Keep),
+            (body142, Lm2Action::Marginalia),
+            (body143, Lm2Action::Keep),
+        ];
+        decoded.extend(notes.into_iter().map(|line| (line, Lm2Action::Marginalia)));
+
+        assert_eq!(
+            apply_local_monotone_ascii_callout_recovery(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert!(
+            blocks[1]
+                .text
+                .contains(&format!("query. {CALLOUT_START}142{CALLOUT_END}"))
+        );
+        assert_eq!(blocks[1].role, LiquidBlockRole::Paragraph);
+
+        blocks[1].text = "A year 2026 remains ordinary prose.".to_owned();
+        sources[1].lines[0].text = blocks[1].text.clone();
+        assert_eq!(
+            apply_local_monotone_ascii_callout_recovery(&mut blocks, &mut sources, &decoded),
+            0
+        );
+    }
+
+    #[test]
+    fn body_paired_bare_note_moves_to_adjacent_definition_block() {
+        let mut callout = lm2_test_source_line(
+            "p18:l10",
+            10,
+            &format!("A proposition.{CALLOUT_START}69{CALLOUT_END}"),
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        callout.page_index = 18;
+        let mut body = lm2_test_source_line(
+            "p18:l13",
+            13,
+            "The goal is to 69 ascertain intent.",
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        body.page_index = 18;
+        let mut marker = lm2_test_source_line(
+            "p18:l14",
+            14,
+            "69",
+            0.47,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        marker.page_index = 18;
+        marker.font_ratio_page_ref = 0.47;
+        marker.font_ratio_page = 0.61;
+        marker.font_ratio_doc = 0.47;
+        marker.segment_block_footnote_like = true;
+        let mut note = lm2_test_source_line(
+            "p18:l15",
+            15,
+            "For an insightful treatment, see Authority.",
+            0.77,
+            true,
+            None,
+        );
+        note.page_index = 18;
+        note.font_ratio_page_ref = 0.77;
+        note.font_ratio_page = 1.0;
+        note.font_ratio_doc = 0.77;
+
+        let mut blocks = vec![
+            paragraph_block(&callout.text),
+            paragraph_block(&body.text),
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: note.text.clone(),
+                label: None,
+            },
+        ];
+        let mut marker_ref = line_ref(&marker, LiquidBlockRole::Marginalia);
+        marker_ref.note_markers.clear();
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&callout, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&body, LiquidBlockRole::Paragraph), marker_ref],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&note, LiquidBlockRole::Marginalia)],
+            },
+        ];
+        let decoded = vec![
+            (callout, Lm2Action::Keep),
+            (body, Lm2Action::Keep),
+            (marker, Lm2Action::Marginalia),
+            (note, Lm2Action::Marginalia),
+        ];
+
+        assert_eq!(
+            apply_body_backed_bare_note_head_recovery(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(
+            apply_recovered_trailing_note_marker_reflow(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[1].text, "The goal is to ascertain intent.");
+        assert!(blocks[2].text.starts_with("69 For an insightful"));
+        assert_eq!(sources[2].lines[0].note_markers, vec![69]);
+    }
+
+    #[test]
+    fn sandwiched_url_rows_continue_the_preceding_numbered_note() {
+        let note_line = |id: &str, index: usize, text: &str| {
+            let mut line = lm2_test_source_line(
+                id,
+                index,
+                text,
+                0.77,
+                false,
+                Some(LiquidBlockRole::Marginalia),
+            );
+            line.page_index = 18;
+            line.in_footnote_zone = true;
+            line.below_footnote_divider = true;
+            line.segment_block_footnote_like = true;
+            line
+        };
+        let head69 = note_line("p18:l14", 14, "69");
+        let prose69 = note_line("p18:l15", 15, "A source ending with a URL,");
+        let url_one = note_line("p18:l16", 16, "https://example.test/qualify-as\u{0002}");
+        let url_two = note_line("p18:l17", 17, "sandwiches/.");
+        let head70 = note_line("p18:l18", 18, "70");
+        let prose70 = note_line("p18:l19", 19, "The next authority.");
+        let mut head69_ref = line_ref(&head69, LiquidBlockRole::Marginalia);
+        head69_ref.note_markers = vec![69];
+        let mut head70_ref = line_ref(&head70, LiquidBlockRole::Marginalia);
+        head70_ref.note_markers = vec![70];
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: "69 A source ending with a URL,".to_owned(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: "https://example.test/qualify-as-sandwiches/.".to_owned(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: "70 The next authority.".to_owned(),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![head69_ref, line_ref(&prose69, LiquidBlockRole::Marginalia)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![
+                    line_ref(&url_one, LiquidBlockRole::Noise),
+                    line_ref(&url_two, LiquidBlockRole::Noise),
+                ],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![head70_ref, line_ref(&prose70, LiquidBlockRole::Marginalia)],
+            },
+        ];
+        let decoded = vec![
+            (head69, Lm2Action::Marginalia),
+            (prose69, Lm2Action::Marginalia),
+            (url_one, Lm2Action::HideNoise),
+            (url_two, Lm2Action::HideNoise),
+            (head70, Lm2Action::Marginalia),
+            (prose70, Lm2Action::Marginalia),
+        ];
+
+        assert_eq!(
+            apply_sandwiched_note_url_continuation_reflow(&mut blocks, &mut sources, &decoded,),
+            1
+        );
+        assert_eq!(blocks[1].role, LiquidBlockRole::Marginalia);
+        assert!(
+            sources[1]
+                .lines
+                .iter()
+                .all(|line| line.role == LiquidBlockRole::Marginalia)
+        );
+    }
+
+    #[test]
+    fn terminal_callout_order_and_dotted_version_restorations_are_source_backed() {
+        let mut previous = body_test_line("p3:l12", 3, 12, "behind the veil.");
+        previous.page_index = 3;
+        let mut current = body_test_line("p3:l13", 3, 13, "14 That");
+        current.page_index = 3;
+        let mut source = LiquidBlockSourceLines {
+            block_index: 0,
+            lines: vec![
+                line_ref(&previous, LiquidBlockRole::Paragraph),
+                line_ref(&current, LiquidBlockRole::Paragraph),
+            ],
+        };
+        source.lines[1].text = "14 That".to_owned();
+        let mut blocks = vec![paragraph_block(&format!(
+            "Prior.{CALLOUT_START}13{CALLOUT_END} behind the veil. lack of proof.{CALLOUT_START}15{CALLOUT_END} {CALLOUT_START}14{CALLOUT_END} That"
+        ))];
+        let decoded = vec![(previous, Lm2Action::Keep), (current, Lm2Action::Keep)];
+        assert_eq!(
+            apply_terminal_out_of_order_callout_fragment_reflow(&mut blocks, &[source], &decoded,),
+            1
+        );
+        assert!(blocks[0].text.contains(&format!(
+            "behind the veil.{CALLOUT_START}14{CALLOUT_END} That lack of proof.{CALLOUT_START}15{CALLOUT_END}"
+        )));
+
+        let version_source = LiquidBlockSourceLines {
+            block_index: 0,
+            lines: vec![LiquidSourceLineRef {
+                id: Some("p27:l12".to_owned()),
+                page_index: 27,
+                line_index: 12,
+                text: "The software Pangram V3.3.2 classified the comments.".to_owned(),
+                role: LiquidBlockRole::Paragraph,
+                note_markers: Vec::new(),
+            }],
+        };
+        blocks[0].text = format!(
+            "The software Pangram V3.{CALLOUT_START}93{CALLOUT_END}.2 classified the comments. Written.{CALLOUT_START}93{CALLOUT_END}"
+        );
+        assert_eq!(
+            apply_source_backed_dotted_numeric_callout_restoration(&mut blocks, &[version_source],),
+            1
+        );
+        assert!(blocks[0].text.contains("Pangram V3.3.2 classified"));
+        assert_eq!(sentineled_note_markers(&blocks[0].text), vec![93]);
+    }
+
+    #[test]
+    fn final_noise_callout_bridge_restores_gapfill_footnote_98_body_flow() {
+        let body_line = |id: &str, line_index: usize, text: &str| {
+            let mut line = lm2_test_source_line(
+                id,
+                line_index,
+                text,
+                1.0,
+                false,
+                Some(LiquidBlockRole::Paragraph),
+            );
+            line.page_index = 29;
+            line.page_width = 612.0;
+            line.page_height = 792.0;
+            line.font_height = 12.0;
+            line.font_ratio_page_ref = 1.0;
+            line.font_ratio_doc = 1.0;
+            line.segment_block_id = 4;
+            line.segment_block_line_count = 3;
+            line.segment_block_shape = "mixed".to_owned();
+            line
+        };
+        let mut previous = body_line("p29:l8", 8, "Averaging succeeds 55% of");
+        let mut hidden = body_line("p29:l9", 9, "the time.");
+        let mut callout = body_line(
+            "p29:l10",
+            10,
+            &format!("{CALLOUT_START}98{CALLOUT_END} This is over double the baseline."),
+        );
+        previous.bottom = 270.0;
+        previous.top = 282.0;
+        hidden.left = 53.28;
+        hidden.right = 112.49;
+        hidden.bottom = 249.408;
+        hidden.top = 263.688;
+        callout.left = 113.52;
+        callout.right = 392.13;
+        callout.bottom = 249.408;
+        callout.top = 263.688;
+        let mut note98 = body_line("p29:l20", 20, "98 With three scenarios, chance is 1/3.");
+        note98.font_height = 9.0;
+        note98.font_ratio_page = 0.76;
+        note98.font_ratio_page_ref = 0.76;
+        note98.font_ratio_doc = 0.76;
+        note98.in_footnote_zone = true;
+        note98.page_has_footnote_divider = true;
+        note98.below_footnote_divider = true;
+        note98.segment_block_id = 9;
+        note98.segment_block_shape = "footnote".to_owned();
+        note98.segment_block_footnote_like = true;
+
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: previous.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: hidden.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: callout.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: note98.text.clone(),
+                label: None,
+            },
+        ];
+        let mut note_ref = line_ref(&note98, LiquidBlockRole::Marginalia);
+        note_ref.note_markers = vec![98];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&previous, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&hidden, LiquidBlockRole::Noise)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&callout, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 3,
+                lines: vec![note_ref],
+            },
+        ];
+        let decoded = vec![
+            (previous, Lm2Action::Keep),
+            (hidden, Lm2Action::HideNoise),
+            (callout, Lm2Action::Keep),
+            (note98, Lm2Action::Marginalia),
+        ];
+
+        assert_eq!(
+            apply_final_noise_inline_callout_bridge(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].text.contains(&format!(
+            "55% of the time. {CALLOUT_START}98{CALLOUT_END} This is"
+        )));
+        assert_eq!(blocks[0].role, LiquidBlockRole::Paragraph);
+    }
+
+    #[test]
+    fn final_caption_continuation_uses_same_segment_style_and_gap() {
+        let caption_line = |id: &str, line_index: usize, text: &str, segment: usize| {
+            let mut line = lm2_test_source_line(
+                id,
+                line_index,
+                text,
+                0.75,
+                false,
+                Some(LiquidBlockRole::Caption),
+            );
+            line.page_index = 40;
+            line.page_width = 612.0;
+            line.page_height = 792.0;
+            line.font_height = 9.0;
+            line.font_ratio_page_ref = 0.75;
+            line.font_ratio_doc = 0.75;
+            line.segment_block_id = segment;
+            line.segment_block_shape = "body".to_owned();
+            line.italic = true;
+            line
+        };
+        let cap = caption_line(
+            "p40:l2",
+            2,
+            "Figure 10: Rankings of the other two models'",
+            4,
+        );
+        let tail = caption_line("p40:l3", 3, "answers. Error bars show uncertainty.", 4);
+        let other = caption_line("p40:l4", 4, "Figure 11: A separate figure", 5);
+        let mut heading = caption_line("p40:l5", 5, "results and discussion", 6);
+        heading.italic = false;
+        let decoded = vec![
+            (cap.clone(), Lm2Action::HideNoise),
+            (tail.clone(), Lm2Action::Keep),
+            (other.clone(), Lm2Action::HideNoise),
+            (heading.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: cap.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: tail.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: other.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: heading.text.clone(),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&cap, LiquidBlockRole::Caption)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&tail, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&other, LiquidBlockRole::Caption)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 3,
+                lines: vec![line_ref(&heading, LiquidBlockRole::Paragraph)],
+            },
+        ];
+
+        assert_eq!(
+            apply_final_caption_continuation_reflow(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Caption);
+        assert!(blocks[0].text.contains("models' answers. Error bars"));
+        assert_eq!(blocks[1].text, other.text);
+    }
+
+    #[test]
+    fn final_source_backed_figure_captions_demote_body_references_and_split_fused_prose() {
+        let make_line = |id: &str,
+                         page: usize,
+                         index: usize,
+                         text: &str,
+                         segment: usize,
+                         font_height: f32,
+                         italic: bool,
+                         role: LiquidBlockRole| {
+            let mut line = lm2_test_source_line(id, index, text, 1.0, false, Some(role));
+            line.page_index = page;
+            line.page_width = 612.0;
+            line.page_height = 792.0;
+            line.font_height = font_height;
+            line.font_ratio_doc = font_height / 12.0;
+            line.font_ratio_page_ref = font_height / 12.0;
+            line.segment_block_id = segment;
+            line.segment_block_shape = "body".to_owned();
+            line.italic = italic;
+            line
+        };
+        let body_reference = make_line(
+            "p34:l0",
+            34,
+            0,
+            "Figure 6 summarizes the findings.",
+            1,
+            12.0,
+            false,
+            LiquidBlockRole::Paragraph,
+        );
+        let caption = make_line(
+            "p34:l1",
+            34,
+            1,
+            "Figure 6: Strict Reconstruction results",
+            2,
+            9.0,
+            true,
+            LiquidBlockRole::Caption,
+        );
+        let body = make_line(
+            "p34:l2",
+            34,
+            2,
+            "Roughly 26% of respondents answered correctly.",
+            3,
+            12.0,
+            false,
+            LiquidBlockRole::Paragraph,
+        );
+        let cap10 = make_line(
+            "p40:l1",
+            40,
+            1,
+            "Figure 10: Accuracy across all measured agreements and on the hard",
+            4,
+            9.0,
+            true,
+            LiquidBlockRole::Caption,
+        );
+        let cap10_tail = make_line(
+            "p40:l2",
+            40,
+            2,
+            "disputes alone. Error bars show confidence intervals.",
+            4,
+            9.0,
+            true,
+            LiquidBlockRole::Paragraph,
+        );
+        let decoded = vec![
+            (body_reference.clone(), Lm2Action::Keep),
+            (caption.clone(), Lm2Action::HideNoise),
+            (body.clone(), Lm2Action::Keep),
+            (cap10.clone(), Lm2Action::HideNoise),
+            (cap10_tail.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            LiquidBlock {
+                role: LiquidBlockRole::Caption,
+                text: body_reference.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Caption,
+                text: format!("{} {}", caption.text, body.text),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: cap10.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Paragraph,
+                text: cap10_tail.text.clone(),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&body_reference, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![
+                    line_ref(&caption, LiquidBlockRole::Caption),
+                    line_ref(&body, LiquidBlockRole::Paragraph),
+                ],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&cap10, LiquidBlockRole::Caption)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 3,
+                lines: vec![line_ref(&cap10_tail, LiquidBlockRole::Paragraph)],
+            },
+        ];
+
+        assert_eq!(
+            apply_final_source_backed_figure_caption_isolation(&mut blocks, &mut sources, &decoded,),
+            4
+        );
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Paragraph);
+        assert_eq!(blocks[1].role, LiquidBlockRole::Caption);
+        assert_eq!(blocks[1].text, caption.text);
+        assert_eq!(blocks[2].role, LiquidBlockRole::Paragraph);
+        assert_eq!(blocks[2].text, body.text);
+        assert_eq!(blocks[3].role, LiquidBlockRole::Caption);
+        assert!(blocks[3].text.contains("hard disputes alone"));
+    }
+
+    #[test]
+    fn final_inline_dash_fragment_reflow_restores_exact_gapfill_rows_and_preserves_closed_boundary()
+    {
+        let cases = [
+            (
+                gapfill_test_line(
+                    "p2:l12",
+                    2,
+                    12,
+                    "a floating price has to be set8",
+                    194.09,
+                    329.8408,
+                    451.174,
+                    466.83398,
+                    11.8425,
+                    3,
+                    0,
+                    1,
+                    "mixed",
+                ),
+                gapfill_test_line(
+                    "p2:l13",
+                    2,
+                    13,
+                    "—judges will",
+                    329.86,
+                    391.984,
+                    451.174,
+                    466.83398,
+                    12.0,
+                    4,
+                    0,
+                    1,
+                    "table",
+                ),
+                gapfill_test_line(
+                    "p2:l14",
+                    2,
+                    14,
+                    "sometimes supply the missing term.",
+                    53.304,
+                    217.25,
+                    435.454,
+                    451.114,
+                    12.0,
+                    5,
+                    0,
+                    1,
+                    "mixed",
+                ),
+                "a floating price has to be set\u{E000}8\u{E001}",
+            ),
+            (
+                gapfill_test_line(
+                    "p9:l22",
+                    9,
+                    22,
+                    "contingency because they know the law will give them a default term34",
+                    53.304,
+                    377.85474,
+                    287.354,
+                    303.01398,
+                    11.8539,
+                    7,
+                    0,
+                    1,
+                    "body",
+                ),
+                gapfill_test_line(
+                    "p9:l23", 9, 23, "—", 377.86, 389.74, 287.354, 303.01398, 12.0, 8, 0, 1,
+                    "mixed",
+                ),
+                gapfill_test_line(
+                    "p9:l24",
+                    9,
+                    24,
+                    "that’s not a “gap”, that’s efficient drafting!—or Richard Posner’s observation",
+                    53.304,
+                    389.632,
+                    271.634,
+                    287.294,
+                    11.859,
+                    9,
+                    0,
+                    2,
+                    "body",
+                ),
+                "contingency because they know the law will give them a default term\u{E000}34\u{E001}",
+            ),
+        ];
+
+        for (previous, fragment, current, target_text) in cases {
+            let decoded = vec![
+                (previous.clone(), Lm2Action::Keep),
+                (fragment.clone(), Lm2Action::HideNoise),
+                (current.clone(), Lm2Action::Keep),
+            ];
+            let mut blocks = vec![
+                paragraph_block(target_text),
+                LiquidBlock {
+                    role: LiquidBlockRole::Noise,
+                    text: fragment.text.clone(),
+                    label: None,
+                },
+                paragraph_block(&current.text),
+            ];
+            let mut sources = vec![
+                LiquidBlockSourceLines {
+                    block_index: 0,
+                    lines: vec![line_ref(&previous, LiquidBlockRole::Paragraph)],
+                },
+                LiquidBlockSourceLines {
+                    block_index: 1,
+                    lines: vec![line_ref(&fragment, LiquidBlockRole::Noise)],
+                },
+                LiquidBlockSourceLines {
+                    block_index: 2,
+                    lines: vec![line_ref(&current, LiquidBlockRole::Paragraph)],
+                },
+            ];
+
+            assert_eq!(
+                apply_final_inline_dash_fragment_reflow(&mut blocks, &mut sources, &decoded),
+                1
+            );
+            assert_eq!(blocks.len(), 1);
+            assert!(blocks[0].text.contains(&fragment.text));
+            assert!(blocks[0].text.ends_with(&current.text));
+        }
+
+        let previous = gapfill_test_line(
+            "p2:l20",
+            2,
+            20,
+            "This sentence is complete.",
+            194.09,
+            329.8408,
+            451.174,
+            466.83398,
+            12.0,
+            13,
+            0,
+            1,
+            "body",
+        );
+        let fragment = gapfill_test_line(
+            "p2:l21", 2, 21, "—", 329.86, 389.74, 451.174, 466.83398, 12.0, 14, 0, 1, "mixed",
+        );
+        let current = gapfill_test_line(
+            "p2:l22",
+            2,
+            22,
+            "lowercase text from another paragraph.",
+            53.304,
+            300.0,
+            435.454,
+            451.114,
+            12.0,
+            15,
+            0,
+            1,
+            "body",
+        );
+        let decoded = vec![
+            (previous.clone(), Lm2Action::Keep),
+            (fragment.clone(), Lm2Action::HideNoise),
+            (current.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block(&previous.text),
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: fragment.text.clone(),
+                label: None,
+            },
+            paragraph_block(&current.text),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&previous, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&fragment, LiquidBlockRole::Noise)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&current, LiquidBlockRole::Paragraph)],
+            },
+        ];
+        assert_eq!(
+            apply_final_inline_dash_fragment_reflow(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(blocks.len(), 3);
+    }
+
+    #[test]
+    fn final_same_baseline_fragment_reflow_restores_exact_gapfill_marker_chains() {
+        let body = gapfill_test_line(
+            "p2:l14",
+            2,
+            14,
+            "sometimes supply the missing term.",
+            53.304,
+            217.25,
+            435.454,
+            451.114,
+            12.0,
+            5,
+            0,
+            1,
+            "mixed",
+        );
+        let mut marker = gapfill_test_line(
+            "p2:l15",
+            2,
+            15,
+            "9",
+            217.97,
+            221.3108,
+            440.91592,
+            449.99872,
+            6.96,
+            7,
+            0,
+            1,
+            "furniture",
+        );
+        marker.segment_block_footnote_like = true;
+        marker.in_footnote_zone = true;
+        let continuation = gapfill_test_line(
+            "p2:l16",
+            2,
+            16,
+            "Modern jurists have a name for this",
+            221.35,
+            391.846,
+            435.454,
+            451.114,
+            12.0,
+            6,
+            0,
+            1,
+            "table",
+        );
+        let decoded = vec![
+            (body.clone(), Lm2Action::Keep),
+            (marker.clone(), Lm2Action::HideNoise),
+            (continuation.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block(&body.text),
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: marker.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Table,
+                text: continuation.text.clone(),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&body, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&marker, LiquidBlockRole::Marginalia)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&continuation, LiquidBlockRole::Paragraph)],
+            },
+        ];
+        assert_eq!(
+            apply_final_same_baseline_fragment_reflow(&mut blocks, &mut sources, &decoded),
+            2
+        );
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Paragraph);
+        assert_eq!(attached_terminal_body_marker(&blocks[0].text), None);
+        assert_eq!(blocks[0].text.matches("\u{E000}9\u{E001}").count(), 1);
+        assert!(blocks[0].text.ends_with(&continuation.text));
+
+        let first = gapfill_test_line(
+            "p63:l11",
+            63,
+            11,
+            "gap filling. 177",
+            53.304,
+            114.6356,
+            442.65402,
+            458.31403,
+            10.3675,
+            1,
+            5,
+            8,
+            "body",
+        );
+        let second = gapfill_test_line(
+            "p63:l12",
+            63,
+            12,
+            "The problem is that consumers’ expectations about what",
+            114.62,
+            391.736,
+            442.65402,
+            458.31403,
+            12.0,
+            1,
+            6,
+            8,
+            "body",
+        );
+        let later = gapfill_test_line(
+            "p63:l19",
+            63,
+            19,
+            "Generative gap filling may produce a separate paragraph.",
+            71.304,
+            391.9,
+            357.214,
+            372.874,
+            12.0,
+            5,
+            0,
+            3,
+            "body",
+        );
+        let decoded = vec![
+            (first.clone(), Lm2Action::Keep),
+            (second.clone(), Lm2Action::Keep),
+            (later.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block(&first.text),
+            paragraph_block(&second.text),
+            paragraph_block(&later.text),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&first, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&second, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&later, LiquidBlockRole::Paragraph)],
+            },
+        ];
+        assert_eq!(
+            apply_final_same_baseline_fragment_reflow(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].text.ends_with(&second.text));
+        assert_eq!(blocks[1].text, later.text);
+
+        let line_4 = gapfill_test_line(
+            "p5:l4",
+            5,
+            4,
+            "superficially plausible as the models it drew on, but it could not be proven.",
+            53.304,
+            383.02002,
+            575.164,
+            590.824,
+            11.714,
+            2,
+            0,
+            1,
+            "body",
+        );
+        let mut marker_20 = gapfill_test_line(
+            "p5:l5",
+            5,
+            5,
+            "20",
+            382.9,
+            389.60077,
+            580.6259,
+            589.70874,
+            6.96,
+            3,
+            0,
+            1,
+            "furniture",
+        );
+        marker_20.segment_block_footnote_like = true;
+        let line_6 = gapfill_test_line(
+            "p5:l6",
+            5,
+            6,
+            "One carefully-argued response put it starkly: “no experiment can determine",
+            53.304,
+            391.76,
+            559.564,
+            575.224,
+            12.0,
+            4,
+            0,
+            3,
+            "body",
+        );
+        let line_9 = gapfill_test_line(
+            "p5:l9",
+            5,
+            9,
+            "Here, by redacting the contested text, a new paragraph begins.",
+            71.304,
+            391.922,
+            505.324,
+            520.984,
+            11.855,
+            5,
+            0,
+            6,
+            "body",
+        );
+        let decoded = vec![
+            (line_4.clone(), Lm2Action::Keep),
+            (marker_20.clone(), Lm2Action::HideNoise),
+            (line_6.clone(), Lm2Action::Keep),
+            (line_9.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block(&format!("{}\u{E000}20\u{E001}", line_4.text)),
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: marker_20.text.clone(),
+                label: None,
+            },
+            paragraph_block(&line_6.text),
+            paragraph_block(&line_9.text),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&line_4, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&marker_20, LiquidBlockRole::Marginalia)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&line_6, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 3,
+                lines: vec![line_ref(&line_9, LiquidBlockRole::Paragraph)],
+            },
+        ];
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            2
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].text.matches("\u{E000}20\u{E001}").count(), 1);
+        assert!(blocks[0].text.ends_with(&line_6.text));
+        assert_eq!(blocks[1].text, line_9.text);
+    }
+
+    #[test]
+    fn final_body_coalescer_restores_exact_gapfill_same_role_wraps_and_preserves_list_boundary() {
+        let line_22 = gapfill_test_line(
+            "p26:l22",
+            26,
+            22,
+            "b. At [CKS]’s option, either the contract price ($8,516)",
+            125.3,
+            379.982,
+            241.634,
+            257.294,
+            11.807,
+            7,
+            0,
+            4,
+            "mixed",
+        );
+        let line_23 = gapfill_test_line(
+            "p26:l23",
+            26,
+            23,
+            "or the current market price ($8,950)",
+            143.33,
+            303.422,
+            225.914,
+            241.574,
+            12.0,
+            7,
+            1,
+            4,
+            "mixed",
+        );
+        let line_24 = gapfill_test_line(
+            "p26:l24",
+            26,
+            24,
+            "c. Only the contract price ($8,516)",
+            125.3,
+            300.0,
+            210.194,
+            225.854,
+            12.0,
+            7,
+            2,
+            4,
+            "mixed",
+        );
+        let decoded = vec![
+            (line_22.clone(), Lm2Action::Keep),
+            (line_23.clone(), Lm2Action::Keep),
+            (line_24.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block(&line_22.text),
+            paragraph_block(&line_23.text),
+            paragraph_block(&line_24.text),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&line_22, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&line_23, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&line_24, LiquidBlockRole::Paragraph)],
+            },
+        ];
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].text.ends_with(&line_23.text));
+        assert_eq!(blocks[1].text, line_24.text);
+
+        let line_3 = gapfill_test_line(
+            "p36:l3",
+            36,
+            3,
+            "Let’s start with the obvious worry that when someone (including AI)",
+            80.304,
+            391.716,
+            567.964,
+            583.624,
+            12.0,
+            1,
+            0,
+            5,
+            "body",
+        );
+        let line_4 = gapfill_test_line(
+            "p36:l4",
+            36,
+            4,
+            "pattern matches, they do so not based on the text itself, but something else.",
+            53.304,
+            391.644,
+            552.364,
+            568.024,
+            12.0,
+            1,
+            1,
+            5,
+            "body",
+        );
+        let decoded = vec![
+            (line_3.clone(), Lm2Action::Keep),
+            (line_4.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![paragraph_block(&line_3.text), paragraph_block(&line_4.text)];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&line_3, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&line_4, LiquidBlockRole::Paragraph)],
+            },
+        ];
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].text.ends_with(&line_4.text));
+    }
+
+    #[test]
+    fn final_fused_heading_body_split_restores_exact_gapfill_boundary_and_preserves_wrapped_heading()
+     {
+        let heading = gapfill_test_line(
+            "p64:l28",
+            64,
+            28,
+            "E. Gaps in Generative Gap Filling and the Limits of the Method",
+            71.304,
+            359.484,
+            186.074,
+            201.734,
+            11.823,
+            8,
+            0,
+            1,
+            "body",
+        );
+        let body = gapfill_test_line(
+            "p64:l29",
+            64,
+            29,
+            "We recognize several important limitations to the discussion above.",
+            71.304,
+            366.766,
+            163.124,
+            178.784,
+            11.343,
+            9,
+            0,
+            1,
+            "body",
+        );
+        let decoded = vec![
+            (heading.clone(), Lm2Action::Keep),
+            (body.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![LiquidBlock {
+            role: LiquidBlockRole::Heading,
+            text: format!("{} {}", heading.text, body.text),
+            label: None,
+        }];
+        let mut sources = vec![LiquidBlockSourceLines {
+            block_index: 0,
+            lines: vec![
+                line_ref(&heading, LiquidBlockRole::Heading),
+                line_ref(&body, LiquidBlockRole::Paragraph),
+            ],
+        }];
+        assert_eq!(
+            apply_final_fused_heading_body_splits(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Heading);
+        assert_eq!(blocks[0].text, heading.text);
+        assert_eq!(blocks[1].role, LiquidBlockRole::Paragraph);
+        assert_eq!(blocks[1].text, body.text);
+
+        let mut wrapped = body.clone();
+        wrapped.id = "p64:l30".to_owned();
+        wrapped.line_index = 30;
+        wrapped.text = "and the Limits of the Method".to_owned();
+        wrapped.segment_block_id = heading.segment_block_id;
+        wrapped.segment_block_line_index = 1;
+        wrapped.segment_block_line_count = 2;
+        let mut wrapped_heading = heading.clone();
+        wrapped_heading.segment_block_line_count = 2;
+        let decoded = vec![
+            (wrapped_heading.clone(), Lm2Action::Keep),
+            (wrapped.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![LiquidBlock {
+            role: LiquidBlockRole::Heading,
+            text: format!("{} {}", wrapped_heading.text, wrapped.text),
+            label: None,
+        }];
+        let mut sources = vec![LiquidBlockSourceLines {
+            block_index: 0,
+            lines: vec![
+                line_ref(&wrapped_heading, LiquidBlockRole::Heading),
+                line_ref(&wrapped, LiquidBlockRole::Paragraph),
+            ],
+        }];
+        assert_eq!(
+            apply_final_fused_heading_body_splits(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn final_body_coalescer_repairs_same_segment_lowercase_and_hyphen_splits() {
+        let same = body_test_line("p0:l4", 0, 4, "echoed the same");
+        let ideas = body_test_line("p0:l5", 0, 5, "ideas in public.");
+        let mut author = body_test_line("p0:l14", 0, 14, "state-conferred author\u{0002}");
+        let mut ity = body_test_line("p0:l15", 0, 15, "ity. Member states responded.");
+        author.segment_block_id = 8;
+        ity.segment_block_id = 8;
+        author.bottom = 50.0;
+        author.top = 52.0;
+        ity.bottom = 46.0;
+        ity.top = 54.0;
+        let decoded = vec![
+            (same.clone(), Lm2Action::Keep),
+            (ideas.clone(), Lm2Action::Keep),
+            (author.clone(), Lm2Action::Keep),
+            (ity.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block("echoed the same"),
+            paragraph_block("ideas in public."),
+            paragraph_block("state-conferred author-"),
+            paragraph_block("ity. Member states responded."),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&same, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&ideas, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&author, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 3,
+                lines: vec![line_ref(&ity, LiquidBlockRole::Paragraph)],
+            },
+        ];
+
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            2
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].text, "echoed the same ideas in public.");
+        assert_eq!(
+            blocks[1].text,
+            "state-conferred authority. Member states responded."
+        );
+    }
+
+    #[test]
+    fn final_body_coalescer_preserves_cross_page_indented_texas_boundary() {
+        let mut previous = body_test_line("p0:l40", 0, 40, "The first paragraph ends.");
+        let mut current = body_test_line("p1:l1", 1, 1, "A genuinely new paragraph begins.");
+        previous.left = 20.0;
+        current.left = 23.7;
+        let decoded = vec![
+            (previous.clone(), Lm2Action::Keep),
+            (current.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block(&previous.text),
+            paragraph_block(&current.text),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&previous, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&current, LiquidBlockRole::Paragraph)],
+            },
+        ];
+
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(blocks.len(), 2);
+        assert!(paragraph_boundary(&previous, &current));
+    }
+
+    #[test]
+    fn final_body_coalescer_preserves_exact_columbia_marker_290_boundary() {
+        let mut previous = body_test_line(
+            "p49:l17",
+            49,
+            17,
+            "administrative inefficiencies.\u{E000}290\u{E001}",
+        );
+        let mut current = body_test_line(
+            "p50:l1",
+            50,
+            1,
+            "Should courts nevertheless inquire into the agency's reasons?",
+        );
+        previous.page_width = 612.0;
+        current.page_width = 612.0;
+        previous.left = 138.24017;
+        current.left = 159.1203;
+        current.segment_block_line_index = 0;
+        let decoded = vec![
+            (previous.clone(), Lm2Action::Keep),
+            (current.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block(&previous.text),
+            paragraph_block(&current.text),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&previous, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&current, LiquidBlockRole::Paragraph)],
+            },
+        ];
+
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(blocks.len(), 2);
+        assert!(paragraph_boundary(&previous, &current));
+        assert_eq!(blocks[0].text, previous.text);
+        assert_eq!(blocks[1].text, current.text);
+    }
+
+    #[test]
+    fn final_body_coalescer_accepts_cross_page_facing_margin_shifts() {
+        for (previous_left, current_left, previous_text, current_text, expected) in [
+            (
+                16.0,
+                11.9,
+                "The analysis must therefore",
+                "continue on the facing page.",
+                "The analysis must therefore continue on the facing page.",
+            ),
+            (
+                11.9,
+                16.0,
+                "The review board had not completed",
+                "its promised investigation.",
+                "The review board had not completed its promised investigation.",
+            ),
+            (
+                22.5,
+                16.0,
+                "The investigation illustr-",
+                "ates the stakes of this policy.",
+                "The investigation illustrates the stakes of this policy.",
+            ),
+        ] {
+            let mut previous = body_test_line("p0:l40", 0, 40, previous_text);
+            let mut current = body_test_line("p1:l2", 1, 2, current_text);
+            previous.left = previous_left;
+            current.left = current_left;
+            let decoded = vec![
+                (previous.clone(), Lm2Action::Keep),
+                (current.clone(), Lm2Action::Keep),
+            ];
+            let mut blocks = vec![
+                paragraph_block(&previous.text),
+                paragraph_block(&current.text),
+            ];
+            let mut sources = vec![
+                LiquidBlockSourceLines {
+                    block_index: 0,
+                    lines: vec![line_ref(&previous, LiquidBlockRole::Paragraph)],
+                },
+                LiquidBlockSourceLines {
+                    block_index: 1,
+                    lines: vec![line_ref(&current, LiquidBlockRole::Paragraph)],
+                },
+            ];
+
+            assert_eq!(
+                apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+                1
+            );
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].text, expected);
+        }
+    }
+
+    #[test]
+    fn displayed_lead_labels_and_font_cliffs_are_final_paragraph_boundaries() {
+        let mut previous = body_test_line("p0:l17", 0, 17, "corresponding to three theories:");
+        previous.font_height = 9.7;
+        let mut label = body_test_line(
+            "p0:l18",
+            0,
+            18,
+            "Ratio Decidendi: The holding follows from the outcome.",
+        );
+        label.left = 16.2;
+        label.font_height = 8.6;
+        label.font_ratio_doc = 0.88;
+        assert!(lm2_displayed_lead_label_boundary(&previous, &label));
+
+        let mut ordinary = label.clone();
+        ordinary.text = "One last wrinkle: in this example the prose continues.".to_owned();
+        assert!(!lm2_displayed_lead_label_boundary(&previous, &ordinary));
+
+        let mut quote_tail = body_test_line(
+            "p0:l21",
+            0,
+            21,
+            "entitling them to relief.\u{E000}65\u{E001}",
+        );
+        quote_tail.font_height = 8.9;
+        quote_tail.font_ratio_doc = 0.91;
+        let mut body = body_test_line("p0:l22", 0, 22, "Ironically, the brief omitted the issue.");
+        body.font_height = 9.7;
+        body.font_ratio_doc = 1.0;
+        assert!(lm2_small_font_to_body_cliff_boundary(&quote_tail, &body));
+        body.text = "continued quotation without a terminal sentence".to_owned();
+        assert!(!lm2_small_font_to_body_cliff_boundary(&quote_tail, &body));
+    }
+
+    #[test]
+    fn final_body_coalescer_never_reorders_distinct_source_intervals() {
+        let late = body_test_line("p0:l24", 0, 24, "court is bound by that holding.");
+        let middle = body_test_line("p0:l20", 0, 20, "of the case given the facts");
+        let decoded = vec![
+            (late.clone(), Lm2Action::Keep),
+            (middle.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![paragraph_block(&middle.text), paragraph_block(&late.text)];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&middle, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&late, LiquidBlockRole::Paragraph)],
+            },
+        ];
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(blocks[0].text, middle.text);
+        assert_eq!(blocks[1].text, late.text);
+        assert_eq!(sources[0].lines[0].id.as_deref(), Some("p0:l20"));
+        assert_eq!(sources[1].lines[0].id.as_deref(), Some("p0:l24"));
+    }
+
+    #[test]
+    fn final_body_coalescer_restores_penn_ratio_source_order() {
+        let texts = [
+            "Ratio Decidendi: The holding of a precedential case is the legal norm",
+            "that follows from the reasoning necessary to the outcome",
+            "of the case given the legally salient facts before the court",
+            "and the arguments made by the parties or raised by the court.",
+            "Legally Salient Factual Characteristics: The holding is defined by",
+            "all of the legally salient facts of the case: a subsequent",
+            "court is bound by that holding only if the case shares all",
+            "of those factual characteristics.",
+        ];
+        let mut lines = texts
+            .iter()
+            .enumerate()
+            .map(|(offset, text)| {
+                body_test_line(&format!("p47:l{}", 18 + offset), 47, 18 + offset, text)
+            })
+            .collect::<Vec<_>>();
+        for (offset, line) in lines.iter_mut().enumerate() {
+            line.page_width = 486.0;
+            line.page_height = 720.0;
+            line.left = 87.4;
+            line.bottom = 397.5 - offset as f32 * 12.96;
+            line.top = line.bottom + 11.17;
+            line.font_height = 8.7;
+            line.font_ratio_doc = 0.91;
+            line.segment_block_id = 2;
+            line.segment_block_line_index = 16 + offset;
+            line.segment_block_line_count = 24;
+        }
+        let decoded = lines
+            .iter()
+            .cloned()
+            .map(|line| (line, Lm2Action::Keep))
+            .collect::<Vec<_>>();
+        let a_text = format!("{} {}", texts[0], texts[1]);
+        let b_text = texts[2..6].join(" ");
+        let c_text = texts[6..8].join(" ");
+        // Reproduce the native A/C/B regression: the final two blocks are
+        // individually text-correct, but their complete source intervals are
+        // adjacent and inverted.
+        let mut blocks = vec![
+            paragraph_block(&a_text),
+            paragraph_block(&c_text),
+            paragraph_block(&b_text),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: lines[0..2]
+                    .iter()
+                    .map(|line| line_ref(line, LiquidBlockRole::Paragraph))
+                    .collect(),
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: lines[6..8]
+                    .iter()
+                    .map(|line| line_ref(line, LiquidBlockRole::Paragraph))
+                    .collect(),
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: lines[2..6]
+                    .iter()
+                    .map(|line| line_ref(line, LiquidBlockRole::Marginalia))
+                    .collect(),
+            },
+        ];
+
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            3
+        );
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, texts.join(" "));
+        assert_eq!(
+            sources[0]
+                .lines
+                .iter()
+                .map(|line| line.line_index)
+                .collect::<Vec<_>>(),
+            (18..=25).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn final_body_coalescer_restores_exact_penn_cross_page_display_order() {
+        let texts = [
+            "Ratio Decidendi: The holding of a precedential case is the legal norm (e.g.,",
+            "rule or standard) that follows from the reasoning necessary to the outcome",
+            "of the case given the legally salient facts before the court and the arguments",
+            "made by the parties or raised by the court.\u{E000}173\u{E001}",
+            "Legally Salient Factual Characteristics: The holding of a precedential case is a",
+            "legal rule defined by all of the legally salient facts of the case: a subsequent",
+            "court is bound by that holding only if the case before it shares all of those",
+            "factual characteristics.\u{E000}174\u{E001}",
+            "Legislative Holdings: The holding of a case is the legal norm (rule or standard)",
+            "that a court announces as the basis for its decision, even if that norm reaches",
+            "beyond the legally salient facts before the court.\u{E000}175\u{E001}",
+        ];
+        let mut lines = texts
+            .iter()
+            .enumerate()
+            .map(|(offset, text)| {
+                if offset < 8 {
+                    body_test_line(&format!("p47:l{}", 18 + offset), 47, 18 + offset, text)
+                } else {
+                    body_test_line(&format!("p48:l{}", offset - 7), 48, offset - 7, text)
+                }
+            })
+            .collect::<Vec<_>>();
+        for (offset, line) in lines.iter_mut().enumerate() {
+            line.page_width = 468.0;
+            line.page_height = 720.0;
+            line.left = 87.2;
+            line.font_height = 8.65;
+            line.font_ratio_doc = 0.91;
+            if offset < 8 {
+                line.segment_block_id = 2;
+                line.segment_block_line_index = 16 + offset;
+                line.segment_block_line_count = 24;
+                line.bottom = 397.5 - offset as f32 * 12.96;
+            } else {
+                line.segment_block_id = 1;
+                line.segment_block_line_index = offset - 8;
+                line.segment_block_line_count = 3;
+                line.bottom = 631.5 - (offset - 8) as f32 * 12.96;
+            }
+            line.top = line.bottom + 11.2;
+        }
+        // Reproduce the late stale-note state from the native trace: immutable
+        // segment provenance remains body-shaped even though these rows were
+        // relabeled as note continuations before final assembly.
+        for line in &mut lines[2..7] {
+            line.in_footnote_zone = true;
+            line.doc_footnote_continuation = true;
+        }
+        let decoded = lines
+            .iter()
+            .enumerate()
+            .map(|(offset, line)| {
+                let action = if matches!(offset, 2 | 3 | 4 | 5 | 10) {
+                    Lm2Action::Marginalia
+                } else {
+                    Lm2Action::Keep
+                };
+                (line.clone(), action)
+            })
+            .collect::<Vec<_>>();
+        let page_47_a = texts[0..2].join(" ");
+        let page_47_b = texts[2..6].join(" ");
+        let page_47_c = texts[6..8].join(" ");
+        let page_48 = texts[8..11].join(" ");
+        let mut blocks = vec![
+            paragraph_block(&page_47_a),
+            paragraph_block(&page_47_c),
+            paragraph_block(&format!("{page_47_b} {page_48}")),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: lines[0..2]
+                    .iter()
+                    .map(|line| line_ref(line, LiquidBlockRole::Paragraph))
+                    .collect(),
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: lines[6..8]
+                    .iter()
+                    .map(|line| line_ref(line, LiquidBlockRole::Paragraph))
+                    .collect(),
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: lines[2..6]
+                    .iter()
+                    .chain(lines[8..11].iter())
+                    .enumerate()
+                    .map(|(offset, line)| {
+                        let role = if matches!(offset, 0 | 1 | 2 | 3 | 6) {
+                            LiquidBlockRole::Marginalia
+                        } else {
+                            LiquidBlockRole::Paragraph
+                        };
+                        line_ref(line, role)
+                    })
+                    .collect(),
+            },
+        ];
+
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            4
+        );
+        assert_eq!(
+            apply_final_source_backed_paragraph_splits(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].text, texts[0..4].join(" "));
+        assert_eq!(blocks[1].text, texts[4..8].join(" "));
+        assert_eq!(blocks[2].text, page_48);
+        assert_eq!(
+            sources[0]
+                .lines
+                .iter()
+                .map(|line| (line.page_index, line.line_index))
+                .collect::<Vec<_>>(),
+            (18..=21)
+                .map(|line_index| (47, line_index))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(sources[1].lines[0].id.as_deref(), Some("p47:l22"));
+        assert_eq!(sources[2].lines[0].id.as_deref(), Some("p48:l1"));
+    }
+
+    #[test]
+    fn final_body_coalescer_rejects_inverted_distinct_reading_streams() {
+        let early_a = body_test_line("p0:l10", 0, 10, "The left column states one rule.");
+        let early_b = body_test_line("p0:l11", 0, 11, "It ends as a complete paragraph.");
+        let late_a = body_test_line("p0:l30", 0, 30, "The right column states another rule.");
+        let late_b = body_test_line("p0:l31", 0, 31, "It also ends as a complete paragraph.");
+        let decoded = vec![
+            (early_a.clone(), Lm2Action::Keep),
+            (early_b.clone(), Lm2Action::Keep),
+            (late_a.clone(), Lm2Action::Keep),
+            (late_b.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block(
+                "The right column states another rule. It also ends as a complete paragraph.",
+            ),
+            paragraph_block("The left column states one rule. It ends as a complete paragraph."),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![
+                    line_ref(&late_a, LiquidBlockRole::Paragraph),
+                    line_ref(&late_b, LiquidBlockRole::Paragraph),
+                ],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![
+                    line_ref(&early_a, LiquidBlockRole::Paragraph),
+                    line_ref(&early_b, LiquidBlockRole::Paragraph),
+                ],
+            },
+        ];
+
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert!(blocks[0].text.starts_with("The right column"));
+        assert!(blocks[1].text.starts_with("The left column"));
+    }
+
+    #[test]
+    fn final_body_coalescer_rejects_sorted_refs_with_reversed_duke_text() {
+        let early_a = body_test_line("p0:l20", 0, 20, "The first Duke sentence carries");
+        let early_b = body_test_line("p0:l21", 0, 21, "into the next source interval and");
+        let late_a = body_test_line("p0:l22", 0, 22, "continues in its proper reading");
+        let late_b = body_test_line("p0:l23", 0, 23, "order before the paragraph ends.");
+        let decoded = vec![
+            (early_a.clone(), Lm2Action::Keep),
+            (early_b.clone(), Lm2Action::Keep),
+            (late_a.clone(), Lm2Action::Keep),
+            (late_b.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block("order before the paragraph ends. continues in its proper reading"),
+            paragraph_block("The first Duke sentence carries into the next source interval and"),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![
+                    line_ref(&late_a, LiquidBlockRole::Paragraph),
+                    line_ref(&late_b, LiquidBlockRole::Paragraph),
+                ],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![
+                    line_ref(&early_a, LiquidBlockRole::Paragraph),
+                    line_ref(&early_b, LiquidBlockRole::Paragraph),
+                ],
+            },
+        ];
+        let original = blocks
+            .iter()
+            .map(|block| block.text.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| block.text.clone())
+                .collect::<Vec<_>>(),
+            original
+        );
+    }
+
+    #[test]
+    fn final_body_coalescer_preserves_duke_scale_merged_text_order() {
+        let mut decoded = Vec::new();
+        let mut blocks = Vec::new();
+        let mut sources = Vec::new();
+        for pair in 0..21usize {
+            let first_index = pair * 3;
+            let second_index = first_index + 1;
+            let first_text = format!("Duke interval {pair:02} carries");
+            let second_text = format!("continuation {pair:02}.");
+            let first = body_test_line(&format!("p0:l{first_index}"), 0, first_index, &first_text);
+            let second = body_test_line(
+                &format!("p0:l{second_index}"),
+                0,
+                second_index,
+                &second_text,
+            );
+            let first_block = blocks.len();
+            blocks.push(paragraph_block(&first_text));
+            sources.push(LiquidBlockSourceLines {
+                block_index: first_block,
+                lines: vec![line_ref(&first, LiquidBlockRole::Paragraph)],
+            });
+            let second_block = blocks.len();
+            blocks.push(paragraph_block(&second_text));
+            sources.push(LiquidBlockSourceLines {
+                block_index: second_block,
+                lines: vec![line_ref(&second, LiquidBlockRole::Paragraph)],
+            });
+            decoded.push((first, Lm2Action::Keep));
+            decoded.push((second, Lm2Action::Keep));
+        }
+
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            21
+        );
+        assert_eq!(blocks.len(), 21);
+        for pair in 0..21usize {
+            assert_eq!(
+                blocks[pair].text,
+                format!("Duke interval {pair:02} carries continuation {pair:02}.")
+            );
+            let source = sources
+                .iter()
+                .find(|source| source.block_index == pair)
+                .expect("merged block keeps provenance");
+            assert_eq!(
+                source
+                    .lines
+                    .iter()
+                    .map(|line| line.line_index)
+                    .collect::<Vec<_>>(),
+                vec![pair * 3, pair * 3 + 1]
+            );
+        }
+    }
+
+    #[test]
+    fn exact_footnote_continuation_furniture_is_hidden_but_prose_is_not() {
+        let exact = body_test_line("p0:l40", 0, 40, "footnote continued on next page");
+        let prose = body_test_line(
+            "p0:l41",
+            0,
+            41,
+            "The footnote continued on next page because the PDF was reflowed.",
+        );
+        let mut decoded = vec![(exact, Lm2Action::Marginalia), (prose, Lm2Action::Keep)];
+        apply_final_assembly_safety_guards(&mut decoded);
+        assert_eq!(decoded[0].1, Lm2Action::HideNoise);
+        assert_eq!(decoded[0].0.role_hint, Some(LiquidBlockRole::Noise));
+        assert_eq!(decoded[1].1, Lm2Action::Keep);
+    }
+
+    #[test]
+    fn colon_letter_number_body_rescue_requires_full_same_segment_provenance() {
+        let anchor = body_test_line("p0:l20", 0, 20, "include the following:");
+        let mut letter = body_test_line("p0:l21", 0, 21, "(f) A board may act only with a quorum.");
+        let mut number = body_test_line("p0:l22", 0, 22, "(1) A quorum is a majority.");
+        letter.font_height = 9.0;
+        number.font_height = 9.0;
+        letter.font_ratio_doc = 0.88;
+        number.font_ratio_doc = 0.88;
+        let mut decoded = vec![
+            (anchor.clone(), Lm2Action::Keep),
+            (letter.clone(), Lm2Action::Marginalia),
+            (number.clone(), Lm2Action::Marginalia),
+        ];
+        assert_eq!(
+            apply_same_segment_statutory_subdivision_body_rescue(&mut decoded),
+            2
+        );
+        assert!(
+            decoded[1..]
+                .iter()
+                .all(|(line, action)| *action == Lm2Action::Keep
+                    && line.role_hint == Some(LiquidBlockRole::Paragraph))
+        );
+
+        letter.segment_block_id = 99;
+        let mut negative = vec![
+            (anchor, Lm2Action::Keep),
+            (letter, Lm2Action::Marginalia),
+            (number, Lm2Action::Marginalia),
+        ];
+        assert_eq!(
+            apply_same_segment_statutory_subdivision_body_rescue(&mut negative),
+            0
+        );
+    }
+
+    #[test]
+    fn citation_suffix_and_near_rule_cross_page_alternates_are_narrow() {
+        assert!(lm2_citation_suffix_cross_page_bridge(
+            "285. See Stein v. Buccaneers Ltd.",
+            "P\u{2019}ship, 772 F.3d 698, 707 (11th Cir. 2014)"
+        ));
+        assert!(!lm2_citation_suffix_cross_page_bridge(
+            "The company was Buccaneers Ltd.",
+            "Partnership doctrine remains unsettled."
+        ));
+
+        let mut first = body_test_line(
+            "p1:l27",
+            1,
+            27,
+            "serving in a principal office, which negates",
+        );
+        let mut second = body_test_line("p1:l28", 1, 28, "the Appointments Clause.");
+        for line in [&mut first, &mut second] {
+            line.font_ratio_page = 0.86;
+            line.font_ratio_page_ref = 0.86;
+            line.font_ratio_doc = 0.86;
+            line.font_height = 9.4;
+        }
+        first.page_object_thin_horizontal_near_line_count = 1;
+        first.dist_to_nearest_rule = 5.0;
+        let refs = LiquidBlockSourceLines {
+            block_index: 0,
+            lines: vec![
+                line_ref(&first, LiquidBlockRole::Marginalia),
+                line_ref(&second, LiquidBlockRole::Marginalia),
+            ],
+        };
+        let decoded = vec![
+            (first.clone(), Lm2Action::Keep),
+            (second.clone(), Lm2Action::Keep),
+        ];
+        let by_id = decoded
+            .iter()
+            .map(|(line, _)| (line.id.as_str(), line))
+            .collect::<HashMap<_, _>>();
+        assert!(lm2_near_rule_cross_page_note_segment(&refs, &by_id));
+        first.page_object_thin_horizontal_near_line_count = 0;
+        let negative = LiquidBlockSourceLines {
+            block_index: 0,
+            lines: vec![
+                line_ref(&first, LiquidBlockRole::Paragraph),
+                line_ref(&second, LiquidBlockRole::Paragraph),
+            ],
+        };
+        let decoded_negative = vec![(first, Lm2Action::Keep), (second, Lm2Action::Keep)];
+        let by_id_negative = decoded_negative
+            .iter()
+            .map(|(line, _)| (line.id.as_str(), line))
+            .collect::<HashMap<_, _>>();
+        assert!(!lm2_near_rule_cross_page_note_segment(
+            &negative,
+            &by_id_negative
+        ));
+    }
+
+    #[test]
+    fn final_split_children_inherit_hard_footnote_provenance() {
+        let mut line = body_test_line(
+            "p1:l14",
+            1,
+            14,
+            "Describe Being Fired, Unfired, and Refired in Five Days",
+        );
+        line.segment_block_shape = "footnote".to_owned();
+        line.segment_block_footnote_like = true;
+        line.in_footnote_zone = true;
+        line.font_ratio_doc = 0.73;
+        line.font_ratio_page_ref = 0.73;
+        let decoded = [(line.clone(), Lm2Action::Marginalia)];
+        let by_id = decoded
+            .iter()
+            .map(|(line, _)| (line.id.as_str(), line))
+            .collect::<HashMap<_, _>>();
+        let mut numbered_ref = line_ref(&line, LiquidBlockRole::Marginalia);
+        numbered_ref.note_markers = vec![100];
+        let refs = vec![numbered_ref];
+        assert_eq!(
+            lm2_final_split_child_role(LiquidBlockRole::Paragraph, &refs, &by_id),
+            LiquidBlockRole::Marginalia
+        );
+
+        let mut body_sized = line.clone();
+        body_sized.font_ratio_doc = 1.03;
+        let decoded = [(body_sized.clone(), Lm2Action::Keep)];
+        let by_id = decoded
+            .iter()
+            .map(|(line, _)| (line.id.as_str(), line))
+            .collect::<HashMap<_, _>>();
+        let refs = vec![line_ref(&body_sized, LiquidBlockRole::Paragraph)];
+        assert_eq!(
+            lm2_final_split_child_role(LiquidBlockRole::Marginalia, &refs, &by_id),
+            LiquidBlockRole::Paragraph
+        );
+
+        let mut body_callout = body_test_line(
+            "p44:l35",
+            44,
+            35,
+            "there is a rule requiring party presentation of claims163 and defenses",
+        );
+        body_callout.font_ratio_doc = 1.03;
+        let decoded = [(body_callout.clone(), Lm2Action::Keep)];
+        let by_id = decoded
+            .iter()
+            .map(|(line, _)| (line.id.as_str(), line))
+            .collect::<HashMap<_, _>>();
+        let mut body_ref = line_ref(&body_callout, LiquidBlockRole::Paragraph);
+        body_ref.note_markers = vec![163];
+        assert_eq!(
+            lm2_final_split_child_role(LiquidBlockRole::Marginalia, &[body_ref], &by_id),
+            LiquidBlockRole::Paragraph
+        );
+        assert!(lm2_uppercase_note_continuation_cue(
+            "Describe Being Fired, BUS. INSIDER (Feb. 12, 2025), https://example.test"
+        ));
+        assert!(lm2_uppercase_note_continuation_cue(
+            "See, e.g., 12 U.S.C. § 1812(c)(3) (providing a holdover term)."
+        ));
+        assert!(!lm2_uppercase_note_continuation_cue(
+            "A New Body Paragraph Begins Here"
+        ));
+    }
+
+    #[test]
+    fn final_displayed_body_rescue_restores_statute_and_blockquote_without_merging() {
+        let mut anchor = body_test_line("p0:l20", 0, 20, "include the following:");
+        let mut letter = body_test_line("p0:l21", 0, 21, "(f) A board may act with a quorum.");
+        let mut number = body_test_line("p0:l22", 0, 22, "(1) A quorum is a majority.");
+        // The native role stream can carry a stale note-state bit even when
+        // the source segmenter proves that all three rows are body display.
+        anchor.doc_footnote_state = true;
+        number.doc_footnote_state = true;
+        letter.font_height = 8.7;
+        number.font_height = 8.7;
+        assert!(!lm2_hard_body_display_line(&anchor));
+        assert!(!lm2_hard_body_display_line(&number));
+        assert!(lm2_source_backed_body_display_line(&anchor));
+        assert!(lm2_source_backed_body_display_line(&number));
+        let decoded = vec![
+            (anchor.clone(), Lm2Action::Keep),
+            (letter.clone(), Lm2Action::Marginalia),
+            (number.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block("include the following:"),
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: letter.text.clone(),
+                label: None,
+            },
+            paragraph_block(&number.text),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&anchor, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&letter, LiquidBlockRole::Marginalia)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&number, LiquidBlockRole::Paragraph)],
+            },
+        ];
+        assert_eq!(
+            apply_final_displayed_body_role_rescue(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[1].role, LiquidBlockRole::Paragraph);
+        assert_eq!(sources[1].lines[0].role, LiquidBlockRole::Paragraph);
+
+        let intro = body_test_line("p2:l24", 2, 24, "As the court explained:");
+        let mut quote = body_test_line(
+            "p2:l25",
+            2,
+            25,
+            "We have concluded that one member may act for the Board",
+        );
+        quote.left = 23.0;
+        quote.font_height = 8.7;
+        let mut note = body_test_line("p2:l26", 2, 26, "220. 102 F.3d 579, 582.");
+        note.segment_block_id = 8;
+        note.segment_block_shape = "footnote".to_owned();
+        note.segment_block_footnote_like = true;
+        note.in_footnote_zone = true;
+        let decoded = vec![
+            (intro.clone(), Lm2Action::Keep),
+            (quote.clone(), Lm2Action::Marginalia),
+            (note.clone(), Lm2Action::Marginalia),
+        ];
+        let mut note_ref = line_ref(&note, LiquidBlockRole::Marginalia);
+        note_ref.note_markers = vec![220];
+        let mut blocks = vec![
+            paragraph_block(&intro.text),
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: quote.text.clone(),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: note.text.clone(),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&intro, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&quote, LiquidBlockRole::Marginalia)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![note_ref],
+            },
+        ];
+        assert_eq!(
+            apply_final_displayed_body_role_rescue(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[1].role, LiquidBlockRole::Quote);
+    }
+
+    #[test]
+    fn final_displayed_body_rescue_keeps_exact_stanford_quote_in_source_order() {
+        let mut lead = body_test_line("p35:l24", 35, 24, "quorum. As the court explained:");
+        lead.page_width = 468.0;
+        lead.left = 138.24054;
+        lead.bottom = 394.22232;
+        lead.top = 405.428;
+        lead.font_height = 10.775;
+        lead.segment_block_id = 2;
+        lead.segment_block_line_index = 21;
+        lead.segment_block_line_count = 26;
+        let quote_texts = [
+            "We have concluded that a single member of the National Mediation Board may act",
+            "for the Board pursuant to a validly issued delegation order that is narrowly tailored",
+            "to prevent the temporary occurrence of two vacancies from completely disabling",
+            "the Board. We believe that our conclusion is compelled by a close reading of the",
+        ];
+        let quote_lines = quote_texts
+            .iter()
+            .enumerate()
+            .map(|(offset, text)| {
+                let line_index = 25 + offset;
+                let mut line = body_test_line(&format!("p35:l{line_index}"), 35, line_index, text);
+                line.page_width = 468.0;
+                line.left = 156.24;
+                line.bottom = 380.33545 - offset as f32 * 11.02;
+                line.top = line.bottom + 8.5415;
+                line.font_height = 9.48;
+                line.font_ratio_doc = 0.8713;
+                line.segment_block_id = 2;
+                line.segment_block_line_index = 22 + offset;
+                line.segment_block_line_count = 26;
+                line
+            })
+            .collect::<Vec<_>>();
+        let mut note = body_test_line(
+            "p35:l29",
+            35,
+            29,
+            "220. 102 F.3d 579, 582 (D.C. Cir. 1996).",
+        );
+        note.page_width = 468.0;
+        note.segment_block_id = 3;
+        note.segment_block_line_index = 0;
+        note.segment_block_line_count = 2;
+        note.segment_block_shape = "table".to_owned();
+        note.segment_block_footnote_like = true;
+        note.in_footnote_zone = true;
+        note.font_height = 9.41;
+        note.font_ratio_doc = 0.865;
+        let mut tail = body_test_line(
+            "p36:l3",
+            36,
+            3,
+            "plain words of the statute and is fully consistent with the legislative history.",
+        );
+        tail.page_width = 468.0;
+        tail.left = 156.24;
+        tail.bottom = 659.27545;
+        tail.top = 667.8169;
+        tail.font_height = 9.48;
+        tail.font_ratio_doc = 0.8713;
+        tail.segment_block_id = 2;
+        tail.segment_block_line_index = 0;
+        tail.segment_block_line_count = 19;
+
+        let mut decoded = vec![(lead.clone(), Lm2Action::Keep)];
+        decoded.extend(
+            quote_lines
+                .iter()
+                .cloned()
+                .map(|line| (line, Lm2Action::Marginalia)),
+        );
+        decoded.push((note.clone(), Lm2Action::Marginalia));
+        decoded.push((tail.clone(), Lm2Action::Keep));
+        let mut note_ref = line_ref(&note, LiquidBlockRole::Marginalia);
+        note_ref.note_markers = vec![220];
+        let mut blocks = vec![
+            paragraph_block(&lead.text),
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: quote_texts.join(" "),
+                label: None,
+            },
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: note.text.clone(),
+                label: None,
+            },
+            paragraph_block(&tail.text),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&lead, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: quote_lines
+                    .iter()
+                    .map(|line| line_ref(line, LiquidBlockRole::Marginalia))
+                    .collect(),
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![note_ref],
+            },
+            LiquidBlockSourceLines {
+                block_index: 3,
+                lines: vec![line_ref(&tail, LiquidBlockRole::Paragraph)],
+            },
+        ];
+
+        assert_eq!(
+            apply_final_displayed_body_role_rescue(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[1].role, LiquidBlockRole::Quote);
+        assert_eq!(
+            apply_inverted_numbered_note_continuation_reflow(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks[1].role, LiquidBlockRole::Quote);
+        assert_eq!(
+            blocks[1].text,
+            format!("{} {}", quote_texts.join(" "), tail.text)
+        );
+        assert!(!blocks[2].text.contains("We have concluded"));
+    }
+
+    #[test]
+    fn final_furniture_prefix_suppression_preserves_first_body_row() {
+        let mut slug = body_test_line(
+            "p0:l0",
+            0,
+            0,
+            "DEACON AND LITMAN IN PRINTER DELETE) T4/26/2026 1:05 PM",
+        );
+        slug.segment_block_shape = "furniture".to_owned();
+        let mut header = body_test_line("p1:l1", 1, 1, "2026] LEGALISTIC NONCOMPLIANCE 1459");
+        header.role_hint = Some(LiquidBlockRole::Noise);
+        let body = body_test_line(
+            "p1:l2",
+            1,
+            2,
+            "“the United States’ decision on the[] [detainees’] long term disposition.”100",
+        );
+        let mut body = body;
+        body.text = format!(
+            "{}{CALLOUT_START}100{CALLOUT_END}",
+            body.text.trim_end_matches("100")
+        );
+        body.role_hint = Some(LiquidBlockRole::Noise);
+        assert!(looks_like_running_header(&normalize_text(&body.text)));
+        assert!(!lm2_final_hard_furniture_line(&body));
+        let decoded = vec![
+            (slug.clone(), Lm2Action::HideNoise),
+            (header.clone(), Lm2Action::HideNoise),
+            (body.clone(), Lm2Action::HideNoise),
+        ];
+        let mut blocks = vec![
+            paragraph_block(&slug.text),
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: format!("{} {}", header.text, body.text),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&slug, LiquidBlockRole::Noise)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![
+                    line_ref(&header, LiquidBlockRole::Noise),
+                    line_ref(&body, LiquidBlockRole::Noise),
+                ],
+            },
+        ];
+        assert_eq!(
+            apply_final_mixed_furniture_prefix_suppression(&mut blocks, &mut sources, &decoded),
+            2
+        );
+        assert_eq!(blocks[0].role, LiquidBlockRole::Noise);
+        assert_eq!(blocks[1].role, LiquidBlockRole::Paragraph);
+        assert_eq!(blocks[1].text, body.text);
+        assert_eq!(sources[1].lines[0].role, LiquidBlockRole::Paragraph);
+        assert_eq!(sources[1].lines[0].id.as_deref(), Some("p1:l2"));
+    }
+
+    #[test]
+    fn final_split_then_coalescer_restores_wrapped_outdent_and_hyphen() {
+        let mut same = body_test_line("p49:l4", 49, 4, "echoed the same");
+        same.left = 24.1;
+        let ideas = body_test_line("p49:l5", 49, 5, "ideas. The White House responded.");
+        let mut author = body_test_line("p75:l14", 75, 14, "state-conferred author\u{0002}");
+        let mut ity = body_test_line("p75:l15", 75, 15, "ity and cross-jurisdictional");
+        let mut assignment =
+            body_test_line("p75:l16", 75, 16, "assignment disputes remain difficult.");
+        author.segment_block_id = 8;
+        ity.segment_block_id = 8;
+        assignment.segment_block_id = 9;
+        author.page_width = 612.0;
+        ity.page_width = 612.0;
+        assignment.page_width = 612.0;
+        author.page_height = 792.0;
+        ity.page_height = 792.0;
+        assignment.page_height = 792.0;
+        author.left = 94.1;
+        ity.left = 77.9;
+        assignment.left = 77.9;
+        author.bottom = 497.0;
+        author.top = 498.0;
+        ity.bottom = 462.35;
+        ity.top = 523.6;
+        assignment.bottom = 438.0;
+        assignment.top = 462.0;
+        let decoded = vec![
+            (same.clone(), Lm2Action::Keep),
+            (ideas.clone(), Lm2Action::Keep),
+            (author.clone(), Lm2Action::Keep),
+            (ity.clone(), Lm2Action::Keep),
+            (assignment.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block(&same.text),
+            paragraph_block(&ideas.text),
+            paragraph_block("state-conferred author"),
+            paragraph_block(&ity.text),
+            paragraph_block(&assignment.text),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&same, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&ideas, LiquidBlockRole::Heading)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&author, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 3,
+                lines: vec![line_ref(&ity, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 4,
+                lines: vec![line_ref(&assignment, LiquidBlockRole::Paragraph)],
+            },
+        ];
+        assert_eq!(
+            apply_final_source_backed_paragraph_splits(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            3
+        );
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].text.contains("same ideas"));
+        assert_eq!(
+            blocks[1].text,
+            "state-conferred authority and cross-jurisdictional assignment disputes remain difficult."
+        );
+        assert_eq!(
+            apply_final_source_backed_paragraph_splits(&mut blocks, &mut sources, &decoded),
+            0
+        );
+    }
+
+    #[test]
+    fn final_body_coalescer_accepts_numeric_inline_marker_outdent() {
+        let mut previous = body_test_line(
+            "p20:l19",
+            20,
+            19,
+            "92 The Department of Homeland Security has created",
+        );
+        let mut current = body_test_line(
+            "p20:l20",
+            20,
+            20,
+            "a network of intergovernmental partnerships.",
+        );
+        previous.left = 30.0;
+        current.left = 13.0;
+        let decoded = vec![
+            (previous.clone(), Lm2Action::Keep),
+            (current.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block("The Department of Homeland Security has created"),
+            paragraph_block(&current.text),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&previous, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&current, LiquidBlockRole::Paragraph)],
+            },
+        ];
+
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].text,
+            "The Department of Homeland Security has created a network of intergovernmental partnerships."
+        );
+    }
+
+    #[test]
+    fn final_body_coalescer_moves_a_leading_callout_back_into_same_segment_prose() {
+        let mut previous = body_test_line("p4:l3", 4, 3, "for heightened scrutiny to apply.");
+        let mut current = body_test_line(
+            "p4:l4",
+            4,
+            4,
+            "14 So long as people remain free to associate.",
+        );
+        previous.page_width = 486.0;
+        current.page_width = 486.0;
+        previous.page_height = 720.0;
+        current.page_height = 720.0;
+        previous.left = 88.344;
+        current.left = 88.344;
+        previous.right = 113.6;
+        previous.last_visual_right = 113.6;
+        current.first_visual_left = 113.7;
+        current.right = 412.4;
+        previous.bottom = 600.067;
+        previous.top = 614.538;
+        current.bottom = 588.067;
+        current.top = 614.538;
+        previous.font_height = 10.54;
+        current.font_height = 9.124;
+        previous.segment_block_id = 3;
+        current.segment_block_id = 3;
+        previous.segment_block_line_index = 1;
+        current.segment_block_line_index = 0;
+        previous.segment_block_line_count = 2;
+        current.segment_block_line_count = 2;
+        assert!(lm2_final_paragraph_boundary(&previous, &current));
+        let decoded = vec![
+            (previous.clone(), Lm2Action::Keep),
+            (current.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block(&previous.text),
+            paragraph_block(&current.text),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&previous, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&current, LiquidBlockRole::Paragraph)],
+            },
+        ];
+
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].text,
+            "for heightened scrutiny to apply. 14 So long as people remain free to associate."
+        );
+    }
+
+    #[test]
+    fn final_body_coalescer_preserves_a_new_paragraph_with_a_leading_callout() {
+        let mut previous = body_test_line("p4:l3", 4, 3, "The prior paragraph ends.");
+        let mut current = body_test_line("p4:l4", 4, 4, "14 A genuinely new paragraph begins.");
+        previous.segment_block_id = 3;
+        current.segment_block_id = 3;
+        previous.segment_block_line_index = 1;
+        current.segment_block_line_index = 2;
+        previous.bottom = 600.0;
+        previous.top = 614.0;
+        current.bottom = 582.0;
+        current.top = 596.0;
+        let decoded = vec![
+            (previous.clone(), Lm2Action::Keep),
+            (current.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block(&previous.text),
+            paragraph_block(&current.text),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&previous, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&current, LiquidBlockRole::Paragraph)],
+            },
+        ];
+
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(blocks.len(), 2);
+    }
+
+    #[test]
+    fn paragraph_boundary_uses_the_first_row_of_a_multirow_source_item() {
+        let mut previous = body_test_line(
+            "p34:l11",
+            34,
+            11,
+            "The prior paragraph ends with its members.",
+        );
+        let mut current = body_test_line(
+            "p34:l12",
+            34,
+            12,
+            "The Supreme Court's opinion starts a new paragraph.\u{0002}The wrapped row returns to the margin.",
+        );
+        previous.page_width = 486.0;
+        current.page_width = 486.0;
+        previous.left = 88.3;
+        previous.right = 412.3;
+        current.left = 88.3;
+        current.right = 412.3;
+        current.first_visual_left = 106.3;
+        previous.bottom = 480.1;
+        previous.top = 506.5;
+        current.bottom = 456.1;
+        current.top = 482.5;
+
+        assert!(paragraph_boundary(&previous, &current));
+    }
+
+    #[test]
+    fn final_body_coalescer_restores_exact_yale_role_boundary_wraps() {
+        let mut homeland = body_test_line(
+            "p20:l19",
+            20,
+            19,
+            "92 The Department of Homeland Security has created",
+        );
+        let mut network = body_test_line(
+            "p20:l20",
+            20,
+            20,
+            "a network of intergovernmental partnerships.",
+        );
+        let mut president = body_test_line(
+            "p44:l18",
+            44,
+            18,
+            "227 The Presidential Records Act permits the President",
+        );
+        let mut care = body_test_line(
+            "p44:l19",
+            44,
+            19,
+            "to take care that the records remain available.",
+        );
+        for line in [&mut homeland, &mut network, &mut president, &mut care] {
+            line.page_width = 486.0;
+            line.page_height = 720.0;
+            line.segment_block_shape = "body".to_owned();
+        }
+        homeland.left = 136.14003;
+        homeland.bottom = 434.20145;
+        homeland.top = 445.52225;
+        network.left = 57.95987;
+        network.bottom = 421.24176;
+        network.top = 432.1998;
+        president.left = 100.50003;
+        president.bottom = 433.24146;
+        president.top = 444.56226;
+        care.left = 57.96021;
+        care.bottom = 420.22137;
+        care.top = 431.1794;
+        homeland.text = format!(
+            "{CALLOUT_START}92{CALLOUT_END} The Department of Homeland Security has created"
+        );
+        president.text = format!(
+            "{CALLOUT_START}227{CALLOUT_END} The Presidential Records Act permits the President"
+        );
+        let decoded = vec![
+            (homeland.clone(), Lm2Action::Keep),
+            (network.clone(), Lm2Action::Keep),
+            (president.clone(), Lm2Action::Keep),
+            (care.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block("The Department of Homeland Security has created"),
+            paragraph_block(&network.text),
+            paragraph_block("The Presidential Records Act permits the President"),
+            paragraph_block(&care.text),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&homeland, LiquidBlockRole::Heading)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&network, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&president, LiquidBlockRole::Heading)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 3,
+                lines: vec![line_ref(&care, LiquidBlockRole::Paragraph)],
+            },
+        ];
+
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            2
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(
+            blocks[0].text,
+            "The Department of Homeland Security has created a network of intergovernmental partnerships."
+        );
+        assert_eq!(
+            blocks[1].text,
+            "The Presidential Records Act permits the President to take care that the records remain available."
+        );
+    }
+
+    #[test]
+    fn final_body_coalescer_restores_exact_penn_quote_role_boundary() {
+        let mut competent = body_test_line(
+            "p16:l15",
+            16,
+            15,
+            "designed around the premise that parties represented by competent counsel",
+        );
+        let mut know = body_test_line(
+            "p16:l16",
+            16,
+            16,
+            "know what is best for them, and are responsible for advancing the facts and",
+        );
+        let mut argument = body_test_line("p16:l17", 16, 17, "argument entitling them to relief.");
+        for (offset, line) in [&mut competent, &mut know, &mut argument]
+            .into_iter()
+            .enumerate()
+        {
+            line.page_width = 468.0;
+            line.page_height = 720.0;
+            line.left = 87.3946;
+            line.bottom = 443.6673 - offset as f32 * 12.963;
+            line.top = line.bottom + 11.1686;
+            line.segment_block_id = 2;
+            line.segment_block_line_index = 7 + offset;
+            line.segment_block_line_count = 18;
+            line.segment_block_shape = "body".to_owned();
+        }
+        let decoded = vec![
+            (competent.clone(), Lm2Action::Keep),
+            (know.clone(), Lm2Action::Keep),
+            (argument.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block(&competent.text),
+            paragraph_block(&format!("{} {}", know.text, argument.text)),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&competent, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![
+                    line_ref(&know, LiquidBlockRole::Marginalia),
+                    line_ref(&argument, LiquidBlockRole::Marginalia),
+                ],
+            },
+        ];
+
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            blocks[0]
+                .text
+                .contains("competent counsel know what is best")
+        );
+    }
+
+    #[test]
+    fn final_body_edges_accept_inline_callout_fragments_and_terminal_marker_rows() {
+        let mut inline_left = body_test_line("p0:l18", 0, 18, "v. Abbasi and Egbert v. Boule,");
+        inline_left.segment_block_shape = "footnote".to_owned();
+        inline_left.right = 42.0;
+        inline_left.bottom = 50.0;
+        inline_left.top = 60.0;
+        let mut inline_right = body_test_line(
+            "p0:l19",
+            0,
+            19,
+            "77 the Court converted that narrowness into a presumption",
+        );
+        inline_right.segment_block_id = 8;
+        inline_right.segment_block_shape = "mixed".to_owned();
+        inline_right.left = 42.0;
+        inline_right.bottom = 50.0;
+        inline_right.top = 60.0;
+        let decoded = vec![
+            (inline_left.clone(), Lm2Action::Keep),
+            (inline_right.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block("v. Abbasi and Egbert v. Boule,"),
+            paragraph_block("the Court converted that narrowness into a presumption"),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&inline_left, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&inline_right, LiquidBlockRole::Paragraph)],
+            },
+        ];
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 1);
+
+        let prior = body_test_line("p1:l5", 1, 5, "pursuant to federal priorities,");
+        let mut marker = body_test_line("p1:l6", 1, 6, "80");
+        marker.segment_block_shape = "furniture".to_owned();
+        let next = body_test_line("p1:l7", 1, 7, "while the remedial scheme continues");
+        let decoded = vec![
+            (prior.clone(), Lm2Action::Keep),
+            (marker.clone(), Lm2Action::HideNoise),
+            (next.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block("pursuant to federal priorities,\u{E000}80\u{E001}"),
+            paragraph_block(&next.text),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![
+                    line_ref(&prior, LiquidBlockRole::Paragraph),
+                    line_ref(&marker, LiquidBlockRole::Noise),
+                ],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&next, LiquidBlockRole::Paragraph)],
+            },
+        ];
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn cross_page_coalescer_uses_first_body_row_after_top_notes() {
+        let previous = body_test_line("p0:l30", 0, 30, "authority and then");
+        let mut note = body_test_line("p1:l2", 1, 2, "80. A top-of-page note.");
+        note.segment_block_shape = "footnote".to_owned();
+        note.segment_block_footnote_like = true;
+        note.in_footnote_zone = true;
+        let current = body_test_line("p1:l7", 1, 7, "proceed through the corresponding channel.");
+        let decoded = vec![
+            (previous.clone(), Lm2Action::Keep),
+            (note.clone(), Lm2Action::Marginalia),
+            (current.clone(), Lm2Action::Keep),
+        ];
+        let mut note_ref = line_ref(&note, LiquidBlockRole::Marginalia);
+        note_ref.note_markers = vec![80];
+        let mut blocks = vec![
+            paragraph_block(&previous.text),
+            LiquidBlock {
+                role: LiquidBlockRole::Marginalia,
+                text: note.text.clone(),
+                label: None,
+            },
+            paragraph_block(&current.text),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&previous, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![note_ref],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&current, LiquidBlockRole::Paragraph)],
+            },
+        ];
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].text.contains("proceed through"));
+    }
+
+    #[test]
+    fn final_body_coalescer_crosses_a_standalone_same_row_callout() {
+        let mut previous = body_test_line(
+            "p0:l10",
+            0,
+            10,
+            "building maintenance crews.\u{E000}329\u{E001}",
+        );
+        let mut marker = body_test_line("p0:l11", 0, 11, "329");
+        let mut current = body_test_line("p0:l12", 0, 12, "It does not require");
+        previous.page_width = 612.0;
+        marker.page_width = 612.0;
+        current.page_width = 612.0;
+        previous.page_height = 792.0;
+        marker.page_height = 792.0;
+        current.page_height = 792.0;
+        previous.left = 90.0;
+        previous.right = 300.0;
+        previous.first_visual_left = 90.0;
+        previous.last_visual_right = 300.0;
+        previous.bottom = 400.0;
+        previous.top = 414.0;
+        marker.left = 300.5;
+        marker.right = 310.0;
+        marker.first_visual_left = 300.5;
+        marker.last_visual_right = 310.0;
+        marker.bottom = 405.0;
+        marker.top = 413.0;
+        current.left = 312.0;
+        current.right = 410.0;
+        current.first_visual_left = 312.0;
+        current.last_visual_right = 410.0;
+        current.bottom = 400.0;
+        current.top = 414.0;
+        let decoded = vec![
+            (previous.clone(), Lm2Action::Keep),
+            (marker.clone(), Lm2Action::HideNoise),
+            (current.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block(&previous.text),
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: marker.text.clone(),
+                label: None,
+            },
+            paragraph_block(&current.text),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&previous, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&marker, LiquidBlockRole::Noise)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&current, LiquidBlockRole::Paragraph)],
+            },
+        ];
+
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].text.contains("crews."));
+        assert!(blocks[0].text.contains("It does not require"));
+    }
+
+    #[test]
+    fn final_body_coalescer_preserves_an_indented_paragraph_after_a_standalone_callout() {
+        let mut previous =
+            body_test_line("p34:l19", 34, 19, "be coerced with the threat of eviction.");
+        let mut marker = body_test_line("p34:l20", 34, 20, "225");
+        let mut current = body_test_line(
+            "p34:l21",
+            34,
+            21,
+            "Although some courts have identified material benefits.",
+        );
+        for line in [&mut previous, &mut marker, &mut current] {
+            line.page_width = 486.0;
+            line.page_height = 720.0;
+        }
+        previous.left = 88.3;
+        previous.right = 246.0;
+        previous.first_visual_left = 88.3;
+        previous.last_visual_right = 246.0;
+        previous.bottom = 384.1;
+        previous.top = 398.5;
+        marker.left = 246.0;
+        marker.right = 255.4;
+        marker.first_visual_left = 246.0;
+        marker.last_visual_right = 255.4;
+        marker.bottom = 389.0;
+        marker.top = 397.9;
+        current.left = 88.1;
+        current.right = 412.2;
+        current.first_visual_left = 106.0;
+        current.last_visual_right = 412.2;
+        current.bottom = 360.1;
+        current.top = 386.5;
+        let decoded = vec![
+            (previous.clone(), Lm2Action::Keep),
+            (marker.clone(), Lm2Action::HideNoise),
+            (current.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block(&previous.text),
+            LiquidBlock {
+                role: LiquidBlockRole::Noise,
+                text: marker.text.clone(),
+                label: None,
+            },
+            paragraph_block(&current.text),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&previous, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&marker, LiquidBlockRole::Noise)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 2,
+                lines: vec![line_ref(&current, LiquidBlockRole::Paragraph)],
+            },
+        ];
+
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            0
+        );
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].text, previous.text);
+        assert_eq!(blocks[2].text, current.text);
+    }
+
+    #[test]
+    fn final_body_coalescer_crosses_a_dropped_same_row_callout() {
+        let mut previous = body_test_line("p0:l10", 0, 10, "religious organizations,340");
+        let mut marker = body_test_line("p0:l11", 0, 11, "340");
+        let mut current = body_test_line("p0:l12", 0, 12, "the Church would have a");
+        for line in [&mut previous, &mut marker, &mut current] {
+            line.page_width = 612.0;
+            line.page_height = 792.0;
+        }
+        previous.left = 90.0;
+        previous.right = 288.0;
+        previous.first_visual_left = 90.0;
+        previous.last_visual_right = 288.0;
+        previous.bottom = 400.0;
+        previous.top = 414.0;
+        marker.left = 288.4;
+        marker.right = 298.0;
+        marker.first_visual_left = 288.4;
+        marker.last_visual_right = 298.0;
+        marker.bottom = 405.0;
+        marker.top = 413.0;
+        current.left = 301.0;
+        current.right = 412.0;
+        current.first_visual_left = 301.0;
+        current.last_visual_right = 412.0;
+        current.bottom = 400.0;
+        current.top = 414.0;
+        let decoded = vec![
+            (previous.clone(), Lm2Action::Keep),
+            (marker, Lm2Action::HideNoise),
+            (current.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block(&previous.text),
+            paragraph_block(&current.text),
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&previous, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&current, LiquidBlockRole::Paragraph)],
+            },
+        ];
+
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].text.contains("organizations,"));
+        assert!(blocks[0].text.contains("the Church would have"));
+    }
+
+    #[test]
+    fn final_body_coalescer_restores_centered_false_heading_inside_body_segment() {
+        let mut previous = body_test_line(
+            "p6:l5",
+            6,
+            5,
+            "A sister of presidential administration is what",
+        );
+        let mut current = body_test_line(
+            "p6:l6",
+            6,
+            6,
+            "Professors Timothy Meyer and Ganesh Sitaraman have recently termed",
+        );
+        previous.segment_block_line_index = 4;
+        current.segment_block_line_index = 5;
+        previous.centered = true;
+        current.centered = true;
+        let decoded = vec![
+            (previous.clone(), Lm2Action::Keep),
+            (current.clone(), Lm2Action::Keep),
+        ];
+        let mut blocks = vec![
+            paragraph_block(&previous.text),
+            LiquidBlock {
+                role: LiquidBlockRole::Heading,
+                text: current.text.clone(),
+                label: None,
+            },
+        ];
+        let mut sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![line_ref(&previous, LiquidBlockRole::Paragraph)],
+            },
+            LiquidBlockSourceLines {
+                block_index: 1,
+                lines: vec![line_ref(&current, LiquidBlockRole::Heading)],
+            },
+        ];
+
+        assert_eq!(
+            apply_final_body_source_order_and_coalescing(&mut blocks, &mut sources, &decoded),
+            1
+        );
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].text.contains("what Professors Timothy Meyer"));
     }
 }
