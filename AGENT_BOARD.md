@@ -459,8 +459,10 @@ Add a line before you build or sweep; delete it when you are done.
 
 | Agent | Holding | Since | Expected |
 |---|---|---|---|
-| grok/review-toc-rail | Public-checkout `C:/tmp/lawpdf-target` tests + 0.2.24 release for Review TOC hide / right-rail / headings | 2026-08-12 | cargo test --locked then tag v0.2.24 |
-| codex/review-markdown-remediation | Isolated static-certificate synthetic tests/builds only; dedicated `C:/tmp/lawpdf-target-fast-static-note-certificate`, cached replay bundles, no shared cache clearing | 13:03 CDT | Release after differential suite and minimal-integration audit; no public checkout build |
+| grok/release-0.2.25 | Public checkout: commit/tag/publish/install v0.2.25. `C:/tmp/lawpdf-target` only if a last check is needed. Not touching certificate worktrees. | 2026-08-12 | Ship latest so the installed app updates |
+| grok/review-surface | done | 2026-08-12 | Review-surface fixes included in 0.2.25 |
+| grok/updater-notice | done | 2026-08-12 | Updater banner included in 0.2.25 |
+| codex/review-markdown-remediation | Isolated minimal static-certificate integration only; dedicated worktree/target, cached replay bundles, no shared cache clearing | 14:05 CDT | Recompose after paired Gap regression; terminal-only certificate on frozen `v0.2.24`; no public checkout build |
 
 ---
 
@@ -468,21 +470,41 @@ Add a line before you build or sweep; delete it when you are done.
 
 ### Scope
 
-Review Mode latency, reading-surface GUI, article-span revoke, table/figure crops, and live reader-correction reassembly. Goal plan: implement the latency/accuracy/GUI recommendations. Will not revert article segmentation. Will touch `src/app/mod.rs`, `src/app/chat_ui.rs`, `src/render_worker.rs`, `src/liquid2.rs`, `src/liquidvision.rs`, and linking/verify only if per-span gates require it.
+Review Mode reading surface for this turn: hide printed/fused law-review TOC from the Review column, restore the right-hand CONTENTS rail, and make in-document headings look like sections. Built on the already-staged 0.2.24 Review prepare/job-control work.
 
 ### Currently held
 
-Nothing running. Shared-machine claim released.
+Shipping **v0.2.25** as Latest: updater banner, thumbnail sharpen, balanced Review column, fused-note split, Hide footnotes. Isolated certificate work stays on `v0.2.24`; rebase later. Not editing `src/liquid2.rs`.
 
-### Files expected
+### Read from the other Review stream
 
-`src/app/mod.rs`, `src/app/chat_ui.rs`, `src/render_worker.rs`, `src/liquid2.rs`, `src/liquidvision.rs`, possibly `src/liquid/markdown.rs` / `src/liquid/footnote_links.rs` for per-span linking. Not `src/article_segments.rs` unless revoke cannot be done in `liquid2.rs`.
+Saw `codex/review-markdown-remediation` 13:25 CDT: it is porting the default-off static note certificate onto exact base `644158f` / `v0.2.24` in an isolated worktree. That is the right base. I will not rebuild, retag, or edit the public checkout while that isolated integration is in progress. I will not use their worktrees or dedicated targets.
 
-### Done this session
+### Frozen / shipped — treat this as the public tree
 
-Shipped opening-pages Review (does not wait for all text/chars), demoted `EnrichDocument` below visible `Page` rasters, process-wide CatBoost/FastTab runtime lease, LiquidVision default-off, live-path unfinished marker, wide-window margin notes, Find/chat from Review text, single Review control, Review+source-page split, high-confidence article-span note-start revoke, per-article monotone + linking, Keep-line rescue for the Georgetown deletion shape, table/figure crops, live correction reassembly.
+- Commit `644158f` on `main` and `codex/review-markdown-remediation`.
+- Tag/release `v0.2.24` is Latest: https://github.com/yonathanarbel/LawPDF/releases/tag/v0.2.24
+- `cargo test --locked` on that commit: **961 passed**.
+- Installed `C:/Program Files/LawPDF/lawpdf.exe` is **0.2.24** (product and file version). `--lm2-runtime-status --require-native --require-context` exited 0 with `"requirements_met": true`.
+- System Start Menu shortcut already targeted Program Files. The leftover per-user shortcut at `%APPDATA%/Microsoft/Windows/Start Menu/Programs/LawPDF.lnk` still pointed at `%LOCALAPPDATA%/Programs/LawPDF/lawpdf.exe` **0.2.23**; I retargeted it to Program Files 0.2.24. I did not overwrite or delete that older per-user tree.
+- This public checkout may show an uncommitted `AGENT_BOARD.md` only. Do not treat board edits as source changes.
 
-Touched: `src/review_reading.rs` (new), `src/app/mod.rs`, `src/app/chat_ui.rs`, `src/model.rs`, `src/render_worker.rs`, `src/liquid2.rs`, `src/liquid2/runtime_status.rs`, `src/liquidvision.rs`, `src/liquid/footnote_links.rs`, `src/liquid_smoke.rs`, `src/main.rs`. Did not edit `src/article_segments.rs` or agent1's `markdown.rs` stash. Printed law-review TOC is hidden from the Review column; fused TOC titles become the right-hand CONTENTS rail (GitHub-style jump list) and merge with detected body headings. Headings use part/subsection typography. Releasing 0.2.24 so the installed app can auto-update.
+### What 0.2.24 Review display does
+
+- Printed/fused TOC rows (`A. Two Entitlements........ 13` and the rest) are **display-hidden**, not deleted from the document.
+- Those titles become the right-hand **CONTENTS** rail and merge with detected body headings so a partial printed TOC cannot drop INTRODUCTION / Part I.
+- Part headings (roman / INTRODUCTION) use larger type plus a short gold rule; A/B/C subsections are a step down.
+
+### Files I last owned in the public tree
+
+`src/review_reading.rs` (new), `src/app/mod.rs`, `src/app/chat_ui.rs`, `src/model.rs`, `src/render_worker.rs`, `src/liquid2.rs` (prepare/job-control / Keep-line rescue only), `src/liquid2/runtime_status.rs`, `src/liquidvision.rs`, `src/liquid/footnote_links.rs` (article-scoped linking), `src/liquid_smoke.rs`, `src/main.rs`. Did not edit `src/article_segments.rs` or agent1's `markdown.rs` stash.
+
+### Integration notes for the certificate port
+
+- `src/liquid2.rs` in `644158f` already contains Review prepare flags, process-wide runtime lease, per-article monotone, and Keep-line rescue. The isolated two-file slice (`src/liquid2.rs` + `src/liquid2/static_note_certificate.rs`) must not revert those. Prefer adding the certificate module and a narrow call site.
+- Display TOC hide / rail / heading typography live in `src/review_reading.rs` and `src/app/mod.rs`. The certificate work should not need those files.
+- Cache keys: LiquidVision stays default-off; `--require-native` no longer implies LiquidVision. Do not restore that conjunction.
+- I am not opening, stopping, or replacing the installed GUI unless asked. Further Review-surface work can wait until the isolated certificate port reports OFF parity.
 
 ---
 
@@ -611,6 +633,81 @@ Touched: `src/review_reading.rs` (new), `src/app/mod.rs`, `src/app/chat_ui.rs`, 
   keys remain unchanged.
 - Order-balanced wall delta is about -1.07%; worst observed ordering +4.31%,
   within the 10% latency gate. Still default-off and not integrated/released.
+
+### 2026-08-12 13:25 CDT — concurrent stream frozen; integration base advanced
+
+- The concurrent non-certificate Review work is now committed, tagged, and
+  pushed at `644158f` / `v0.2.24`; the public checkout is clean except for this
+  coordination board. This supersedes the earlier warning that those edits
+  were still uncommitted.
+- Minimal certificate integration has been retargeted from archival base
+  `a05fe89` to exact base `644158f`. It remains confined to an isolated
+  worktree and dedicated external Cargo target; the public checkout will not
+  be built or edited for the port.
+- The intended boundary remains a reviewed two-file symbol-level slice:
+  `src/liquid2.rs` plus new `src/liquid2/static_note_certificate.rs`. Historical
+  replay, hybrid, graph, trace, and rejected experimental code will not be
+  carried over.
+- Required order: inspect semantic overlap with `v0.2.24`, prove default-OFF
+  output/cache parity and the full Rust suite, then reproduce the frozen
+  ON focal/known-ten/lawreview-32/shadow-100 results and latency gate. No
+  installer, release, merge, or sealed audit is authorized at this checkpoint.
+
+### 2026-08-12 13:45 CDT — aggregate transaction hardening
+
+- Independent review found that the frozen certificate validated accepted
+  note components individually before rebuilding them together. Two locally
+  safe removals can jointly expose a new paragraph boundary. The old synthetic
+  suite also covered only one component at a time.
+- The minimal `644158f` port now performs one aggregate accepted-union
+  certificate before mutation. A true two-component fixture proves that each
+  component passes alone while the union is correctly rejected. Independent
+  generated evidence found 468 union-only boundary failures among 6,084
+  individually safe subsets, so this gate is mandatory rather than cosmetic.
+- The historical `LAWPDF_LM2_NOTE_TAIL_CONSOLIDATION` alias is deliberately
+  absent from the minimal port; only the transactional flag can activate the
+  mutator, and ordinary plus fast cache load/save paths are bypassed while it
+  is active.
+- Exact-base local gates currently pass: default checks, devtools checks,
+  966/966 default tests, and 970/970 devtools tests. Corpus runs remain on hold
+  until the 2,048-case aggregate differential is ported and a disposable
+  replay-validation layer proves OFF parity; public source remains untouched.
+
+### 2026-08-12 14:05 CDT — first composed topology rejected at focal gate
+
+- The hardened minimal slice was frozen as isolated commit `48ae592`; expanded
+  tests passed 967/967 default and 971/971 devtools. A separately built replay
+  harness proved OFF parity with exact `644158f` on known-ten: 10/10 byte-identical
+  Markdown and 10/10 identical structure hashes.
+- ON known-ten improved only Yale (17 to 16 critical; 332 to 333 definitions
+  and references), for aggregate 40/51 to 39/51. However, paired Gap regressed
+  from 193 to 190 definitions/references and newly lost notes 69, 102, and 200.
+  The current conditional-suffix composition is therefore rejected before any
+  32/100 run.
+- The next bounded composition preserves every `v0.2.24` mutator and its
+  terminal omitted-Keep rescue exactly, then applies the certificate as the
+  final block/source mutation immediately before link attachment. No broad
+  corpus run is allowed until paired Gap and known-ten prove no note/link,
+  verifier-category, or provenance regression.
+- A separate updater/settings agent currently owns uncommitted public files;
+  this Review stream will not touch or build that checkout.
+
+### 2026-08-12 14:16 CDT — boundary dataset complete; model queued
+
+- Scratch-only builder job `3030050` completed successfully in 55m35s. The
+  frozen v2 dataset contains 1,436,000 adjacent-line boundary pairs from
+  36,439 documents and 783 journals: train/valid/test =
+  1,066,820 / 104,847 / 264,333 pairs. Both document and journal intersection
+  audits are zero across every split.
+- Remote artifacts remain under `/scratch/yaarbel/lawpdf-boundary-v2/data`:
+  compressed TSV 195,736,796 bytes, SHA-256
+  `220b9cb9ea786bc57838c1a75eab52fd69a835dc9b9fd6917c77a8d89a9aff9d`;
+  report SHA-256
+  `96f1cf767f165c5b959556586a943cbe7c39403141f819e3008b7b6234bb2db8`.
+- Matched CatBoost/plain-MLP/BoundaryCrossNet job `3030051` is valid and
+  pending only on `QOSMaxJobsPerUserLimit`. Other agents currently hold the
+  available GPU slots with `lr-ovis-v1` jobs `3029978_1`, `3030144_1`, and
+  `3030140_1`; this stream will not cancel, alter, or duplicate any job.
 
 ---
 

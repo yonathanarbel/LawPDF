@@ -42,11 +42,11 @@ use crate::liquid2::{
 };
 use crate::review_reading::{
     apply_live_review_correction, find_hits_in_review_blocks, opening_pages_ready_for_review,
-    review_all_pages_ready, review_contents_navigation_entries, review_document_plain_text,
-    review_hidden_display_mask, review_margin_width, review_opening_page_count,
-    review_prepare_flags_after_restart, review_prepare_next_action, review_table_figure_crop,
-    should_apply_review_event, ReviewPrepareAction, ReviewPrepareFlags,
-    REVIEW_OUTLINE_RAIL_DEFAULT_WIDTH,
+    review_all_pages_ready, review_column_layout, review_contents_navigation_entries,
+    review_document_plain_text, review_hidden_display_mask, review_opening_page_count,
+    review_prepare_flags_after_restart, review_prepare_next_action,
+    review_table_figure_crop, should_apply_review_event, split_fused_review_notes,
+    ReviewPrepareAction, ReviewPrepareFlags, REVIEW_OUTLINE_RAIL_DEFAULT_WIDTH,
 };
 use crate::model::{
     AnnotationKind, EditorAnnotation, LoadedDocument, MarkerStyle, OcrPageState, PageLink,
@@ -106,7 +106,7 @@ fn should_precompute_review_on_open(page_count: usize) -> bool {
 }
 const NOTCHED_WHEEL_IMMEDIATE_SHARE: f32 = 0.60;
 const NOTCHED_WHEEL_POINT_CHUNK: f32 = 6.0;
-const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const UPDATE_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const UPDATE_SUCCESS_NOTICE_DURATION: Duration = Duration::from_secs(15);
 const NOTICE_CAPACITY: usize = 5;
@@ -379,6 +379,7 @@ pub struct PdfEditorApp {
     /// normally hidden for display (headers/footers/TOC/noise/tables) as dimmed,
     /// role-tagged lines instead of dropping them.
     liquid_show_hidden_furniture: bool,
+    liquid_hide_footnotes: bool,
     tts_controller: TtsController,
     marker_animations: Vec<MarkerAnim>,
     active_tool: Tool,
@@ -808,6 +809,7 @@ struct PageTexture {
 #[derive(Clone)]
 struct ThumbnailTexture {
     texture: TextureHandle,
+    render_scale: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -1115,6 +1117,7 @@ impl PdfEditorApp {
             review_heading_screen_rects: Vec::new(),
             liquid_provenance_highlight: Vec::new(),
             liquid_show_hidden_furniture: false,
+            liquid_hide_footnotes: false,
             tts_controller,
             marker_animations: Vec::new(),
             active_tool: Tool::Select,
@@ -1769,11 +1772,11 @@ impl PdfEditorApp {
                     self.update_ui.state = UpdateUiState::Downloading;
                     self.update_ui.download_version = Some(version.clone());
                     self.update_ui.download_progress = Some((0, None));
-                    self.update_ui.notice = Some(UpdateNotice::new(
-                        format!("Downloading LawPDF {version}…"),
+                    self.update_ui.notice = Some(UpdateNotice::persistent(
+                        format!("LawPDF {version} is available. Downloading…"),
                         UpdateNoticeKind::Working,
                     ));
-                    self.status = format!("Downloading LawPDF {version} in the background.");
+                    self.status = format!("LawPDF {version} is available. Downloading…");
                     ctx.request_repaint();
                 }
                 UpdateEvent::NotAvailable => {
@@ -1804,12 +1807,26 @@ impl PdfEditorApp {
                     self.update_ui.check_in_flight = false;
                     self.update_ui.next_check = None;
                     self.update_ui.download_progress = None;
-                    self.install_ready_update(pending, ctx);
+                    self.update_ui.pending = Some(pending.clone());
+                    self.update_ui.state = UpdateUiState::Ready;
+                    self.update_ui.notice = Some(UpdateNotice::persistent(
+                        format!(
+                            "LawPDF {} is ready. Restart to install it.",
+                            pending.version
+                        ),
+                        UpdateNoticeKind::Success,
+                    ));
+                    self.status = format!(
+                        "LawPDF {} is ready. Restart this window to install it.",
+                        pending.version
+                    );
+                    ctx.request_repaint();
                 }
                 UpdateEvent::Failed(message) => {
                     self.update_ui.check_in_flight = false;
                     self.update_ui.next_check = Some(Instant::now() + UPDATE_RETRY_INTERVAL);
                     self.update_ui.download_progress = None;
+                    self.update_ui.pending = None;
                     self.update_ui.notice = Some(UpdateNotice::new(
                         format!("Update failed: {message}"),
                         UpdateNoticeKind::Error,
@@ -2823,21 +2840,35 @@ impl PdfEditorApp {
 
                     match result {
                         Ok(rendered) => {
+                            let incoming_scale = thumbnail_scale_from_key(key.render_scale_key);
+                            if self
+                                .thumbnail_textures
+                                .get(&key.page_index)
+                                .is_some_and(|existing| existing.render_scale + 0.001 >= incoming_scale)
+                            {
+                                continue;
+                            }
                             let image = egui::ColorImage::from_rgba_unmultiplied(
                                 [rendered.width, rendered.height],
                                 &rendered.rgba,
                             );
                             let texture = ctx.load_texture(
                                 format!(
-                                    "thumb-e{}-{}",
+                                    "thumb-e{}-{}-{}",
                                     key.document_epoch,
-                                    rendered.page_index + 1
+                                    rendered.page_index + 1,
+                                    key.render_scale_key
                                 ),
                                 image,
                                 TextureOptions::LINEAR,
                             );
-                            self.thumbnail_textures
-                                .insert(key.page_index, ThumbnailTexture { texture });
+                            self.thumbnail_textures.insert(
+                                key.page_index,
+                                ThumbnailTexture {
+                                    texture,
+                                    render_scale: incoming_scale,
+                                },
+                            );
                             ctx.request_repaint();
                         }
                         Err(error) => {
@@ -4171,10 +4202,16 @@ impl PdfEditorApp {
         page_index: usize,
         page_width: f32,
     ) -> Option<ThumbnailTextureView> {
-        if !self.thumbnail_textures.contains_key(&page_index) {
-            let display_width = 118.0;
-            let render_scale = (display_width / page_width).clamp(0.12, 0.32);
-            self.request_thumbnail_render(ctx, path, page_index, render_scale);
+        let preview_scale = thumbnail_preview_scale(page_width);
+        let sharp_scale = thumbnail_sharp_scale(page_width, ctx.pixels_per_point());
+        match self.thumbnail_textures.get(&page_index) {
+            None => {
+                self.request_thumbnail_render(ctx, path, page_index, preview_scale);
+            }
+            Some(existing) if existing.render_scale + 0.04 < sharp_scale => {
+                self.request_thumbnail_render(ctx, path, page_index, sharp_scale);
+            }
+            Some(_) => {}
         }
 
         self.thumbnail_textures
@@ -4248,10 +4285,7 @@ impl PdfEditorApp {
         page_index: usize,
         render_scale: f32,
     ) {
-        let key = ThumbnailRenderKey {
-            document_epoch: self.document_epoch,
-            page_index,
-        };
+        let key = ThumbnailRenderKey::new(self.document_epoch, page_index, render_scale);
         if self
             .pending_thumbnail_renders
             .get(&page_index)
@@ -6426,6 +6460,7 @@ impl PdfEditorApp {
         }
 
         let mut dismiss = false;
+        let mut restart = false;
         egui::Area::new(egui::Id::new("update_notice"))
             .order(egui::Order::Foreground)
             .anchor(Align2::RIGHT_TOP, Vec2::new(-24.0, 24.0))
@@ -6462,6 +6497,7 @@ impl PdfEditorApp {
                                 .wrap(),
                             );
                             if !matches!(notice.kind, UpdateNoticeKind::Working)
+                                && !matches!(self.update_ui.state, UpdateUiState::Ready)
                                 && ui
                                     .small_button(RichText::new("x").color(MUTED_INK))
                                     .on_hover_text("Dismiss")
@@ -6481,9 +6517,22 @@ impl PdfEditorApp {
                                     .desired_width(298.0),
                             );
                         }
+                        if matches!(self.update_ui.state, UpdateUiState::Ready)
+                            && self.update_ui.pending.is_some()
+                        {
+                            ui.add_space(8.0);
+                            if ui.button("Restart to install").clicked() {
+                                restart = true;
+                            }
+                        }
                     });
             });
 
+        if restart {
+            if let Some(pending) = self.update_ui.pending.clone() {
+                self.install_ready_update(pending, ctx);
+            }
+        }
         if dismiss {
             self.update_ui.notice = None;
         }
@@ -6848,6 +6897,14 @@ impl PdfEditorApp {
                                         block_index += 1;
                                         continue;
                                     }
+                                    if matches!(
+                                        block.role,
+                                        LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote
+                                    ) && self.liquid_hide_footnotes
+                                    {
+                                        block_index += 1;
+                                        continue;
+                                    }
                                     if block.role == LiquidBlockRole::Marginalia {
                                         let mut margin_notes = Vec::new();
                                         while block_index < document.blocks.len() {
@@ -7021,23 +7078,20 @@ impl PdfEditorApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let available = ui.available_width();
-                let desired_body = available
-                    .min(self.liquid_max_width)
-                    .max(360.0)
-                    .min(available.max(360.0));
-                let margin_width = review_margin_width(available, desired_body);
-                let width = if margin_width > 0.0 {
-                    (available - 2.0 * (margin_width + LIQUID_MARGIN_NOTE_GAP))
-                        .max(360.0)
-                        .min(self.liquid_max_width)
-                } else {
-                    desired_body
-                };
-                let side = ((available - width) * 0.5).max(0.0);
+                let column = review_column_layout(
+                    available,
+                    self.liquid_max_width,
+                    !self.liquid_hide_footnotes,
+                );
+                let width = column.body_width;
+                let margin_width = column.margin_width;
                 ui.horizontal(|ui| {
-                    ui.add_space(side);
+                    ui.add_space(column.side);
                     ui.vertical(|ui| {
-                        ui.set_width(width);
+                        ui.set_width(column.row_width);
+                        if column.body_indent > 0.0 {
+                            ui.add_space(0.0);
+                        }
                         ui.add_space(28.0);
                         match state {
                             LiquidState::Idle => {
@@ -7083,8 +7137,14 @@ impl PdfEditorApp {
                             }
                             LiquidState::Ready(document) => {
                                 self.review_heading_screen_rects.clear();
-                                self.draw_liquid_controls(ui, &document);
-                                self.draw_liquid_tts_controls(ui, &document);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(column.body_indent);
+                                    ui.vertical(|ui| {
+                                        ui.set_width(width);
+                                        self.draw_liquid_controls(ui, &document);
+                                        self.draw_liquid_tts_controls(ui, &document);
+                                    });
+                                });
                                 self.liquid_footnote_index =
                                     build_liquid_footnote_index(&document.blocks);
                                 if liquid_document_needs_ocr(&document) {
@@ -7106,6 +7166,14 @@ impl PdfEditorApp {
                                         if self.liquid_show_hidden_furniture {
                                             self.draw_liquid_hidden_furniture_block(ui, block);
                                         }
+                                        block_index += 1;
+                                        continue;
+                                    }
+                                    if matches!(
+                                        block.role,
+                                        LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote
+                                    ) && self.liquid_hide_footnotes
+                                    {
                                         block_index += 1;
                                         continue;
                                     }
@@ -7197,7 +7265,15 @@ impl PdfEditorApp {
                                 if !self.liquid_mode2_complete {
                                     self.draw_liquid_deciphering(ui, ctx);
                                 }
-                                self.draw_liquid_notes(ui, &notes);
+                                if !self.liquid_hide_footnotes {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(column.body_indent);
+                                        ui.vertical(|ui| {
+                                            ui.set_width(width);
+                                            self.draw_liquid_notes(ui, &notes);
+                                        });
+                                    });
+                                }
                                 ui.add_space(40.0);
                             }
                         }
@@ -7727,27 +7803,28 @@ impl PdfEditorApp {
         width: f32,
         left_side: bool,
     ) {
-        for (position, (_, note)) in notes.iter().enumerate() {
-            if position > 0 {
-                ui.add_space(7.0);
+        let mut position = 0usize;
+        for (_, note) in notes {
+            for (marker, body) in split_fused_review_notes(&note.text) {
+                if position > 0 {
+                    ui.add_space(7.0);
+                }
+                self.draw_liquid_margin_note_card_parts(ui, &marker, &body, width, left_side);
+                position += 1;
             }
-            self.draw_liquid_margin_note_card(ui, note, width, left_side);
         }
     }
 
-    fn draw_liquid_margin_note_card(
+    fn draw_liquid_margin_note_card_parts(
         &self,
         ui: &mut egui::Ui,
-        note: &LiquidBlock,
+        marker: &str,
+        body: &str,
         width: f32,
         left_side: bool,
     ) {
-        let (marker, body) = split_liquid_note_marker(&note.text);
-        let label = marker.unwrap_or("cont.");
-        let body = compact_liquid_margin_note_text(callout_body_text(
-            note.label.as_deref().unwrap_or("Footnote"),
-            body,
-        ));
+        let label = if marker.is_empty() { "cont." } else { marker };
+        let body = compact_liquid_margin_note_text(callout_body_text("Footnote", body));
         let (fill, stroke, label_color, body_color) = match self.liquid_theme {
             LiquidTheme::Paper => (
                 Color32::from_rgb(252, 249, 242),
@@ -8381,6 +8458,15 @@ try {
         color: Color32,
     ) -> Vec<(Rect, u16)> {
         let has_callout = text.contains(crate::layout_roles::CALLOUT_START);
+        if self.liquid_hide_footnotes && has_callout {
+            let stripped = strip_liquid_footnote_callouts(text);
+            ui.add(
+                egui::Label::new(RichText::new(stripped).size(size).color(color))
+                    .wrap()
+                    .selectable(true),
+            );
+            return Vec::new();
+        }
         if !has_callout {
             ui.add(
                 egui::Label::new(RichText::new(text).size(size).color(color))
@@ -8966,45 +9052,42 @@ try {
             .show(ui, |ui| {
                 ui.add_space(4.0);
                 for (index, note) in notes.iter().enumerate() {
-                    let is_footnote = note.role == LiquidBlockRole::Footnote;
-                    let (marker, body) = if is_footnote {
-                        split_liquid_note_marker(&note.text)
+                    let parts = split_fused_review_notes(&note.text);
+                    let entries = if parts.is_empty() {
+                        vec![(
+                            (index + 1).to_string(),
+                            note.text.trim().to_owned(),
+                        )]
                     } else {
-                        (None, note.text.as_str())
+                        parts
                     };
-                    let marker = if is_footnote {
-                        marker
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| (index + 1).to_string())
-                    } else {
-                        // Show role for mis-classified blocks now surfaced in Notes
-                        format!("{:?}", note.role)
-                    };
-                    ui.horizontal_top(|ui| {
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(52.0, 18.0),
-                            egui::Layout::top_down(Align::RIGHT),
-                            |ui| {
-                                ui.label(
-                                    RichText::new(marker)
-                                        .size(11.0)
-                                        .strong()
+                    for (marker, body) in entries {
+                        ui.horizontal_top(|ui| {
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(52.0, 18.0),
+                                egui::Layout::top_down(Align::RIGHT),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(marker)
+                                            .size(11.0)
+                                            .strong()
+                                            .color(self.liquid_muted_color()),
+                                    );
+                                },
+                            );
+                            ui.add_space(8.0);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(body)
+                                        .size(14.0)
                                         .color(self.liquid_muted_color()),
-                                );
-                            },
-                        );
-                        ui.add_space(8.0);
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(body)
-                                    .size(14.0)
-                                    .color(self.liquid_muted_color()),
-                            )
-                            .wrap()
-                            .selectable(true),
-                        );
-                    });
-                    ui.add_space(7.0);
+                                )
+                                .wrap()
+                                .selectable(true),
+                            );
+                        });
+                        ui.add_space(7.0);
+                    }
                 }
             });
     }
@@ -9115,6 +9198,23 @@ try {
             {
                 self.review_feedback_dialog_open = true;
                 self.review_feedback_prompt_visible = false;
+            }
+            ui.add_space(12.0);
+            let footnotes_label = if self.liquid_hide_footnotes {
+                "Show footnotes"
+            } else {
+                "Hide footnotes"
+            };
+            if ui
+                .button(
+                    RichText::new(footnotes_label)
+                        .size(11.0)
+                        .color(self.liquid_ink_color()),
+                )
+                .on_hover_text("Hide footnote markers, margin notes, and the notes list")
+                .clicked()
+            {
+                self.liquid_hide_footnotes = !self.liquid_hide_footnotes;
             }
             ui.add_space(12.0);
             // #29: reveal normally-hidden furniture (headers/footers/TOC/noise/tables).
@@ -14862,6 +14962,18 @@ fn page_marker_rect(page_rect: Rect, width: f32) -> Rect {
     )
 }
 
+fn thumbnail_preview_scale(page_width: f32) -> f32 {
+    (118.0 / page_width.max(1.0)).clamp(0.12, 0.28)
+}
+
+fn thumbnail_sharp_scale(page_width: f32, pixels_per_point: f32) -> f32 {
+    ((118.0 * pixels_per_point.max(1.0) * 1.35) / page_width.max(1.0)).clamp(0.32, 1.25)
+}
+
+fn thumbnail_scale_from_key(render_scale_key: u32) -> f32 {
+    render_scale_key as f32 / 1000.0
+}
+
 fn liquid_note_blocks(blocks: &[LiquidBlock]) -> Vec<&LiquidBlock> {
     blocks
         .iter()
@@ -14992,21 +15104,35 @@ fn build_liquid_footnote_index(blocks: &[LiquidBlock]) -> HashMap<u16, String> {
         ) {
             continue;
         }
-        let (marker, body) = split_liquid_note_marker(&block.text);
-        let Some(marker) = marker else { continue };
-        let Ok(number) = marker.parse::<u16>() else {
-            continue;
-        };
-        if number == 0 {
-            continue;
+        for (marker, body) in split_fused_review_notes(&block.text) {
+            let Ok(number) = marker.parse::<u16>() else {
+                continue;
+            };
+            if number == 0 {
+                continue;
+            }
+            let body = body.trim();
+            if body.is_empty() {
+                continue;
+            }
+            index.entry(number).or_insert_with(|| body.to_owned());
         }
-        let body = body.trim();
-        if body.is_empty() {
-            continue;
-        }
-        index.entry(number).or_insert_with(|| body.to_owned());
     }
     index
+}
+
+fn strip_liquid_footnote_callouts(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut in_callout = false;
+    for ch in text.chars() {
+        match ch {
+            crate::layout_roles::CALLOUT_START => in_callout = true,
+            crate::layout_roles::CALLOUT_END => in_callout = false,
+            _ if !in_callout => output.push(ch),
+            _ => {}
+        }
+    }
+    output.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Stable egui id for a body marker's footnote popover, unique per block+number.
@@ -16782,6 +16908,22 @@ mod app_tests {
         assert_eq!(index.get(&1).map(String::as_str), Some("First note."));
         assert_eq!(index.get(&2).map(String::as_str), Some("Second note."));
         assert_eq!(index.len(), 2);
+    }
+
+    #[test]
+    fn build_liquid_footnote_index_splits_fused_harvard_notes() {
+        let blocks = vec![test_liquid_block(
+            LiquidBlockRole::Marginalia,
+            "24 See RIPSTEIN, supra note 17, at 200. 25 See GOLDBERG & ZIPURSKY, supra note 6, at 154–55. 26 This Article shares the assumption.",
+        )];
+        let index = build_liquid_footnote_index(&blocks);
+        assert_eq!(
+            index.get(&24).map(String::as_str),
+            Some("See RIPSTEIN, supra note 17, at 200.")
+        );
+        assert!(index.get(&25).is_some_and(|body| body.starts_with("See GOLDBERG")));
+        assert!(index.get(&26).is_some());
+        assert_eq!(index.get(&17), None);
     }
 
     #[test]

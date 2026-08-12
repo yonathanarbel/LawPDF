@@ -29,6 +29,17 @@ impl PageRenderKey {
 pub struct ThumbnailRenderKey {
     pub document_epoch: u64,
     pub page_index: usize,
+    pub render_scale_key: u32,
+}
+
+impl ThumbnailRenderKey {
+    pub fn new(document_epoch: u64, page_index: usize, render_scale: f32) -> Self {
+        Self {
+            document_epoch,
+            page_index,
+            render_scale_key: float_key(render_scale),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -424,10 +435,7 @@ fn error_event(request: RenderRequest, message: String) -> RenderEvent {
         RenderRequest::LoadDocument { reply, .. } => {
             let _ = reply.send(Err(message));
             RenderEvent::Thumbnail {
-                key: ThumbnailRenderKey {
-                    document_epoch: 0,
-                    page_index: 0,
-                },
+                key: ThumbnailRenderKey::new(0, 0, 0.0),
                 path: PathBuf::new(),
                 result: Err("PDF worker failed before loading document".to_owned()),
             }
@@ -476,10 +484,7 @@ fn error_event(request: RenderRequest, message: String) -> RenderEvent {
         RenderRequest::PageImmediate { reply, .. } => {
             let _ = reply.send(Err(message));
             RenderEvent::Thumbnail {
-                key: ThumbnailRenderKey {
-                    document_epoch: 0,
-                    page_index: 0,
-                },
+                key: ThumbnailRenderKey::new(0, 0, 0.0),
                 path: PathBuf::new(),
                 result: Err("PDF worker failed before immediate page render".to_owned()),
             }
@@ -492,10 +497,7 @@ fn error_event(request: RenderRequest, message: String) -> RenderEvent {
         RenderRequest::ExportPagePng { reply, .. } => {
             let _ = reply.send(Err(message));
             RenderEvent::Thumbnail {
-                key: ThumbnailRenderKey {
-                    document_epoch: 0,
-                    page_index: 0,
-                },
+                key: ThumbnailRenderKey::new(0, 0, 0.0),
                 path: PathBuf::new(),
                 result: Err("PDF worker failed before exporting PNG".to_owned()),
             }
@@ -620,10 +622,7 @@ mod tests {
     fn coalescing_keeps_thumbnail_and_page_requests_distinct() {
         let (tx, rx) = unbounded();
         tx.send(RenderRequest::Thumbnail {
-            key: ThumbnailRenderKey {
-                document_epoch: 7,
-                page_index: 0,
-            },
+            key: ThumbnailRenderKey::new(7, 0, 0.25),
             path: PathBuf::from("document.pdf"),
             render_scale: 0.25,
         })

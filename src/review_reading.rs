@@ -21,9 +21,25 @@ pub const REVIEW_OUTLINE_RAIL_DEFAULT_WIDTH: f32 = 236.0;
 /// Hide printed tables of contents from the Review reading column.
 pub fn review_hidden_display_mask(blocks: &[LiquidBlock]) -> Vec<bool> {
     let mut mask = hidden_contents_mask_for_display(blocks);
+    let title_keys = blocks
+        .iter()
+        .filter(|block| block.role == LiquidBlockRole::Title)
+        .map(|block| normalize_review_title_key(&block.text))
+        .filter(|key| !key.is_empty())
+        .collect::<HashSet<_>>();
     for (index, block) in blocks.iter().enumerate() {
         if is_review_table_of_contents_text(&block.text) {
             mask[index] = true;
+            continue;
+        }
+        if matches!(
+            block.role,
+            LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+        ) {
+            let key = normalize_review_title_key(&block.text);
+            if !key.is_empty() && title_keys.contains(&key) {
+                mask[index] = true;
+            }
         }
     }
     mask
@@ -430,15 +446,211 @@ pub fn review_prepare_flags_after_restart() -> ReviewPrepareFlags {
 
 /// Side-note column width. Zero means the three-column margin layout stays off.
 pub fn review_margin_width(available_width: f32, body_width: f32) -> f32 {
-    if available_width <= 0.0 || body_width <= 0.0 {
-        return 0.0;
+    review_column_layout(available_width, body_width, true).margin_width
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReviewColumnLayout {
+    pub body_width: f32,
+    pub margin_width: f32,
+    pub row_width: f32,
+    pub side: f32,
+    pub body_indent: f32,
+}
+
+/// Center the reading row in the remaining Review area. Note columns live
+/// *inside* `row_width`, so leftover grey is equal on both sides of the
+/// whole row — not a wide left gutter plus a body jammed against CONTENTS.
+pub fn review_column_layout(
+    available_width: f32,
+    max_body_width: f32,
+    show_note_margins: bool,
+) -> ReviewColumnLayout {
+    let body_width = available_width
+        .min(max_body_width)
+        .max(360.0)
+        .min(available_width.max(360.0));
+    if !show_note_margins || available_width <= 0.0 || body_width <= 0.0 {
+        let side = ((available_width - body_width) * 0.5).max(0.0);
+        return ReviewColumnLayout {
+            body_width,
+            margin_width: 0.0,
+            row_width: body_width,
+            side,
+            body_indent: 0.0,
+        };
     }
     let needed = body_width + 2.0 * (REVIEW_MARGIN_MIN_WIDTH + REVIEW_MARGIN_GAP);
     if available_width + 0.5 < needed {
-        return 0.0;
+        let side = ((available_width - body_width) * 0.5).max(0.0);
+        return ReviewColumnLayout {
+            body_width,
+            margin_width: 0.0,
+            row_width: body_width,
+            side,
+            body_indent: 0.0,
+        };
     }
     let leftover = (available_width - body_width) / 2.0 - REVIEW_MARGIN_GAP;
-    leftover.clamp(REVIEW_MARGIN_MIN_WIDTH, REVIEW_MARGIN_MAX_WIDTH)
+    let margin_width = leftover.clamp(REVIEW_MARGIN_MIN_WIDTH, REVIEW_MARGIN_MAX_WIDTH);
+    let row_width = body_width + 2.0 * (margin_width + REVIEW_MARGIN_GAP);
+    let side = ((available_width - row_width) * 0.5).max(0.0);
+    ReviewColumnLayout {
+        body_width,
+        margin_width,
+        row_width,
+        side,
+        body_indent: margin_width + REVIEW_MARGIN_GAP,
+    }
+}
+
+fn normalize_review_title_key(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Split a fused law-review note block (`24 See … 25 See … 26 This …`)
+/// into one entry per note number so the rail and popovers stay sequential.
+pub fn split_fused_review_notes(text: &str) -> Vec<(String, String)> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let (first_marker, first_body) = split_leading_note_marker(trimmed);
+    let start_number = first_marker.and_then(|marker| marker.parse::<u16>().ok());
+    let mut starts = vec![(
+        0usize,
+        first_marker
+            .map(str::to_owned)
+            .unwrap_or_else(|| "*".to_owned()),
+    )];
+    let mut expected = start_number.map(|number| number.saturating_add(1)).unwrap_or(1);
+    let mut search_from = first_marker.map(|marker| marker.len()).unwrap_or(0);
+    while let Some((at, number)) = find_next_fused_note_number(trimmed, search_from, expected) {
+        starts.push((at, number.to_string()));
+        expected = number.saturating_add(1);
+        search_from = at + number.to_string().len();
+    }
+    if starts.len() == 1 {
+        return vec![(starts[0].1.clone(), first_body.trim().to_owned())];
+    }
+    let mut parts = Vec::new();
+    for (index, (start, marker)) in starts.iter().enumerate() {
+        let end = starts
+            .get(index + 1)
+            .map(|(next, _)| *next)
+            .unwrap_or(trimmed.len());
+        let chunk = trimmed[*start..end].trim();
+        let body = chunk
+            .strip_prefix(marker.as_str())
+            .unwrap_or(chunk)
+            .trim()
+            .to_owned();
+        if !body.is_empty() || marker != "*" {
+            parts.push((marker.clone(), body));
+        }
+    }
+    parts
+}
+
+fn split_leading_note_marker(text: &str) -> (Option<&str>, &str) {
+    let trimmed = text.trim_start();
+    let mut end = 0usize;
+    let mut digits = 0usize;
+    for (index, ch) in trimmed.char_indices() {
+        if ch.is_ascii_digit() && digits < 3 {
+            digits += 1;
+            end = index + ch.len_utf8();
+            continue;
+        }
+        break;
+    }
+    if digits == 0 {
+        return (None, trimmed);
+    }
+    let rest = &trimmed[end..];
+    if rest.starts_with(char::is_whitespace)
+        || rest.starts_with(['.', ')', ':'])
+        || rest.is_empty()
+    {
+        (Some(&trimmed[..end]), rest.trim_start_matches(['.', ')', ':']).trim_start())
+    } else {
+        (None, trimmed)
+    }
+}
+
+fn find_next_fused_note_number(text: &str, from: usize, expected: u16) -> Option<(usize, u16)> {
+    for candidate in expected..=expected.saturating_add(2) {
+        if let Some(at) = find_note_number_at_boundary(text, from, candidate) {
+            return Some((at, candidate));
+        }
+    }
+    None
+}
+
+fn find_note_number_at_boundary(text: &str, from: usize, number: u16) -> Option<usize> {
+    if from >= text.len() {
+        return None;
+    }
+    let needle = number.to_string();
+    let mut search = from;
+    while let Some(rel) = text.get(search..)?.find(&needle) {
+        let at = search + rel;
+        let after = at + needle.len();
+        let prev = text.get(..at).and_then(|prefix| prefix.chars().rev().next());
+        if prev.is_some_and(|ch| ch.is_ascii_digit()) {
+            search = after;
+            continue;
+        }
+        let next = text.get(after..).and_then(|suffix| suffix.chars().next());
+        if !next.is_some_and(|ch| ch.is_whitespace()) {
+            search = after;
+            continue;
+        }
+        if note_number_has_citation_prefix(text, at) {
+            search = after;
+            continue;
+        }
+        if !note_number_follows_sentence_break(text, at) {
+            search = after;
+            continue;
+        }
+        return Some(at);
+    }
+    None
+}
+
+fn note_number_has_citation_prefix(text: &str, at: usize) -> bool {
+    let prefix = text
+        .get(..at)
+        .unwrap_or("")
+        .rsplit_once(char::is_whitespace)
+        .map(|(_, last)| last)
+        .unwrap_or("")
+        .trim_end_matches(['.', ',', ';', ':'])
+        .to_ascii_lowercase();
+    matches!(
+        prefix.as_str(),
+        "note" | "notes" | "n" | "nn" | "p" | "pp" | "at" | "supra" | "infra" | "§"
+    )
+}
+
+fn note_number_follows_sentence_break(text: &str, at: usize) -> bool {
+    let prefix = text.get(..at).unwrap_or("").trim_end();
+    if prefix.is_empty() {
+        return true;
+    }
+    prefix.ends_with(['.', '?', '!', ';', ':', '”', '"', ')', '…'])
 }
 
 pub fn article_spans_may_revoke_global_note_starts(spans: &[ArticleSpan]) -> bool {
@@ -673,6 +885,57 @@ mod tests {
         assert!(width > 0.0);
         assert!(width >= REVIEW_MARGIN_MIN_WIDTH);
         assert_eq!(review_margin_width(900.0, 920.0), 0.0);
+    }
+
+    #[test]
+    fn review_column_balances_grey_outside_the_full_row() {
+        let layout = review_column_layout(1424.0, 920.0, true);
+        assert!(layout.margin_width >= REVIEW_MARGIN_MIN_WIDTH);
+        assert!((layout.row_width - (layout.body_width + 2.0 * (layout.margin_width + REVIEW_MARGIN_GAP))).abs() < 0.01);
+        assert!((layout.side * 2.0 + layout.row_width - 1424.0).abs() < 0.5);
+        let hidden = review_column_layout(1424.0, 920.0, false);
+        assert_eq!(hidden.margin_width, 0.0);
+        assert_eq!(hidden.row_width, hidden.body_width);
+    }
+
+    #[test]
+    fn fused_harvard_notes_split_into_sequential_entries() {
+        let fused = "24 See RIPSTEIN, supra note 17, at 200. 25 See GOLDBERG & ZIPURSKY, supra note 6, at 154–55. 26 This Article shares with the Palsgraf perspective the basic assumption.";
+        let parts = split_fused_review_notes(fused);
+        assert_eq!(
+            parts
+                .iter()
+                .map(|(marker, _)| marker.as_str())
+                .collect::<Vec<_>>(),
+            vec!["24", "25", "26"]
+        );
+        assert!(parts[0].1.starts_with("See RIPSTEIN"));
+        assert!(parts[1].1.starts_with("See GOLDBERG"));
+        assert!(!parts.iter().any(|(marker, _)| marker == "17"));
+        let eight = split_fused_review_notes(
+            "7 See BURROWS. 8 162 N.E. 99 (N.Y. 1928). 9 Palsgraf, 162 N.E. at 99.",
+        );
+        assert_eq!(
+            eight.iter().map(|(marker, _)| marker.as_str()).collect::<Vec<_>>(),
+            vec!["7", "8", "9"]
+        );
+    }
+
+    #[test]
+    fn repeated_article_title_is_hidden_from_review_display() {
+        let blocks = vec![
+            block(LiquidBlockRole::Title, "WHAT IS A TORT? Ketan Ramakrishnan"),
+            block(LiquidBlockRole::Heading, "ARTICLE"),
+            block(
+                LiquidBlockRole::Heading,
+                "WHAT IS A TORT? Ketan Ramakrishnan∗",
+            ),
+            block(LiquidBlockRole::Heading, "INTRODUCTION"),
+        ];
+        assert_eq!(
+            review_hidden_display_mask(&blocks),
+            vec![false, false, true, false]
+        );
     }
 
     #[test]

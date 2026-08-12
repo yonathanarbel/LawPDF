@@ -71,6 +71,7 @@ pub fn spawn_update_check(tx: Sender<UpdateEvent>) {
     thread::spawn(move || {
         let _ = tx.send(UpdateEvent::Checking);
         if let Err(error) = check_and_stage_update(&tx) {
+            write_last_check("failed", None);
             let _ = tx.send(UpdateEvent::Failed(error));
         }
     });
@@ -171,6 +172,7 @@ pub fn start_update_helper(
 
 fn check_and_stage_update(tx: &Sender<UpdateEvent>) -> Result<(), String> {
     if let Some(pending) = load_pending_update() {
+        write_last_check("ready", Some(&pending.version));
         let _ = tx.send(UpdateEvent::Ready(pending));
         return Ok(());
     }
@@ -183,9 +185,17 @@ fn check_and_stage_update(tx: &Sender<UpdateEvent>) -> Result<(), String> {
 
     let version = normalize_version(&release.tag_name);
     if !is_newer_version(&version, CURRENT_VERSION) {
+        write_last_check("not_available", Some(&version));
         let _ = tx.send(UpdateEvent::NotAvailable);
         return Ok(());
     }
+
+    // Tell the UI immediately. Waiting until the 30–40 MB package is staged
+    // made older copies look like they never checked for updates.
+    write_last_check("available", Some(&version));
+    let _ = tx.send(UpdateEvent::Detected {
+        version: version.clone(),
+    });
 
     let package_kind = preferred_package_kind();
     let asset_name = match package_kind {
@@ -227,9 +237,6 @@ fn check_and_stage_update(tx: &Sender<UpdateEvent>) -> Result<(), String> {
         ));
     }
 
-    let _ = tx.send(UpdateEvent::Detected {
-        version: version.clone(),
-    });
     let asset_path = download_asset(tx, &version, asset)?;
     let actual_sha256 = match sha256_hex_of_file(&asset_path) {
         Ok(hash) => hash,
@@ -422,6 +429,23 @@ fn write_pending_update(pending: &PendingUpdate) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(pending)
         .map_err(|error| format!("Could not encode update state: {error}"))?;
     std::fs::write(path, bytes).map_err(|error| format!("Could not save update state: {error}"))
+}
+
+fn write_last_check(result: &str, latest: Option<&str>) {
+    let Some(path) = updates_dir().map(|dir| dir.join("last-check.json")) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let payload = serde_json::json!({
+        "current": CURRENT_VERSION,
+        "latest": latest,
+        "result": result,
+    });
+    if let Ok(bytes) = serde_json::to_vec_pretty(&payload) {
+        let _ = std::fs::write(path, bytes);
+    }
 }
 
 fn pending_update_path() -> Option<PathBuf> {
@@ -851,6 +875,8 @@ mod tests {
     fn compares_release_versions_and_rejects_garbage() {
         assert!(!is_newer_version("v0.2.6", "0.2.6"));
         assert!(is_newer_version("0.2.10", "0.2.9"));
+        assert!(is_newer_version("0.2.24", "0.2.23"));
+        assert!(!is_newer_version("0.2.24", "0.2.24"));
         assert!(is_newer_version("0.3", "0.2.6"));
         assert!(!is_newer_version("garbage", "0.2.6"));
         assert!(!is_newer_version("garbage", "also-garbage"));

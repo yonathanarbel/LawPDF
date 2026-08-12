@@ -31,6 +31,26 @@ impl PdfEditorApp {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(APP_VERSION_LABEL)
+                        .size(12.0)
+                        .color(MUTED_INK),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Check for updates").clicked() {
+                        self.update_ui.check_in_flight = true;
+                        self.update_ui.next_check = None;
+                        self.update_ui.notice = Some(UpdateNotice::persistent(
+                            "Checking for updates…",
+                            UpdateNoticeKind::Working,
+                        ));
+                        updater::spawn_update_check(self.update_ui.tx.clone());
+                    }
+                    if self.update_ui.check_in_flight {
+                        ui.spinner();
+                    }
+                });
+                ui.add_space(12.0);
                 ui.label(RichText::new("Groq").strong().color(INK));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.settings_ui.groq_api_key_edit)
