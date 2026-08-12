@@ -849,6 +849,7 @@ fn measure_lm2_timing_document(
         use_pp_footnote_regions: false,
         external_emissions_path: None,
         runtime_choice: crate::liquid2::Lm2RuntimeChoice::Automatic,
+        preview_only: false,
     };
     let (preview_page_count, preview_lm2) = lm2_progressive_preview_request(&request)
         .and_then(|(preview_request, page_count)| {
@@ -1568,6 +1569,7 @@ fn smoke_document(
             use_pp_footnote_regions,
             external_emissions_path: lm2_external_emissions_path.map(Path::to_path_buf),
             runtime_choice: crate::liquid2::Lm2RuntimeChoice::Automatic,
+            preview_only: false,
         })
     } else {
         prepare_liquid_document(LiquidRequest {

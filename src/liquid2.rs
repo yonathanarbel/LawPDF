@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Mutex, OnceLock};
 use std::ffi::{CStr, CString};
 #[cfg(any(feature = "devtools", test))]
 use std::ffi::{OsStr, OsString};
@@ -27,6 +29,7 @@ use crate::liquid::{
 };
 use crate::liquidvision::{fill_document_features, liquidvision_enabled};
 use crate::pdf_backend::PdfEngine;
+use crate::review_reading::{merge_article_and_global_note_starts, omitted_keep_source_ids};
 use crate::settings::app_data_dir;
 
 mod fast_cache;
@@ -50,7 +53,7 @@ const LM2_D1_RUNTIME_FOOTER_ARTIFACT_OVERLAY_VERSION: &str =
     "d1-footer-artifact-v1-guarded-no-contact";
 const LM2_FOOTNOTE_MONOTONE_OVERLAY_VERSION: &str = "footnote-monotone-v1-marker-context";
 const LM2_FOOTNOTE_CARRYOVER_OVERLAY_VERSION: &str = "footnote-carryover-v1-open-prev-smallfont";
-const LM2_ASSEMBLY_CACHE_VERSION: &str = "lm2-assembly-v153-callout-gap-first-row-guard";
+const LM2_ASSEMBLY_CACHE_VERSION: &str = "lm2-assembly-v154-article-revoke-keep-rescue";
 const LM2_MAX_NOTE_MARKER: u16 = 999;
 const LM2_TABLE_FIGURE_ROUTER_OVERLAY_VERSION: &str = "table-figure-router-v4-default-on";
 const LM2_PAGE_OBJECT_OVERLAY_VERSION: &str = "page-object-overlay-v1-guarded-ruled-path";
@@ -332,6 +335,77 @@ impl Lm2RuntimeChoice {
             Self::FastTab => true,
         }
     }
+
+    fn cache_key(self) -> u8 {
+        match self {
+            Self::Automatic => 0,
+            Self::CatBoost => 1,
+            Self::FastTab => 2,
+        }
+    }
+}
+
+static LM2_RUNTIME_LOADS: AtomicU64 = AtomicU64::new(0);
+static LM2_RUNTIME_CACHE: OnceLock<Mutex<HashMap<u8, Lm2Runtime>>> = OnceLock::new();
+
+struct Lm2RuntimeLease {
+    choice: Lm2RuntimeChoice,
+    runtime: Option<Lm2Runtime>,
+}
+
+impl Lm2RuntimeLease {
+    fn acquire(choice: Lm2RuntimeChoice) -> Self {
+        let cache = LM2_RUNTIME_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let runtime = cache
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.remove(&choice.cache_key()))
+            .unwrap_or_else(|| {
+                LM2_RUNTIME_LOADS.fetch_add(1, AtomicOrdering::SeqCst);
+                Lm2Runtime::load(choice)
+            });
+        Self {
+            choice,
+            runtime: Some(runtime),
+        }
+    }
+
+    fn runtime(&mut self) -> &mut Lm2Runtime {
+        self.runtime
+            .as_mut()
+            .expect("LM2 runtime lease is still held")
+    }
+}
+
+impl Drop for Lm2RuntimeLease {
+    fn drop(&mut self) {
+        let Some(mut runtime) = self.runtime.take() else {
+            return;
+        };
+        runtime.pp_footnote_region_membership = false;
+        if let Ok(mut guard) = LM2_RUNTIME_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+        {
+            guard.insert(self.choice.cache_key(), runtime);
+        }
+    }
+}
+
+/// Number of times the native Review runtime was actually constructed.
+pub fn lm2_runtime_process_load_count() -> u64 {
+    LM2_RUNTIME_LOADS.load(AtomicOrdering::SeqCst)
+}
+
+/// Drive two prepares through the process cache and report how many new loads
+/// each one caused. The second value is 0 when the runtime is reused.
+pub fn lm2_runtime_reuse_across_two_prepares(choice: Lm2RuntimeChoice) -> (u64, u64) {
+    let before = lm2_runtime_process_load_count();
+    drop(Lm2RuntimeLease::acquire(choice));
+    let mid = lm2_runtime_process_load_count();
+    drop(Lm2RuntimeLease::acquire(choice));
+    let after = lm2_runtime_process_load_count();
+    (mid - before, after - mid)
 }
 
 #[derive(Debug, Clone)]
@@ -345,6 +419,7 @@ pub struct LiquidMode2Request {
     pub use_pp_footnote_regions: bool,
     pub external_emissions_path: Option<PathBuf>,
     pub runtime_choice: Lm2RuntimeChoice,
+    pub preview_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -927,6 +1002,19 @@ pub fn spawn_liquid_mode2_job(request: LiquidMode2Request, tx: Sender<LiquidMode
         let use_pymupdf_blocks = request.use_pymupdf_blocks;
         let use_pp_footnote_regions = request.use_pp_footnote_regions;
         let runtime_choice = request.runtime_choice;
+        if request.preview_only {
+            let preview_page_count = request.pages.len();
+            let result = prepare_liquid_mode2_document(request);
+            let _ = tx.send(LiquidMode2Event {
+                document_epoch,
+                path,
+                complete: false,
+                preview_page_count: Some(preview_page_count),
+                runtime_choice,
+                result,
+            });
+            return;
+        }
         if lm2_progressive_preview_enabled()
             && let Some((preview_request, preview_page_count)) =
                 lm2_progressive_preview_request(&request)
@@ -982,6 +1070,7 @@ pub(crate) fn lm2_progressive_preview_request(
     preview
         .deep_source_lines
         .retain(|line| line.page_index < LM2_PROGRESSIVE_PREVIEW_PAGES);
+    preview.preview_only = true;
     (!preview.deep_source_lines.is_empty()).then_some((preview, LM2_PROGRESSIVE_PREVIEW_PAGES))
 }
 
@@ -2260,6 +2349,7 @@ pub fn run_lm2_source_smoke(args: impl IntoIterator<Item = OsString>) -> Result<
             use_pp_footnote_regions: false,
             external_emissions_path: external_emissions_path.clone(),
             runtime_choice: Lm2RuntimeChoice::Automatic,
+            preview_only: false,
         };
         match prepare_liquid_mode2_document(request) {
             Ok(liquid) => documents.push(Lm2SourceSmokeDocument {
@@ -2313,7 +2403,8 @@ pub fn prepare_liquid_mode2_document_with_timing(
 ) -> Result<(LiquidDocument, LiquidMode2Timing), String> {
     let total_started = Instant::now();
     let runtime_started = Instant::now();
-    let mut runtime = Lm2Runtime::load(request.runtime_choice);
+    let mut runtime_lease = Lm2RuntimeLease::acquire(request.runtime_choice);
+    let runtime = runtime_lease.runtime();
     let mut pp_runtime_warnings = Vec::new();
     let mut liquidvision_runtime_warnings = Vec::new();
     if request.use_pp_footnote_regions {
@@ -2524,7 +2615,7 @@ pub fn prepare_liquid_mode2_document_with_timing(
             llm_used: false,
             llm_provider: Some("LM2".to_owned()),
             deep_liquid_used: false,
-            deep_liquid_model: Some(runtime.model_label),
+            deep_liquid_model: Some(runtime.model_label.clone()),
             warnings: vec![
                 "LiquidMode2 found no selectable text. Run OCR before using LM2.".to_owned(),
             ],
@@ -2631,7 +2722,8 @@ pub fn prepare_liquid_mode2_document_with_timing(
         apply_footnote_carryover_overlay(&mut decoded);
     }
     if footnote_monotone_overlay {
-        apply_footnote_monotone_overlay(&mut decoded);
+        // Applied after article spans are known so bound volumes do not share
+        // one file-wide missing-marker chain.
     }
     if open_footnote_carryover_overlay {
         apply_open_footnote_carryover_overlay(&mut decoded);
@@ -2685,6 +2777,9 @@ pub fn prepare_liquid_mode2_document_with_timing(
     apply_hidden_numbered_note_head_recovery(&mut decoded);
     apply_same_segment_statutory_subdivision_body_rescue(&mut decoded);
     let article_spans = detect_lm2_article_spans(&decoded, request.pages.len());
+    if footnote_monotone_overlay {
+        apply_footnote_monotone_overlay(&mut decoded, &article_spans);
+    }
     apply_document_discretionary_hyphen_repairs(&mut decoded);
     apply_document_fused_word_spacing_repairs(&mut decoded);
     timing.overlay_decode_ms = overlay_started.elapsed().as_secs_f64() * 1000.0;
@@ -2908,6 +3003,7 @@ pub fn prepare_liquid_mode2_document_with_timing(
     // Markdown note assembler cannot absorb that body display into an open
     // cross-page footnote.
     apply_final_displayed_body_role_rescue(&mut blocks, &mut block_source_lines, &decoded);
+    rescue_omitted_keep_source_lines(&mut blocks, &mut block_source_lines, &decoded);
     let mut warnings = if runtime.native_line_model_active() {
         vec![format!(
             "Review Mode uses {} raw no-stack emissions.",
@@ -3073,7 +3169,7 @@ pub fn prepare_liquid_mode2_document_with_timing(
         llm_used: false,
         llm_provider: Some("LM2".to_owned()),
         deep_liquid_used: false,
-        deep_liquid_model: Some(runtime.model_label),
+        deep_liquid_model: Some(runtime.model_label.clone()),
         warnings,
         source_signature,
     };
@@ -8729,7 +8825,40 @@ fn d1_runtime_citation_like(lower: &str) -> bool {
         || d1_runtime_zerospend_citation_cue(lower)
 }
 
-fn apply_footnote_monotone_overlay(decoded: &mut [(DeepLiquidSourceLine, Lm2Action)]) {
+fn apply_footnote_monotone_overlay(
+    decoded: &mut [(DeepLiquidSourceLine, Lm2Action)],
+    article_spans: &[ArticleSpan],
+) {
+    if decoded.is_empty() {
+        return;
+    }
+    if article_spans.len() > 1 {
+        let mut start = 0usize;
+        while start < decoded.len() {
+            let article = article_index_at(
+                article_spans,
+                decoded[start].0.page_index,
+                decoded[start].0.line_index,
+            );
+            let mut end = start + 1;
+            while end < decoded.len()
+                && article_index_at(
+                    article_spans,
+                    decoded[end].0.page_index,
+                    decoded[end].0.line_index,
+                ) == article
+            {
+                end += 1;
+            }
+            apply_footnote_monotone_overlay_unscoped(&mut decoded[start..end]);
+            start = end;
+        }
+        return;
+    }
+    apply_footnote_monotone_overlay_unscoped(decoded);
+}
+
+fn apply_footnote_monotone_overlay_unscoped(decoded: &mut [(DeepLiquidSourceLine, Lm2Action)]) {
     if decoded.is_empty() {
         return;
     }
@@ -12365,16 +12494,54 @@ fn note_start_line_ids(
     decoded: &[(DeepLiquidSourceLine, Lm2Action)],
     article_spans: &[ArticleSpan],
 ) -> HashSet<String> {
-    let mut starts = note_start_line_ids_for_scope(decoded, article_spans);
-    if !article_spans.is_empty() {
-        // Article scope may recover heads hidden by a later article's restart,
-        // but must never revoke a head the document-global constraint accepted.
-        // Revocation merges note blocks and can make downstream linked assembly
-        // discard the merged text wholesale.
-        starts.extend(note_start_line_ids_for_scope(decoded, &[]));
-    }
+    let scoped = note_start_line_ids_for_scope(decoded, article_spans);
+    let global = if article_spans.is_empty() {
+        HashSet::new()
+    } else {
+        note_start_line_ids_for_scope(decoded, &[])
+    };
+    let mut starts = merge_article_and_global_note_starts(scoped, global, article_spans);
     starts.extend(same_page_body_referenced_note_heads(decoded));
     starts
+}
+
+fn rescue_omitted_keep_source_lines(
+    blocks: &mut Vec<LiquidBlock>,
+    sources: &mut Vec<LiquidBlockSourceLines>,
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+) {
+    let assembled = sources
+        .iter()
+        .flat_map(|source| {
+            source
+                .lines
+                .iter()
+                .filter_map(|line| line.id.clone())
+        })
+        .collect::<HashSet<_>>();
+    let keep_ids = decoded
+        .iter()
+        .filter(|(_, action)| *action == Lm2Action::Keep)
+        .map(|(line, _)| line.id.as_str());
+    for id in omitted_keep_source_ids(keep_ids, &assembled) {
+        let Some((line, _)) = decoded.iter().find(|(line, _)| line.id == id) else {
+            continue;
+        };
+        let text = clean_lm2_line_text(&line.text);
+        if text.is_empty() {
+            continue;
+        }
+        let block_index = blocks.len();
+        blocks.push(LiquidBlock {
+            role: LiquidBlockRole::Paragraph,
+            text,
+            label: None,
+        });
+        sources.push(LiquidBlockSourceLines {
+            block_index,
+            lines: vec![line_ref(line, LiquidBlockRole::Paragraph)],
+        });
+    }
 }
 
 /// A citation-shaped definition such as `15 28 U.S.C. ...` is ambiguous in
@@ -29990,6 +30157,7 @@ mod tests {
             use_pp_footnote_regions: false,
             external_emissions_path: None,
             runtime_choice: Lm2RuntimeChoice::CatBoost,
+            preview_only: false,
         };
 
         let (preview, page_count) = lm2_progressive_preview_request(&request).unwrap();
@@ -30190,7 +30358,7 @@ mod tests {
     }
 
     #[test]
-    fn article_scope_never_revokes_a_global_note_start() {
+    fn high_confidence_article_spans_revoke_a_global_note_start() {
         let mut decoded = Vec::new();
         for (page, markers) in [
             (0, vec![1, 1, 1, 1, 1, 1, 1, 1]),
@@ -30217,7 +30385,7 @@ mod tests {
                 start_line_index: 0,
                 end_page_index: 1,
                 end_line_index: 0,
-                confidence: 1.0,
+                confidence: crate::review_reading::REVIEW_HIGH_CONFIDENCE_ARTICLE_SPAN,
                 title_hint: None,
                 evidence: Vec::new(),
             },
@@ -30227,7 +30395,7 @@ mod tests {
                 start_line_index: 0,
                 end_page_index: 2,
                 end_line_index: 0,
-                confidence: 1.0,
+                confidence: crate::review_reading::REVIEW_HIGH_CONFIDENCE_ARTICLE_SPAN,
                 title_hint: None,
                 evidence: Vec::new(),
             },
@@ -30235,21 +30403,52 @@ mod tests {
 
         let global = note_start_line_ids_for_scope(&decoded, &[]);
         let scoped_only = note_start_line_ids_for_scope(&decoded, &spans);
-        let monotonic_scoped = note_start_line_ids(&decoded, &spans);
+        let revoked = note_start_line_ids(&decoded, &spans);
         let one_span = vec![ArticleSpan {
             article_index: 0,
             start_page_index: 0,
             start_line_index: 0,
             end_page_index: 2,
             end_line_index: 0,
-            confidence: 1.0,
+            confidence: crate::review_reading::REVIEW_HIGH_CONFIDENCE_ARTICLE_SPAN,
             title_hint: None,
             evidence: Vec::new(),
         }];
         assert!(global.contains("p1:l1:n1"));
         assert!(!scoped_only.contains("p1:l1:n1"));
-        assert!(global.is_subset(&monotonic_scoped));
+        assert!(!revoked.contains("p1:l1:n1"));
         assert_eq!(global, note_start_line_ids(&decoded, &one_span));
+    }
+
+    #[test]
+    fn omitted_keep_lines_are_rescued_as_body_paragraphs() {
+        let keep = lm2_test_source_line(
+            "keep-lost",
+            0,
+            "we are now to consider the extent to which the company's agent may",
+            1.0,
+            false,
+            None,
+        );
+        let noise = lm2_test_source_line("noise", 1, "1", 0.6, false, None);
+        let decoded = vec![
+            (keep, Lm2Action::Keep),
+            (noise, Lm2Action::HideNoise),
+        ];
+        let mut blocks = Vec::new();
+        let mut sources = Vec::new();
+        rescue_omitted_keep_source_lines(&mut blocks, &mut sources, &decoded);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].role, LiquidBlockRole::Paragraph);
+        assert!(blocks[0].text.contains("company's agent"));
+        assert_eq!(sources[0].lines[0].id.as_deref(), Some("keep-lost"));
+    }
+
+    #[test]
+    fn native_runtime_is_reused_across_two_prepares() {
+        let (first, second) = lm2_runtime_reuse_across_two_prepares(Lm2RuntimeChoice::CatBoost);
+        assert!(first <= 1);
+        assert_eq!(second, 0);
     }
 
     #[test]
@@ -39461,7 +39660,7 @@ mod tests {
         line.doc_note_marker_page_delta = 1;
         let mut decoded = vec![(line, Lm2Action::Keep)];
 
-        apply_footnote_monotone_overlay(&mut decoded);
+        apply_footnote_monotone_overlay(&mut decoded, &[]);
 
         assert_eq!(decoded[0].1, Lm2Action::Marginalia);
         assert_eq!(decoded[0].0.role_hint, Some(LiquidBlockRole::Footnote));
@@ -39499,7 +39698,7 @@ mod tests {
             (continuation, Lm2Action::Keep),
         ];
 
-        apply_footnote_monotone_overlay(&mut decoded);
+        apply_footnote_monotone_overlay(&mut decoded, &[]);
 
         assert_eq!(decoded[1].1, Lm2Action::Marginalia);
         assert_eq!(decoded[1].0.role_hint, Some(LiquidBlockRole::Footnote));
@@ -39525,7 +39724,7 @@ mod tests {
         line.doc_note_marker_page_delta = 1;
         let mut decoded = vec![(line, Lm2Action::Keep)];
 
-        apply_footnote_monotone_overlay(&mut decoded);
+        apply_footnote_monotone_overlay(&mut decoded, &[]);
 
         assert_eq!(decoded[0].1, Lm2Action::Keep);
         assert_eq!(decoded[0].0.role_hint, None);
@@ -39573,7 +39772,7 @@ mod tests {
             (note24, Lm2Action::Marginalia),
         ];
 
-        apply_footnote_monotone_overlay(&mut decoded);
+        apply_footnote_monotone_overlay(&mut decoded, &[]);
 
         assert_eq!(decoded[1].1, Lm2Action::Marginalia);
         assert_eq!(decoded[1].0.role_hint, Some(LiquidBlockRole::Footnote));
@@ -39607,7 +39806,7 @@ mod tests {
         note.page_height = 1000.0;
         let mut decoded = vec![(body, Lm2Action::Keep), (note, Lm2Action::Keep)];
 
-        apply_footnote_monotone_overlay(&mut decoded);
+        apply_footnote_monotone_overlay(&mut decoded, &[]);
 
         assert_eq!(decoded[1].1, Lm2Action::Marginalia);
         assert_eq!(decoded[1].0.role_hint, Some(LiquidBlockRole::Footnote));
@@ -39639,7 +39838,7 @@ mod tests {
         false_note.page_height = 1000.0;
         let mut decoded = vec![(body, Lm2Action::Keep), (false_note, Lm2Action::Keep)];
 
-        apply_footnote_monotone_overlay(&mut decoded);
+        apply_footnote_monotone_overlay(&mut decoded, &[]);
 
         assert_eq!(decoded[1].1, Lm2Action::Keep);
         assert_eq!(decoded[1].0.role_hint, None);

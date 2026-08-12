@@ -255,10 +255,7 @@ fn lm2_runtime_status(
         errors.push("required learned footnote link-ranker model was not loaded".to_owned());
     }
     let liquidvision_active =
-        native_line_model_active && liquidvision_enabled(true) && LiquidVision::global().is_some();
-    if require_native && !liquidvision_active {
-        errors.push("required LiquidVision feature model was not loaded".to_owned());
-    }
+        native_line_model_active && liquidvision_enabled(false) && LiquidVision::global().is_some();
 
     let legacy_model = load_lm2_model().ok().filter(model_is_usable);
     let legacy_model_available = legacy_model.is_some();
@@ -318,7 +315,6 @@ fn lm2_runtime_status(
     };
     let requirements_met = (!require_fasttab || fasttab_active)
         && (!require_native || native_catboost_active)
-        && (!require_native || liquidvision_active)
         && (!require_context || context_twopass_active)
         && (!require_arbiter || context_arbiter_active)
         && (!require_note_head || note_head_active)

@@ -147,15 +147,19 @@ pub struct LiquidVisionFillReport {
     pub errors: Vec<String>,
 }
 
-pub fn liquidvision_enabled(default_enabled: bool) -> bool {
-    std::env::var("LAWPDF_LMV")
+pub fn liquidvision_enabled(_default_enabled: bool) -> bool {
+    liquidvision_enabled_from_env(std::env::var("LAWPDF_LMV").ok().as_deref())
+}
+
+pub fn liquidvision_enabled_from_env(value: Option<&str>) -> bool {
+    value
         .map(|value| {
             !matches!(
                 value.trim().to_ascii_lowercase().as_str(),
                 "0" | "false" | "off" | "no"
             )
         })
-        .unwrap_or(default_enabled)
+        .unwrap_or(false)
 }
 
 pub fn fill_document_features(
@@ -563,5 +567,12 @@ mod tests {
             unletterbox_bbox([0.0, 0.0, 1.0, 1.0], transform, 612.0, 792.0),
             None
         );
+    }
+
+    #[test]
+    fn liquidvision_stays_off_without_an_explicit_env_opt_in() {
+        assert!(!liquidvision_enabled_from_env(None));
+        assert!(!liquidvision_enabled_from_env(Some("0")));
+        assert!(liquidvision_enabled_from_env(Some("1")));
     }
 }

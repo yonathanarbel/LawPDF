@@ -21,6 +21,7 @@ mod performance_cache;
 #[cfg(feature = "devtools")]
 mod profile_dataset;
 mod render_worker;
+mod review_reading;
 mod settings;
 mod single_instance;
 mod text_conversion;

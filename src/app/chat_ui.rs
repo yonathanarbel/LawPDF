@@ -172,6 +172,13 @@ impl PdfEditorApp {
     }
 
     fn chat_context_for_document(&self, document: &LoadedDocument) -> (String, usize) {
+        if let LiquidState::Ready(review) = &self.liquid_mode2_state {
+            let context = review_document_plain_text(review);
+            if !context.trim().is_empty() {
+                let estimated_tokens = estimate_tokens(&context);
+                return (context, estimated_tokens);
+            }
+        }
         let pages = self.collect_liquid_source_pages(document);
         let mut context = String::new();
         for (page_index, page) in pages.iter().enumerate() {

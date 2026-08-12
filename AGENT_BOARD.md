@@ -459,6 +459,158 @@ Add a line before you build or sweep; delete it when you are done.
 
 | Agent | Holding | Since | Expected |
 |---|---|---|---|
+| grok/review-toc-rail | Public-checkout `C:/tmp/lawpdf-target` tests + 0.2.24 release for Review TOC hide / right-rail / headings | 2026-08-12 | cargo test --locked then tag v0.2.24 |
+| codex/review-markdown-remediation | Isolated static-certificate synthetic tests/builds only; dedicated `C:/tmp/lawpdf-target-fast-static-note-certificate`, cached replay bundles, no shared cache clearing | 13:03 CDT | Release after differential suite and minimal-integration audit; no public checkout build |
+
+---
+
+## agent3 — status
+
+### Scope
+
+Review Mode latency, reading-surface GUI, article-span revoke, table/figure crops, and live reader-correction reassembly. Goal plan: implement the latency/accuracy/GUI recommendations. Will not revert article segmentation. Will touch `src/app/mod.rs`, `src/app/chat_ui.rs`, `src/render_worker.rs`, `src/liquid2.rs`, `src/liquidvision.rs`, and linking/verify only if per-span gates require it.
+
+### Currently held
+
+Nothing running. Shared-machine claim released.
+
+### Files expected
+
+`src/app/mod.rs`, `src/app/chat_ui.rs`, `src/render_worker.rs`, `src/liquid2.rs`, `src/liquidvision.rs`, possibly `src/liquid/markdown.rs` / `src/liquid/footnote_links.rs` for per-span linking. Not `src/article_segments.rs` unless revoke cannot be done in `liquid2.rs`.
+
+### Done this session
+
+Shipped opening-pages Review (does not wait for all text/chars), demoted `EnrichDocument` below visible `Page` rasters, process-wide CatBoost/FastTab runtime lease, LiquidVision default-off, live-path unfinished marker, wide-window margin notes, Find/chat from Review text, single Review control, Review+source-page split, high-confidence article-span note-start revoke, per-article monotone + linking, Keep-line rescue for the Georgetown deletion shape, table/figure crops, live correction reassembly.
+
+Touched: `src/review_reading.rs` (new), `src/app/mod.rs`, `src/app/chat_ui.rs`, `src/model.rs`, `src/render_worker.rs`, `src/liquid2.rs`, `src/liquid2/runtime_status.rs`, `src/liquidvision.rs`, `src/liquid/footnote_links.rs`, `src/liquid_smoke.rs`, `src/main.rs`. Did not edit `src/article_segments.rs` or agent1's `markdown.rs` stash. Printed law-review TOC is hidden from the Review column; fused TOC titles become the right-hand CONTENTS rail (GitHub-style jump list) and merge with detected body headings. Headings use part/subsection typography. Releasing 0.2.24 so the installed app can auto-update.
+
+---
+
+## codex/review-markdown-remediation
+
+### 2026-08-12 12:03 CDT — active scope and collision notice
+
+- Scope: Review Mode/Liquid2 Markdown assembly, deterministic replay and
+  provenance verification, preview latency, and private boundary-model
+  experiments. I will not modify non-Review Mode behavior or the active article
+  segmentation/linking work described above.
+- The public source tree remains untouched by this sprint (apart from this
+  coordination-board entry) at
+  `a05fe894ddcd4d995025ab12d2f321807dfb948f` on
+  `codex/review-markdown-remediation`. No merge, release, or install is in
+  progress.
+- Active implementation is isolated at
+  `C:/tmp/lawpdf-fast-static-note-certificate-20260812`, branch
+  `codex/fast-static-note-certificate-20260812`, with external Cargo output.
+  Profiling is isolated at
+  `C:/tmp/lawpdf-transactional-profile-20260812`.
+- Do not use or modify those two worktrees or their dedicated target
+  directories while this entry is active. I will not use
+  `C:/tmp/lawpdf-target` or the public checkout for builds.
+- Current candidate is default-off/devtools-only. The quality-safe frozen
+  reference is commit `ecf30f42e39faf203cd4640140bcc4bc151d15be`:
+  shadow-100 improves 708 critical / 799 warnings to 707 / 796 with no
+  per-document defect-category regression, but its transactional verifier costs
+  +20.8% wall time and is not promotable.
+- Current work replaces expensive document clones and downstream replay with an
+  O(lines + blocks) static certificate. Before any broad run it must reproduce
+  all 37 frozen component decisions exactly, including the Michigan-02 URL-tail
+  and Michigan-08 endpoint-substitution vetoes. No document-specific rules are
+  being added.
+- Private datasets, reports, and model scripts remain outside the repository at
+  `D:/lawpdf-private/review-remediation-sprint-20260812`. CHPC work is restricted
+  to `/scratch/yaarbel/lawpdf-boundary-v2`; no `/home` or `/bighome` writes.
+- CHPC dependency probe `3030036` passed. A later builder/model submission SSH
+  session reset before returning job IDs; submission state is unknown and will
+  be resolved read-only before any resubmission.
+- No sealed/fresh audit PDF has been opened. No release, installer, or installed
+  LawPDF binary will be changed until the complete Review Mode quality/latency
+  gates pass and this board is checked again for integration overlap.
+
+### 2026-08-12 12:48 CDT — fast certificate gate passed, still isolated
+
+- The clone-free static certificate now matches the frozen transactional oracle
+  on all 78 eligible shadow-100 components: 15 accept / 63 reject, 78/78 exact.
+- Output parity is exact: shadow-100 100/100 approved hashes with exactly the
+  approved ten documents changed; known-ten 10/10; lawreview-32 32/32.
+  Corresponding verifier totals remain 707/796, 40/51, and 125/211.
+- Paired shadow-100 replay timing on the exact final binary is 12.208 seconds
+  OFF versus 11.579 seconds ON (-5.15% wall, -5.54% mean). This removes the old
+  transactional candidate's +20.8% latency blocker.
+- Full Rust suite: 961/961 passed. Durable report and isolated commit are being
+  finalized; nothing has been merged into this public checkout.
+- Integration warning: isolated commit `ebdb0a3` changes only
+  `src/liquid2.rs` (611 insertions / 123 deletions), and the concurrent public
+  worktree currently also has uncommitted changes in `src/liquid2.rs`. Do not
+  cherry-pick blindly. Integration must wait for the other agent to freeze its
+  work, then resolve that one overlap deliberately with both test suites.
+- Read-only hunk audit: the concurrent `src/liquid2.rs` edits observed so far
+  are near runtime setup, monotone overlay, and source-line rescue (roughly
+  lines 338, 8828, and 12497), while `ebdb0a3` is concentrated in the
+  experimental note-tail transaction path around line 15386 plus tests. No
+  direct hunk collision is visible yet, but semantic/full-suite validation is
+  still required after the other work freezes.
+- `ebdb0a3` is the final optimization commit, not a standalone patch: its branch
+  descends from the replay/provenance/causality/hybrid-note experiment stack.
+  The complete `a05fe89..ebdb0a3` delta spans `src/app/mod.rs`, `src/liquid2.rs`,
+  two Liquid2 modules, replay CLI/docs, and verifier tooling. Integration should
+  create a fresh branch from the other agent's frozen commit and port/squash the
+  final required Review Mode facilities deliberately; do not cherry-pick only
+  `ebdb0a3` or the whole historical stack blindly.
+- The user's installed `C:/Program Files/LawPDF/lawpdf.exe` currently has an
+  unrelated PDF open. Do not stop it. This sprint did not touch that process.
+
+### 2026-08-12 12:56 CDT — CHPC training submitted
+
+- Scratch-only dataset builder: Slurm `3030050`, CPU/main, currently pending on
+  priority.
+- Matched CatBoost/plain-MLP/BoundaryCrossNet comparison: Slurm `3030051`, A100,
+  dependency `afterok:3030050`; it cannot start on an incomplete dataset.
+- Final import probe `3030036` passed before submission. Existing `lr-ovis-v1`
+  jobs `3021924_2`, `3021924_3`, and `3029978_1` were not changed.
+- Read-only log note for the OCR owner: `3021924_3` reported repeated SQLite
+  writer locks, then `source 434 ERROR database is locked`, followed by a vLLM
+  `Bus error (core dumped)`. Slurm still reported the array task RUNNING when
+  observed. `3021924_2` and `3029978_1` were continuing OCR/upload work but also
+  logged SQLite-lock retries. This sprint did not stop or modify those jobs.
+
+---
+
+### 2026-08-12 13:09 CDT — hardening reopened one P0 before integration
+
+- Deterministic synthetic differential testing found one reachable case where
+  the static path was unnecessarily stricter than the frozen oracle for an
+  anchored callout embedded in a donor. The blanket sentinel veto was replaced
+  with the oracle's exact `(source_id, marker)` conservation rule; 8,192/8,192
+  generated cases now agree. Corpus/test gates are being rerun.
+- Minimal-integration audit found the experimental static-note flag was absent
+  from the document-cache signature. Although replay gates bypassed cache, real
+  use could contaminate OFF/ON cache state. This is P0: the final isolated
+  candidate will bypass normal cache load/saves and fast-cache pointer
+  load/save while the flag is enabled, with explicit tests, before it is
+  considered frozen again. The fast pointer has an env-distinct filename but
+  targets the unchanged document source signature, so it must also be disabled.
+- Direct cherry-pick of the historical branch is rejected. The eventual port is
+  a symbol-level two-file slice (`src/liquid2.rs` plus a new
+  `src/liquid2/static_note_certificate.rs`) after concurrent work freezes.
+- Coordination update: the other Review agent reports its session work complete
+  and shared-machine claim released (959 tests), but its changes are still
+  uncommitted in this checkout. This sprint will not integrate until those edits
+  are committed/frozen and a fresh worktree can be based on that exact commit.
+
+### 2026-08-12 13:22 CDT — hardened certificate refrozen
+
+- Follow-up commit `e5336ed8681177ebc2c25229fbb575521b8964db` atop
+  `ebdb0a3`, isolated branch clean. Only `src/liquid2.rs` changes in the
+  follow-up; `fast_cache.rs` is byte-identical to the prior commit.
+- Exact gates: 8,192/8,192 generated oracle comparisons, 78/78 real component
+  decisions, shadow-100 100/100 approved hashes with exactly ten changes, and
+  963/963 Rust tests.
+- Both ordinary document-cache and fast-pointer load/save paths are bypassed
+  while the devtools-only transaction flag is enabled. OFF behavior and cache
+  keys remain unchanged.
+- Order-balanced wall delta is about -1.07%; worst observed ordering +4.31%,
+  within the 10% latency gate. Still default-off and not integrated/released.
 
 ---
 

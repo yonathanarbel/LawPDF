@@ -26,7 +26,11 @@ struct NoteHead {
 
 pub fn attach_footnote_links(document: &mut LiquidDocument) {
     restore_source_backed_plain_callouts(&mut document.blocks, &document.block_source_lines);
-    let (links, integrity) = resolve_footnote_links(&document.blocks, &document.block_source_lines);
+    let (links, integrity) = resolve_footnote_links_in_articles(
+        &document.blocks,
+        &document.block_source_lines,
+        &document.article_spans,
+    );
     document.footnote_links = links;
     document.footnote_link_integrity = (integrity.detectable_markers > 0).then_some(integrity);
 }
@@ -130,6 +134,14 @@ pub fn resolve_footnote_links(
     blocks: &[LiquidBlock],
     block_source_lines: &[LiquidBlockSourceLines],
 ) -> (Vec<LiquidFootnoteLink>, LiquidFootnoteLinkIntegrity) {
+    resolve_footnote_links_in_articles(blocks, block_source_lines, &[])
+}
+
+pub fn resolve_footnote_links_in_articles(
+    blocks: &[LiquidBlock],
+    block_source_lines: &[LiquidBlockSourceLines],
+    article_spans: &[super::ArticleSpan],
+) -> (Vec<LiquidFootnoteLink>, LiquidFootnoteLinkIntegrity) {
     let pages = block_pages(block_source_lines);
     let reference_pages = block_reference_pages(block_source_lines);
     let source_note_heads = block_note_heads(block_source_lines);
@@ -174,9 +186,19 @@ pub fn resolve_footnote_links(
     let mut unmatched = 0usize;
     let mut ambiguous = 0usize;
     for reference in &references {
+        let reference_article =
+            block_article_index(reference.block_index, block_source_lines, article_spans);
         let same_marker = notes
             .iter()
-            .filter(|note| note.marker == reference.marker)
+            .filter(|note| {
+                note.marker == reference.marker
+                    && (article_spans.is_empty()
+                        || block_article_index(
+                            note.block_index,
+                            block_source_lines,
+                            article_spans,
+                        ) == reference_article)
+            })
             .copied()
             .collect::<Vec<_>>();
         let candidates = conservative_candidates(reference, &same_marker);
@@ -382,6 +404,29 @@ fn note_role(role: LiquidBlockRole) -> bool {
     )
 }
 
+fn block_article_index(
+    block_index: usize,
+    block_source_lines: &[LiquidBlockSourceLines],
+    article_spans: &[super::ArticleSpan],
+) -> Option<usize> {
+    if article_spans.is_empty() {
+        return Some(0);
+    }
+    let source = block_source_lines
+        .iter()
+        .find(|source| source.block_index == block_index)?;
+    let coordinate = source
+        .lines
+        .iter()
+        .map(|line| (line.page_index, line.line_index))
+        .min()?;
+    article_spans.iter().find_map(|span| {
+        (coordinate >= (span.start_page_index, span.start_line_index)
+            && coordinate < (span.end_page_index, span.end_line_index))
+        .then_some(span.article_index)
+    })
+}
+
 fn rate(numerator: usize, denominator: usize) -> f32 {
     if denominator == 0 {
         0.0
@@ -404,12 +449,16 @@ mod tests {
     }
 
     fn source(block_index: usize, page_index: usize) -> LiquidBlockSourceLines {
+        source_at(block_index, page_index, 0)
+    }
+
+    fn source_at(block_index: usize, page_index: usize, line_index: usize) -> LiquidBlockSourceLines {
         LiquidBlockSourceLines {
             block_index,
             lines: vec![LiquidSourceLineRef {
                 id: None,
                 page_index,
-                line_index: 0,
+                line_index,
                 text: String::new(),
                 role: LiquidBlockRole::Paragraph,
                 note_markers: Vec::new(),
@@ -662,5 +711,50 @@ mod tests {
         assert!(links.is_empty());
         assert_eq!(integrity.note_heads, 0);
         assert_eq!(integrity.unmatched, 1);
+    }
+
+    #[test]
+    fn article_spans_keep_restarted_note_numbers_in_their_own_article() {
+        use crate::liquid::ArticleSpan;
+        let blocks = vec![
+            block(LiquidBlockRole::Paragraph, "First.\u{E000}1\u{E001}"),
+            block(LiquidBlockRole::Marginalia, "1 First article note."),
+            block(LiquidBlockRole::Paragraph, "Second.\u{E000}1\u{E001}"),
+            block(LiquidBlockRole::Marginalia, "1 Second article note."),
+        ];
+        let sources = vec![
+            source_at(0, 0, 0),
+            source_at(1, 0, 2),
+            source_at(2, 12, 0),
+            source_at(3, 12, 2),
+        ];
+        let spans = vec![
+            ArticleSpan {
+                article_index: 0,
+                start_page_index: 0,
+                start_line_index: 0,
+                end_page_index: 12,
+                end_line_index: 0,
+                confidence: 3.0,
+                title_hint: None,
+                evidence: Vec::new(),
+            },
+            ArticleSpan {
+                article_index: 1,
+                start_page_index: 12,
+                start_line_index: 0,
+                end_page_index: 20,
+                end_line_index: 0,
+                confidence: 3.0,
+                title_hint: None,
+                evidence: Vec::new(),
+            },
+        ];
+        let (links, integrity) = resolve_footnote_links_in_articles(&blocks, &sources, &spans);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].note_block_index, 1);
+        assert_eq!(links[1].note_block_index, 3);
+        assert_eq!(integrity.ambiguous, 0);
+        assert_eq!(integrity.landing_rate, 1.0);
     }
 }

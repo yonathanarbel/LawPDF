@@ -365,15 +365,15 @@ fn push_coalesced(backlog: &mut VecDeque<RenderRequest>, request: RenderRequest)
 fn request_priority(request: &RenderRequest) -> u8 {
     match request {
         RenderRequest::LoadDocument { .. }
-        | RenderRequest::EnrichDocument { .. }
         | RenderRequest::PageImmediate { .. }
         | RenderRequest::ExportPagePng { .. }
         | RenderRequest::SyncComments { .. }
         | RenderRequest::RotatePage { .. } => 0,
         RenderRequest::Page { .. } => 1,
-        RenderRequest::TextCharsAsync { .. } => 2,
-        RenderRequest::Thumbnail { .. } => 3,
-        RenderRequest::TextPageAsync { .. } => 4,
+        RenderRequest::EnrichDocument { .. } => 2,
+        RenderRequest::TextCharsAsync { .. } => 3,
+        RenderRequest::Thumbnail { .. } => 4,
+        RenderRequest::TextPageAsync { .. } => 5,
     }
 }
 
@@ -636,6 +636,32 @@ mod tests {
         assert!(matches!(
             backlog.pop_front(),
             Some(RenderRequest::Thumbnail { .. })
+        ));
+    }
+
+    #[test]
+    fn visible_page_render_overtakes_full_document_enrichment() {
+        let (tx, rx) = unbounded();
+        tx.send(RenderRequest::EnrichDocument {
+            document_epoch: 7,
+            path: PathBuf::from("document.pdf"),
+        })
+        .unwrap();
+        tx.send(page_request(2, 1.0)).unwrap();
+        let mut backlog = VecDeque::new();
+
+        let next = next_prioritized_request(&rx, &mut backlog).unwrap();
+
+        assert!(matches!(
+            next,
+            RenderRequest::Page {
+                key: PageRenderKey { page_index: 2, .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            backlog.pop_front(),
+            Some(RenderRequest::EnrichDocument { document_epoch: 7, .. })
         ));
     }
 

@@ -241,6 +241,7 @@ pub struct RenderedPage {
 pub enum SearchSource {
     NativeText,
     OcrText,
+    ReviewText,
 }
 
 impl SearchSource {
@@ -248,6 +249,7 @@ impl SearchSource {
         match self {
             SearchSource::NativeText => "PDF",
             SearchSource::OcrText => "OCR",
+            SearchSource::ReviewText => "Review",
         }
     }
 }
@@ -259,6 +261,7 @@ pub struct SearchHit {
     pub match_start: usize,
     pub match_end: usize,
     pub snippet: String,
+    pub block_index: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
