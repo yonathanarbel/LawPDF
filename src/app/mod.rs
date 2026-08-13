@@ -41,12 +41,15 @@ use crate::liquid2::{
     spawn_liquid_mode2_job,
 };
 use crate::review_reading::{
-    apply_live_review_correction, find_hits_in_review_blocks, opening_pages_ready_for_review,
-    review_all_pages_ready, review_column_layout, review_contents_navigation_entries,
-    review_document_plain_text, review_hidden_display_mask, review_opening_page_count,
-    review_prepare_flags_after_restart, review_prepare_next_action,
-    review_table_figure_crop, should_apply_review_event, split_fused_review_notes,
-    ReviewPrepareAction, ReviewPrepareFlags, REVIEW_OUTLINE_RAIL_DEFAULT_WIDTH,
+    apply_live_review_correction, find_hits_in_review_blocks, is_review_margin_note_block,
+    is_review_note_display_block, opening_pages_ready_for_review, review_all_pages_ready,
+    review_allows_automatic_full_prepare, review_collect_margin_note_indices, review_column_layout,
+    review_contents_navigation_entries, review_document_plain_text, review_footnote_superscript,
+    review_gate_automatic_full, review_hidden_display_mask, review_opening_page_count,
+    review_paragraph_display_parts, review_prepare_flags_after_restart, review_prepare_next_action,
+    review_skips_block_as_furniture, review_table_figure_crop, should_apply_review_event,
+    should_precompute_review_on_open, split_fused_review_notes, ReviewPrepareAction,
+    ReviewPrepareFlags, REVIEW_OUTLINE_RAIL_DEFAULT_WIDTH, REVIEW_PARAGRAPH_GAP,
 };
 use crate::model::{
     AnnotationKind, EditorAnnotation, LoadedDocument, MarkerStyle, OcrPageState, PageLink,
@@ -99,11 +102,6 @@ const SBS_TEXTURE_CACHE_CAP: usize = PAGE_TEXTURE_CACHE_CAP * 2;
 const PAGE_PREFETCH_RADIUS: usize = 3;
 const PAGE_TEXTURE_CACHE_CAP: usize = 32;
 const SMALL_DOCUMENT_PREFETCH_LIMIT: usize = 6;
-const REVIEW_PRECOMPUTE_PAGE_LIMIT_EXCLUSIVE: usize = 120;
-
-fn should_precompute_review_on_open(page_count: usize) -> bool {
-    (1..REVIEW_PRECOMPUTE_PAGE_LIMIT_EXCLUSIVE).contains(&page_count)
-}
 const NOTCHED_WHEEL_IMMEDIATE_SHARE: f32 = 0.60;
 const NOTCHED_WHEEL_POINT_CHUNK: f32 = 6.0;
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
@@ -312,6 +310,7 @@ pub struct PdfEditorApp {
     liquid_mode2_complete: bool,
     liquid_mode2_preview_spawned: bool,
     liquid_mode2_full_spawned: bool,
+    liquid_mode2_allow_full: bool,
     review_pdf_split: bool,
     liquid_mode2_runtime_choice: Lm2RuntimeChoice,
     /// When the reflow first became readable while the reader was still on the
@@ -950,6 +949,7 @@ struct DocumentTab {
     liquid_mode2_complete: bool,
     liquid_mode2_preview_spawned: bool,
     liquid_mode2_full_spawned: bool,
+    liquid_mode2_allow_full: bool,
     review_pdf_split: bool,
     liquid_mode2_runtime_choice: Lm2RuntimeChoice,
     liquid_notice_dismissed: bool,
@@ -1061,6 +1061,7 @@ impl PdfEditorApp {
             liquid_mode2_complete: false,
             liquid_mode2_preview_spawned: false,
             liquid_mode2_full_spawned: false,
+            liquid_mode2_allow_full: false,
             review_pdf_split: false,
             liquid_mode2_runtime_choice: Lm2RuntimeChoice::CatBoost,
             liquid_mode2_reveal_at: None,
@@ -1230,6 +1231,7 @@ impl PdfEditorApp {
             liquid_mode2_complete: review_flags.complete,
             liquid_mode2_preview_spawned: review_flags.preview_spawned,
             liquid_mode2_full_spawned: review_flags.full_spawned,
+            liquid_mode2_allow_full: self.liquid_mode2_allow_full,
             review_pdf_split: review_flags.pdf_split,
             liquid_mode2_runtime_choice: self.liquid_mode2_runtime_choice,
             liquid_notice_dismissed: self.liquid_notice_dismissed,
@@ -1302,6 +1304,7 @@ impl PdfEditorApp {
         self.liquid_mode2_complete = tab.liquid_mode2_complete;
         self.liquid_mode2_preview_spawned = tab.liquid_mode2_preview_spawned;
         self.liquid_mode2_full_spawned = tab.liquid_mode2_full_spawned;
+        self.liquid_mode2_allow_full = tab.liquid_mode2_allow_full;
         self.review_pdf_split = tab.review_pdf_split;
         self.liquid_mode2_runtime_choice = tab.liquid_mode2_runtime_choice;
         self.liquid_notice_dismissed = tab.liquid_notice_dismissed;
@@ -1593,6 +1596,7 @@ impl PdfEditorApp {
         self.liquid_mode2_complete = false;
         self.liquid_mode2_preview_spawned = false;
         self.liquid_mode2_full_spawned = false;
+        self.liquid_mode2_allow_full = false;
         self.review_pdf_split = false;
         self.liquid_mode2_runtime_choice = Lm2RuntimeChoice::CatBoost;
         self.liquid_mode2_reveal_at = None;
@@ -2018,6 +2022,7 @@ impl PdfEditorApp {
             liquid_mode2_complete: false,
             liquid_mode2_preview_spawned: false,
             liquid_mode2_full_spawned: false,
+            liquid_mode2_allow_full: false,
             review_pdf_split: false,
             liquid_mode2_runtime_choice: Lm2RuntimeChoice::CatBoost,
             liquid_notice_dismissed: false,
@@ -2257,7 +2262,7 @@ impl PdfEditorApp {
         self.status = "Preparing document structure for Markdown...".to_owned();
         self.finish_pending_markdown_from_current_state(ctx);
         if self.pending_markdown_request.is_some() {
-            self.ensure_liquid_mode2_started(ctx);
+            self.request_full_review_prepare(ctx);
             self.finish_pending_markdown_from_current_state(ctx);
         }
         ctx.request_repaint_after(RENDER_POLL_INTERVAL);
@@ -3434,6 +3439,7 @@ impl PdfEditorApp {
             self.liquid_mode2_complete = false;
             self.liquid_mode2_preview_spawned = false;
             self.liquid_mode2_full_spawned = false;
+            self.liquid_mode2_allow_full = false;
             self.liquid_mode2_reveal_at = None;
             self.liquid_scroll_to_block = None;
             self.status = match choice {
@@ -3619,6 +3625,7 @@ impl PdfEditorApp {
 
     fn reset_liquid_mode2_jobs(&mut self) {
         self.apply_review_prepare_flags(review_prepare_flags_after_restart());
+        self.liquid_mode2_allow_full = false;
     }
 
     fn ensure_liquid_mode2_started(&mut self, ctx: &Context) {
@@ -3664,8 +3671,10 @@ impl PdfEditorApp {
             return;
         };
         let opening_count = review_opening_page_count(page_count);
+        let allow_full = self.liquid_mode2_allow_full
+            || review_allows_automatic_full_prepare(page_count);
         self.enqueue_review_extract_pages(opening_count);
-        if self.liquid_mode2_preview_spawned || opening_count == page_count {
+        if allow_full && (self.liquid_mode2_preview_spawned || opening_count == page_count) {
             self.enqueue_review_extract_pages(page_count);
         }
 
@@ -3673,12 +3682,16 @@ impl PdfEditorApp {
         let opening_ready =
             opening_pages_ready_for_review(&native_flags, &char_flags, page_count);
         let all_ready = review_all_pages_ready(&native_flags, &char_flags, page_count);
-        match review_prepare_next_action(
+        match review_gate_automatic_full(
+            review_prepare_next_action(
+                page_count,
+                opening_ready,
+                all_ready,
+                self.liquid_mode2_preview_spawned,
+                self.liquid_mode2_full_spawned,
+            ),
             page_count,
-            opening_ready,
-            all_ready,
-            self.liquid_mode2_preview_spawned,
-            self.liquid_mode2_full_spawned,
+            allow_full,
         ) {
             ReviewPrepareAction::WaitForPages => {
                 if !matches!(self.liquid_mode2_state, LiquidState::Ready(_)) {
@@ -3691,7 +3704,9 @@ impl PdfEditorApp {
                 self.spawn_liquid_mode2_request(ctx, pages, true);
             }
             ReviewPrepareAction::SpawnFull { page_count: pages } => {
-                let _ = self.ensure_review_document_enriched(ctx);
+                if !self.ensure_review_document_enriched(ctx) {
+                    return;
+                }
                 self.spawn_liquid_mode2_request(ctx, pages, false);
             }
             ReviewPrepareAction::Nothing => {}
@@ -3773,16 +3788,46 @@ impl PdfEditorApp {
         let Some(page_count) = self.document.as_ref().map(|document| document.page_count) else {
             return;
         };
-        if !should_precompute_review_on_open(page_count)
-            || !matches!(self.liquid_mode2_state, LiquidState::Idle)
-        {
+        if !matches!(self.liquid_mode2_state, LiquidState::Idle) {
             return;
         }
+        // Always accept a cached Review. Never start extract/model work on open:
+        // that is the hitch the user feels, and a large PDF may never be Reviewed.
+        if self.try_load_cached_review(ctx) {
+            return;
+        }
+        if should_precompute_review_on_open(page_count) {
+            self.liquid_mode2_state = LiquidState::PreparingText;
+            self.liquid_mode2_complete = false;
+            self.ensure_liquid_mode2_started(ctx);
+        }
+    }
 
-        // Mark this as a background preparation before asking for detailed layout so an
-        // optimized PDF resumes automatically when the enrichment worker finishes.
-        self.liquid_mode2_state = LiquidState::PreparingText;
-        self.liquid_mode2_complete = false;
+    fn try_load_cached_review(&mut self, ctx: &Context) -> bool {
+        if self.liquid_mode2_preview_spawned || self.liquid_mode2_full_spawned {
+            return false;
+        }
+        let Some(document) = self.document.as_ref().and_then(|source| {
+            load_fast_cached_liquid_mode2_document(
+                &source.path,
+                self.settings.liquid_mode2_use_pymupdf_blocks,
+                self.settings.liquid_mode2_use_pp_footnote_regions,
+                self.liquid_mode2_runtime_choice,
+            )
+        }) else {
+            return false;
+        };
+        self.liquid_mode2_state = LiquidState::Ready(document);
+        self.liquid_mode2_complete = true;
+        self.liquid_mode2_preview_spawned = true;
+        self.liquid_mode2_full_spawned = true;
+        self.status = "Review Mode ready from cache.".to_owned();
+        ctx.request_repaint();
+        true
+    }
+
+    fn request_full_review_prepare(&mut self, ctx: &Context) {
+        self.liquid_mode2_allow_full = true;
         self.ensure_liquid_mode2_started(ctx);
     }
 
@@ -6887,9 +6932,10 @@ impl PdfEditorApp {
                                 let mut block_index = 0usize;
                                 while block_index < document.blocks.len() {
                                     let block = &document.blocks[block_index];
-                                    if hidden_contents.get(block_index).copied().unwrap_or(false)
-                                        || should_hide_contents_block_for_display(block)
-                                    {
+                                    if review_skips_block_as_furniture(
+                                        block,
+                                        hidden_contents.get(block_index).copied().unwrap_or(false),
+                                    ) {
                                         // #29: reveal hidden furniture (dimmed) when toggled on.
                                         if self.liquid_show_hidden_furniture {
                                             self.draw_liquid_hidden_furniture_block(ui, block);
@@ -6897,33 +6943,26 @@ impl PdfEditorApp {
                                         block_index += 1;
                                         continue;
                                     }
-                                    if matches!(
-                                        block.role,
-                                        LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote
-                                    ) && self.liquid_hide_footnotes
+                                    if is_review_note_display_block(block)
+                                        && self.liquid_hide_footnotes
                                     {
                                         block_index += 1;
                                         continue;
                                     }
-                                    if block.role == LiquidBlockRole::Marginalia {
-                                        let mut margin_notes = Vec::new();
-                                        while block_index < document.blocks.len() {
-                                            let note = &document.blocks[block_index];
-                                            if hidden_contents
-                                                .get(block_index)
-                                                .copied()
-                                                .unwrap_or(false)
-                                                || should_hide_contents_block_for_display(note)
-                                            {
-                                                block_index += 1;
-                                                continue;
-                                            }
-                                            if note.role != LiquidBlockRole::Marginalia {
-                                                break;
-                                            }
-                                            margin_notes.push((block_index, note));
-                                            block_index += 1;
-                                        }
+                                    if is_review_margin_note_block(block) {
+                                        let (indices, next_index) =
+                                            review_collect_margin_note_indices(
+                                                &document.blocks,
+                                                block_index,
+                                                &hidden_contents,
+                                            );
+                                        let margin_notes = indices
+                                            .iter()
+                                            .map(|&note_index| {
+                                                (note_index, &document.blocks[note_index])
+                                            })
+                                            .collect::<Vec<_>>();
+                                        block_index = next_index;
                                         self.draw_liquid_reader_row(
                                             ui,
                                             &document,
@@ -6962,22 +7001,17 @@ impl PdfEditorApp {
                                         }
                                         continue;
                                     }
-                                    let mut margin_notes = Vec::new();
-                                    let mut next_index = block_index + 1;
-                                    while next_index < document.blocks.len() {
-                                        let note = &document.blocks[next_index];
-                                        if hidden_contents.get(next_index).copied().unwrap_or(false)
-                                            || should_hide_contents_block_for_display(note)
-                                        {
-                                            next_index += 1;
-                                            continue;
-                                        }
-                                        if note.role != LiquidBlockRole::Marginalia {
-                                            break;
-                                        }
-                                        margin_notes.push((next_index, note));
-                                        next_index += 1;
-                                    }
+                                    let (indices, next_index) = review_collect_margin_note_indices(
+                                        &document.blocks,
+                                        block_index + 1,
+                                        &hidden_contents,
+                                    );
+                                    let margin_notes = indices
+                                        .iter()
+                                        .map(|&note_index| {
+                                            (note_index, &document.blocks[note_index])
+                                        })
+                                        .collect::<Vec<_>>();
                                     self.draw_liquid_reader_row(
                                         ui,
                                         &document,
@@ -7097,7 +7131,7 @@ impl PdfEditorApp {
                             LiquidState::Idle => {
                                 ui.label(RichText::new("Review Mode").size(26.0).strong());
                                 if ui.button("Prepare Review Mode").clicked() {
-                                    self.ensure_liquid_mode2_started(ctx);
+                                    self.request_full_review_prepare(ctx);
                                 }
                             }
                             LiquidState::PreparingText => {
@@ -7132,7 +7166,7 @@ impl PdfEditorApp {
                                 if ui.button("Retry Review Mode").clicked() {
                                     self.liquid_mode2_state = LiquidState::Idle;
                                     self.reset_liquid_mode2_jobs();
-                                    self.ensure_liquid_mode2_started(ctx);
+                                    self.request_full_review_prepare(ctx);
                                 }
                             }
                             LiquidState::Ready(document) => {
@@ -7142,6 +7176,7 @@ impl PdfEditorApp {
                                     ui.vertical(|ui| {
                                         ui.set_width(width);
                                         self.draw_liquid_controls(ui, &document);
+                                        self.draw_review_full_prepare_prompt(ui, ctx);
                                         self.draw_liquid_tts_controls(ui, &document);
                                     });
                                 });
@@ -7159,9 +7194,10 @@ impl PdfEditorApp {
                                 let mut block_index = 0usize;
                                 while block_index < document.blocks.len() {
                                     let block = &document.blocks[block_index];
-                                    if hidden_contents.get(block_index).copied().unwrap_or(false)
-                                        || should_hide_contents_block_for_display(block)
-                                    {
+                                    if review_skips_block_as_furniture(
+                                        block,
+                                        hidden_contents.get(block_index).copied().unwrap_or(false),
+                                    ) {
                                         // #29: reveal hidden furniture (dimmed) when toggled on.
                                         if self.liquid_show_hidden_furniture {
                                             self.draw_liquid_hidden_furniture_block(ui, block);
@@ -7169,33 +7205,26 @@ impl PdfEditorApp {
                                         block_index += 1;
                                         continue;
                                     }
-                                    if matches!(
-                                        block.role,
-                                        LiquidBlockRole::Marginalia | LiquidBlockRole::Footnote
-                                    ) && self.liquid_hide_footnotes
+                                    if is_review_note_display_block(block)
+                                        && self.liquid_hide_footnotes
                                     {
                                         block_index += 1;
                                         continue;
                                     }
-                                    if block.role == LiquidBlockRole::Marginalia {
-                                        let mut margin_notes = Vec::new();
-                                        while block_index < document.blocks.len() {
-                                            let note = &document.blocks[block_index];
-                                            if hidden_contents
-                                                .get(block_index)
-                                                .copied()
-                                                .unwrap_or(false)
-                                                || should_hide_contents_block_for_display(note)
-                                            {
-                                                block_index += 1;
-                                                continue;
-                                            }
-                                            if note.role != LiquidBlockRole::Marginalia {
-                                                break;
-                                            }
-                                            margin_notes.push((block_index, note));
-                                            block_index += 1;
-                                        }
+                                    if is_review_margin_note_block(block) {
+                                        let (indices, next_index) =
+                                            review_collect_margin_note_indices(
+                                                &document.blocks,
+                                                block_index,
+                                                &hidden_contents,
+                                            );
+                                        let margin_notes = indices
+                                            .iter()
+                                            .map(|&note_index| {
+                                                (note_index, &document.blocks[note_index])
+                                            })
+                                            .collect::<Vec<_>>();
+                                        block_index = next_index;
                                         self.draw_liquid_reader_row(
                                             ui,
                                             &document,
@@ -7234,22 +7263,17 @@ impl PdfEditorApp {
                                         }
                                         continue;
                                     }
-                                    let mut margin_notes = Vec::new();
-                                    let mut next_index = block_index + 1;
-                                    while next_index < document.blocks.len() {
-                                        let note = &document.blocks[next_index];
-                                        if hidden_contents.get(next_index).copied().unwrap_or(false)
-                                            || should_hide_contents_block_for_display(note)
-                                        {
-                                            next_index += 1;
-                                            continue;
-                                        }
-                                        if note.role != LiquidBlockRole::Marginalia {
-                                            break;
-                                        }
-                                        margin_notes.push((next_index, note));
-                                        next_index += 1;
-                                    }
+                                    let (indices, next_index) = review_collect_margin_note_indices(
+                                        &document.blocks,
+                                        block_index + 1,
+                                        &hidden_contents,
+                                    );
+                                    let margin_notes = indices
+                                        .iter()
+                                        .map(|&note_index| {
+                                            (note_index, &document.blocks[note_index])
+                                        })
+                                        .collect::<Vec<_>>();
                                     self.draw_liquid_reader_row(
                                         ui,
                                         &document,
@@ -8456,23 +8480,23 @@ try {
         text: &str,
         size: f32,
         color: Color32,
+        strong: bool,
     ) -> Vec<(Rect, u16)> {
+        let body_text = |value: &str| {
+            let mut rich = RichText::new(value).size(size).color(color);
+            if strong {
+                rich = rich.strong();
+            }
+            rich
+        };
         let has_callout = text.contains(crate::layout_roles::CALLOUT_START);
         if self.liquid_hide_footnotes && has_callout {
             let stripped = strip_liquid_footnote_callouts(text);
-            ui.add(
-                egui::Label::new(RichText::new(stripped).size(size).color(color))
-                    .wrap()
-                    .selectable(true),
-            );
+            ui.add(egui::Label::new(body_text(&stripped)).wrap().selectable(true));
             return Vec::new();
         }
         if !has_callout {
-            ui.add(
-                egui::Label::new(RichText::new(text).size(size).color(color))
-                    .wrap()
-                    .selectable(true),
-            );
+            ui.add(egui::Label::new(body_text(text)).wrap().selectable(true));
             return Vec::new();
         }
 
@@ -8510,7 +8534,7 @@ try {
             for (is_callout, run) in &segments {
                 if !is_callout {
                     ui.add(
-                        egui::Label::new(RichText::new(run).size(size).color(color))
+                        egui::Label::new(body_text(run))
                             .wrap()
                             .selectable(true),
                     );
@@ -8521,14 +8545,14 @@ try {
                     .parse::<u16>()
                     .ok()
                     .filter(|n| self.liquid_footnote_index.contains_key(n));
+                let label = review_footnote_superscript(run);
                 if let Some(number) = number {
                     let response = ui
                         .add(
                             egui::Label::new(
-                                RichText::new(run)
-                                    .size(size * 0.66)
-                                    .color(marker_color)
-                                    .raised(),
+                                RichText::new(label)
+                                    .size(size * 0.78)
+                                    .color(marker_color),
                             )
                             .sense(Sense::click()),
                         )
@@ -8536,7 +8560,7 @@ try {
                     marker_hits.push((response.rect, number));
                 } else {
                     ui.add(egui::Label::new(
-                        RichText::new(run).size(size * 0.66).color(muted).raised(),
+                        RichText::new(label).size(size * 0.78).color(muted),
                     ));
                 }
             }
@@ -8687,16 +8711,8 @@ try {
         match block.role {
             LiquidBlockRole::Title => {
                 ui.add_space(8.0);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(&block.text)
-                            .size(30.0 * s)
-                            .strong()
-                            .color(ink),
-                    )
-                    .wrap(),
-                );
-                ui.add_space(12.0);
+                marker_hits = self.draw_liquid_paragraph(ui, &block.text, 30.0 * s, ink, true);
+                ui.add_space(14.0);
             }
             LiquidBlockRole::Heading => {
                 self.draw_review_heading(ui, &block.text, true, s, ink);
@@ -8806,8 +8822,16 @@ try {
                 self.draw_liquid_caption_block(ui, "Table", &block.text);
             }
             LiquidBlockRole::Paragraph => {
-                marker_hits = self.draw_liquid_paragraph(ui, &block.text, 17.0 * s, ink);
-                ui.add_space(8.0);
+                for (index, part) in review_paragraph_display_parts(&block.text)
+                    .into_iter()
+                    .enumerate()
+                {
+                    if index > 0 {
+                        ui.add_space(REVIEW_PARAGRAPH_GAP);
+                    }
+                    marker_hits.extend(self.draw_liquid_paragraph(ui, part, 17.0 * s, ink, false));
+                }
+                ui.add_space(REVIEW_PARAGRAPH_GAP);
             }
             LiquidBlockRole::Lead => {
                 ui.add_space(2.0);
@@ -9108,6 +9132,36 @@ try {
             LiquidTheme::Sepia => Color32::from_rgb(125, 100, 75),
             LiquidTheme::Dark => Color32::from_rgb(170, 165, 155),
         }
+    }
+
+    fn draw_review_full_prepare_prompt(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+        let Some(page_count) = self.document.as_ref().map(|document| document.page_count) else {
+            return;
+        };
+        if self.liquid_mode2_complete
+            || self.liquid_mode2_full_spawned
+            || review_allows_automatic_full_prepare(page_count)
+            || page_count <= review_opening_page_count(page_count)
+        {
+            return;
+        }
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(format!(
+                "Showing the first {} pages of {}. Preparing the rest can pause the app for a few seconds.",
+                review_opening_page_count(page_count),
+                page_count
+            ))
+            .size(12.0)
+            .color(self.liquid_muted_color()),
+        );
+        if ui
+            .button(format!("Prepare entire {page_count}-page document"))
+            .clicked()
+        {
+            self.request_full_review_prepare(ctx);
+        }
+        ui.add_space(6.0);
     }
 
     fn draw_liquid_controls(&mut self, ui: &mut egui::Ui, document: &LiquidDocument) {
@@ -14977,12 +15031,7 @@ fn thumbnail_scale_from_key(render_scale_key: u32) -> f32 {
 fn liquid_note_blocks(blocks: &[LiquidBlock]) -> Vec<&LiquidBlock> {
     blocks
         .iter()
-        .filter(|block| {
-            matches!(
-                block.role,
-                LiquidBlockRole::Footnote | LiquidBlockRole::Marginalia
-            )
-        })
+        .filter(|block| is_review_note_display_block(block))
         .collect()
 }
 
@@ -15098,10 +15147,7 @@ fn split_numbered_list_marker(text: &str) -> Option<(&str, &str, usize)> {
 fn build_liquid_footnote_index(blocks: &[LiquidBlock]) -> HashMap<u16, String> {
     let mut index = HashMap::new();
     for block in blocks {
-        if !matches!(
-            block.role,
-            LiquidBlockRole::Footnote | LiquidBlockRole::Marginalia
-        ) {
+        if !is_review_note_display_block(block) {
             continue;
         }
         for (marker, body) in split_fused_review_notes(&block.text) {
@@ -15269,12 +15315,22 @@ mod app_tests {
     }
 
     #[test]
-    fn review_precompute_is_bounded_to_nonempty_documents_under_120_pages() {
+    fn review_precompute_is_off_on_open_and_large_files_need_an_ask() {
         assert!(!should_precompute_review_on_open(0));
-        assert!(should_precompute_review_on_open(1));
-        assert!(should_precompute_review_on_open(119));
-        assert!(!should_precompute_review_on_open(120));
+        assert!(!should_precompute_review_on_open(1));
+        assert!(!should_precompute_review_on_open(119));
         assert!(!should_precompute_review_on_open(500));
+        assert!(review_allows_automatic_full_prepare(12));
+        assert!(!review_allows_automatic_full_prepare(80));
+        assert_eq!(
+            review_gate_automatic_full(
+                ReviewPrepareAction::SpawnFull { page_count: 80 },
+                80,
+                false
+            ),
+            ReviewPrepareAction::Nothing
+        );
+        assert_eq!(review_footnote_superscript("1"), "¹");
     }
 
     fn loaded_document_for_enrichment(path: &Path, optimized: bool) -> LoadedDocument {

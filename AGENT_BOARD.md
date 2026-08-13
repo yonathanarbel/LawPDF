@@ -459,10 +459,13 @@ Add a line before you build or sweep; delete it when you are done.
 
 | Agent | Holding | Since | Expected |
 |---|---|---|---|
-| grok/release-0.2.25 | Public checkout: commit/tag/publish/install v0.2.25. `C:/tmp/lawpdf-target` only if a last check is needed. Not touching certificate worktrees. | 2026-08-12 | Ship latest so the installed app updates |
+| grok/release-0.2.26 | Public checkout release build. `C:/tmp/lawpdf-target` and `C:/tmp/lawpdf-release-0.2.26`. | 2026-08-12 | Ship Latest v0.2.26 Windows installer; no certificate worktrees; no shared cache clear |
+| grok/review-lazy-ui | done | 2026-08-12 | No auto Review on open; large files wait for Prepare entire; superscripts + paragraph gap |
+| grok/review-bench-3h | done | 2026-08-12 | Display fused-note/TOC/Noise rescue on public checkout; 361/361 HLR notes, 0 gaps; claim released |
+| grok/release-0.2.25 | done | 2026-08-12 | v0.2.25 Latest, installed to Program Files; claim released |
 | grok/review-surface | done | 2026-08-12 | Review-surface fixes included in 0.2.25 |
 | grok/updater-notice | done | 2026-08-12 | Updater banner included in 0.2.25 |
-| codex/review-markdown-remediation | Isolated minimal static-certificate integration only; dedicated worktree/target, cached replay bundles, no shared cache clearing | 14:05 CDT | Recompose after paired Gap regression; terminal-only certificate on frozen `v0.2.24`; no public checkout build |
+| codex/review-markdown-remediation | Isolated Review-only final-state note diagnosis plus scratch-only boundary-model training; dedicated worktrees/targets, cached replay bundles, no shared cache clearing | 14:38 CDT | Preserve shipped `v0.2.25`; diagnose Yale 161 on frozen `v0.2.24`; collect matched model job `3030051`; no public checkout build |
 
 ---
 
@@ -708,6 +711,132 @@ Saw `codex/review-markdown-remediation` 13:25 CDT: it is porting the default-off
   pending only on `QOSMaxJobsPerUserLimit`. Other agents currently hold the
   available GPU slots with `lr-ovis-v1` jobs `3029978_1`, `3030144_1`, and
   `3030140_1`; this stream will not cancel, alter, or duplicate any job.
+
+### 2026-08-12 14:38 CDT — v0.2.25 preserved; final-state diagnosis and training active
+
+- The public checkout is now clean at `5c8e702` / shipped `v0.2.25`, owned by
+  the other agent's updater and Review-surface stream. This remediation stream
+  will not edit, build, rebase, merge, install, or release from the public
+  checkout while the isolated investigation continues.
+- The first `v0.2.24` certificate composition remains rejected: its one Yale
+  improvement depended on skipping late production passes and caused Gap to
+  lose definitions/callouts 69, 102, and 200. Preserving the complete suffix is
+  safe but inert, so no certificate candidate is ready for promotion.
+- Current bounded work is a final-state source/provenance census. Exact Yale
+  evidence shows note 161's encoded definition head survives inside note 160,
+  while its body marker is also retained but misowned as Marginalia. A safe fix
+  therefore needs both definition splitting and body-callout reownership; a
+  definition-only rule is insufficient. No new mutation has passed focal gates.
+- Boundary-model job `3030051` is now RUNNING on `chpc-gpu003` (16 CPU, 96G,
+  A100 request) against the completed 1.436M-pair scratch dataset. It will
+  produce the first matched CatBoost/plain-MLP/BoundaryCrossNet accuracy,
+  calibration, abstention, ONNX-parity, and CPU-latency comparison. No existing
+  Ovis job was cancelled or duplicated, and no `/home` or `/bighome` path is
+  used.
+- Live installation check at 14:40 CDT: the public repository is at `5c8e702`
+  / `v0.2.25`, but `C:/Program Files/LawPDF/lawpdf.exe` still reports product
+  and file version `0.2.24`. Its native/context runtime status exits 0 with
+  `requirements_met: true`. Do not describe `v0.2.25` as installed on this
+  machine until the release stream installs and re-verifies that exact binary.
+
+### 2026-08-12 15:00 CDT — final-state opportunity census complete
+
+- Fail-closed cached replay/enrichment completed for all 143 available documents
+  (Gap + known-ten + lawreview-32 + shadow-100), with nonempty Markdown, replay
+  provenance, and document JSON for every input. No PDF or sealed audit input
+  was opened.
+- Exact final `v0.2.24` evidence contains 756 strong source-encoded definition
+  heads missing from rendered definitions; 665 have a matching callout source,
+  635 are body-owned, and 30 are misowned-only. Marker identity is retained for
+  751/756, disproving the earlier marker-clearing hypothesis.
+- The safe architectural target is a split-only, same-owner transaction: 198
+  candidates have exact bounded same-owner topology and 176 also have a
+  body-renderable marker. It may partition one existing Marginalia block but
+  must not move owners, roles, source IDs, neighboring blocks, or body text.
+- Yale note 161 is inside this 176-candidate ceiling: its definition head is
+  retained inside note 160 and the final body paragraph already contains the
+  encoded callout. The implementation is being rewritten as propose/validate/
+  commit after an unsafe dry-run draft was rejected. No focal result yet.
+- Durable census report:
+  `D:/lawpdf-private/review-remediation-sprint-20260812/reports/final-v024-note-opportunity-census.md`
+  (SHA-256 `163E9FB487B8A8252D972F31E60CEAD5B66D2D15D4A72A2E47C97B23C6F0CFDD`).
+
+### 2026-08-12 16:02 CDT - near-stop promotion gate in progress
+
+- The broad 176-candidate split-only idea was reduced by an independent
+  document-complete certificate to one unique Tier-A source signature, Yale
+  note 161 (present once in known-ten and once in shadow-100). Tier B has zero
+  certifiable corpus candidates and is closed for this sprint.
+- The first Tier-A implementation is rejected evidence, even though its Yale
+  focal output improved, because review found a mixed-batch relocation leak,
+  normalized rather than byte-exact note reconstruction, weak destination
+  ownership proof, and proxy rather than semantic link validation.
+- The hardened replacement is fail-whole-batch and atomic. It partitions the
+  original note-block bytes at unique exact head offsets, conserves source IDs
+  and body payloads, requires unique exact ownership/article/order and terminal
+  body-anchor evidence, preserves every existing semantic body-callout link,
+  and requires exactly one new semantic link per repair. Focused tests and the
+  974-test devtools suite pass.
+- A first hardened binary failed safely as a Yale no-op because its legacy-link
+  signature demanded unavailable target-source provenance. The bounded
+  correction conserves stable `(article, marker, body source, ordinal)` callout
+  identities while separately proving the exact new definition head. Direct
+  Yale replay now produces the expected 488 blocks / 341 links and Markdown
+  SHA-256 `0609607E3B7FA2EAD1869720CDCD718D0B046DA0E08253B6A0F3BB5FBFF9646E`.
+  Exact release executable SHA-256 is
+  `C9AC098AFAF784B8066F304DC221D8B4C1C3B435A932E3788BC2A90E71D727CA`.
+- Same-executable OFF/ON Yale and Gap gates are running first; no broad claim
+  is permitted unless Yale gains exactly note/link 161 without a new defect and
+  Gap is byte-identical. Independent rereview and, only after focal success,
+  known-ten/lawreview-32/shadow-100 plus latency remain mandatory.
+- Boundary jobs `3030050` and `3030051` are remotely reported complete, but one
+  authorized artifact-collection attempt timed out at the first read-only
+  `sacct`. No held-out model metrics or ONNX artifact has therefore been locally
+  validated, and no boundary model is promoted.
+- Public `5c8e702` / v0.2.25, the installed GUI, and the separate non-Review
+  stream remain untouched. No release or installer action is authorized here.
+
+### 2026-08-12 16:35 CDT - Tier-A candidate passes and is frozen
+
+- Frozen isolated commit `dddb24a` and release executable SHA-256
+  `C9AC098AFAF784B8066F304DC221D8B4C1C3B435A932E3788BC2A90E71D727CA`
+  pass the full cached promotion gate. The transaction remains devtools-only,
+  default OFF, and cache-isolated.
+- Gap is byte-identical OFF/ON at 6 critical / 8 warnings and 193 definitions /
+  links. Known-ten improves 40/51 to 39/51; only `yale-01` changes, adding note
+  161 and link 161 (332 to 333 definitions/references, 340 to 341 links). The
+  historical 32 is exact at 124/212. Shadow-100 improves 711/801 to 710/801;
+  only duplicate `yale-yale-01` changes with the same one-note delta.
+- Reverse-order shadow timing is within gate: OFF then ON is 12.212s/11.756s;
+  ON then OFF is 11.602s/11.408s. Balanced overhead is approximately -1%; worst
+  adverse ordering is +1.70%.
+- Default check passes; full devtools tests pass 974/974. A separate default
+  full-test link attempt exhausted host memory, not a test assertion. No sealed
+  corpus, public source, installed app, release, or installer was touched.
+- Promotion scope is deliberately narrow: retain `dddb24a` as a reviewed
+  candidate and port only its minimal final-state certificate/cache/resolver
+  slice onto current `5c8e702` before any production merge. Do not cherry-pick
+  the disposable replay/experimental history wholesale. Repeat all gates on
+  the exact v0.2.25 integration and only then consider sealed audit/release.
+
+### 2026-08-12 17:15 CDT - minimal v0.2.25 Tier-A port frozen for replay gating
+
+- Review work remains isolated from the public checkout and the separate
+  non-Review stream. The exact v0.2.25 base is public `5c8e702`; the candidate
+  worktree is `C:/tmp/lawpdf-tier-a-v025-integration-20260812` on commit
+  `12d7c7ae75fec05cd1f4e219cfdd66f7ea78b9bc`.
+- The production candidate contains only three Review files: the final-state
+  Tier-A certificate, terminal invocation/cache isolation in `src/liquid2.rs`,
+  and the internal footnote-link resolver re-export. Replay, profiling, app,
+  updater, and release-history changes were deliberately excluded.
+- Focused gates pass on v0.2.25: 3/3 Tier-A transaction tests plus normal and
+  fast-cache isolation tests. Devtools `cargo check --locked` passes using
+  `C:/tmp/lawpdf-target-tier-a-v025`; no build output entered Box.
+- This is a candidate commit, not a public merge or release. Next gate is a
+  disposable replay-only validation layer with paired OFF/ON Gap, known-ten,
+  lawreview-32, shadow-100, per-category verifier, link, hash, and latency
+  comparison. The production commit is promotable only if the prior Yale-only
+  gain reproduces exactly and all other documents remain invariant.
 
 ---
 

@@ -5,13 +5,22 @@
 //! path. Keep them free of Pdfium and native-model I/O so tests can drive them
 //! directly.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
 
 use crate::liquid::{
-    hidden_contents_mask_for_display, ArticleSpan, LiquidBlock, LiquidBlockRole, LiquidDocument,
+    hidden_contents_mask_for_display, should_hide_contents_block_for_display, ArticleSpan,
+    LiquidBlock, LiquidBlockRole, LiquidDocument,
 };
 
 pub const REVIEW_OPENING_PAGE_LIMIT: usize = 4;
+/// Opening a PDF never starts a full Review job. Cache hits are free; anything
+/// larger waits until the user actually opens Review.
+pub const REVIEW_AUTO_PRECOMPUTE_PAGE_LIMIT_EXCLUSIVE: usize = 1;
+/// Full-document Review is automatic only for short files. Longer PDFs stay on
+/// the opening-page preview until the user asks for the rest.
+pub const REVIEW_AUTO_FULL_PAGE_LIMIT_EXCLUSIVE: usize = 32;
+pub const REVIEW_PARAGRAPH_GAP: f32 = 16.0;
 pub const REVIEW_MARGIN_MIN_WIDTH: f32 = 168.0;
 pub const REVIEW_MARGIN_MAX_WIDTH: f32 = 260.0;
 pub const REVIEW_MARGIN_GAP: f32 = 16.0;
@@ -28,6 +37,10 @@ pub fn review_hidden_display_mask(blocks: &[LiquidBlock]) -> Vec<bool> {
         .filter(|key| !key.is_empty())
         .collect::<HashSet<_>>();
     for (index, block) in blocks.iter().enumerate() {
+        if is_review_note_display_block(block) {
+            mask[index] = false;
+            continue;
+        }
         if is_review_table_of_contents_text(&block.text) {
             mask[index] = true;
             continue;
@@ -236,10 +249,7 @@ pub fn compound_toc_entries(text: &str) -> Vec<String> {
             .map_or(leader_end, |(offset, _)| leader_end + offset);
         let locator_end = text[locator_start..]
             .char_indices()
-            .find(|(_, ch)| {
-                !ch.is_ascii_digit()
-                    && !matches!(ch.to_ascii_lowercase(), 'i' | 'v' | 'x' | 'l' | 'c')
-            })
+            .find(|(_, ch)| ch.is_whitespace())
             .map_or(text.len(), |(offset, _)| locator_start + offset);
         let locator = text[locator_start..locator_end].trim();
         if !title.is_empty() && is_toc_page_locator_token(locator) {
@@ -344,6 +354,55 @@ pub fn review_opening_page_count(total_pages: usize) -> usize {
     total_pages.min(REVIEW_OPENING_PAGE_LIMIT)
 }
 
+/// Background Review on file-open is cache-only. Starting extract + model work
+/// here is what stalls the UI and wastes cost on PDFs the user never Reviews.
+pub fn should_precompute_review_on_open(page_count: usize) -> bool {
+    (1..REVIEW_AUTO_PRECOMPUTE_PAGE_LIMIT_EXCLUSIVE).contains(&page_count)
+}
+
+pub fn review_allows_automatic_full_prepare(page_count: usize) -> bool {
+    page_count > 0 && page_count < REVIEW_AUTO_FULL_PAGE_LIMIT_EXCLUSIVE
+}
+
+/// Law-review style superscripts. Regular digits plus `.raised()` look like a
+/// floating callout chip; these sit on the line like a print footnote.
+pub fn review_footnote_superscript(marker: &str) -> String {
+    marker
+        .trim()
+        .chars()
+        .map(|ch| match ch {
+            '0' => '⁰',
+            '1' => '¹',
+            '2' => '²',
+            '3' => '³',
+            '4' => '⁴',
+            '5' => '⁵',
+            '6' => '⁶',
+            '7' => '⁷',
+            '8' => '⁸',
+            '9' => '⁹',
+            '*' | '∗' => '⁎',
+            _ => ch,
+        })
+        .collect()
+}
+
+/// Visual paragraph breaks already present in a single Review block.
+pub fn review_paragraph_display_parts(text: &str) -> Vec<&str> {
+    let parts = text
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() > 1 {
+        parts
+    } else if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![text]
+    }
+}
+
 /// True when the first readable Review screen can be built from the pages that
 /// are already extracted. A longer document must not wait for later pages.
 pub fn opening_pages_ready_for_review(
@@ -423,6 +482,21 @@ pub fn review_prepare_next_action(
         }
     } else {
         ReviewPrepareAction::WaitForPages
+    }
+}
+
+/// Drop a full-document spawn when the file is large and the user has not asked.
+pub fn review_gate_automatic_full(
+    action: ReviewPrepareAction,
+    total_pages: usize,
+    allow_full: bool,
+) -> ReviewPrepareAction {
+    if allow_full || total_pages <= review_opening_page_count(total_pages) {
+        return action;
+    }
+    match action {
+        ReviewPrepareAction::SpawnFull { .. } => ReviewPrepareAction::Nothing,
+        other => other,
     }
 }
 
@@ -527,24 +601,59 @@ pub fn split_fused_review_notes(text: &str) -> Vec<(String, String)> {
         return Vec::new();
     }
     let (first_marker, first_body) = split_leading_note_marker(trimmed);
-    let start_number = first_marker.and_then(|marker| marker.parse::<u16>().ok());
-    let mut starts = vec![(
-        0usize,
-        first_marker
-            .map(str::to_owned)
-            .unwrap_or_else(|| "*".to_owned()),
-    )];
-    let mut expected = start_number.map(|number| number.saturating_add(1)).unwrap_or(1);
-    let mut search_from = first_marker.map(|marker| marker.len()).unwrap_or(0);
-    while let Some((at, number)) = find_next_fused_note_number(trimmed, search_from, expected) {
-        starts.push((at, number.to_string()));
-        expected = number.saturating_add(1);
-        search_from = at + number.to_string().len();
+    let leading_number = first_marker.and_then(|marker| marker.parse::<u16>().ok());
+    let mut starts = Vec::new();
+    if let Some(number) = leading_number {
+        starts.push((0usize, number.to_string()));
+        let mut expected = number.saturating_add(1);
+        let mut search_from = first_marker.map(|marker| marker.len()).unwrap_or(0);
+        while let Some((at, found)) = find_next_fused_note_number(trimmed, search_from, expected) {
+            starts.push((at, found.to_string()));
+            expected = found.saturating_add(1);
+            search_from = at + found.to_string().len();
+        }
+        if starts.len() == 1 {
+            if let Some(run) = first_fused_note_run(trimmed, search_from) {
+                if false_leading_note_head(number, &run) {
+                    starts = run
+                        .into_iter()
+                        .map(|(at, found)| (at, found.to_string()))
+                        .collect();
+                }
+            }
+        }
+    } else {
+        if trimmed.starts_with(['*', '∗']) {
+            starts.push((0usize, "*".to_owned()));
+        }
+        if let Some(run) = first_fused_note_run(trimmed, 0) {
+            for (at, found) in run {
+                starts.push((at, found.to_string()));
+            }
+        }
+        if starts.is_empty() {
+            return vec![("*".to_owned(), first_body.trim().to_owned())];
+        }
     }
-    if starts.len() == 1 {
-        return vec![(starts[0].1.clone(), first_body.trim().to_owned())];
-    }
+    emit_fused_note_parts(trimmed, &starts, first_body)
+}
+
+fn emit_fused_note_parts(
+    trimmed: &str,
+    starts: &[(usize, String)],
+    first_body: &str,
+) -> Vec<(String, String)> {
     let mut parts = Vec::new();
+    let first_at = starts.first().map(|(at, _)| *at).unwrap_or(0);
+    if first_at > 0 {
+        let continuation = continuation_body_from_prefix(trimmed[..first_at].trim());
+        if !continuation.is_empty() {
+            parts.push(("*".to_owned(), continuation));
+        }
+    } else if starts.len() == 1 {
+        let body = first_body.trim().to_owned();
+        return vec![(starts[0].1.clone(), body)];
+    }
     for (index, (start, marker)) in starts.iter().enumerate() {
         let end = starts
             .get(index + 1)
@@ -554,39 +663,79 @@ pub fn split_fused_review_notes(text: &str) -> Vec<(String, String)> {
         let body = chunk
             .strip_prefix(marker.as_str())
             .unwrap_or(chunk)
+            .trim_start_matches(['.', ')', ':'])
             .trim()
             .to_owned();
         if !body.is_empty() || marker != "*" {
             parts.push((marker.clone(), body));
         }
     }
+    if parts.is_empty() {
+        return vec![("*".to_owned(), first_body.trim().to_owned())];
+    }
     parts
 }
 
-fn split_leading_note_marker(text: &str) -> (Option<&str>, &str) {
-    let trimmed = text.trim_start();
-    let mut end = 0usize;
-    let mut digits = 0usize;
-    for (index, ch) in trimmed.char_indices() {
-        if ch.is_ascii_digit() && digits < 3 {
-            digits += 1;
-            end = index + ch.len_utf8();
-            continue;
-        }
-        break;
-    }
-    if digits == 0 {
-        return (None, trimmed);
-    }
-    let rest = &trimmed[end..];
-    if rest.starts_with(char::is_whitespace)
-        || rest.starts_with(['.', ')', ':'])
-        || rest.is_empty()
-    {
-        (Some(&trimmed[..end]), rest.trim_start_matches(['.', ')', ':']).trim_start())
+fn continuation_body_from_prefix(prefix: &str) -> String {
+    let (marker, body) = split_leading_note_marker(prefix);
+    if marker.is_some() {
+        body.trim().to_owned()
     } else {
-        (None, trimmed)
+        prefix.trim().to_owned()
     }
+}
+
+fn first_fused_note_run(text: &str, from: usize) -> Option<Vec<(usize, u16)>> {
+    let (at, number) = find_first_plausible_note_head(text, from)?;
+    let mut run = vec![(at, number)];
+    let mut expected = number.saturating_add(1);
+    let mut search = at + number.to_string().len();
+    while let Some((next_at, found)) = find_next_fused_note_number(text, search, expected) {
+        run.push((next_at, found));
+        expected = found.saturating_add(1);
+        search = next_at + found.to_string().len();
+    }
+    Some(run)
+}
+
+fn false_leading_note_head(lead: u16, run: &[(usize, u16)]) -> bool {
+    run.len() >= 2 && run[0].1.saturating_add(15) < lead
+}
+
+fn find_first_plausible_note_head(text: &str, from: usize) -> Option<(usize, u16)> {
+    let tail = text.get(from..)?;
+    let mut search = 0usize;
+    while search < tail.len() {
+        let rest = &tail[search..];
+        let Some(digit_at) = rest.find(|ch: char| ch.is_ascii_digit()) else {
+            return None;
+        };
+        let abs = from + search + digit_at;
+        let mut end = abs;
+        let mut digits = 0usize;
+        for (index, ch) in text[abs..].char_indices() {
+            if ch.is_ascii_digit() && digits < 3 {
+                digits += 1;
+                end = abs + index + ch.len_utf8();
+                continue;
+            }
+            break;
+        }
+        let parsed = text[abs..end].parse::<u16>().ok();
+        let next = text.get(end..).and_then(|suffix| suffix.chars().next());
+        if let Some(number) = parsed {
+            if (1..=399).contains(&number)
+                && next.is_some_and(|ch| ch.is_whitespace())
+                && !note_number_has_citation_prefix(text, abs)
+                && (abs == 0 || note_number_follows_sentence_break(text, abs))
+                && !note_number_is_citation_token(text, abs, number)
+            {
+                return Some((abs, number));
+            }
+        }
+        search = end.saturating_sub(from).max(search + 1);
+    }
+    None
 }
 
 fn find_next_fused_note_number(text: &str, from: usize, expected: u16) -> Option<(usize, u16)> {
@@ -617,17 +766,41 @@ fn find_note_number_at_boundary(text: &str, from: usize, number: u16) -> Option<
             search = after;
             continue;
         }
-        if note_number_has_citation_prefix(text, at) {
-            search = after;
-            continue;
-        }
-        if !note_number_follows_sentence_break(text, at) {
+        if note_number_has_citation_prefix(text, at)
+            || !note_number_follows_sentence_break(text, at)
+        {
             search = after;
             continue;
         }
         return Some(at);
     }
     None
+}
+
+fn split_leading_note_marker(text: &str) -> (Option<&str>, &str) {
+    let trimmed = text.trim_start();
+    let mut end = 0usize;
+    let mut digits = 0usize;
+    for (index, ch) in trimmed.char_indices() {
+        if ch.is_ascii_digit() && digits < 3 {
+            digits += 1;
+            end = index + ch.len_utf8();
+            continue;
+        }
+        break;
+    }
+    if digits == 0 {
+        return (None, trimmed);
+    }
+    let rest = &trimmed[end..];
+    if rest.starts_with(char::is_whitespace)
+        || rest.starts_with(['.', ')', ':'])
+        || rest.is_empty()
+    {
+        (Some(&trimmed[..end]), rest.trim_start_matches(['.', ')', ':']).trim_start())
+    } else {
+        (None, trimmed)
+    }
 }
 
 fn note_number_has_citation_prefix(text: &str, at: usize) -> bool {
@@ -641,7 +814,23 @@ fn note_number_has_citation_prefix(text: &str, at: usize) -> bool {
         .to_ascii_lowercase();
     matches!(
         prefix.as_str(),
-        "note" | "notes" | "n" | "nn" | "p" | "pp" | "at" | "supra" | "infra" | "§"
+        "note"
+            | "notes"
+            | "n"
+            | "nn"
+            | "p"
+            | "pp"
+            | "at"
+            | "supra"
+            | "infra"
+            | "§"
+            | "rev"
+            | "vol"
+            | "volume"
+            | "id"
+            | "ibid"
+            | "cir"
+            | "app"
     )
 }
 
@@ -650,7 +839,149 @@ fn note_number_follows_sentence_break(text: &str, at: usize) -> bool {
     if prefix.is_empty() {
         return true;
     }
-    prefix.ends_with(['.', '?', '!', ';', ':', '”', '"', ')', '…'])
+    prefix.ends_with([
+        '.', '?', '!', ';', ':', ')', '…', '"', '\u{201C}', '\u{201D}', '\u{2018}', '\u{2019}',
+    ])
+}
+
+fn note_number_is_citation_token(text: &str, at: usize, number: u16) -> bool {
+    let after = at + number.to_string().len();
+    let rest = text.get(after..).unwrap_or("").trim_start();
+    if rest.starts_with('(') {
+        let year: String = rest.chars().skip(1).take(4).collect();
+        if year.len() == 4 && year.chars().all(|ch| ch.is_ascii_digit()) {
+            if let Ok(parsed) = year.parse::<u16>() {
+                if (1600..=2099).contains(&parsed) {
+                    return true;
+                }
+            }
+        }
+    }
+    if looks_like_reporter_start(rest) || looks_like_volume_title(rest) {
+        return true;
+    }
+    false
+}
+
+fn looks_like_reporter_start(rest: &str) -> bool {
+    let token = rest
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches([',', ';', ':']);
+    let compact: String = token
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+    matches!(
+        compact.as_str(),
+        "p2d"
+            | "p3d"
+            | "a2d"
+            | "a3d"
+            | "ne"
+            | "ne2d"
+            | "nw"
+            | "nw2d"
+            | "se"
+            | "se2d"
+            | "sw"
+            | "sw2d"
+            | "so"
+            | "so2d"
+            | "so3d"
+            | "f2d"
+            | "f3d"
+            | "f4th"
+            | "fsupp"
+            | "fsupp2d"
+            | "us"
+            | "sct"
+            | "led"
+            | "led2d"
+            | "eng"
+    )
+}
+
+fn looks_like_volume_title(rest: &str) -> bool {
+    let mut words = rest.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    let Some(second) = words.next() else {
+        return false;
+    };
+    is_smallcaps_title_word(first) && is_smallcaps_title_word(second)
+}
+
+fn is_smallcaps_title_word(word: &str) -> bool {
+    let letters: String = word.chars().filter(|ch| ch.is_ascii_alphabetic()).collect();
+    !letters.is_empty() && letters.chars().all(|ch| ch.is_ascii_uppercase())
+}
+
+/// Footnote/marginalia blocks, plus Noise that is actually a dropped note.
+pub fn is_review_note_display_block(block: &LiquidBlock) -> bool {
+    matches!(
+        block.role,
+        LiquidBlockRole::Footnote | LiquidBlockRole::Marginalia
+    ) || (block.role == LiquidBlockRole::Noise && noise_block_is_review_note(&block.text))
+}
+
+/// Marginalia and rescued Noise notes sit in the side rail, not the body.
+pub fn is_review_margin_note_block(block: &LiquidBlock) -> bool {
+    block.role == LiquidBlockRole::Marginalia
+        || (block.role == LiquidBlockRole::Noise && noise_block_is_review_note(&block.text))
+}
+
+pub fn noise_block_is_review_note(text: &str) -> bool {
+    let (marker, body) = split_leading_note_marker(text.trim());
+    let Some(marker) = marker else {
+        return false;
+    };
+    let Ok(number) = marker.parse::<u16>() else {
+        return false;
+    };
+    if !(1..=399).contains(&number) {
+        return false;
+    }
+    let body = body.trim();
+    if body.is_empty() || body.starts_with(']') || is_review_table_of_contents_text(body) {
+        return false;
+    }
+    body.chars().next().is_some_and(|ch| ch.is_alphabetic())
+        && body.split_whitespace().count() >= 6
+}
+
+/// Furniture skip for the Review column. Rescued notes are never furniture.
+pub fn review_skips_block_as_furniture(block: &LiquidBlock, hidden_by_mask: bool) -> bool {
+    if is_review_note_display_block(block) {
+        return false;
+    }
+    hidden_by_mask || should_hide_contents_block_for_display(block)
+}
+
+/// Consecutive margin notes from `start`, skipping true furniture only.
+pub fn review_collect_margin_note_indices(
+    blocks: &[LiquidBlock],
+    mut index: usize,
+    hidden: &[bool],
+) -> (Vec<usize>, usize) {
+    let mut notes = Vec::new();
+    while index < blocks.len() {
+        let block = &blocks[index];
+        let is_hidden = hidden.get(index).copied().unwrap_or(false);
+        if review_skips_block_as_furniture(block, is_hidden) {
+            index += 1;
+            continue;
+        }
+        if !is_review_margin_note_block(block) {
+            break;
+        }
+        notes.push(index);
+        index += 1;
+    }
+    (notes, index)
 }
 
 pub fn article_spans_may_revoke_global_note_starts(spans: &[ArticleSpan]) -> bool {
@@ -818,6 +1149,181 @@ pub fn review_table_figure_crop(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ReviewDisplayBenchmark {
+    pub document: String,
+    pub source_retention: f64,
+    pub visible_words: usize,
+    pub retained_source_words: usize,
+    pub criticals_by_category: BTreeMap<String, usize>,
+    pub fused_note_first_only: Vec<u16>,
+    pub fused_note_visible: Vec<u16>,
+    pub fused_note_longest_consecutive: usize,
+    pub fused_note_gap_count: usize,
+    pub hidden_toc_blocks: usize,
+    pub hidden_reprint_titles: usize,
+    pub keep_lines_omitted: usize,
+}
+
+/// Display-layer Review metrics used as the 3-hour before/after snapshot.
+/// Source retention is visible Review words over non-furniture words.
+pub fn review_display_benchmark(
+    document: &str,
+    blocks: &[LiquidBlock],
+    keep_line_ids: &[&str],
+    assembled_line_ids: &HashSet<String>,
+) -> ReviewDisplayBenchmark {
+    let hidden = review_hidden_display_mask(blocks);
+    let first_only = first_only_note_markers(blocks);
+    let visible = visible_review_note_sequence(blocks);
+    let (longest, gaps) = note_sequence_run_and_gaps(&visible);
+    let mut criticals = BTreeMap::new();
+    criticals.insert("note.sequence_gap".to_owned(), gaps);
+    criticals.insert(
+        "note.collapsed_vs_split".to_owned(),
+        visible.len().saturating_sub(first_only.len()),
+    );
+    let hidden_toc = blocks
+        .iter()
+        .zip(hidden.iter())
+        .filter(|(block, hide)| {
+            **hide
+                && (is_review_table_of_contents_text(&block.text)
+                    || block.role == LiquidBlockRole::Contents)
+        })
+        .count();
+    let hidden_reprints = blocks
+        .iter()
+        .enumerate()
+        .filter(|(index, block)| {
+            hidden.get(*index).copied().unwrap_or(false)
+                && matches!(
+                    block.role,
+                    LiquidBlockRole::Heading | LiquidBlockRole::Subheading
+                )
+                && !is_review_table_of_contents_text(&block.text)
+        })
+        .count();
+    criticals.insert("furniture.toc_leaked".to_owned(), {
+        blocks
+            .iter()
+            .zip(hidden.iter())
+            .filter(|(block, hide)| {
+                !**hide && is_review_table_of_contents_text(&block.text)
+            })
+            .count()
+    });
+    let omitted = omitted_keep_source_ids(keep_line_ids.iter().copied(), assembled_line_ids);
+    let (visible_words, retained_source_words) = review_retention_words(blocks, &hidden);
+    let source_retention = if retained_source_words == 0 {
+        1.0
+    } else {
+        visible_words as f64 / retained_source_words as f64
+    };
+    ReviewDisplayBenchmark {
+        document: document.to_owned(),
+        source_retention,
+        visible_words,
+        retained_source_words,
+        criticals_by_category: criticals,
+        fused_note_first_only: first_only,
+        fused_note_visible: visible,
+        fused_note_longest_consecutive: longest,
+        fused_note_gap_count: gaps,
+        hidden_toc_blocks: hidden_toc,
+        hidden_reprint_titles: hidden_reprints,
+        keep_lines_omitted: omitted.len(),
+    }
+}
+
+pub fn write_review_display_benchmark_json(
+    path: &Path,
+    snapshot: &ReviewDisplayBenchmark,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let bytes = serde_json::to_vec_pretty(snapshot).map_err(|error| error.to_string())?;
+    std::fs::write(path, bytes).map_err(|error| error.to_string())
+}
+
+/// Leading marker only — the old Review notes-list collapse.
+pub fn first_only_note_markers(blocks: &[LiquidBlock]) -> Vec<u16> {
+    blocks
+        .iter()
+        .filter(|block| is_review_note_display_block(block))
+        .filter_map(|block| split_leading_note_marker(block.text.trim()).0)
+        .filter_map(|marker| marker.parse().ok())
+        .filter(|number| *number > 0)
+        .collect()
+}
+
+/// Visible Review note numbers after fused-block splitting, in document order.
+pub fn visible_review_note_sequence(blocks: &[LiquidBlock]) -> Vec<u16> {
+    let hidden = review_hidden_display_mask(blocks);
+    let mut numbers = Vec::new();
+    for (index, block) in blocks.iter().enumerate() {
+        if hidden.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        if !is_review_note_display_block(block) {
+            continue;
+        }
+        for (marker, _) in split_fused_review_notes(&block.text) {
+            if let Ok(number) = marker.parse::<u16>() {
+                if number > 0 {
+                    numbers.push(number);
+                }
+            }
+        }
+    }
+    numbers
+}
+
+pub fn note_sequence_run_and_gaps(numbers: &[u16]) -> (usize, usize) {
+    if numbers.is_empty() {
+        return (0, 0);
+    }
+    let mut longest = 1usize;
+    let mut run = 1usize;
+    let mut gaps = 0usize;
+    for window in numbers.windows(2) {
+        if window[1] == window[0].saturating_add(1) {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            if window[1] > window[0].saturating_add(1) {
+                gaps += 1;
+            }
+            run = 1;
+        }
+    }
+    (longest, gaps)
+}
+
+fn review_retention_words(blocks: &[LiquidBlock], hidden: &[bool]) -> (usize, usize) {
+    let mut visible = 0usize;
+    let mut source = 0usize;
+    for (index, block) in blocks.iter().enumerate() {
+        let furniture = matches!(
+            block.role,
+            LiquidBlockRole::Header
+                | LiquidBlockRole::Footer
+                | LiquidBlockRole::Contents
+                | LiquidBlockRole::Noise
+                | LiquidBlockRole::SectionBreak
+        ) || is_review_table_of_contents_text(&block.text);
+        let words = block.text.split_whitespace().count();
+        if !furniture {
+            source += words;
+            if !hidden.get(index).copied().unwrap_or(false) {
+                visible += words;
+            }
+        }
+    }
+    (visible, source)
+}
+
 pub fn omitted_keep_source_ids<'a>(
     keep_line_ids: impl IntoIterator<Item = &'a str>,
     assembled_line_ids: &HashSet<String>,
@@ -919,6 +1425,159 @@ mod tests {
             eight.iter().map(|(marker, _)| marker.as_str()).collect::<Vec<_>>(),
             vec!["7", "8", "9"]
         );
+        let continuation = split_fused_review_notes(
+            "among representative persons, with respect to the kinds of dangers that we might reasonably foresee happening.”). 49 For a structurally similar example involving battery, see infra notes 173–75.",
+        );
+        assert_eq!(
+            continuation
+                .iter()
+                .map(|(marker, _)| marker.as_str())
+                .collect::<Vec<_>>(),
+            vec!["*", "49"]
+        );
+        assert!(continuation[0].1.contains("among representative persons"));
+        let page_glitch = split_fused_review_notes(
+            "542. But the law conspicuously declines to impose such liability. 280 See Smith. 281 See Jones. 282 See Brown.",
+        );
+        assert_eq!(
+            page_glitch
+                .iter()
+                .map(|(marker, _)| marker.as_str())
+                .collect::<Vec<_>>(),
+            vec!["*", "280", "281", "282"]
+        );
+        assert!(page_glitch[0].1.contains("conspicuously declines"));
+        assert!(!page_glitch[0].1.contains("542"));
+        let mid = split_fused_review_notes(
+            "foundation of our negligence law.” Id. at 564. 54 See William L. Prosser. 55 See id. 56 See Jones.",
+        );
+        assert_eq!(
+            mid.iter().map(|(marker, _)| marker.as_str()).collect::<Vec<_>>(),
+            vec!["*", "54", "55", "56"]
+        );
+        assert!(mid[0].1.contains("foundation of our negligence law"));
+        let star = split_fused_review_notes(
+            "∗ I am grateful to many friends. This piece is much better than it was before their work. 1 See Sharkey. 2 See Calabresi. 3 Smith New Ct.",
+        );
+        assert_eq!(star[0].0, "*");
+        assert_eq!(
+            star.iter().map(|(marker, _)| marker.as_str()).collect::<Vec<_>>(),
+            vec!["*", "1", "2", "3"]
+        );
+        let volume_in_body = split_fused_review_notes(
+            "125 Compare Frederick Pollock and Frederic William Maitland’s famous remarks. “We and our fathers have got on well enough without such an action.” 2 FREDERICK POLLOCK & FREDERIC WILLIAM MAITLAND, THE HISTORY OF ENGLISH LAW BEFORE THE TIME OF EDWARD I, at 186 (2d ed. 2010).",
+        );
+        assert_eq!(
+            volume_in_body
+                .iter()
+                .map(|(marker, _)| marker.as_str())
+                .collect::<Vec<_>>(),
+            vec!["125"]
+        );
+        let harvard_249 = split_fused_review_notes(
+            "249 See Winter. 250 See RIPSTEIN, supra note 17, at 192–95. 251 See generally Bryson Kern, Note, Reputational Injury, 83 FORDHAM L. REV. 253 (2014) (surveying). 252 See, e.g., Kennedy v. McKesson Co., 448 N.E.2d 1332 (N.Y. 1983). 253 See Kern, supra note 251, at 255.",
+        );
+        assert_eq!(
+            harvard_249
+                .iter()
+                .map(|(marker, _)| marker.as_str())
+                .collect::<Vec<_>>(),
+            vec!["249", "250", "251", "252", "253"]
+        );
+        let restatement = split_fused_review_notes(
+            "308 See RESTATEMENT (SECOND) OF TORTS § 217 cmt. c (A.L.I. 1965) (“The intention required.”). The defendant has committed trespass to chattels and conversion. 309 See supra notes 49–51 and accompanying text. 310 For versions of this idea, see WEINRIB, supra note 17, at 169 n.53. 311 For a structurally similar case, see Lewinsohn, supra note 48, at 199.",
+        );
+        assert_eq!(
+            restatement
+                .iter()
+                .map(|(marker, _)| marker.as_str())
+                .collect::<Vec<_>>(),
+            vec!["308", "309", "310", "311"]
+        );
+        assert!(noise_block_is_review_note(
+            "279 There are, of course, moral accounts of tort law that seek to explain the scope and incidence of both fault-based and strict liability."
+        ));
+        assert!(!noise_block_is_review_note("2026] WHAT IS A TORT? 1071"));
+        assert!(!noise_block_is_review_note(
+            "–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––"
+        ));
+        assert!(is_review_note_display_block(&block(
+            LiquidBlockRole::Noise,
+            "279 There are, of course, moral accounts of tort law that seek to explain the scope and incidence of both fault-based and strict liability.",
+        )));
+    }
+
+    #[test]
+    fn fused_split_keeps_hlr_continuation_tails() {
+        const BLOCK_47: &str = "among representative persons, with respect to the kinds of dangers that we might reasonably foresee happening.”). For a precise articulation of this generic understanding of the Palsgraf principle, see Jed Lewinsohn, “I Didn’t Know It Was You”: The Impersonal Grounds of Relational Normativity, 59 NOÛS 191, 194–96 (2025). 49 For a structurally similar example involving battery, see infra notes 173–75 and accompanying text.";
+        const BLOCK_58: &str = "foundation of our negligence law.” Id. at 564. This position is, on a natural interpretation, congruent with this Article’s claim that the normative principles underlying tort law are substantially continuous across common law and civil law systems. 54 See infra section II.A, pp. 1035–46. 55 See William L. Prosser, Transferred Intent, 45 TEX. L. REV. 650, 650 (1967) (quoting State v. Batson, 96 S.W.2d 384, 389 (Mo. 1936)). 56 See Palsgraf, 162 N.E. at 101. 57 See id. at 100. 58 Prosser, supra note 55, at 650.";
+        const BLOCK_112: &str = "principles they implement, are considered in section II.F, pp. 1067–76. Until then, this Article principally focuses on the paradigm of liability-for-rights infringement through culpable wrongdoing that (it argues) underlies both civil law general clauses such as CC 2043 and BGB section 823(1) and much of common law negligence and battery doctrine. 104 On the centrality of negligence and negligence-like forms of products liability in common law tort, see generally James A. Henderson, Jr., Why Negligence Dominates Tort, 50 UCLA L. REV. 377 (2002).";
+        const BLOCK_330: &str = "542. But the law conspicuously declines to impose such liability except in limited domains. 280 See, e.g., Richard A. Epstein, A Theory of Strict Liability, 2 J. LEGAL STUD. 151, 160–61 (1973). 281 See, e.g., Larry Alexander & Kimberly Kessler Ferzan, Confused Culpability, Contrived Causation, and the Collapse of Tort Theory, in PHILOSOPHICAL FOUNDATIONS OF THE LAW OF TORTS, supra note 39, at 416–25. 282 WIEACKER, supra note 124, at 257.";
+        const NOTE_279: &str = "279 There are, of course, moral accounts of tort law that seek to explain the scope and incidence of both fault-based and strict liability on the basis of a unified, consistent set of moral principles. See, e.g., Fletcher, supra note 272, at 556; Stein, supra note 272, at 611. But such accounts do not seem to succeed in capturing even the broad contours of the doctrine. Fletcher’s account, for example, implies that justifiably imposing a five percent risk of serious property damage on another person should incur liability, given that it is a “nonreciprocal” risk. See Fletcher, supra note 272, at";
+
+        let forty_eight = split_fused_review_notes(BLOCK_47);
+        assert_eq!(forty_eight[0].0, "*");
+        assert!(
+            forty_eight[0].1.contains("Lewinsohn"),
+            "note 48 tail must stay visible: {:?}",
+            forty_eight[0].1
+        );
+        assert!(forty_eight[0].1.contains("among representative persons"));
+        assert_eq!(forty_eight[1].0, "49");
+        assert!(forty_eight[1].1.starts_with("For a structurally similar"));
+
+        let fifty_three = split_fused_review_notes(BLOCK_58);
+        assert_eq!(fifty_three[0].0, "*");
+        assert!(
+            fifty_three[0].1.contains("foundation of our negligence law"),
+            "note 53 tail must stay visible: {:?}",
+            fifty_three[0].1
+        );
+        assert_eq!(
+            fifty_three
+                .iter()
+                .map(|(marker, _)| marker.as_str())
+                .collect::<Vec<_>>(),
+            vec!["*", "54", "55", "56", "57", "58"]
+        );
+
+        let one_oh_three = split_fused_review_notes(BLOCK_112);
+        assert_eq!(one_oh_three[0].0, "*");
+        assert!(
+            one_oh_three[0].1.contains("abnormally dangerous activity")
+                || one_oh_three[0].1.contains("principles they implement"),
+            "note 103 tail must stay visible: {:?}",
+            one_oh_three[0].1
+        );
+        assert_eq!(one_oh_three[1].0, "104");
+
+        let glitch = split_fused_review_notes(BLOCK_330);
+        assert_eq!(
+            glitch
+                .iter()
+                .map(|(marker, _)| marker.as_str())
+                .collect::<Vec<_>>(),
+            vec!["*", "280", "281", "282"]
+        );
+        assert!(
+            glitch[0].1.contains("conspicuously declines to impose such liability"),
+            "542-glitch body is the tail of 279: {:?}",
+            glitch[0].1
+        );
+        assert!(!glitch.iter().any(|(marker, _)| marker == "542"));
+
+        let rescued = block(LiquidBlockRole::Noise, NOTE_279);
+        let follow = block(LiquidBlockRole::Marginalia, BLOCK_330);
+        let header = block(LiquidBlockRole::Noise, "2026] WHAT IS A TORT? 1071");
+        let body = block(LiquidBlockRole::Paragraph, "Defenders of the Palsgraf perspective.");
+        assert!(!review_skips_block_as_furniture(&rescued, true));
+        assert!(review_skips_block_as_furniture(&header, false));
+        let blocks = vec![rescued, follow, header, body];
+        let hidden = review_hidden_display_mask(&blocks);
+        let (notes, next) = review_collect_margin_note_indices(&blocks, 0, &hidden);
+        assert_eq!(notes, vec![0, 1], "rescued 279 must enter the margin run with 280–282");
+        assert_eq!(next, 3);
+        assert!(is_review_margin_note_block(&blocks[0]));
     }
 
     #[test]
@@ -1085,6 +1744,12 @@ mod tests {
         assert!(!is_review_table_of_contents_text(
             "Introduction. This Article fills the gap without any leader dots."
         ));
+        assert!(
+            !is_review_table_of_contents_text(
+                "308 See RESTATEMENT (SECOND) OF TORTS § 217 cmt. c (A.L.I. 1965) (“The intention required to make an actor liable for trespass to a chattel . . . is present when an act is done for the purpose of using or otherwise intermeddling with a chattel . . . .”)."
+            ),
+            "legal ellipses must not hide a fused note as a TOC"
+        );
         assert_eq!(
             compound_toc_entries(fused),
             vec![
@@ -1162,6 +1827,47 @@ mod tests {
     }
 
     #[test]
+    fn review_open_does_not_precompute_and_large_files_wait_for_full() {
+        assert!(!should_precompute_review_on_open(0));
+        assert!(!should_precompute_review_on_open(1));
+        assert!(!should_precompute_review_on_open(40));
+        assert!(!should_precompute_review_on_open(500));
+        assert!(review_allows_automatic_full_prepare(12));
+        assert!(!review_allows_automatic_full_prepare(32));
+        assert!(!review_allows_automatic_full_prepare(80));
+        assert_eq!(
+            review_gate_automatic_full(
+                ReviewPrepareAction::SpawnFull { page_count: 80 },
+                80,
+                false
+            ),
+            ReviewPrepareAction::Nothing
+        );
+        assert_eq!(
+            review_gate_automatic_full(
+                ReviewPrepareAction::SpawnFull { page_count: 80 },
+                80,
+                true
+            ),
+            ReviewPrepareAction::SpawnFull { page_count: 80 }
+        );
+        assert_eq!(
+            review_gate_automatic_full(
+                ReviewPrepareAction::SpawnPreview { page_count: 4 },
+                80,
+                false
+            ),
+            ReviewPrepareAction::SpawnPreview { page_count: 4 }
+        );
+        assert_eq!(review_footnote_superscript("1"), "¹");
+        assert_eq!(review_footnote_superscript("12"), "¹²");
+        assert_eq!(
+            review_paragraph_display_parts("First paragraph.\n\nSecond paragraph."),
+            vec!["First paragraph.", "Second paragraph."]
+        );
+    }
+
+    #[test]
     fn retry_clears_spawn_flags_so_prepare_can_run_again() {
         let after_full = ReviewPrepareFlags {
             preview_spawned: true,
@@ -1185,5 +1891,77 @@ mod tests {
             ),
             ReviewPrepareAction::Nothing
         );
+    }
+
+    fn harvard_tort_fixture_blocks() -> Vec<LiquidBlock> {
+        if let Ok(path) = std::env::var("LAWPDF_FIXTURE_JSON") {
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if let Some(blocks) = value.get("blocks").and_then(|item| item.as_array()) {
+                        return blocks
+                            .iter()
+                            .filter_map(|entry| {
+                                let role = match entry.get("role")?.as_str()? {
+                                    "title" | "Title" => LiquidBlockRole::Title,
+                                    "heading" | "Heading" => LiquidBlockRole::Heading,
+                                    "subheading" | "Subheading" => LiquidBlockRole::Subheading,
+                                    "paragraph" | "Paragraph" => LiquidBlockRole::Paragraph,
+                                    "marginalia" | "Marginalia" => LiquidBlockRole::Marginalia,
+                                    "footnote" | "Footnote" => LiquidBlockRole::Footnote,
+                                    "noise" | "Noise" => LiquidBlockRole::Noise,
+                                    "contents" | "Contents" => LiquidBlockRole::Contents,
+                                    _ => LiquidBlockRole::Paragraph,
+                                };
+                                Some(block(role, entry.get("text")?.as_str()?))
+                            })
+                            .collect();
+                    }
+                }
+            }
+        }
+        vec![
+            block(LiquidBlockRole::Title, "WHAT IS A TORT? Ketan Ramakrishnan"),
+            block(LiquidBlockRole::Heading, "ARTICLE"),
+            block(
+                LiquidBlockRole::Heading,
+                "WHAT IS A TORT? Ketan Ramakrishnan∗",
+            ),
+            block(
+                LiquidBlockRole::Paragraph,
+                "INTRODUCTION ........................................................................ 1 II. THE PALSGRAF PERSPECTIVE ........................ 8",
+            ),
+            block(
+                LiquidBlockRole::Marginalia,
+                "24 See RIPSTEIN, supra note 17, at 200. 25 See GOLDBERG & ZIPURSKY, supra note 6, at 154–55. 26 This Article shares the assumption.",
+            ),
+            block(
+                LiquidBlockRole::Marginalia,
+                "7 See BURROWS. 8 162 N.E. 99 (N.Y. 1928). 9 Palsgraf, 162 N.E. at 99.",
+            ),
+        ]
+    }
+
+    #[test]
+    fn review_display_benchmark_drives_shipped_helpers() {
+        let blocks = harvard_tort_fixture_blocks();
+        let assembled = HashSet::from(["keep-a".to_owned()]);
+        let snapshot = review_display_benchmark(
+            "harvard-tort-fixture",
+            &blocks,
+            &["keep-a", "keep-b"],
+            &assembled,
+        );
+        assert!(snapshot.source_retention > 0.0);
+        assert!(!snapshot.fused_note_visible.is_empty());
+        assert!(
+            snapshot.fused_note_visible.contains(&25),
+            "shipped splitter must expose 25, not only 24: {:?}",
+            snapshot.fused_note_visible
+        );
+        assert!(snapshot.criticals_by_category.contains_key("note.sequence_gap"));
+        if let Ok(path) = std::env::var("LAWPDF_BENCH_OUT") {
+            write_review_display_benchmark_json(Path::new(&path), &snapshot)
+                .expect("write snapshot");
+        }
     }
 }
