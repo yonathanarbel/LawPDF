@@ -31,11 +31,7 @@ impl PdfEditorApp {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label(
-                    RichText::new(APP_VERSION_LABEL)
-                        .size(12.0)
-                        .color(MUTED_INK),
-                );
+                ui.label(RichText::new(APP_VERSION_LABEL).size(12.0).color(MUTED_INK));
                 ui.horizontal(|ui| {
                     if ui.button("Check for updates").clicked() {
                         self.update_ui.check_in_flight = true;

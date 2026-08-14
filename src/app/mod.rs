@@ -33,23 +33,12 @@ use crate::layout_roles;
 use crate::liquid::{
     DeepLiquidConfig, DocumentProfileKind, FootnoteMode, LiquidBlock, LiquidBlockRole,
     LiquidDocument, LiquidEvent, LiquidRequest, LiquidSourceLineRef, MarkdownOptions,
-    liquid_document_markdown,
-    should_hide_contents_block_for_display, should_prefer_ocr_page_text, spawn_liquid_job,
+    liquid_document_markdown, should_hide_contents_block_for_display, should_prefer_ocr_page_text,
+    spawn_liquid_job,
 };
 use crate::liquid2::{
     LiquidMode2Event, LiquidMode2Request, Lm2RuntimeChoice, load_fast_cached_liquid_mode2_document,
     spawn_liquid_mode2_job,
-};
-use crate::review_reading::{
-    apply_live_review_correction, find_hits_in_review_blocks, is_review_margin_note_block,
-    is_review_note_display_block, opening_pages_ready_for_review, review_all_pages_ready,
-    review_allows_automatic_full_prepare, review_collect_margin_note_indices, review_column_layout,
-    review_contents_navigation_entries, review_document_plain_text, review_footnote_superscript,
-    review_gate_automatic_full, review_hidden_display_mask, review_opening_page_count,
-    review_paragraph_display_parts, review_prepare_flags_after_restart, review_prepare_next_action,
-    review_skips_block_as_furniture, review_table_figure_crop, should_apply_review_event,
-    should_precompute_review_on_open, split_fused_review_notes, ReviewPrepareAction,
-    ReviewPrepareFlags, REVIEW_OUTLINE_RAIL_DEFAULT_WIDTH, REVIEW_PARAGRAPH_GAP,
 };
 use crate::model::{
     AnnotationKind, EditorAnnotation, LoadedDocument, MarkerStyle, OcrPageState, PageLink,
@@ -64,6 +53,18 @@ use crate::pdf_backend::{
 };
 use crate::render_worker::{
     PageRenderKey, RenderEvent, RenderRequest, ThumbnailRenderKey, spawn_render_worker,
+};
+use crate::review_reading::{
+    REVIEW_OUTLINE_RAIL_DEFAULT_WIDTH, REVIEW_PARAGRAPH_GAP, ReviewPrepareAction,
+    ReviewPrepareFlags, apply_live_review_correction, find_hits_in_review_blocks,
+    is_review_margin_note_block, is_review_note_display_block, opening_pages_ready_for_review,
+    review_all_pages_ready, review_allows_automatic_full_prepare,
+    review_collect_margin_note_indices, review_column_layout, review_contents_navigation_entries,
+    review_document_plain_text, review_footnote_superscript, review_gate_automatic_full,
+    review_hidden_display_mask, review_opening_page_count, review_paragraph_display_parts,
+    review_prepare_flags_after_restart, review_prepare_next_action,
+    review_skips_block_as_furniture, review_table_figure_crop, should_apply_review_event,
+    should_precompute_review_on_open, split_fused_review_notes,
 };
 use crate::settings::{
     AppSettings, app_data_dir, effective_groq_api_key, effective_openai_api_key,
@@ -2846,11 +2847,9 @@ impl PdfEditorApp {
                     match result {
                         Ok(rendered) => {
                             let incoming_scale = thumbnail_scale_from_key(key.render_scale_key);
-                            if self
-                                .thumbnail_textures
-                                .get(&key.page_index)
-                                .is_some_and(|existing| existing.render_scale + 0.001 >= incoming_scale)
-                            {
+                            if self.thumbnail_textures.get(&key.page_index).is_some_and(
+                                |existing| existing.render_scale + 0.001 >= incoming_scale,
+                            ) {
                                 continue;
                             }
                             let image = egui::ColorImage::from_rgba_unmultiplied(
@@ -3671,16 +3670,15 @@ impl PdfEditorApp {
             return;
         };
         let opening_count = review_opening_page_count(page_count);
-        let allow_full = self.liquid_mode2_allow_full
-            || review_allows_automatic_full_prepare(page_count);
+        let allow_full =
+            self.liquid_mode2_allow_full || review_allows_automatic_full_prepare(page_count);
         self.enqueue_review_extract_pages(opening_count);
         if allow_full && (self.liquid_mode2_preview_spawned || opening_count == page_count) {
             self.enqueue_review_extract_pages(page_count);
         }
 
         let (native_flags, char_flags) = self.review_extract_ready_flags();
-        let opening_ready =
-            opening_pages_ready_for_review(&native_flags, &char_flags, page_count);
+        let opening_ready = opening_pages_ready_for_review(&native_flags, &char_flags, page_count);
         let all_ready = review_all_pages_ready(&native_flags, &char_flags, page_count);
         match review_gate_automatic_full(
             review_prepare_next_action(
@@ -5781,12 +5779,7 @@ impl PdfEditorApp {
                     .stroke(Stroke::new(1.0, stroke)),
             )
             .show(ctx, |ui| {
-                ui.label(
-                    RichText::new("CONTENTS")
-                        .size(11.0)
-                        .strong()
-                        .color(muted),
-                );
+                ui.label(RichText::new("CONTENTS").size(11.0).strong().color(muted));
                 ui.add_space(6.0);
                 let Some((title, outline)) = &ready else {
                     ui.horizontal(|ui| {
@@ -5824,11 +5817,7 @@ impl PdfEditorApp {
                                     .add(
                                         egui::Label::new(
                                             RichText::new(&item.text)
-                                                .size(if item.level == 1 {
-                                                    12.5
-                                                } else {
-                                                    11.5
-                                                })
+                                                .size(if item.level == 1 { 12.5 } else { 11.5 })
                                                 .strong()
                                                 .color(color),
                                         )
@@ -6927,8 +6916,7 @@ impl PdfEditorApp {
                                     self.draw_liquid_reflow_gate(ui, ctx, hint);
                                 }
                                 let notes = liquid_note_blocks(&document.blocks);
-                                let hidden_contents =
-                                    review_hidden_display_mask(&document.blocks);
+                                let hidden_contents = review_hidden_display_mask(&document.blocks);
                                 let mut block_index = 0usize;
                                 while block_index < document.blocks.len() {
                                     let block = &document.blocks[block_index];
@@ -7077,7 +7065,9 @@ impl PdfEditorApp {
                 Color32::WHITE,
             );
             if let Some(page) = page.as_ref() {
-                for (_, pdf_rect) in highlights.iter().filter(|(page_i, _)| *page_i == page_index)
+                for (_, pdf_rect) in highlights
+                    .iter()
+                    .filter(|(page_i, _)| *page_i == page_index)
                 {
                     let x0 = dest.left() + pdf_rect.left / page.width * dest.width();
                     let x1 = dest.left() + pdf_rect.right / page.width * dest.width();
@@ -7189,8 +7179,7 @@ impl PdfEditorApp {
                                     self.draw_liquid_reflow_gate(ui, ctx, hint);
                                 }
                                 let notes = liquid_note_blocks(&document.blocks);
-                                let hidden_contents =
-                                    review_hidden_display_mask(&document.blocks);
+                                let hidden_contents = review_hidden_display_mask(&document.blocks);
                                 let mut block_index = 0usize;
                                 while block_index < document.blocks.len() {
                                     let block = &document.blocks[block_index];
@@ -8492,7 +8481,11 @@ try {
         let has_callout = text.contains(crate::layout_roles::CALLOUT_START);
         if self.liquid_hide_footnotes && has_callout {
             let stripped = strip_liquid_footnote_callouts(text);
-            ui.add(egui::Label::new(body_text(&stripped)).wrap().selectable(true));
+            ui.add(
+                egui::Label::new(body_text(&stripped))
+                    .wrap()
+                    .selectable(true),
+            );
             return Vec::new();
         }
         if !has_callout {
@@ -8533,11 +8526,7 @@ try {
             ui.spacing_mut().item_spacing.x = 0.0;
             for (is_callout, run) in &segments {
                 if !is_callout {
-                    ui.add(
-                        egui::Label::new(body_text(run))
-                            .wrap()
-                            .selectable(true),
-                    );
+                    ui.add(egui::Label::new(body_text(run)).wrap().selectable(true));
                     continue;
                 }
                 let number = run
@@ -8550,9 +8539,7 @@ try {
                     let response = ui
                         .add(
                             egui::Label::new(
-                                RichText::new(label)
-                                    .size(size * 0.78)
-                                    .color(marker_color),
+                                RichText::new(label).size(size * 0.78).color(marker_color),
                             )
                             .sense(Sense::click()),
                         )
@@ -8666,7 +8653,9 @@ try {
                 .wrap(),
             );
             ui.add_space(7.0);
-            let width = ui.available_width().min(if canonical { 56.0 } else { 88.0 });
+            let width = ui
+                .available_width()
+                .min(if canonical { 56.0 } else { 88.0 });
             let (rule, _) = ui.allocate_exact_size(Vec2::new(width, 1.5), Sense::hover());
             ui.painter().rect_filled(
                 rule,
@@ -9078,10 +9067,7 @@ try {
                 for (index, note) in notes.iter().enumerate() {
                     let parts = split_fused_review_notes(&note.text);
                     let entries = if parts.is_empty() {
-                        vec![(
-                            (index + 1).to_string(),
-                            note.text.trim().to_owned(),
-                        )]
+                        vec![((index + 1).to_string(), note.text.trim().to_owned())]
                     } else {
                         parts
                     };
@@ -9475,8 +9461,7 @@ try {
                     return;
                 }
 
-                if self.review_pdf_split
-                    && matches!(self.liquid_mode2_state, LiquidState::Ready(_))
+                if self.review_pdf_split && matches!(self.liquid_mode2_state, LiquidState::Ready(_))
                 {
                     self.ensure_liquid_mode2_started(ctx);
                     ui.columns(2, |columns| {
@@ -14269,7 +14254,10 @@ fn merge_liquid_outline_items(
     for item in from_contents {
         by_index.insert(item.block_index, item);
     }
-    by_index.into_values().take(MAX_LIQUID_OUTLINE_ITEMS).collect()
+    by_index
+        .into_values()
+        .take(MAX_LIQUID_OUTLINE_ITEMS)
+        .collect()
 }
 
 /// Prefer the printed TOC as the navigation specification when it can be
@@ -15971,7 +15959,10 @@ mod app_tests {
             test_liquid_block(LiquidBlockRole::Heading, "I. What Is Nationalization?"),
             test_liquid_block(LiquidBlockRole::Heading, "A. Two Entitlements"),
             test_liquid_block(LiquidBlockRole::Heading, "B. A Typology of Nationalization"),
-            test_liquid_block(LiquidBlockRole::Heading, "C. Control and claim as spectrums"),
+            test_liquid_block(
+                LiquidBlockRole::Heading,
+                "C. Control and claim as spectrums",
+            ),
             test_liquid_block(LiquidBlockRole::Heading, "II. Should We Nationalize AI?"),
         ];
         let hidden = review_hidden_display_mask(&blocks);
@@ -16977,7 +16968,11 @@ mod app_tests {
             index.get(&24).map(String::as_str),
             Some("See RIPSTEIN, supra note 17, at 200.")
         );
-        assert!(index.get(&25).is_some_and(|body| body.starts_with("See GOLDBERG")));
+        assert!(
+            index
+                .get(&25)
+                .is_some_and(|body| body.starts_with("See GOLDBERG"))
+        );
         assert!(index.get(&26).is_some());
         assert_eq!(index.get(&17), None);
     }

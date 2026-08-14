@@ -660,7 +660,10 @@ mod tests {
         ));
         assert!(matches!(
             backlog.pop_front(),
-            Some(RenderRequest::EnrichDocument { document_epoch: 7, .. })
+            Some(RenderRequest::EnrichDocument {
+                document_epoch: 7,
+                ..
+            })
         ));
     }
 
