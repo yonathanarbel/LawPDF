@@ -5885,13 +5885,8 @@ fn load_lm2_context_twopass_model(
         .find(|path| path.is_file())
         .cloned()
         .ok_or_else(|| missing_model_error("LM2 context two-pass model", &candidates))?;
-    load_lm2_context_model_from_path(
-        &path,
-        "context_model",
-        active_primary_model_sha256,
-        None,
-    )
-    .map(Some)
+    load_lm2_context_model_from_path(&path, "context_model", active_primary_model_sha256, None)
+        .map(Some)
 }
 
 fn load_lm2_context_arbiter_model(
@@ -5981,9 +5976,14 @@ fn load_lm2_context_model_from_path(
                 ));
             }
             if is_residual {
-                let expected_context = input.baseline_context_model_sha256.as_deref().ok_or_else(|| {
-                    "LM2 runtime residual v3 is missing baseline_context_model_sha256".to_owned()
-                })?;
+                let expected_context =
+                    input
+                        .baseline_context_model_sha256
+                        .as_deref()
+                        .ok_or_else(|| {
+                            "LM2 runtime residual v3 is missing baseline_context_model_sha256"
+                                .to_owned()
+                        })?;
                 let active_context = active_baseline_context_model_sha256.ok_or_else(|| {
                     "LM2 runtime residual v3 requires its exact baseline context model".to_owned()
                 })?;
@@ -27201,12 +27201,8 @@ mod tests {
             (Lm2Action::Keep, [0.0, 1.0, 0.0]),
             (Lm2Action::Marginalia, [0.0, 0.0, 1.0]),
         ] {
-            let features = lm2_context_runtime_residual_feature_vector(
-                &decoded,
-                &probabilities,
-                action,
-                0,
-            );
+            let features =
+                lm2_context_runtime_residual_feature_vector(&decoded, &probabilities, action, 0);
             assert_eq!(features.len(), LM2_CONTEXT_RESIDUAL_FEATURE_COUNT_V3);
             assert_eq!(&features[LM2_CONTEXT_ARBITER_FEATURE_COUNT_V2..], &expected);
         }
