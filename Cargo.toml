@@ -1,6 +1,6 @@
 [package]
 name = "lawpdf"
-version = "0.2.26"
+version = "0.2.27"
 edition = "2024"
 description = "Native PDF reader and annotation editor for legal workflows"
 license = "MIT"
