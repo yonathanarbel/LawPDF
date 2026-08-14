@@ -41,6 +41,7 @@ $fastTabModelName = "fasttab-v1.onnx"
 $nativeModelName = "lm2-catboost-augmented-epoch51lv-relabels-tc.cbm"
 $nativeLibraryName = "catboostmodel.dll"
 $contextModelName = "lm2-context-twopass-hgb-v1.json"
+$contextArbiterModelName = "lm2-runtime-residual-rescue-v7.json"
 $noteHeadModelName = "lm2-note-head-hgb-v1.json"
 $linkRankerModelName = "lm2-footnote-link-ranker-hgb-v1.json"
 $requiredRuntimeAssets = @(
@@ -48,6 +49,7 @@ $requiredRuntimeAssets = @(
     (Join-Path $nativeRuntimeSource $nativeModelName),
     (Join-Path $nativeRuntimeSource $nativeLibraryName),
     (Join-Path $contextRuntimeSource $contextModelName),
+    (Join-Path $contextRuntimeSource $contextArbiterModelName),
     (Join-Path $noteHeadRuntimeSource $noteHeadModelName),
     (Join-Path $linkRankerRuntimeSource $linkRankerModelName)
 )
@@ -81,6 +83,7 @@ Copy-Item -LiteralPath (Join-Path $fastTabRuntimeSource $fastTabModelName) -Dest
 Copy-Item -LiteralPath (Join-Path $nativeRuntimeSource $nativeModelName) -Destination (Join-Path $nativeRuntimeDest $nativeModelName) -Force
 Copy-Item -LiteralPath (Join-Path $nativeRuntimeSource $nativeLibraryName) -Destination (Join-Path $nativeRuntimeDest $nativeLibraryName) -Force
 Copy-Item -LiteralPath (Join-Path $contextRuntimeSource $contextModelName) -Destination (Join-Path $contextRuntimeDest $contextModelName) -Force
+Copy-Item -LiteralPath (Join-Path $contextRuntimeSource $contextArbiterModelName) -Destination (Join-Path $contextRuntimeDest $contextArbiterModelName) -Force
 Copy-Item -LiteralPath (Join-Path $noteHeadRuntimeSource $noteHeadModelName) -Destination (Join-Path $noteHeadRuntimeDest $noteHeadModelName) -Force
 Copy-Item -LiteralPath (Join-Path $linkRankerRuntimeSource $linkRankerModelName) -Destination (Join-Path $linkRankerRuntimeDest $linkRankerModelName) -Force
 
@@ -90,12 +93,12 @@ Push-Location $verifyWorkingDir
 try {
     $runtimeStatus = Start-Process `
         -FilePath (Join-Path $portableDir $exeName) `
-        -ArgumentList @("--lm2-runtime-status", "--require-native", "--require-context", "--require-note-head", "--require-link-ranker") `
+        -ArgumentList @("--lm2-runtime-status", "--require-native", "--require-context", "--require-arbiter", "--require-note-head", "--require-link-ranker") `
         -NoNewWindow `
         -PassThru `
         -Wait
     if ($runtimeStatus.ExitCode -ne 0) {
-        throw "Packaged LawPDF did not load the complete CatBoost + context + footnote-link runtime."
+        throw "Packaged LawPDF did not load the complete CatBoost + context + residual rescue + footnote-link runtime."
     }
     $previousFastTab = $env:LAWPDF_LM2_FASTTAB
     $env:LAWPDF_LM2_FASTTAB = "1"

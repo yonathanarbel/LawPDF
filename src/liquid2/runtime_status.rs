@@ -209,7 +209,7 @@ fn lm2_runtime_status(
     if require_context && !context_twopass_active {
         errors.push("required context two-pass model was not loaded".to_owned());
     }
-    let context_arbiter_model = if native_line_model_active {
+    let context_arbiter_model = if native_catboost_active && !fasttab_active {
         match load_lm2_context_arbiter_model(
             context_primary_sha256,
             context_model

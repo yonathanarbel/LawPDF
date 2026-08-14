@@ -67,6 +67,7 @@ def main() -> int:
         "fasttab_model",
         "native_model",
         "context_model",
+        "context_arbiter_model",
         "note_head_model",
         "link_ranker_model",
     ):
@@ -101,6 +102,7 @@ def main() -> int:
         for requirement in (
             "--require-native",
             "--require-context",
+            "--require-arbiter",
             "--require-note-head",
             "--require-link-ranker",
         )
