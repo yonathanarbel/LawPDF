@@ -65,7 +65,7 @@ const LM2_FASTTAB_RUNTIME_DIR: &str = "profile-models/lm2-fasttab-runtime";
 const LM2_FASTTAB_MODEL_FILE: &str = "fasttab-v1.onnx";
 const LM2_CONTEXT_TWOPASS_RUNTIME_DIR: &str = "profile-models/lm2-context-twopass-runtime";
 const LM2_CONTEXT_TWOPASS_MODEL_FILE: &str = "lm2-context-twopass-hgb-v1.json";
-const LM2_CONTEXT_ARBITER_MODEL_FILE: &str = "lm2-context-arbiter-hgb-v2.json";
+const LM2_CONTEXT_ARBITER_MODEL_FILE: &str = "lm2-runtime-residual-rescue-v7.json";
 const LM2_NOTE_HEAD_RUNTIME_DIR: &str = "profile-models/lm2-note-head-runtime";
 const LM2_NOTE_HEAD_MODEL_FILE: &str = "lm2-note-head-hgb-v1.json";
 const LM2_NOTE_HEAD_SCHEMA_V1: &str = "lawpdf-footnote-head-hgb-v1";
@@ -3479,7 +3479,10 @@ impl Lm2Runtime {
         } else {
             None
         };
-        let context_arbiter_model = if native_line_model_active && lm2_context_twopass_enabled() {
+        let context_arbiter_model = if native_catboost_model.is_some()
+            && fasttab_model.is_none()
+            && lm2_context_twopass_enabled()
+        {
             match load_lm2_context_arbiter_model(
                 context_primary_sha256,
                 context_twopass_model
