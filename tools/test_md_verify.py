@@ -28,6 +28,42 @@ class FootnoteChecksTest(unittest.TestCase):
         ]
         self.assertEqual(orphans, ["note 2 is defined but never referenced in the body"])
 
+    def test_article_scoped_numbers_are_verified_independently(self) -> None:
+        blocks, report = report_for(
+            "First article.[^a1-1] More.[^a1-2]\n\n"
+            "Second article.[^a2-1] More.[^a2-2]\n\n"
+            "[^a1-1]: First one.\n\n"
+            "[^a1-2]: First two.\n\n"
+            "[^a2-1]: Second one.\n\n"
+            "[^a2-2]: Second two.\n"
+        )
+
+        md_verify.check_footnotes(blocks, report)
+
+        self.assertEqual(report.stats["footnote_numeric_definitions"], 4)
+        self.assertEqual(report.stats["footnote_scope_count"], 2)
+        self.assertFalse(
+            [
+                defect
+                for defect in report.defects
+                if defect.kind.startswith("footnote.sequence_")
+            ]
+        )
+
+    def test_article_scoped_orphan_and_gap_still_fail(self) -> None:
+        blocks, report = report_for(
+            "First article.[^a1-1] Later.[^a1-3]\n\n"
+            "[^a1-1]: First.\n\n"
+            "[^a1-3]: Third.\n\n"
+            "[^a2-1]: Unreferenced second article note.\n"
+        )
+
+        md_verify.check_footnotes(blocks, report)
+
+        kinds = [defect.kind for defect in report.critical]
+        self.assertIn("footnote.orphan_definition", kinds)
+        self.assertIn("footnote.sequence_gap", kinds)
+
     def test_literal_continuation_notice_is_detected_outside_code(self) -> None:
         blocks, report = report_for(
             "Body.\n\n"
@@ -183,6 +219,46 @@ class HeadingChecksTest(unittest.TestCase):
         ]
         self.assertEqual(len(overlong), 1)
         self.assertEqual(overlong[0].severity, md_verify.WARNING)
+
+
+class FencedProseChecksTest(unittest.TestCase):
+    def test_sentence_like_legal_prose_in_unlabelled_fence_is_critical(self) -> None:
+        blocks, report = report_for(
+            "```\n"
+            "This ordinary legal discussion was extracted from the main body of the article.\n"
+            "It continues with a complete sentence explaining the court's reasoning and result.\n"
+            "The final sentence contains enough natural language to make the classification clear.\n"
+            "```\n"
+        )
+
+        md_verify.check_fenced_prose(blocks, report)
+
+        self.assertEqual(
+            [defect.kind for defect in report.critical], ["table.prose_fence"]
+        )
+        self.assertEqual(report.stats["prose_fences"], 1)
+
+    def test_numeric_table_and_language_tagged_code_are_allowed(self) -> None:
+        blocks, report = report_for(
+            "```\n"
+            "State 1996 1997 1998 1999 2000\n"
+            "New York 11.06 11.13 11.13 10.71 11.19\n"
+            "California 9.48 9.54 9.03 9.34 8.53\n"
+            "Illinois 7.69 7.71 7.46 6.95 6.58\n"
+            "Michigan 7.10 7.04 7.09 7.14 7.11\n"
+            "Ohio 6.30 6.25 6.38 6.40 6.51\n"
+            "```\n\n"
+            "```python\n"
+            "def explain_the_long_legal_example_with_words():\n"
+            "    return 'This language-tagged source example is not a LawPDF table.'\n"
+            "```\n"
+        )
+
+        md_verify.check_fenced_prose(blocks, report)
+
+        self.assertFalse(report.critical)
+        self.assertEqual(report.stats["fenced_blocks"], 1)
+        self.assertEqual(report.stats["prose_fences"], 0)
 
 
 if __name__ == "__main__":
