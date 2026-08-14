@@ -22,6 +22,11 @@ const FURNITURE_MAX_WORDS: usize = 14;
 /// Words a rejected block needs before it is rescued as prose rather than
 /// left out as furniture.
 const RESCUED_NOISE_MIN_WORDS: usize = 20;
+/// Table-classified text this long must still look tabular before Markdown
+/// fencing is allowed. OCR-layered scans can make every line overlap a
+/// page-sized image, which is useful classification evidence for recovering
+/// notes but not enough reason to display ordinary prose as code.
+const TABLE_PROSE_MIN_WORDS: usize = 24;
 /// Longest all-digit line still treated as a folio or accession stamp.
 const MAX_BARE_NUMBER_LEN: usize = 12;
 /// Below this share of markers matched to a note, the document is probably
@@ -90,8 +95,8 @@ pub fn liquid_document_markdown(
     document: &LiquidDocument,
     options: &MarkdownOptions,
 ) -> MarkdownExport {
-    let linked_note_indices = document
-        .footnote_links
+    let markdown_links = safe_markdown_footnote_links(document);
+    let linked_note_indices = markdown_links
         .iter()
         .map(|link| link.note_block_index)
         .collect::<BTreeSet<_>>();
@@ -139,9 +144,18 @@ pub fn liquid_document_markdown(
         .any(|index| !available_author_notes.note_blocks.contains(index));
 
     let mut warnings = Vec::new();
+    let suppressed_unsafe_links = document
+        .footnote_links
+        .len()
+        .saturating_sub(markdown_links.len());
+    if suppressed_unsafe_links > 0 {
+        warnings.push(format!(
+            "{suppressed_unsafe_links} footnote link(s) sharing a printed number across unscoped note blocks were listed without links"
+        ));
+    }
     let mut inline_blocks = BTreeMap::new();
     let footnotes_inlined = match options.footnotes {
-        FootnoteMode::Inline if !has_non_author_notes && document.footnote_links.is_empty() => true,
+        FootnoteMode::Inline if !has_non_author_notes && markdown_links.is_empty() => true,
         FootnoteMode::Inline => {
             // Gate on correctness, not coverage. A marker that found no note
             // head simply does not become a link, so a low landing rate costs
@@ -162,7 +176,7 @@ pub fn liquid_document_markdown(
                 warnings.push(LOW_LINK_CONFIDENCE_WARNING.to_owned());
                 false
             } else {
-                let placement = rewrite_inline_blocks(document);
+                let placement = rewrite_inline_blocks(document, &markdown_links);
                 let too_many_failed = placement.attempted > 0
                     && placement.failed.saturating_mul(100) > placement.attempted.saturating_mul(5);
                 if too_many_failed {
@@ -244,9 +258,10 @@ pub fn liquid_document_markdown(
     let standalone_display_quotes = standalone_display_quote_indices(document);
     let inline_display_quote_cues = inline_display_quote_cues(document);
     let (figure_exports, figure_label_blocks) = figure_export_plan(document, &inline_blocks);
-    let (table_run_text, table_run_continuations) =
+    let (table_run_text, table_run_continuations, prose_table_blocks) =
         adjacent_table_run_text(document, &inline_blocks, &figure_label_blocks);
     let mut visual_figure_count = 0usize;
+    let mut prose_table_fallbacks = 0usize;
     for (index, block) in document.blocks.iter().enumerate() {
         if matches!(
             block.role,
@@ -576,6 +591,18 @@ pub fn liquid_document_markdown(
                     let text = raw_text.trim();
                     if text.is_empty() {
                         false
+                    } else if prose_table_blocks.contains(&index)
+                        || table_run_is_sentence_prose(text)
+                    {
+                        let body = normalize_and_escape_body(text);
+                        if body.is_empty() {
+                            false
+                        } else {
+                            writer.push(body, BlockJoin::Loose);
+                            prose_table_fallbacks += 1;
+                            last_special_section = None;
+                            true
+                        }
                     } else {
                         let fence = if text.contains("```") { "````" } else { "```" };
                         writer.push(format!("{fence}\n{text}\n{fence}"), BlockJoin::Loose);
@@ -660,6 +687,11 @@ pub fn liquid_document_markdown(
             "dropped {discarded_furniture} block(s) of page furniture such as running heads and folios"
         ));
     }
+    if prose_table_fallbacks > 0 {
+        warnings.push(format!(
+            "rendered {prose_table_fallbacks} sentence-like table-classified block(s) as ordinary prose"
+        ));
+    }
     if omitted_footnote_separator_rules > 0 {
         warnings.push(format!(
             "stripped a leading footnote-separator rule from {omitted_footnote_separator_rules} block(s), keeping the text that followed"
@@ -668,7 +700,13 @@ pub fn liquid_document_markdown(
 
     let footnote_count = match options.footnotes {
         FootnoteMode::Inline if footnotes_inlined => {
-            let notes = build_inline_notes(document, &note_indices, author_notes, &mut warnings);
+            let notes = build_inline_notes(
+                document,
+                &note_indices,
+                author_notes,
+                &markdown_links,
+                &mut warnings,
+            );
             append_inline_notes(&mut writer, &notes);
             notes.definitions.len() + notes.unlinked.len()
         }
@@ -912,6 +950,66 @@ fn render_figure_notice(caption: &str, figure: &FigureExportInfo) -> String {
     notice
 }
 
+/// Whether a run carrying the semantic `Table` role is actually sentence
+/// prose for Markdown presentation.
+///
+/// This is intentionally a serialization guard. The underlying role remains
+/// available to note recovery and layout diagnostics. Dense numeric grids stay
+/// fenced, while long prose and citation paragraphs are emitted as readable
+/// body text even when an OCR-layered scan's page image supplied a false table
+/// overlap signal.
+fn table_run_is_sentence_prose(text: &str) -> bool {
+    let lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let total_words = lines
+        .iter()
+        .map(|line| line.split_whitespace().count())
+        .sum::<usize>();
+    if total_words < TABLE_PROSE_MIN_WORDS || lines.is_empty() {
+        return false;
+    }
+
+    let numeric_rows = lines
+        .iter()
+        .filter(|line| {
+            let tokens = line
+                .split_whitespace()
+                .map(|token| token.trim_matches(|ch: char| !ch.is_alphanumeric()))
+                .filter(|token| !token.is_empty())
+                .collect::<Vec<_>>();
+            let numeric = tokens
+                .iter()
+                .filter(|token| token.chars().any(|ch| ch.is_ascii_digit()))
+                .count();
+            tokens.len() >= 3 && numeric >= 2 && numeric * 2 >= tokens.len()
+        })
+        .count();
+    if numeric_rows >= 3 && numeric_rows * 2 >= lines.len() {
+        return false;
+    }
+
+    let prose_lines = lines
+        .iter()
+        .filter(|line| {
+            let alphabetic_words = line
+                .split_whitespace()
+                .filter(|word| word.chars().any(char::is_alphabetic))
+                .count();
+            alphabetic_words >= 6
+                || (alphabetic_words >= 4
+                    && line
+                        .chars()
+                        .last()
+                        .is_some_and(|ch| matches!(ch, '.' | '!' | '?' | ')' | ']' | '"')))
+        })
+        .count();
+
+    prose_lines * 2 >= lines.len()
+}
+
 /// PyMuPDF commonly emits each visual table row (and sometimes each wrapped
 /// cell) as its own semantic Table block. Keep those source boundaries in the
 /// document model for navigation, but render an adjacent run as one code block
@@ -921,9 +1019,10 @@ fn adjacent_table_run_text(
     document: &LiquidDocument,
     inline_blocks: &BTreeMap<usize, String>,
     excluded_blocks: &BTreeSet<usize>,
-) -> (BTreeMap<usize, String>, BTreeSet<usize>) {
+) -> (BTreeMap<usize, String>, BTreeSet<usize>, BTreeSet<usize>) {
     let mut starts = BTreeMap::new();
     let mut continuations = BTreeSet::new();
+    let mut prose_blocks = BTreeSet::new();
     let mut index = 0usize;
     while index < document.blocks.len() {
         if document.blocks[index].role != LiquidBlockRole::Table || excluded_blocks.contains(&index)
@@ -933,10 +1032,12 @@ fn adjacent_table_run_text(
         }
         let start = index;
         let mut rows = Vec::new();
+        let mut run_indices = Vec::new();
         while index < document.blocks.len()
             && document.blocks[index].role == LiquidBlockRole::Table
             && !excluded_blocks.contains(&index)
         {
+            run_indices.push(index);
             let text = inline_blocks
                 .get(&index)
                 .map(String::as_str)
@@ -945,16 +1046,19 @@ fn adjacent_table_run_text(
             if !text.is_empty() {
                 rows.push(text);
             }
-            if index > start {
-                continuations.insert(index);
-            }
             index += 1;
         }
         if index - start > 1 && !rows.is_empty() {
-            starts.insert(start, rows.join("\n"));
+            let combined = rows.join("\n");
+            if table_run_is_sentence_prose(&combined) {
+                prose_blocks.extend(run_indices);
+            } else {
+                starts.insert(start, combined);
+                continuations.extend(run_indices.into_iter().skip(1));
+            }
         }
     }
-    (starts, continuations)
+    (starts, continuations, prose_blocks)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -982,6 +1086,16 @@ impl MarkdownWriter {
         {
             return;
         }
+        let join = if join == BlockJoin::Loose
+            && self.last_rendered.as_ref().is_some_and(|previous| {
+                markdown_plain_body_boundary(previous, &text)
+                    && markdown_paragraph_is_visibly_open(previous)
+                    && markdown_starts_with_lowercase_prose(&text)
+            }) {
+            BlockJoin::Tight
+        } else {
+            join
+        };
         if !self.text.is_empty() {
             if join == BlockJoin::Tight {
                 if self.text.ends_with('-')
@@ -1008,6 +1122,66 @@ impl MarkdownWriter {
     fn finish(self) -> String {
         self.text
     }
+}
+
+fn markdown_plain_body_boundary(previous: &str, current: &str) -> bool {
+    [previous, current]
+        .into_iter()
+        .all(|text| !markdown_block_is_structural(text))
+}
+
+fn markdown_block_is_structural(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with('#')
+        || trimmed.starts_with('>')
+        || trimmed.starts_with("```")
+        || trimmed.starts_with("~~~")
+        || trimmed.starts_with("[^")
+        || trimmed.starts_with("- ")
+        || trimmed.starts_with("* ")
+        || trimmed.starts_with("+ ")
+        || matches!(trimmed, "***" | "---" | "___")
+}
+
+fn markdown_paragraph_is_visibly_open(text: &str) -> bool {
+    let mut trimmed = text.trim_end();
+    while trimmed.ends_with(']') {
+        let Some(marker_start) = trimmed.rfind("[^") else {
+            break;
+        };
+        let marker = &trimmed[marker_start + 2..trimmed.len() - 1];
+        if marker.is_empty()
+            || !marker
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '*'))
+        {
+            break;
+        }
+        trimmed = trimmed[..marker_start].trim_end();
+    }
+    let trimmed = trimmed.trim_end_matches(|ch: char| {
+        matches!(
+            ch,
+            '*' | '_' | '`' | '"' | '\'' | '\u{2019}' | '\u{201d}' | ')' | ']' | '}'
+        )
+    });
+    trimmed
+        .chars()
+        .last()
+        .is_some_and(|ch| !matches!(ch, '.' | '!' | '?'))
+}
+
+fn markdown_starts_with_lowercase_prose(text: &str) -> bool {
+    text.trim_start()
+        .trim_start_matches(|ch: char| {
+            matches!(
+                ch,
+                '*' | '_' | '`' | '"' | '\'' | '\u{201c}' | '\u{2018}' | '(' | '[' | '{'
+            )
+        })
+        .chars()
+        .next()
+        .is_some_and(char::is_lowercase)
 }
 
 #[derive(Default)]
@@ -1231,6 +1405,147 @@ struct MarkerOccurrence {
     marker: u16,
 }
 
+/// Markdown footnote identifiers are file-global, while a bound journal volume
+/// restarts its printed note numbers for every article.  Keep the familiar
+/// numeric label unless the same marker is linked to distinct note blocks.
+/// Scope those collisions to their detected articles so a callout in article A
+/// cannot silently land on article B's note.  Links whose colliding blocks do
+/// not have distinct article provenance are filtered before this function; the
+/// block fallback is retained only as a defensive uniqueness guarantee.
+fn numeric_footnote_labels(
+    document: &LiquidDocument,
+    links: &[&LiquidFootnoteLink],
+) -> BTreeMap<(u16, usize), String> {
+    let mut note_blocks_by_marker = BTreeMap::<u16, BTreeSet<usize>>::new();
+    for link in links {
+        note_blocks_by_marker
+            .entry(link.marker)
+            .or_default()
+            .insert(link.note_block_index);
+    }
+
+    let mut labels = BTreeMap::new();
+    for (marker, note_blocks) in note_blocks_by_marker {
+        if note_blocks.len() == 1 {
+            let note_block_index = *note_blocks.first().expect("one note block");
+            labels.insert((marker, note_block_index), marker.to_string());
+            continue;
+        }
+
+        let proposed = note_blocks
+            .iter()
+            .map(|note_block_index| {
+                let label = markdown_article_index_for_block(document, *note_block_index)
+                    .map(|article_index| format!("a{}-{marker}", article_index + 1))
+                    .unwrap_or_else(|| format!("n{}-{marker}", note_block_index + 1));
+                (*note_block_index, label)
+            })
+            .collect::<Vec<_>>();
+        let proposed_are_unique = proposed
+            .iter()
+            .map(|(_, label)| label)
+            .collect::<BTreeSet<_>>()
+            .len()
+            == proposed.len();
+        for (note_block_index, proposed_label) in proposed {
+            let label = if proposed_are_unique {
+                proposed_label
+            } else {
+                format!("n{}-{marker}", note_block_index + 1)
+            };
+            labels.insert((marker, note_block_index), label);
+        }
+    }
+    labels
+}
+
+fn safe_markdown_footnote_links(document: &LiquidDocument) -> Vec<&LiquidFootnoteLink> {
+    let mut note_blocks_by_marker = BTreeMap::<u16, BTreeSet<usize>>::new();
+    for link in &document.footnote_links {
+        note_blocks_by_marker
+            .entry(link.marker)
+            .or_default()
+            .insert(link.note_block_index);
+    }
+    let mut allowed_note_blocks = BTreeMap::<u16, BTreeSet<usize>>::new();
+    for (marker, note_blocks) in note_blocks_by_marker {
+        if note_blocks.len() <= 1 {
+            allowed_note_blocks.insert(marker, note_blocks);
+            continue;
+        }
+        let articles = note_blocks
+            .iter()
+            .filter_map(|note_block_index| {
+                markdown_article_index_for_block(document, *note_block_index)
+            })
+            .collect::<BTreeSet<_>>();
+        if articles.len() == note_blocks.len() {
+            allowed_note_blocks.insert(marker, note_blocks);
+            continue;
+        }
+
+        // Without distinct article provenance, Markdown cannot represent two
+        // definitions with the same printed label safely. Keep only the block
+        // supported by the most resolved body references, breaking ties by
+        // source order, and leave every competing block unlinked in `## Notes`.
+        let preferred = note_blocks
+            .iter()
+            .copied()
+            .max_by_key(|note_block_index| {
+                let support = document
+                    .footnote_links
+                    .iter()
+                    .filter(|link| {
+                        link.marker == marker && link.note_block_index == *note_block_index
+                    })
+                    .count();
+                let coordinate = markdown_block_coordinate(document, *note_block_index)
+                    .unwrap_or((*note_block_index, 0));
+                (support, std::cmp::Reverse(coordinate))
+            })
+            .expect("colliding marker has a note block");
+        allowed_note_blocks.insert(marker, BTreeSet::from([preferred]));
+    }
+    document
+        .footnote_links
+        .iter()
+        .filter(|link| {
+            allowed_note_blocks
+                .get(&link.marker)
+                .is_some_and(|blocks| blocks.contains(&link.note_block_index))
+        })
+        .collect()
+}
+
+fn markdown_article_index_for_block(
+    document: &LiquidDocument,
+    block_index: usize,
+) -> Option<usize> {
+    let coordinate = markdown_block_coordinate(document, block_index)?;
+    document
+        .article_spans
+        .iter()
+        .find(|span| {
+            coordinate >= (span.start_page_index, span.start_line_index)
+                && coordinate < (span.end_page_index, span.end_line_index)
+        })
+        .map(|span| span.article_index)
+}
+
+fn markdown_block_coordinate(
+    document: &LiquidDocument,
+    block_index: usize,
+) -> Option<(usize, usize)> {
+    document
+        .block_source_lines
+        .iter()
+        .find(|source| source.block_index == block_index)?
+        .lines
+        .iter()
+        .map(|line| (line.page_index, line.line_index))
+        .min()
+}
+
 #[derive(Default)]
 struct PlacementOutcome {
     blocks: BTreeMap<usize, String>,
@@ -1239,9 +1554,13 @@ struct PlacementOutcome {
     appended: usize,
 }
 
-fn rewrite_inline_blocks(document: &LiquidDocument) -> PlacementOutcome {
+fn rewrite_inline_blocks(
+    document: &LiquidDocument,
+    markdown_links: &[&LiquidFootnoteLink],
+) -> PlacementOutcome {
+    let labels = numeric_footnote_labels(document, markdown_links);
     let mut by_block: BTreeMap<usize, Vec<&LiquidFootnoteLink>> = BTreeMap::new();
-    for link in &document.footnote_links {
+    for link in markdown_links {
         by_block
             .entry(link.body_block_index)
             .or_default()
@@ -1269,7 +1588,11 @@ fn rewrite_inline_blocks(document: &LiquidDocument) -> PlacementOutcome {
                 && occurrence.marker == link.marker
                 && !replacements.contains_key(&occurrence.start)
             {
-                replacements.insert(occurrence.start, (occurrence.end, occurrence.marker));
+                let label = labels
+                    .get(&(link.marker, link.note_block_index))
+                    .cloned()
+                    .unwrap_or_else(|| link.marker.to_string());
+                replacements.insert(occurrence.start, (occurrence.end, label));
             }
         }
 
@@ -1282,8 +1605,12 @@ fn rewrite_inline_blocks(document: &LiquidDocument) -> PlacementOutcome {
         if can_append_missing {
             let mut rewritten = replace_marker_occurrences(&block.text, &replacements);
             for link in &links {
+                let label = labels
+                    .get(&(link.marker, link.note_block_index))
+                    .cloned()
+                    .unwrap_or_else(|| link.marker.to_string());
                 rewritten.push(MARKDOWN_MARKER_START);
-                rewritten.push_str(&link.marker.to_string());
+                rewritten.push_str(&label);
                 rewritten.push(MARKDOWN_MARKER_END);
             }
             outcome.appended += missing;
@@ -1318,16 +1645,19 @@ fn source_marker_matches(
         .unwrap_or(false)
 }
 
-fn replace_marker_occurrences(text: &str, replacements: &BTreeMap<usize, (usize, u16)>) -> String {
+fn replace_marker_occurrences(
+    text: &str,
+    replacements: &BTreeMap<usize, (usize, String)>,
+) -> String {
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0usize;
-    for (start, (end, marker)) in replacements {
+    for (start, (end, label)) in replacements {
         if *start < cursor || *end > text.len() {
             continue;
         }
         out.push_str(&text[cursor..*start]);
         out.push(MARKDOWN_MARKER_START);
-        out.push_str(&marker.to_string());
+        out.push_str(label);
         out.push(MARKDOWN_MARKER_END);
         cursor = *end;
     }
@@ -1735,10 +2065,12 @@ fn build_inline_notes(
     document: &LiquidDocument,
     note_indices: &[usize],
     author_notes: AuthorNotes,
+    markdown_links: &[&LiquidFootnoteLink],
     warnings: &mut Vec<String>,
 ) -> InlineNotes {
+    let labels = numeric_footnote_labels(document, markdown_links);
     let mut definitions = author_notes.definitions;
-    let mut links = document.footnote_links.iter().collect::<Vec<_>>();
+    let mut links = markdown_links.to_vec();
     links.sort_by_key(|link| (link.note_block_index, link.marker));
     let mut consumed_ranges: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
     let mut seen_labels = definitions
@@ -1768,7 +2100,10 @@ fn build_inline_notes(
     let mut dropped_distinct_notes = 0usize;
 
     for link in links {
-        let label = link.marker.to_string();
+        let label = labels
+            .get(&(link.marker, link.note_block_index))
+            .cloned()
+            .unwrap_or_else(|| link.marker.to_string());
         match block_for_label.get(&label) {
             Some(seen) if *seen != link.note_block_index => dropped_distinct_notes += 1,
             None => {
@@ -1947,6 +2282,8 @@ fn build_inline_notes(
         unlinked.push(escape_footnote_text(&label));
     }
 
+    repair_glued_note_boundaries(&mut definitions, &unlinked);
+
     InlineNotes {
         definitions,
         unlinked,
@@ -1974,6 +2311,33 @@ fn append_footnote_continuation(text: &mut String, continuation: &str) {
         }
     }
     text.push_str(continuation);
+}
+
+/// Remove a marker glued to the previous definition only when the same marker
+/// survives as a separate unlinked note. Without an exact body occurrence it
+/// stays unlinked: placing a synthetic reference after marker N-1 or at the end
+/// of the body would silently move or invent a citation.
+fn repair_glued_note_boundaries(definitions: &mut [FootnoteDefinition], unlinked: &[String]) {
+    let existing: BTreeSet<String> = definitions
+        .iter()
+        .map(|definition| definition.label.clone())
+        .collect();
+    for definition in definitions.iter_mut() {
+        let Some((kept, marker)) = peel_glued_trailing_note_number(&definition.text) else {
+            continue;
+        };
+        let label = marker.to_string();
+        if existing.contains(&label) {
+            continue;
+        }
+        let has_bare_partner = unlinked.iter().any(|note| {
+            recover_bare_numeric_note_line(note).is_some_and(|(found, _)| found == marker)
+        });
+        if !has_bare_partner {
+            continue;
+        }
+        definition.text = kept;
+    }
 }
 
 /// Whether a block has an explicitly recovered numeric note head in its source
@@ -2338,12 +2702,90 @@ fn is_note_candidate(role: LiquidBlockRole, text: &str, linked: bool) -> bool {
         LiquidBlockRole::Footnote | LiquidBlockRole::Marginalia => {
             linked || !marker_only_unlinked_note_head(text)
         }
+        // A URL-only footnote can be classified as a caption or body line, but
+        // text shape alone is not provenance. Move it into the notes apparatus
+        // only when a real body callout was linked; otherwise preserve it in
+        // place rather than moving substantive numbered prose or inventing a
+        // citation.
+        LiquidBlockRole::Caption | LiquidBlockRole::Paragraph => linked,
         // Rejected text that opens with a note number is footnote material the
         // classifier mislabelled. It belongs with the notes, not loose in the
         // body where it reads as a numbered fragment interrupting the prose.
         LiquidBlockRole::Noise => false,
         _ => false,
     }
+}
+
+/// Italic or plain URL-only note left in the body/caption stream.
+///
+/// Matches `*63 Biglaw Investor, … https://…*` and the same text without
+/// Markdown italics. Rejects years (`2024 See https://…`) by requiring the
+/// whole leading number to be a 1–3 digit marker followed by a title word.
+pub(crate) fn numeric_url_note_marker(text: &str) -> Option<u16> {
+    recover_numeric_url_note_line(text).map(|(marker, _)| marker)
+}
+
+fn recover_numeric_url_note_line(text: &str) -> Option<(u16, String)> {
+    let trimmed = text.trim();
+    let inner = unwrap_italic_line(trimmed);
+    let marker = leading_numeric_note_marker(inner)?;
+    let rest = strip_leading_numeric_marker(inner, marker).trim();
+    if rest.is_empty()
+        || rest.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+        || !rest.chars().next().is_some_and(|ch| ch.is_alphabetic())
+        || rest.split_whitespace().count() > 24
+    {
+        return None;
+    }
+    let has_url = rest.contains("https://") || rest.contains("http://") || rest.contains("www.");
+    has_url.then(|| (marker, escape_footnote_text(rest)))
+}
+
+fn unwrap_italic_line(text: &str) -> &str {
+    let trimmed = text.trim();
+    if trimmed.len() > 2 && trimmed.starts_with('*') && trimmed.ends_with('*') {
+        trimmed[1..trimmed.len() - 1].trim()
+    } else {
+        trimmed
+    }
+}
+
+/// `…conditions.295` → keep `…conditions.` and the glued marker 295.
+fn peel_glued_trailing_note_number(text: &str) -> Option<(String, u16)> {
+    let trimmed = text.trim_end();
+    let digit_start = trimmed
+        .char_indices()
+        .rev()
+        .take_while(|(_, ch)| ch.is_ascii_digit())
+        .last()
+        .map(|(index, _)| index)?;
+    if digit_start == 0 || trimmed.len() - digit_start > 3 {
+        return None;
+    }
+    let marker = trimmed[digit_start..].parse::<u16>().ok()?;
+    if !(1..=MAX_NOTE_MARKER).contains(&marker) {
+        return None;
+    }
+    let kept = &trimmed[..digit_start];
+    kept.ends_with('.').then(|| (kept.to_owned(), marker))
+}
+
+/// Leftover `295 Id. at 682–83 …` line that never became `[^295]:`.
+fn recover_bare_numeric_note_line(text: &str) -> Option<(u16, String)> {
+    let trimmed = unwrap_italic_line(text);
+    let marker = leading_numeric_note_marker(trimmed)?;
+    let rest = strip_leading_numeric_marker(trimmed, marker).trim();
+    if rest.is_empty() || rest.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let citation_open = rest.starts_with("Id.")
+        || rest.starts_with("id.")
+        || rest.starts_with("See ")
+        || rest.starts_with("See,")
+        || rest.starts_with("Ibid")
+        || rest.starts_with("supra")
+        || rest.starts_with("Supra");
+    citation_open.then(|| (marker, escape_footnote_text(rest)))
 }
 
 fn marker_only_unlinked_note_head(text: &str) -> bool {
@@ -3500,7 +3942,8 @@ fn compact_liquid_metadata(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::liquid::{
-        LiquidBlock, LiquidBlockSourceLines, LiquidFootnoteLinkIntegrity, LiquidSourceLineRef,
+        ArticleSpan, LiquidBlock, LiquidBlockSourceLines, LiquidFootnoteLinkIntegrity,
+        LiquidSourceLineRef,
     };
 
     fn block(role: LiquidBlockRole, text: &str) -> LiquidBlock {
@@ -3568,6 +4011,117 @@ mod tests {
                 include_tables: true,
                 include_metadata: false,
             }
+        );
+    }
+
+    #[test]
+    fn bound_volume_repeated_numbers_get_article_scoped_markdown_labels() {
+        let mut document = document(vec![
+            block(
+                LiquidBlockRole::Paragraph,
+                "First article proposition.\u{E000}1\u{E001}",
+            ),
+            block(LiquidBlockRole::Footnote, "1 First article authority."),
+            block(
+                LiquidBlockRole::Paragraph,
+                "Second article proposition.\u{E000}1\u{E001}",
+            ),
+            block(LiquidBlockRole::Footnote, "1 Second article authority."),
+        ]);
+        document.article_spans = vec![
+            ArticleSpan {
+                article_index: 0,
+                start_page_index: 0,
+                start_line_index: 0,
+                end_page_index: 1,
+                end_line_index: 0,
+                confidence: 0.99,
+                title_hint: None,
+                evidence: Vec::new(),
+            },
+            ArticleSpan {
+                article_index: 1,
+                start_page_index: 1,
+                start_line_index: 0,
+                end_page_index: 2,
+                end_line_index: 0,
+                confidence: 0.99,
+                title_hint: None,
+                evidence: Vec::new(),
+            },
+        ];
+        document.block_source_lines = (0..4)
+            .map(|block_index| LiquidBlockSourceLines {
+                block_index,
+                lines: vec![LiquidSourceLineRef {
+                    id: None,
+                    page_index: block_index / 2,
+                    line_index: block_index % 2,
+                    text: document.blocks[block_index].text.clone(),
+                    role: document.blocks[block_index].role,
+                    note_markers: Vec::new(),
+                }],
+            })
+            .collect();
+        add_link(&mut document, 0, 0, 1, 1);
+        add_link(&mut document, 2, 0, 1, 3);
+        document.footnote_link_integrity = Some(LiquidFootnoteLinkIntegrity {
+            detectable_markers: 2,
+            landed: 2,
+            unmatched: 0,
+            ambiguous: 0,
+            note_heads: 2,
+            landing_rate: 1.0,
+            ambiguous_rate: 0.0,
+        });
+
+        let export = liquid_document_markdown(&document, &MarkdownOptions::default());
+
+        assert!(export.text.contains("First article proposition.[^a1-1]"));
+        assert!(export.text.contains("Second article proposition.[^a2-1]"));
+        assert!(export.text.contains("[^a1-1]: First article authority."));
+        assert!(export.text.contains("[^a2-1]: Second article authority."));
+        assert!(!export.text.contains("[^1]:"));
+    }
+
+    #[test]
+    fn repeated_number_without_distinct_article_provenance_keeps_only_one_landing() {
+        let mut document = document(vec![
+            block(
+                LiquidBlockRole::Paragraph,
+                "One possible callout.\u{E000}1\u{E001}",
+            ),
+            block(LiquidBlockRole::Footnote, "1 First possible authority."),
+            block(
+                LiquidBlockRole::Paragraph,
+                "Another possible callout.\u{E000}1\u{E001}",
+            ),
+            block(LiquidBlockRole::Footnote, "1 Second possible authority."),
+        ]);
+        add_link(&mut document, 0, 0, 1, 1);
+        add_link(&mut document, 2, 0, 1, 3);
+        document.footnote_link_integrity = Some(LiquidFootnoteLinkIntegrity {
+            detectable_markers: 2,
+            landed: 2,
+            unmatched: 0,
+            ambiguous: 0,
+            note_heads: 2,
+            landing_rate: 1.0,
+            ambiguous_rate: 0.0,
+        });
+
+        let export = liquid_document_markdown(&document, &MarkdownOptions::default());
+
+        assert!(export.text.contains("One possible callout.[^1]"));
+        assert!(export.text.contains("Another possible callout."));
+        assert!(!export.text.contains("Another possible callout.[^1]"));
+        assert!(export.text.contains("[^1]: First possible authority."));
+        assert!(export.text.contains("1 Second possible authority."));
+        assert!(
+            export
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("sharing a printed number"))
         );
     }
 
@@ -4388,6 +4942,112 @@ mod tests {
             "```\nCommission Dates Without Quorum\nAgency A 01/20/2025 Removal\nAgency B 02/28/2025 Resignation\n```"
         ));
         assert!(export.text.ends_with("The discussion resumes."));
+    }
+
+    #[test]
+    fn adjacent_sentence_table_blocks_keep_real_paragraph_boundaries() {
+        let document = document(vec![
+            block(
+                LiquidBlockRole::Table,
+                "The first complete paragraph explains the governing rule in practical terms.",
+            ),
+            block(
+                LiquidBlockRole::Table,
+                "The second complete paragraph applies that rule to the disputed conduct.",
+            ),
+            block(
+                LiquidBlockRole::Table,
+                "The third complete paragraph states the resulting legal conclusion clearly.",
+            ),
+        ]);
+
+        let export = liquid_document_markdown(&document, &MarkdownOptions::default());
+
+        assert!(!export.text.contains("```"), "{}", export.text);
+        assert!(
+            export
+                .text
+                .contains("practical terms.\n\nThe second complete paragraph")
+        );
+        assert!(
+            export
+                .text
+                .contains("disputed conduct.\n\nThe third complete paragraph")
+        );
+    }
+
+    #[test]
+    fn sentence_prose_misclassified_as_table_renders_as_body_and_keeps_note() {
+        let mut document = document(vec![
+            block(
+                LiquidBlockRole::Table,
+                &format!(
+                    "After examining the governing rule, the commission explained that ordinary clients need clear advice about the objectives and scope of representation.{CALLOUT_START}1{CALLOUT_END} The discussion then describes the lawyer's obligations in complete sentences and applies those duties to the facts before the court."
+                ),
+            ),
+            block(
+                LiquidBlockRole::Marginalia,
+                "1 See Model Rule of Professional Conduct 1.2 and accompanying commentary.",
+            ),
+        ]);
+        document.footnote_link_integrity = Some(integrity(1.0));
+        add_link(&mut document, 0, 0, 1, 1);
+
+        let export = liquid_document_markdown(&document, &MarkdownOptions::default());
+
+        assert!(!export.text.contains("```"), "{}", export.text);
+        assert!(export.text.contains("scope of representation.[^1]"));
+        assert!(export.text.contains("[^1]: See Model Rule"));
+        assert!(
+            export
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("table-classified"))
+        );
+    }
+
+    #[test]
+    fn table_prose_fallback_rejoins_lowercase_body_continuations() {
+        let document = document(vec![
+            block(LiquidBlockRole::Paragraph, "The court explained"),
+            block(
+                LiquidBlockRole::Table,
+                "that the governing doctrine protects ordinary clients when counsel defines the objectives and scope of a limited representation. The commission reviewed the complete rule, its comments, the drafting history, and the practical consequences because",
+            ),
+            block(
+                LiquidBlockRole::Paragraph,
+                "the final interpretation depends on all of those sources.",
+            ),
+        ]);
+
+        let export = liquid_document_markdown(&document, &MarkdownOptions::default());
+
+        assert!(!export.text.contains("```"), "{}", export.text);
+        assert!(
+            export.text.contains(
+                "The court explained that the governing doctrine protects ordinary clients"
+            )
+        );
+        assert!(
+            export
+                .text
+                .contains("practical consequences because the final interpretation depends")
+        );
+        assert!(!export.text.contains("explained\n\nthat"));
+        assert!(!export.text.contains("because\n\nthe final"));
+    }
+
+    #[test]
+    fn long_numeric_table_remains_fenced() {
+        let document = document(vec![block(
+            LiquidBlockRole::Table,
+            "State 1996 1997 1998 1999 2000\nNew York 11.06 11.13 11.13 10.71 11.19\nCalifornia 9.48 9.54 9.03 9.34 8.53\nIllinois 7.69 7.71 7.46 6.95 6.58\nMichigan 7.10 7.04 7.09 7.14 7.11\nOhio 6.30 6.25 6.38 6.40 6.51",
+        )]);
+
+        let export = liquid_document_markdown(&document, &MarkdownOptions::default());
+
+        assert_eq!(export.text.matches("```").count(), 2, "{}", export.text);
+        assert!(export.warnings.is_empty());
     }
 
     #[test]
@@ -5969,5 +6629,166 @@ mod tests {
             let export = liquid_document_markdown(&document, &MarkdownOptions::default());
             assert_eq!(export.text, expected.trim_end());
         }
+    }
+
+    #[test]
+    fn recovers_italic_url_note_line_shape() {
+        let source = "*63 Biglaw Investor, Biglaw Salary Scale, https://www.biglawinvestor.com/biglaw-salary-scale/*";
+        let (marker, text) = recover_numeric_url_note_line(source).expect("url note");
+        assert_eq!(marker, 63);
+        assert!(text.starts_with("Biglaw Investor"));
+        assert!(text.contains("https://www.biglawinvestor.com/biglaw-salary-scale/"));
+        assert_eq!(
+            recover_numeric_url_note_line(
+                "63 Biglaw Investor, Biglaw Salary Scale, https://www.biglawinvestor.com/biglaw-salary-scale/"
+            ),
+            Some((marker, text.clone()))
+        );
+        assert!(recover_numeric_url_note_line("2024 See https://example.com/paper").is_none());
+        assert!(numeric_url_note_marker(source) == Some(63));
+    }
+
+    #[test]
+    fn recovers_fused_trailing_note_and_bare_id_line() {
+        let fused = "Compare id. at 152, with Dye, 908 F.3d at 678. tions, it's also eminently reasonable to assume that by opening and retaining those items a consumer necessarily accepts the accompanying terms and conditions.295";
+        let (kept, marker) = peel_glued_trailing_note_number(fused).expect("glued 295");
+        assert_eq!(marker, 295);
+        assert!(kept.ends_with("conditions."));
+        assert!(!kept.ends_with("295"));
+        let leftover =
+            "295 Id. at 682–83 (citing Kolodziej v. Mason, 774 F.3d 736, 742 (11th Cir. 2014)).";
+        let (bare_marker, bare_text) =
+            recover_bare_numeric_note_line(leftover).expect("bare 295 Id.");
+        assert_eq!(bare_marker, 295);
+        assert!(bare_text.starts_with("Id. at 682"));
+        assert!(peel_glued_trailing_note_number("Dye, 908 F.3d at 678.").is_none());
+        assert!(recover_bare_numeric_note_line("9 Unlinked authority.").is_none());
+    }
+
+    #[test]
+    fn italic_url_caption_becomes_landed_footnote() {
+        let mut document = document(vec![
+            block(
+                LiquidBlockRole::Paragraph,
+                "Figure 3 shows salaries have risen faster than inflation since 1999.\u{E000}63\u{E001} Though comprehensive data is difficult to obtain.",
+            ),
+            block(
+                LiquidBlockRole::Caption,
+                "63 Biglaw Investor, Biglaw Salary Scale, https://www.biglawinvestor.com/biglaw-salary-scale/",
+            ),
+            block(
+                LiquidBlockRole::Paragraph,
+                "Median lawyer wages have also been increasing.\u{E000}64\u{E001}",
+            ),
+            block(
+                LiquidBlockRole::Footnote,
+                "64 MARC GALANTER & THOMAS PALAY, TOURNAMENT OF LAWYERS 24 (1991).",
+            ),
+        ]);
+        crate::liquid::attach_footnote_links(&mut document);
+        assert!(
+            document
+                .footnote_links
+                .iter()
+                .any(|link| link.marker == 63 && link.note_block_index == 1),
+            "url caption must become the note head for 63: {:?}",
+            document.footnote_links
+        );
+
+        let export = liquid_document_markdown(&document, &MarkdownOptions::default());
+        assert!(
+            export.text.contains("[^63]: Biglaw Investor"),
+            "{}",
+            export.text
+        );
+        assert!(
+            export.text.contains("1999.[^63]"),
+            "body callout must land: {}",
+            export.text
+        );
+        assert!(
+            !export.text.contains("*63 Biglaw"),
+            "caption must not stay italic body: {}",
+            export.text
+        );
+    }
+
+    #[test]
+    fn numbered_url_paragraph_without_callout_stays_in_body() {
+        let document = document(vec![block(
+            LiquidBlockRole::Paragraph,
+            "2 Learn more at https://example.com/clinic",
+        )]);
+
+        let export = liquid_document_markdown(&document, &MarkdownOptions::default());
+
+        assert!(
+            export
+                .text
+                .contains("2 Learn more at https://example.com/clinic"),
+            "{}",
+            export.text
+        );
+        assert!(!export.text.contains("[^2]:"), "{}", export.text);
+        assert_eq!(export.footnote_count, 0);
+    }
+
+    #[test]
+    fn fused_continuation_number_stays_unlinked_without_body_provenance() {
+        let mut document = document(vec![
+            block(
+                LiquidBlockRole::Paragraph,
+                "The warranty was at the heart of the suit.\u{E000}293\u{E001} Homeowners accepted the terms.\u{E000}294\u{E001} The court later continued: items come with terms and condi",
+            ),
+            block(
+                LiquidBlockRole::Footnote,
+                "293 Compare id. at 152, with Dye, 908 F.3d at 678.",
+            ),
+            block(
+                LiquidBlockRole::Footnote,
+                "tions, it's also eminently reasonable to assume that by opening and retaining those items a consumer necessarily accepts the accompanying terms and conditions.295",
+            ),
+            block(LiquidBlockRole::Footnote, "294 Dye, 908 F.3d at 678."),
+            block(
+                LiquidBlockRole::Footnote,
+                "295 Id. at 682–83 (citing Kolodziej v. Mason, 774 F.3d 736, 742 (11th Cir. 2014)).",
+            ),
+            block(
+                LiquidBlockRole::Paragraph,
+                "The court even said fair notice has been building.\u{E000}296\u{E001}",
+            ),
+            block(LiquidBlockRole::Footnote, "296 Id. at 683."),
+        ]);
+        add_link(&mut document, 0, 0, 293, 1);
+        add_link(&mut document, 0, 1, 294, 3);
+        add_link(&mut document, 5, 0, 296, 6);
+        document.footnote_link_integrity = Some(integrity(1.0));
+
+        let export = liquid_document_markdown(&document, &MarkdownOptions::default());
+        let note_293 = export
+            .text
+            .lines()
+            .find(|line| line.starts_with("[^293]:"))
+            .unwrap_or("");
+        assert!(
+            !note_293.trim_end().ends_with("295"),
+            "293 must not keep a glued 295: {note_293}"
+        );
+        let body = export.text.split("\n---\n").next().unwrap_or("");
+        assert!(
+            !body.contains("[^295]"),
+            "body must not invent a location for 295: {}",
+            export.text
+        );
+        assert!(
+            !export.text.contains("[^295]:"),
+            "an unlocated 295 must not become an orphan definition: {}",
+            export.text
+        );
+        assert!(
+            export.text.lines().any(|line| line.starts_with("295 Id.")),
+            "the exact unlinked 295 text must remain visible: {}",
+            export.text
+        );
     }
 }

@@ -210,7 +210,12 @@ fn lm2_runtime_status(
         errors.push("required context two-pass model was not loaded".to_owned());
     }
     let context_arbiter_model = if native_line_model_active {
-        match load_lm2_context_arbiter_model(context_primary_sha256) {
+        match load_lm2_context_arbiter_model(
+            context_primary_sha256,
+            context_model
+                .as_ref()
+                .map(|model| model.asset_sha256.as_str()),
+        ) {
             Ok(model) => model,
             Err(error) => {
                 errors.push(format!("context arbiter load failed: {error}"));

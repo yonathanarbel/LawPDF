@@ -58,12 +58,17 @@ LONG_HEADING_WORDS = 18
 # this deliberately short so ordinary footnoted paragraph endings do not all
 # become warnings.
 SHORT_MARKER_SPLICE_WORDS = 30
+# Unlabelled fences are how LawPDF serializes tables. A fence dominated by
+# sentence-like natural language is normally ordinary body or note prose that
+# was misrouted as a table. Keep the floor high enough to ignore terse labels.
+PROSE_FENCE_WORDS = 24
 
 PRIVATE_USE = re.compile(r"[-]")
 # LawPDF's own callout/marker sentinels, which must never reach the output.
 LAWPDF_SENTINEL = re.compile(r"[]")
 FOOTNOTE_DEF = re.compile(r"^\[\^([^\]]+)\]:\s*(.*)$")
 FOOTNOTE_REF = re.compile(r"\[\^([^\]]+)\]")
+SCOPED_NUMERIC_FOOTNOTE = re.compile(r"^((?:a|n)\d+)-(\d+)$")
 HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
 TOC_LEADER = re.compile(r"\.{4,}\s*\d+\s*$")
 PAGE_NUMBER_ONLY = re.compile(r"^\[?\d{1,4}\]?$")
@@ -311,7 +316,11 @@ def check_footnotes(blocks: Sequence[Block], report: DocumentReport) -> None:
     # Numeric notes are the article's ordered apparatus and must be linked.
     # Author and symbol notes are often emitted deliberately without an inline
     # body reference, so they are allowed here rather than failing the gate.
-    for ident in sorted(ident for ident in defined - referenced if ident.isdigit()):
+    for ident in sorted(
+        ident
+        for ident in defined - referenced
+        if numeric_footnote_identity(ident) is not None
+    ):
         report.add(
             "footnote.orphan_definition",
             CRITICAL,
@@ -319,7 +328,12 @@ def check_footnotes(blocks: Sequence[Block], report: DocumentReport) -> None:
             f"note {ident} is defined but never referenced in the body",
         )
 
-    numeric = [(int(i), line) for i, line in definitions if i.isdigit()]
+    numeric = [
+        (scope, number, line)
+        for ident, line in definitions
+        if (parsed := numeric_footnote_identity(ident)) is not None
+        for scope, number in [parsed]
+    ]
     report.stats["footnote_definitions"] = len(definitions)
     report.stats["footnote_references"] = len(referenced)
     report.stats["footnote_numeric_definitions"] = len(numeric)
@@ -327,39 +341,68 @@ def check_footnotes(blocks: Sequence[Block], report: DocumentReport) -> None:
     if not numeric:
         return
 
-    numbers = [n for n, _ in numeric]
-    line_of = {n: line for n, line in numeric}
-    lowest, highest = min(numbers), max(numbers)
-    report.stats["footnote_range"] = [lowest, highest]
+    by_scope: dict[str, list[tuple[int, int]]] = {}
+    for scope, number, line in numeric:
+        by_scope.setdefault(scope, []).append((number, line))
+    report.stats["footnote_scope_count"] = len(by_scope)
+    report.stats["footnote_scopes"] = {}
+    missing_by_scope: dict[str, list[int]] = {}
+    for scope, scoped_numeric in by_scope.items():
+        numbers = [number for number, _ in scoped_numeric]
+        line_of = {number: line for number, line in scoped_numeric}
+        lowest, highest = min(numbers), max(numbers)
+        display_scope = scope or "document"
+        missing = sorted(set(range(lowest, highest + 1)) - set(numbers))
+        missing_by_scope[display_scope] = missing
+        report.stats["footnote_scopes"][display_scope] = {
+            "range": [lowest, highest],
+            "missing": missing,
+        }
+        detail_scope = f" in {scope}" if scope else ""
 
-    if lowest != 1:
-        report.add(
-            "footnote.sequence_start",
-            WARNING,
-            line_of[lowest],
-            f"numbering starts at {lowest}, not 1",
-        )
-
-    missing = sorted(set(range(lowest, highest + 1)) - set(numbers))
-    report.stats["footnote_missing"] = missing
-    if missing:
-        report.add(
-            "footnote.sequence_gap",
-            CRITICAL,
-            line_of[highest],
-            f"{len(missing)} note(s) missing from {lowest}..{highest}: "
-            + summarize_runs(missing),
-        )
-
-    for previous, current in zip(numeric, numeric[1:]):
-        if current[0] < previous[0]:
+        if lowest != 1:
             report.add(
-                "footnote.sequence_disorder",
-                CRITICAL,
-                current[1],
-                f"note {current[0]} is defined after note {previous[0]}",
+                "footnote.sequence_start",
+                WARNING,
+                line_of[lowest],
+                f"numbering{detail_scope} starts at {lowest}, not 1",
             )
-            break
+
+        if missing:
+            report.add(
+                "footnote.sequence_gap",
+                CRITICAL,
+                line_of[highest],
+                f"{len(missing)} note(s) missing{detail_scope} from {lowest}..{highest}: "
+                + summarize_runs(missing),
+            )
+
+        for previous, current in zip(scoped_numeric, scoped_numeric[1:]):
+            if current[0] < previous[0]:
+                report.add(
+                    "footnote.sequence_disorder",
+                    CRITICAL,
+                    current[1],
+                    f"note {current[0]}{detail_scope} is defined after note {previous[0]}",
+                )
+                break
+
+    if len(by_scope) == 1:
+        only = next(iter(report.stats["footnote_scopes"].values()))
+        report.stats["footnote_range"] = only["range"]
+        report.stats["footnote_missing"] = only["missing"]
+    else:
+        report.stats["footnote_missing_by_scope"] = missing_by_scope
+
+
+def numeric_footnote_identity(ident: str) -> tuple[str, int] | None:
+    """Return the sequence scope and printed number for a numeric note label."""
+    if ident.isdigit():
+        return "", int(ident)
+    match = SCOPED_NUMERIC_FOOTNOTE.fullmatch(ident)
+    if match is None:
+        return None
+    return match.group(1), int(match.group(2))
 
 
 def check_pagination_artifacts(
@@ -577,6 +620,65 @@ def check_body(blocks: Sequence[Block], report: DocumentReport) -> None:
         ordered = sorted(body_words)
         report.stats["body_words_median"] = ordered[len(ordered) // 2]
         report.stats["body_words_max"] = ordered[-1]
+
+
+def check_fenced_prose(blocks: Sequence[Block], report: DocumentReport) -> None:
+    """Reject table fences that are actually ordinary prose.
+
+    LawPDF emits extracted tables in unlabelled fences. Real code samples with
+    a language tag are outside this check; so are compact numeric grids and
+    short figure labels. This closes a verifier blind spot where scanned-page
+    background images could route most of an article into `Table` blocks while
+    source-token recall remained deceptively high.
+    """
+    fenced_blocks = 0
+    fenced_words = 0
+    prose_fences = 0
+    for block in blocks:
+        opener = block.first.strip()
+        if opener not in {"```", "~~~"}:
+            continue
+        fenced_blocks += 1
+        content_lines = [line.strip() for line in block.lines[1:-1] if line.strip()]
+        content = "\n".join(content_lines)
+        words = word_count(strip_markup(content))
+        fenced_words += words
+        if words < PROSE_FENCE_WORDS or not content_lines:
+            continue
+
+        numeric_rows = 0
+        for line in content_lines:
+            tokens = [
+                token.strip(".,;:()[]{}%$'’“”")
+                for token in line.split()
+            ]
+            tokens = [token for token in tokens if token]
+            numeric = sum(any(char.isdigit() for char in token) for token in tokens)
+            if len(tokens) >= 3 and numeric >= 2 and numeric * 2 >= len(tokens):
+                numeric_rows += 1
+        if numeric_rows >= 3 and numeric_rows * 2 >= len(content_lines):
+            continue
+
+        prose_lines = sum(
+            word_count(strip_markup(line)) >= 8
+            or bool(re.search(r"[.!?][\"'\u2019\u201d)\]]*$", line))
+            for line in content_lines
+        )
+        if prose_lines * 2 < len(content_lines):
+            continue
+
+        prose_fences += 1
+        report.add(
+            "table.prose_fence",
+            CRITICAL,
+            block.line,
+            f"{words}-word sentence-like block was emitted as a table/code fence: "
+            f"{preview(content)}",
+        )
+
+    report.stats["fenced_blocks"] = fenced_blocks
+    report.stats["fenced_words"] = fenced_words
+    report.stats["prose_fences"] = prose_fences
 
 
 def check_headings(blocks: Sequence[Block], report: DocumentReport) -> None:
@@ -881,6 +983,7 @@ def verify(path: Path, reference: Path | None, source: Path | None) -> DocumentR
     check_pagination_artifacts(blocks, report)
     check_blank_boundary_continuations(blocks, report)
     check_body(blocks, report)
+    check_fenced_prose(blocks, report)
     check_headings(blocks, report)
     if reference is not None:
         check_reference_recall(
@@ -904,9 +1007,13 @@ def print_report(report: DocumentReport, verbose: bool) -> None:
             heads=stats.get("headings", 0),
             defs=stats.get("footnote_definitions", 0),
             rng=(
-                f" ({stats['footnote_range'][0]}..{stats['footnote_range'][1]})"
-                if stats.get("footnote_range")
-                else ""
+                f" ({stats['footnote_scope_count']} article scopes)"
+                if stats.get("footnote_scope_count", 0) > 1
+                else (
+                    f" ({stats['footnote_range'][0]}..{stats['footnote_range'][1]})"
+                    if stats.get("footnote_range")
+                    else ""
+                )
             ),
             recall=(
                 ", recall {source:.0%} source / {body:.0%} body / {fn:.0%} notes".format(

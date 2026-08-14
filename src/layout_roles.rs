@@ -1424,8 +1424,8 @@ impl LineBuilder {
     }
 }
 
-/// Detect inline footnote callouts — short digit runs set in a font clearly smaller than the line's
-/// body text (i.e. superscript reference markers) — and wrap them in `CALLOUT_START`/`CALLOUT_END`
+/// Detect inline footnote callouts — short digit runs set in a smaller font or
+/// drawn with a visibly smaller, raised glyph box — and wrap them in `CALLOUT_START`/`CALLOUT_END`
 /// sentinels on the raw line text (before whitespace normalization). Conservative by design:
 /// requires real body content on the line, so standalone/marginal number lines are left alone.
 const IMPLICIT_WORD_SPACE_GAP_RATIO: f32 = 0.14;
@@ -1565,6 +1565,22 @@ fn wrap_superscript_callouts(text: &mut String, meta: &[CharMeta]) {
         m.font_size
             .is_some_and(|s| s.is_finite() && s < body * 0.80)
     };
+    let mut body_bottoms = meta
+        .iter()
+        .filter(|m| m.ch.is_ascii_alphabetic() && !small(m))
+        .filter_map(|m| m.rect.map(|rect| rect.bottom))
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    let mut body_heights = meta
+        .iter()
+        .filter(|m| m.ch.is_ascii_alphabetic() && !small(m))
+        .filter_map(|m| m.rect.map(|rect| rect.top - rect.bottom))
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect::<Vec<_>>();
+    body_bottoms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    body_heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let body_bottom = body_bottoms.get(body_bottoms.len() / 2).copied();
+    let body_height = body_heights.get(body_heights.len() / 2).copied();
     // Require substantial body content (chars at/above body size) so we don't superscript a line
     // that is itself a small standalone marker/footnote line.
     let body_visible = meta
@@ -1574,18 +1590,47 @@ fn wrap_superscript_callouts(text: &mut String, meta: &[CharMeta]) {
     if body_visible < 12 {
         return;
     }
-    // Collect maximal runs of small numeric chars (1–4 digits) = superscript callouts.
+    // Collect maximal runs of numeric chars (one to three digits). A geometry
+    // path covers OCR layers that report one synthetic font size for the line.
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
     while i < meta.len() {
-        if small(&meta[i]) && meta[i].ch.is_ascii_digit() {
+        if meta[i].ch.is_ascii_digit() {
             let start = meta[i].start;
             let mut j = i;
-            while j < meta.len() && small(&meta[j]) && meta[j].ch.is_ascii_digit() {
+            while j < meta.len() && meta[j].ch.is_ascii_digit() {
                 j += 1;
             }
             let end = meta[j - 1].start + meta[j - 1].len;
-            if (1..=4).contains(&(j - i)) {
+            let explicit_small = (i..j).all(|index| small(&meta[index]));
+            let geometry_raised =
+                body_bottom
+                    .zip(body_height)
+                    .is_some_and(|(baseline, body_height)| {
+                        let rects = meta[i..j]
+                            .iter()
+                            .filter_map(|item| item.rect)
+                            .collect::<Vec<_>>();
+                        if rects.len() != j - i {
+                            return false;
+                        }
+                        let run_bottom = rects
+                            .iter()
+                            .map(|rect| rect.bottom)
+                            .fold(f32::INFINITY, f32::min);
+                        let run_top = rects
+                            .iter()
+                            .map(|rect| rect.top)
+                            .fold(f32::NEG_INFINITY, f32::max);
+                        let run_height = run_top - run_bottom;
+                        run_height > 0.0
+                            && run_height <= body_height * 0.90
+                            && run_bottom - baseline >= body_height * 0.14
+                    });
+            if (1..=3).contains(&(j - i))
+                && (explicit_small || geometry_raised)
+                && plausible_inline_callout_context(text, start, end)
+            {
                 runs.push((start, end));
             }
             i = j;
@@ -1600,6 +1645,59 @@ fn wrap_superscript_callouts(text: &mut String, meta: &[CharMeta]) {
             text.insert(s, CALLOUT_START);
         }
     }
+}
+
+fn plausible_inline_callout_context(text: &str, start: usize, end: usize) -> bool {
+    let before = &text[..start];
+    let after = &text[end..];
+    if !before.chars().any(char::is_alphabetic) {
+        return false;
+    }
+    let before_lower = before
+        .chars()
+        .rev()
+        .take(24)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let after_lower = after
+        .chars()
+        .take(16)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let citation_prefixes = [
+        " at ",
+        " p. ",
+        " pp. ",
+        " f.",
+        " f. ",
+        " u.s. ",
+        " s. ct. ",
+        " l. rev. ",
+        " section ",
+        " chapter ",
+        " § ",
+    ];
+    if citation_prefixes
+        .iter()
+        .any(|prefix| before_lower.ends_with(prefix))
+        || (after_lower.starts_with('d') && before_lower.ends_with('f'))
+        || [" u.s.", " s. ct.", " f.2d", " f.3d", " l. rev."]
+            .iter()
+            .any(|suffix| after_lower.starts_with(suffix))
+    {
+        return false;
+    }
+    let previous = before.chars().rev().find(|ch| !ch.is_whitespace());
+    previous.is_some_and(|ch| {
+        ch.is_alphabetic()
+            || matches!(
+                ch,
+                '.' | ',' | ';' | ':' | '?' | '!' | ')' | ']' | '}' | '"' | '\''
+            )
+    })
 }
 
 fn normalize_line_text(text: &str) -> String {
@@ -12686,6 +12784,70 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].text, "NADIABANTEKA");
         assert_eq!(trace.stats.implicit_spaces_inserted, 0);
+    }
+
+    #[test]
+    fn equal_font_raised_glyph_geometry_marks_inline_callout() {
+        let mut text = "The rule protects the witness.27".to_owned();
+        let marker_start = text.find("27").unwrap();
+        let marker_end = marker_start + 2;
+        let mut left = 72.0;
+        let mut meta = Vec::new();
+        for (start, ch) in text.char_indices() {
+            let raised = (marker_start..marker_end).contains(&start);
+            let width = if ch.is_whitespace() { 3.0 } else { 5.0 };
+            let bottom = if raised { 684.0 } else { 680.0 };
+            let height = if raised { 7.0 } else { 10.0 };
+            meta.push(CharMeta {
+                start,
+                len: ch.len_utf8(),
+                ch,
+                font_size: Some(10.0),
+                rect: Some(PdfRect::new(left, bottom, left + width, bottom + height)),
+            });
+            left += width;
+        }
+
+        wrap_superscript_callouts(&mut text, &meta);
+
+        assert_eq!(text, "The rule protects the witness.27");
+    }
+
+    #[test]
+    fn raised_reporter_volume_and_leading_note_head_are_not_callouts() {
+        for source in [
+            "The reporter citation is 157 U.S. 1.",
+            "27 Le Baron stated the governing rule.",
+        ] {
+            let marker = if source.starts_with("27") {
+                "27"
+            } else {
+                "157"
+            };
+            let marker_start = source.find(marker).unwrap();
+            let marker_end = marker_start + marker.len();
+            let mut text = source.to_owned();
+            let mut left = 72.0;
+            let mut meta = Vec::new();
+            for (start, ch) in source.char_indices() {
+                let raised = (marker_start..marker_end).contains(&start);
+                let width = if ch.is_whitespace() { 3.0 } else { 5.0 };
+                let bottom = if raised { 684.0 } else { 680.0 };
+                let height = if raised { 7.0 } else { 10.0 };
+                meta.push(CharMeta {
+                    start,
+                    len: ch.len_utf8(),
+                    ch,
+                    font_size: Some(10.0),
+                    rect: Some(PdfRect::new(left, bottom, left + width, bottom + height)),
+                });
+                left += width;
+            }
+
+            wrap_superscript_callouts(&mut text, &meta);
+
+            assert_eq!(text, source);
+        }
     }
 
     #[test]

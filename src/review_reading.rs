@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use crate::liquid::{
-    hidden_contents_mask_for_display, should_hide_contents_block_for_display, ArticleSpan,
-    LiquidBlock, LiquidBlockRole, LiquidDocument,
+    ArticleSpan, LiquidBlock, LiquidBlockRole, LiquidDocument, hidden_contents_mask_for_display,
+    should_hide_contents_block_for_display,
 };
 
 pub const REVIEW_OPENING_PAGE_LIMIT: usize = 4;
@@ -24,7 +24,11 @@ pub const REVIEW_PARAGRAPH_GAP: f32 = 16.0;
 pub const REVIEW_MARGIN_MIN_WIDTH: f32 = 168.0;
 pub const REVIEW_MARGIN_MAX_WIDTH: f32 = 260.0;
 pub const REVIEW_MARGIN_GAP: f32 = 16.0;
-pub const REVIEW_HIGH_CONFIDENCE_ARTICLE_SPAN: f32 = 3.0;
+// `article_segments::score_confidence` normalizes boundary scores to 0.50..0.99.
+// Keep this threshold on that same scale; the former raw-score value `3.0`
+// made every detected bound volume look low-confidence and silently unioned
+// article-local note starts with the unsafe file-global result.
+pub const REVIEW_HIGH_CONFIDENCE_ARTICLE_SPAN: f32 = 0.85;
 pub const REVIEW_OUTLINE_RAIL_DEFAULT_WIDTH: f32 = 236.0;
 
 /// Hide printed tables of contents from the Review reading column.
@@ -756,7 +760,9 @@ fn find_note_number_at_boundary(text: &str, from: usize, number: u16) -> Option<
     while let Some(rel) = text.get(search..)?.find(&needle) {
         let at = search + rel;
         let after = at + needle.len();
-        let prev = text.get(..at).and_then(|prefix| prefix.chars().rev().next());
+        let prev = text
+            .get(..at)
+            .and_then(|prefix| prefix.chars().rev().next());
         if prev.is_some_and(|ch| ch.is_ascii_digit()) {
             search = after;
             continue;
@@ -793,11 +799,12 @@ fn split_leading_note_marker(text: &str) -> (Option<&str>, &str) {
         return (None, trimmed);
     }
     let rest = &trimmed[end..];
-    if rest.starts_with(char::is_whitespace)
-        || rest.starts_with(['.', ')', ':'])
-        || rest.is_empty()
+    if rest.starts_with(char::is_whitespace) || rest.starts_with(['.', ')', ':']) || rest.is_empty()
     {
-        (Some(&trimmed[..end]), rest.trim_start_matches(['.', ')', ':']).trim_start())
+        (
+            Some(&trimmed[..end]),
+            rest.trim_start_matches(['.', ')', ':']).trim_start(),
+        )
     } else {
         (None, trimmed)
     }
@@ -949,8 +956,7 @@ pub fn noise_block_is_review_note(text: &str) -> bool {
     if body.is_empty() || body.starts_with(']') || is_review_table_of_contents_text(body) {
         return false;
     }
-    body.chars().next().is_some_and(|ch| ch.is_alphabetic())
-        && body.split_whitespace().count() >= 6
+    body.chars().next().is_some_and(|ch| ch.is_alphabetic()) && body.split_whitespace().count() >= 6
 }
 
 /// Furniture skip for the Review column. Rescued notes are never furniture.
@@ -1208,9 +1214,7 @@ pub fn review_display_benchmark(
         blocks
             .iter()
             .zip(hidden.iter())
-            .filter(|(block, hide)| {
-                !**hide && is_review_table_of_contents_text(&block.text)
-            })
+            .filter(|(block, hide)| !**hide && is_review_table_of_contents_text(&block.text))
             .count()
     });
     let omitted = omitted_keep_source_ids(keep_line_ids.iter().copied(), assembled_line_ids);
@@ -1397,7 +1401,12 @@ mod tests {
     fn review_column_balances_grey_outside_the_full_row() {
         let layout = review_column_layout(1424.0, 920.0, true);
         assert!(layout.margin_width >= REVIEW_MARGIN_MIN_WIDTH);
-        assert!((layout.row_width - (layout.body_width + 2.0 * (layout.margin_width + REVIEW_MARGIN_GAP))).abs() < 0.01);
+        assert!(
+            (layout.row_width
+                - (layout.body_width + 2.0 * (layout.margin_width + REVIEW_MARGIN_GAP)))
+                .abs()
+                < 0.01
+        );
         assert!((layout.side * 2.0 + layout.row_width - 1424.0).abs() < 0.5);
         let hidden = review_column_layout(1424.0, 920.0, false);
         assert_eq!(hidden.margin_width, 0.0);
@@ -1422,7 +1431,10 @@ mod tests {
             "7 See BURROWS. 8 162 N.E. 99 (N.Y. 1928). 9 Palsgraf, 162 N.E. at 99.",
         );
         assert_eq!(
-            eight.iter().map(|(marker, _)| marker.as_str()).collect::<Vec<_>>(),
+            eight
+                .iter()
+                .map(|(marker, _)| marker.as_str())
+                .collect::<Vec<_>>(),
             vec!["7", "8", "9"]
         );
         let continuation = split_fused_review_notes(
@@ -1452,7 +1464,9 @@ mod tests {
             "foundation of our negligence law.” Id. at 564. 54 See William L. Prosser. 55 See id. 56 See Jones.",
         );
         assert_eq!(
-            mid.iter().map(|(marker, _)| marker.as_str()).collect::<Vec<_>>(),
+            mid.iter()
+                .map(|(marker, _)| marker.as_str())
+                .collect::<Vec<_>>(),
             vec!["*", "54", "55", "56"]
         );
         assert!(mid[0].1.contains("foundation of our negligence law"));
@@ -1461,7 +1475,9 @@ mod tests {
         );
         assert_eq!(star[0].0, "*");
         assert_eq!(
-            star.iter().map(|(marker, _)| marker.as_str()).collect::<Vec<_>>(),
+            star.iter()
+                .map(|(marker, _)| marker.as_str())
+                .collect::<Vec<_>>(),
             vec!["*", "1", "2", "3"]
         );
         let volume_in_body = split_fused_review_notes(
@@ -1529,7 +1545,9 @@ mod tests {
         let fifty_three = split_fused_review_notes(BLOCK_58);
         assert_eq!(fifty_three[0].0, "*");
         assert!(
-            fifty_three[0].1.contains("foundation of our negligence law"),
+            fifty_three[0]
+                .1
+                .contains("foundation of our negligence law"),
             "note 53 tail must stay visible: {:?}",
             fifty_three[0].1
         );
@@ -1560,7 +1578,9 @@ mod tests {
             vec!["*", "280", "281", "282"]
         );
         assert!(
-            glitch[0].1.contains("conspicuously declines to impose such liability"),
+            glitch[0]
+                .1
+                .contains("conspicuously declines to impose such liability"),
             "542-glitch body is the tail of 279: {:?}",
             glitch[0].1
         );
@@ -1569,13 +1589,20 @@ mod tests {
         let rescued = block(LiquidBlockRole::Noise, NOTE_279);
         let follow = block(LiquidBlockRole::Marginalia, BLOCK_330);
         let header = block(LiquidBlockRole::Noise, "2026] WHAT IS A TORT? 1071");
-        let body = block(LiquidBlockRole::Paragraph, "Defenders of the Palsgraf perspective.");
+        let body = block(
+            LiquidBlockRole::Paragraph,
+            "Defenders of the Palsgraf perspective.",
+        );
         assert!(!review_skips_block_as_furniture(&rescued, true));
         assert!(review_skips_block_as_furniture(&header, false));
         let blocks = vec![rescued, follow, header, body];
         let hidden = review_hidden_display_mask(&blocks);
         let (notes, next) = review_collect_margin_note_indices(&blocks, 0, &hidden);
-        assert_eq!(notes, vec![0, 1], "rescued 279 must enter the margin run with 280–282");
+        assert_eq!(
+            notes,
+            vec![0, 1],
+            "rescued 279 must enter the margin run with 280–282"
+        );
         assert_eq!(next, 3);
         assert!(is_review_margin_note_block(&blocks[0]));
     }
@@ -1844,11 +1871,7 @@ mod tests {
             ReviewPrepareAction::Nothing
         );
         assert_eq!(
-            review_gate_automatic_full(
-                ReviewPrepareAction::SpawnFull { page_count: 80 },
-                80,
-                true
-            ),
+            review_gate_automatic_full(ReviewPrepareAction::SpawnFull { page_count: 80 }, 80, true),
             ReviewPrepareAction::SpawnFull { page_count: 80 }
         );
         assert_eq!(
@@ -1958,7 +1981,11 @@ mod tests {
             "shipped splitter must expose 25, not only 24: {:?}",
             snapshot.fused_note_visible
         );
-        assert!(snapshot.criticals_by_category.contains_key("note.sequence_gap"));
+        assert!(
+            snapshot
+                .criticals_by_category
+                .contains_key("note.sequence_gap")
+        );
         if let Ok(path) = std::env::var("LAWPDF_BENCH_OUT") {
             write_review_display_benchmark_json(Path::new(&path), &snapshot)
                 .expect("write snapshot");

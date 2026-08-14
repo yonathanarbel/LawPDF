@@ -1,12 +1,12 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Mutex, OnceLock};
 use std::ffi::{CStr, CString};
 #[cfg(any(feature = "devtools", test))]
 use std::ffi::{OsStr, OsString};
 use std::os::raw::{c_char, c_double, c_float, c_void};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 #[cfg(any(feature = "devtools", test))]
 use std::time::SystemTime;
@@ -53,7 +53,7 @@ const LM2_D1_RUNTIME_FOOTER_ARTIFACT_OVERLAY_VERSION: &str =
     "d1-footer-artifact-v1-guarded-no-contact";
 const LM2_FOOTNOTE_MONOTONE_OVERLAY_VERSION: &str = "footnote-monotone-v1-marker-context";
 const LM2_FOOTNOTE_CARRYOVER_OVERLAY_VERSION: &str = "footnote-carryover-v1-open-prev-smallfont";
-const LM2_ASSEMBLY_CACHE_VERSION: &str = "lm2-assembly-v154-article-revoke-keep-rescue";
+const LM2_ASSEMBLY_CACHE_VERSION: &str = "lm2-assembly-v155-scanned-glyph-note-sequence-bridge";
 const LM2_MAX_NOTE_MARKER: u16 = 999;
 const LM2_TABLE_FIGURE_ROUTER_OVERLAY_VERSION: &str = "table-figure-router-v4-default-on";
 const LM2_PAGE_OBJECT_OVERLAY_VERSION: &str = "page-object-overlay-v1-guarded-ruled-path";
@@ -174,8 +174,11 @@ const LM2_LINK_RANKER_FEATURES_V1: [&str; LM2_LINK_RANKER_FEATURE_COUNT_V1] = [
 ];
 const LM2_CONTEXT_TWOPASS_VERSION: &str = "context-twopass-hgb-v1-agent2-task30-foldnorm";
 const LM2_CONTEXT_ARBITER_SCHEMA_V2: &str = "lawpdf-lm2-context-arbiter-hgb-v2";
+const LM2_CONTEXT_RESIDUAL_SCHEMA_V3: &str = "lawpdf-lm2-runtime-residual-hgb-v3";
 const LM2_CONTEXT_ARBITER_RUNTIME_VERSION: &str = "context-arbiter-runtime-v2.1-gated-nonkeep";
+const LM2_CONTEXT_RESIDUAL_RUNTIME_VERSION: &str = "runtime-residual-v3-rescue-only";
 const LM2_CONTEXT_ARBITER_FEATURE_COUNT_V2: usize = 139;
+const LM2_CONTEXT_RESIDUAL_FEATURE_COUNT_V3: usize = 142;
 const LM2_CONTEXT_ARBITER_NEIGHBOR_OFFSETS: [isize; 4] = [-2, -1, 1, 2];
 const LM2_NATIVE_CATBOOST_FLOAT_FEATURES: [&str; 116] = [
     "page_width",
@@ -606,6 +609,10 @@ struct Lm2ContextTwopassModelFile {
     primary_probability_order: Vec<String>,
     #[serde(default)]
     primary_model_sha256: Option<String>,
+    #[serde(default)]
+    baseline_context_model_sha256: Option<String>,
+    #[serde(default)]
+    baseline_action_order: Vec<String>,
     #[serde(default)]
     neighbor_offsets: Vec<isize>,
     #[serde(default)]
@@ -1549,6 +1556,8 @@ struct Lm2SourceSmokeDocument {
 struct Lm2DraftReport {
     schema_version: &'static str,
     model_label: String,
+    applied_runtime_context: bool,
+    runtime_context_layers: Vec<String>,
     pp_prior_source: Option<String>,
     pp_footnote_region_membership: bool,
     source_input: String,
@@ -2190,6 +2199,7 @@ pub fn run_lm2_decoder_lattice_dump(
 pub fn run_lm2_draft(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     let mut input_path = PathBuf::from("eval/benchmark-v2/extracted-lines-lm2-source.json");
     let mut output_path: Option<PathBuf> = None;
+    let mut apply_runtime_context = false;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -2211,6 +2221,10 @@ pub fn run_lm2_draft(args: impl IntoIterator<Item = OsString>) -> Result<(), Str
             );
             continue;
         }
+        if arg == OsStr::new("--apply-runtime-context") {
+            apply_runtime_context = true;
+            continue;
+        }
         if arg.to_string_lossy().starts_with("--") {
             return Err(format!(
                 "unknown LM2 draft argument: {}",
@@ -2221,6 +2235,18 @@ pub fn run_lm2_draft(args: impl IntoIterator<Item = OsString>) -> Result<(), Str
 
     reject_label_like_path(&input_path)?;
     let runtime = Lm2Runtime::load(Lm2RuntimeChoice::Automatic);
+    let runtime_context_layers = apply_runtime_context
+        .then(|| {
+            [
+                runtime.context_twopass_model.as_ref(),
+                runtime.context_arbiter_model.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(Lm2ContextTwopassModel::label)
+            .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let input: Lm2DraftInput = read_json_file(&input_path)?;
     let mut rows = Vec::new();
     for document in input.documents {
@@ -2228,7 +2254,25 @@ pub fn run_lm2_draft(args: impl IntoIterator<Item = OsString>) -> Result<(), Str
         lines.sort_by_key(|line| (line.page_index, line.line_index));
         annotate_pp_priors_for_lines(&runtime, &document.path, &mut lines);
         enrich_lm2_document_features(&mut lines);
-        let decoded = decode_pages(&runtime, &lines);
+        let (mut decoded, primary_emissions) = decode_pages_with_scores(&runtime, &lines);
+        if apply_runtime_context {
+            if let Some(model) = runtime.context_twopass_model.as_ref() {
+                apply_context_twopass_model(
+                    model,
+                    Path::new(&document.path),
+                    Some(&primary_emissions),
+                    &mut decoded,
+                );
+            }
+            if let Some(model) = runtime.context_arbiter_model.as_ref() {
+                apply_context_twopass_model(
+                    model,
+                    Path::new(&document.path),
+                    Some(&primary_emissions),
+                    &mut decoded,
+                );
+            }
+        }
         for (line, lm2_action) in decoded {
             let lm1_hint_action = line.role_hint.map(role_action).unwrap_or(Lm2Action::Keep);
             rows.push(Lm2DraftRow {
@@ -2263,6 +2307,8 @@ pub fn run_lm2_draft(args: impl IntoIterator<Item = OsString>) -> Result<(), Str
     let report = Lm2DraftReport {
         schema_version: "lm2-benchmark-draft-v1",
         model_label: runtime.model_label,
+        applied_runtime_context: apply_runtime_context,
+        runtime_context_layers,
         pp_prior_source,
         pp_footnote_region_membership: runtime.pp_footnote_region_membership,
         source_input: input_path.display().to_string(),
@@ -2764,6 +2810,7 @@ pub fn prepare_liquid_mode2_document_with_timing(
     // the early body overlay ran. Re-run the guarded page sequence now so
     // flattened multi-digit callouts can use those newly established heads
     // before block assembly's more permissive one-digit recovery.
+    apply_scanned_glyph_note_sequence_bridge(&request.path, &mut decoded);
     apply_decoded_page_sequence_callout_recovery(&mut decoded);
     apply_repository_cover_guard(&mut decoded);
     apply_strict_no_dot_toc_page_guard(&mut decoded);
@@ -3433,7 +3480,12 @@ impl Lm2Runtime {
             None
         };
         let context_arbiter_model = if native_line_model_active && lm2_context_twopass_enabled() {
-            match load_lm2_context_arbiter_model(context_primary_sha256) {
+            match load_lm2_context_arbiter_model(
+                context_primary_sha256,
+                context_twopass_model
+                    .as_ref()
+                    .map(|model| model.asset_sha256.as_str()),
+            ) {
                 Ok(model) => model,
                 Err(error) => {
                     load_warnings.push(format!(
@@ -3675,7 +3727,10 @@ fn argmax_lm2_action(scores: [f64; 3]) -> Lm2Action {
 
 impl Lm2ContextTwopassModel {
     fn label(&self) -> String {
-        if self.schema_version == LM2_CONTEXT_ARBITER_SCHEMA_V2 {
+        if matches!(
+            self.schema_version.as_str(),
+            LM2_CONTEXT_ARBITER_SCHEMA_V2 | LM2_CONTEXT_RESIDUAL_SCHEMA_V3
+        ) {
             let primary = self
                 .primary_model_sha256
                 .as_deref()
@@ -3684,9 +3739,14 @@ impl Lm2ContextTwopassModel {
                 .take(12)
                 .collect::<String>();
             let asset = self.asset_sha256.chars().take(12).collect::<String>();
+            let runtime_version = if self.schema_version == LM2_CONTEXT_RESIDUAL_SCHEMA_V3 {
+                LM2_CONTEXT_RESIDUAL_RUNTIME_VERSION
+            } else {
+                LM2_CONTEXT_ARBITER_RUNTIME_VERSION
+            };
             return format!(
                 "{}:{}:a{}f{}m{}:primary{}:asset{}",
-                LM2_CONTEXT_ARBITER_RUNTIME_VERSION,
+                runtime_version,
                 self.schema_version,
                 self.actions.len(),
                 self.feature_count,
@@ -3862,7 +3922,10 @@ fn apply_context_twopass_model(
     let Some(document_model) = model.model_for_document(document_path) else {
         return;
     };
-    if model.schema_version == LM2_CONTEXT_ARBITER_SCHEMA_V2 {
+    if matches!(
+        model.schema_version.as_str(),
+        LM2_CONTEXT_ARBITER_SCHEMA_V2 | LM2_CONTEXT_RESIDUAL_SCHEMA_V3
+    ) {
         let Some(primary_emissions) = primary_emissions.filter(|rows| rows.len() == decoded.len())
         else {
             return;
@@ -3880,14 +3943,31 @@ fn apply_context_twopass_model(
             return;
         };
         for index in 0..decoded.len() {
-            let features =
-                lm2_context_arbiter_feature_vector(decoded, &primary_probabilities, index);
+            let features = if model.schema_version == LM2_CONTEXT_RESIDUAL_SCHEMA_V3 {
+                lm2_context_runtime_residual_feature_vector(
+                    decoded,
+                    &primary_probabilities,
+                    baseline_actions[index],
+                    index,
+                )
+            } else {
+                lm2_context_arbiter_feature_vector(decoded, &primary_probabilities, index)
+            };
             if features.len() != model.feature_count {
                 continue;
             }
             let arbiter = document_model.predict_probabilities(&features);
-            decoded[index].1 =
-                lm2_context_arbiter_policy(baseline_actions[index], arbiter, calibration);
+            let prediction = if model.schema_version == LM2_CONTEXT_RESIDUAL_SCHEMA_V3 {
+                lm2_context_runtime_residual_policy(
+                    baseline_actions[index],
+                    arbiter,
+                    calibration,
+                    &decoded[index].0.text,
+                )
+            } else {
+                lm2_context_arbiter_policy(baseline_actions[index], arbiter, calibration)
+            };
+            decoded[index].1 = prediction;
         }
         return;
     }
@@ -3964,6 +4044,22 @@ fn lm2_context_arbiter_feature_vector(
     features.extend(neighbor_meta.iter().map(|(same_page, _)| *same_page));
     features.extend(neighbor_meta.iter().map(|(_, gap)| *gap));
     features
+}
+
+fn lm2_context_runtime_residual_feature_vector(
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+    primary_probabilities: &[[f64; 3]],
+    baseline_action: Lm2Action,
+    index: usize,
+) -> Vec<f64> {
+    let mut features = lm2_context_arbiter_feature_vector(decoded, primary_probabilities, index);
+    features.reserve(3);
+    lm2_context_onehot(&mut features, Some(baseline_action));
+    features
+}
+
+fn lm2_context_has_substantive_text(text: &str) -> bool {
+    text.chars().any(char::is_alphabetic)
 }
 
 fn lm2_note_head_feature_vector(
@@ -4124,6 +4220,7 @@ fn lm2_link_numeric_candidates(
 
 fn lm2_note_head_auth_probabilities(
     model: &Lm2NoteHeadModel,
+    document_path: &Path,
     primary_emissions: &[[f64; 3]],
     decoded: &[(DeepLiquidSourceLine, Lm2Action)],
 ) -> Vec<Option<(u16, f64)>> {
@@ -4136,18 +4233,58 @@ fn lm2_note_head_auth_probabilities(
         .map(lm2_context_primary_probabilities)
         .collect::<Vec<_>>();
     let sequence_features = lm2_note_head_sequence_features(decoded, &primary_probabilities);
-    decoded
-        .iter()
-        .enumerate()
-        .map(|(index, (line, _))| {
-            let (marker, mut features) =
-                lm2_note_head_feature_vector(line, Some(primary_probabilities[index]))?;
-            if let Some(sequence) = sequence_features.get(index).copied().flatten() {
-                features.extend(sequence);
+    let trace_path = std::env::var_os("LAWPDF_LM2_TRACE_NOTE_HEAD_FILE").map(PathBuf::from);
+    let mut trace_rows = Vec::new();
+    let mut output = Vec::with_capacity(decoded.len());
+    for (index, (line, action)) in decoded.iter().enumerate() {
+        let Some((marker, mut features)) =
+            lm2_note_head_feature_vector(line, Some(primary_probabilities[index]))
+        else {
+            output.push(None);
+            continue;
+        };
+        if let Some(sequence) = sequence_features.get(index).copied().flatten() {
+            features.extend(sequence);
+        }
+        if features.len() != model.feature_count {
+            output.push(None);
+            continue;
+        }
+        let probability = model.probability(&features);
+        if trace_path.is_some() {
+            trace_rows.push(serde_json::json!({
+                "document": document_path.display().to_string(),
+                "id": line.id.clone(),
+                "page_index": line.page_index,
+                "line_index": line.line_index,
+                "marker": marker,
+                "probability": probability,
+                "threshold": model.threshold,
+                "primary_probabilities": primary_probabilities[index],
+                "features": features,
+                "baseline_action": action.as_str(),
+                "text": line.text.clone(),
+            }));
+        }
+        output.push(Some((marker, probability)));
+    }
+    if let Some(path) = trace_path
+        && !trace_rows.is_empty()
+        && let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    {
+        use std::io::Write as _;
+        let mut writer = std::io::BufWriter::new(file);
+        for row in trace_rows {
+            if let Ok(encoded) = serde_json::to_string(&row) {
+                let _ = writeln!(writer, "{encoded}");
             }
-            (features.len() == model.feature_count).then(|| (marker, model.probability(&features)))
-        })
-        .collect()
+        }
+        let _ = writer.flush();
+    }
+    output
 }
 
 fn lm2_link_text_contains_marker(text: &str, marker: u16) -> bool {
@@ -4444,7 +4581,7 @@ fn apply_footnote_link_ranker(
         return 0;
     }
     let auth_probabilities =
-        lm2_note_head_auth_probabilities(auth_model, primary_emissions, decoded);
+        lm2_note_head_auth_probabilities(auth_model, document_path, primary_emissions, decoded);
     let mut candidate_counts_by_marker = HashMap::<u16, usize>::new();
     let mut candidate_positions_by_marker = HashMap::<u16, Vec<usize>>::new();
     let mut current_note_pages_by_marker = HashMap::<u16, HashSet<usize>>::new();
@@ -4763,6 +4900,22 @@ fn lm2_context_arbiter_policy(
         prediction = Lm2Action::HideNoise;
     }
     prediction
+}
+
+fn lm2_context_runtime_residual_policy(
+    baseline: Lm2Action,
+    residual: [f64; 3],
+    calibration: &Lm2ContextArbiterCalibration,
+    text: &str,
+) -> Lm2Action {
+    if baseline != Lm2Action::Keep
+        && residual[1] >= calibration.rescue_keep_threshold
+        && lm2_context_has_substantive_text(text)
+    {
+        Lm2Action::Keep
+    } else {
+        baseline
+    }
 }
 
 fn lm2_context_norm_path(value: &str) -> String {
@@ -5732,11 +5885,13 @@ fn load_lm2_context_twopass_model(
         .find(|path| path.is_file())
         .cloned()
         .ok_or_else(|| missing_model_error("LM2 context two-pass model", &candidates))?;
-    load_lm2_context_model_from_path(&path, "context_model", active_primary_model_sha256).map(Some)
+    load_lm2_context_model_from_path(&path, "context_model", active_primary_model_sha256, None)
+        .map(Some)
 }
 
 fn load_lm2_context_arbiter_model(
     active_primary_model_sha256: Option<&str>,
+    active_baseline_context_model_sha256: Option<&str>,
 ) -> Result<Option<Lm2ContextTwopassModel>, String> {
     let candidates = lm2_context_arbiter_runtime_asset_candidates(LM2_CONTEXT_ARBITER_MODEL_FILE);
     let Some(path) = candidates.iter().find(|path| path.is_file()).cloned() else {
@@ -5746,10 +5901,14 @@ fn load_lm2_context_arbiter_model(
         &path,
         "context_arbiter_model",
         active_primary_model_sha256,
+        active_baseline_context_model_sha256,
     )?;
-    if model.schema_version != LM2_CONTEXT_ARBITER_SCHEMA_V2 {
+    if !matches!(
+        model.schema_version.as_str(),
+        LM2_CONTEXT_ARBITER_SCHEMA_V2 | LM2_CONTEXT_RESIDUAL_SCHEMA_V3
+    ) {
         return Err(format!(
-            "LM2 context arbiter must use schema {LM2_CONTEXT_ARBITER_SCHEMA_V2}, found {}",
+            "LM2 context arbiter must use schema {LM2_CONTEXT_ARBITER_SCHEMA_V2} or {LM2_CONTEXT_RESIDUAL_SCHEMA_V3}, found {}",
             model.schema_version
         ));
     }
@@ -5760,6 +5919,7 @@ fn load_lm2_context_model_from_path(
     path: &Path,
     release_asset_name: &str,
     active_primary_model_sha256: Option<&str>,
+    active_baseline_context_model_sha256: Option<&str>,
 ) -> Result<Lm2ContextTwopassModel, String> {
     verify_model_asset_hash(path, release_asset_name)?;
     let asset_sha256 = sha256_hex_of_file(&path)?;
@@ -5779,18 +5939,28 @@ fn load_lm2_context_model_from_path(
                 ));
             }
         }
-        LM2_CONTEXT_ARBITER_SCHEMA_V2 => {
-            if input.feature_count != LM2_CONTEXT_ARBITER_FEATURE_COUNT_V2
+        LM2_CONTEXT_ARBITER_SCHEMA_V2 | LM2_CONTEXT_RESIDUAL_SCHEMA_V3 => {
+            let is_residual = input.schema_version == LM2_CONTEXT_RESIDUAL_SCHEMA_V3;
+            let expected_feature_count = if is_residual {
+                LM2_CONTEXT_RESIDUAL_FEATURE_COUNT_V3
+            } else {
+                LM2_CONTEXT_ARBITER_FEATURE_COUNT_V2
+            };
+            if input.feature_count != expected_feature_count
                 || input.numeric_feature_count != Some(LM2_NATIVE_CATBOOST_FLOAT_FEATURES.len())
                 || input.primary_probability_order != ["hide_noise", "keep", "marginalia"]
                 || input.neighbor_offsets != LM2_CONTEXT_ARBITER_NEIGHBOR_OFFSETS
+                || (is_residual
+                    && input.baseline_action_order != ["hide_noise", "keep", "marginalia"])
             {
                 return Err(format!(
-                    "LM2 context arbiter v2 feature contract mismatch: f{}/numeric{:?}/probability_order={:?}/offsets={:?}",
+                    "LM2 context arbiter feature contract mismatch: schema={}/f{}/numeric{:?}/probability_order={:?}/offsets={:?}/baseline_order={:?}",
+                    input.schema_version,
                     input.feature_count,
                     input.numeric_feature_count,
                     input.primary_probability_order,
-                    input.neighbor_offsets
+                    input.neighbor_offsets,
+                    input.baseline_action_order
                 ));
             }
             let expected_primary = input.primary_model_sha256.as_deref().ok_or_else(|| {
@@ -5804,6 +5974,24 @@ fn load_lm2_context_model_from_path(
                 return Err(format!(
                     "LM2 context arbiter v2 primary-model mismatch: expected {expected_primary}, active {active_primary}"
                 ));
+            }
+            if is_residual {
+                let expected_context =
+                    input
+                        .baseline_context_model_sha256
+                        .as_deref()
+                        .ok_or_else(|| {
+                            "LM2 runtime residual v3 is missing baseline_context_model_sha256"
+                                .to_owned()
+                        })?;
+                let active_context = active_baseline_context_model_sha256.ok_or_else(|| {
+                    "LM2 runtime residual v3 requires its exact baseline context model".to_owned()
+                })?;
+                if !expected_context.eq_ignore_ascii_case(active_context) {
+                    return Err(format!(
+                        "LM2 runtime residual v3 baseline-context mismatch: expected {expected_context}, active {active_context}"
+                    ));
+                }
             }
             let calibration = input.calibration.as_ref().ok_or_else(|| {
                 "LM2 context arbiter v2 is missing calibrated policy thresholds".to_owned()
@@ -5828,6 +6016,16 @@ fn load_lm2_context_model_from_path(
                         "LM2 context arbiter v2 has invalid {name}: {value}"
                     ));
                 }
+            }
+            if is_residual
+                && (calibration.demote_to_marginalia_threshold != 1.0
+                    || calibration.demote_to_noise_threshold != 1.0
+                    || calibration.reclassify_nonkeep_threshold != 1.0)
+            {
+                return Err(
+                    "LM2 runtime residual v3 must be rescue-only; all demotion and nonkeep-reclassification thresholds must be closed at 1.0"
+                        .to_owned(),
+                );
             }
         }
         schema => {
@@ -12015,6 +12213,370 @@ fn apply_same_page_body_callout_overlay(
     repaired
 }
 
+/// Bridge older law-review PDFs whose embedded font draws a superscript note
+/// number but maps that glyph to an unrelated character. These files can
+/// still expose two independent, exact page-local signals:
+///
+/// * body text contains one unique consecutive run of attached callout digits;
+/// * footnote first rows form an equally long, tightly aligned indent column.
+///
+/// The bridge is deliberately all-or-nothing. It rejects synthetic OCR,
+/// readable-but-conflicting note numbers, ordinary indented quotations, and
+/// any ambiguous body run. It only assigns markers to physical source rows;
+/// `apply_decoded_page_sequence_callout_recovery` still has to find every
+/// corresponding body occurrence before it rewrites any text.
+fn apply_scanned_glyph_note_sequence_bridge(
+    document_path: &Path,
+    decoded: &mut [(DeepLiquidSourceLine, Lm2Action)],
+) -> usize {
+    let mut indices_by_page = BTreeMap::<usize, Vec<usize>>::new();
+    for (index, (line, _)) in decoded.iter().enumerate() {
+        indices_by_page
+            .entry(line.page_index)
+            .or_default()
+            .push(index);
+    }
+
+    let trace_path = std::env::var_os("LAWPDF_LM2_TRACE_SCANNED_GLYPH_FILE").map(PathBuf::from);
+    let mut trace_rows = Vec::new();
+    let mut assignments = Vec::<(usize, u16, bool)>::new();
+    for page_indices in indices_by_page.values_mut() {
+        page_indices.sort_by_key(|index| decoded[*index].0.line_index);
+        let body_indices = page_indices
+            .iter()
+            .copied()
+            .filter(|index| {
+                let line = &decoded[*index].0;
+                !line.in_footnote_zone
+                    && !line.below_footnote_divider
+                    && !line.doc_footnote_state
+                    && !line.doc_repeated_edge_text
+            })
+            .collect::<Vec<_>>();
+        let Some(markers) = scanned_glyph_body_marker_sequence(decoded, &body_indices) else {
+            continue;
+        };
+        let Some(head_indices) =
+            scanned_glyph_note_head_rows(decoded, page_indices, markers.as_slice())
+        else {
+            continue;
+        };
+        if trace_path.is_some() {
+            trace_rows.push(serde_json::json!({
+                "document": document_path.display().to_string(),
+                "page_index": decoded[head_indices[0]].0.page_index,
+                "markers": markers,
+                "heads": head_indices.iter().map(|index| serde_json::json!({
+                    "id": decoded[*index].0.id,
+                    "line_index": decoded[*index].0.line_index,
+                    "left": decoded[*index].0.left,
+                    "text": decoded[*index].0.text,
+                })).collect::<Vec<_>>(),
+            }));
+        }
+        assignments.extend(
+            head_indices
+                .into_iter()
+                .zip(markers)
+                .enumerate()
+                .map(|(position, (index, marker))| (index, marker, position == 0)),
+        );
+    }
+
+    for (index, marker, first_on_page) in &assignments {
+        let (line, action) = &mut decoded[*index];
+        if leading_sentineled_marker(&line.text) != Some(*marker) {
+            line.text = format!(
+                "{CALLOUT_START}{marker}{CALLOUT_END} {}",
+                line.text.trim_start()
+            );
+        }
+        line.doc_note_marker = *marker;
+        line.doc_note_marker_first_on_page = *first_on_page;
+        line.doc_note_marker_mid_sequence_page = *marker > 1;
+        line.doc_note_marker_follows_previous_page = false;
+        line.doc_note_marker_page_delta = 0;
+        line.role_hint = Some(LiquidBlockRole::Marginalia);
+        *action = Lm2Action::Marginalia;
+    }
+    let mut marker_rows_by_page = BTreeMap::<usize, Vec<(usize, u16)>>::new();
+    for (index, marker, _) in &assignments {
+        marker_rows_by_page
+            .entry(decoded[*index].0.page_index)
+            .or_default()
+            .push((decoded[*index].0.line_index, *marker));
+    }
+    apply_decoded_page_sequence_callout_recovery_from_rows(decoded, marker_rows_by_page);
+    if let Some(path) = trace_path
+        && !trace_rows.is_empty()
+        && let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    {
+        use std::io::Write as _;
+        let mut writer = std::io::BufWriter::new(file);
+        for row in trace_rows {
+            if let Ok(encoded) = serde_json::to_string(&row) {
+                let _ = writeln!(writer, "{encoded}");
+            }
+        }
+        let _ = writer.flush();
+    }
+    assignments.len()
+}
+
+fn scanned_glyph_body_marker_sequence(
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+    body_indices: &[usize],
+) -> Option<Vec<u16>> {
+    let mut candidates = body_indices
+        .iter()
+        .flat_map(|index| {
+            scanned_glyph_body_marker_candidates(&decoded[*index].0.text)
+                .into_iter()
+                .map(move |(byte_index, marker)| (decoded[*index].0.line_index, byte_index, marker))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+    candidates.dedup();
+
+    let mut runs = Vec::<(usize, usize)>::new();
+    let mut start = 0usize;
+    while start < candidates.len() {
+        let mut end = start + 1;
+        while end < candidates.len() && candidates[end].2 == candidates[end - 1].2.saturating_add(1)
+        {
+            end += 1;
+        }
+        runs.push((start, end));
+        start = end;
+    }
+    let longest = runs
+        .iter()
+        .map(|(start, end)| end - start)
+        .max()
+        .unwrap_or(0);
+    if longest < 4
+        || runs
+            .iter()
+            .filter(|(start, end)| end - start == longest)
+            .count()
+            != 1
+    {
+        return None;
+    }
+    let (start, end) = runs
+        .into_iter()
+        .find(|(start, end)| end - start == longest)?;
+    let markers = candidates[start..end]
+        .iter()
+        .map(|(_, _, marker)| *marker)
+        .collect::<Vec<_>>();
+    let counts = candidates.iter().fold(
+        HashMap::<u16, usize>::new(),
+        |mut counts, (_, _, marker)| {
+            *counts.entry(*marker).or_default() += 1;
+            counts
+        },
+    );
+    markers
+        .iter()
+        .all(|marker| counts.get(marker) == Some(&1))
+        .then_some(markers)
+}
+
+fn scanned_glyph_body_marker_candidates(text: &str) -> Vec<(usize, u16)> {
+    let chars = text.char_indices().collect::<Vec<_>>();
+    let mut candidates = Vec::new();
+    let mut position = 0usize;
+    while position < chars.len() {
+        if chars[position].1 == CALLOUT_START {
+            let start = chars[position].0;
+            let mut cursor = position + 1;
+            let mut digits = String::new();
+            while cursor < chars.len() && chars[cursor].1.is_ascii_digit() && digits.len() < 3 {
+                digits.push(chars[cursor].1);
+                cursor += 1;
+            }
+            if chars.get(cursor).is_some_and(|(_, ch)| *ch == CALLOUT_END)
+                && let Ok(marker) = digits.parse::<u16>()
+                && (1..=LM2_MAX_NOTE_MARKER).contains(&marker)
+            {
+                candidates.push((start, marker));
+                position = cursor + 1;
+                continue;
+            }
+        }
+        if !chars[position].1.is_ascii_digit()
+            || position > 0 && chars[position - 1].1.is_ascii_digit()
+        {
+            position += 1;
+            continue;
+        }
+        let start_position = position;
+        let start = chars[position].0;
+        while position < chars.len() && chars[position].1.is_ascii_digit() {
+            position += 1;
+        }
+        if position - start_position > 3 {
+            continue;
+        }
+        let end = chars
+            .get(position)
+            .map(|(offset, _)| *offset)
+            .unwrap_or(text.len());
+        let before = start_position
+            .checked_sub(1)
+            .and_then(|index| chars.get(index))
+            .map(|(_, ch)| *ch);
+        let after = chars.get(position).map(|(_, ch)| *ch);
+        if before.is_some_and(|ch| matches!(ch, '\u{00A7}' | '-' | '*' | CALLOUT_START))
+            || after.is_some_and(|ch| {
+                !ch.is_whitespace()
+                    && !matches!(ch, '"' | '\'' | '\u{2019}' | '\u{201D}' | CALLOUT_END)
+            })
+        {
+            continue;
+        }
+        let left = text[..start].trim_end();
+        let attached = before.is_some_and(|ch| !ch.is_whitespace() && !ch.is_ascii_digit());
+        let spaced_after_punctuation = before.is_some_and(char::is_whitespace)
+            && left
+                .chars()
+                .next_back()
+                .is_some_and(|ch| matches!(ch, '.' | '!' | '?' | ',' | ':' | ';' | ')' | ']'));
+        if !(attached || spaced_after_punctuation) || scanned_glyph_abbreviation_before_marker(left)
+        {
+            continue;
+        }
+        if let Ok(marker) = text[start..end].parse::<u16>()
+            && (1..=LM2_MAX_NOTE_MARKER).contains(&marker)
+        {
+            candidates.push((start, marker));
+        }
+    }
+    candidates
+}
+
+fn scanned_glyph_abbreviation_before_marker(left: &str) -> bool {
+    let Some(stem) = left.strip_suffix('.') else {
+        return false;
+    };
+    let token = stem
+        .split(|ch: char| !ch.is_ascii_alphabetic())
+        .next_back()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        token.as_str(),
+        "p" | "pp" | "no" | "nos" | "vol" | "sec" | "art" | "cl" | "fig"
+    )
+}
+
+fn scanned_glyph_note_head_rows(
+    decoded: &[(DeepLiquidSourceLine, Lm2Action)],
+    page_indices: &[usize],
+    markers: &[u16],
+) -> Option<Vec<usize>> {
+    let footnote_indices = page_indices
+        .iter()
+        .copied()
+        .filter(|index| {
+            let line = &decoded[*index].0;
+            (line.in_footnote_zone || line.below_footnote_divider || line.doc_footnote_state)
+                && !line.synthetic_text_geometry
+                && !line.doc_repeated_edge_text
+                && !line.in_ruled_cell
+                && !line.ruled_row_membership_exact
+                && !line.page_table_column_like
+        })
+        .collect::<Vec<_>>();
+    if footnote_indices.len() < markers.len() || markers.len() < 4 {
+        return None;
+    }
+    let page_width = footnote_indices
+        .iter()
+        .map(|index| decoded[*index].0.page_width)
+        .fold(1.0f32, f32::max);
+    let mut lefts = footnote_indices
+        .iter()
+        .map(|index| decoded[*index].0.left)
+        .collect::<Vec<_>>();
+    lefts.sort_by(f32::total_cmp);
+    lefts.dedup_by(|left, right| (*left - *right).abs() < 0.25);
+    let (gap, split) = lefts
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0], (pair[0] + pair[1]) * 0.5))
+        .max_by(|left, right| left.0.total_cmp(&right.0))?;
+    if gap < (page_width * 0.009).max(4.0) || gap > page_width * 0.05 {
+        return None;
+    }
+    let mut heads = footnote_indices
+        .into_iter()
+        .filter(|index| decoded[*index].0.left > split)
+        .collect::<Vec<_>>();
+    heads.sort_by_key(|index| decoded[*index].0.line_index);
+    if heads.len() == markers.len() + 1
+        && markers.first() == Some(&1)
+        && heads
+            .first()
+            .is_some_and(|index| scanned_glyph_author_note_candidate(&decoded[*index].0.text))
+    {
+        heads.remove(0);
+    }
+    if heads.len() != markers.len() {
+        return None;
+    }
+    let (min_left, max_left) = heads
+        .iter()
+        .map(|index| decoded[*index].0.left)
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), left| {
+            (min.min(left), max.max(left))
+        });
+    if max_left - min_left > (page_width * 0.008).max(2.5)
+        || heads.iter().any(|index| {
+            let line = &decoded[*index].0;
+            line.font_ratio_page_ref > 0.93 || !line.segment_block_footnote_like
+        })
+        || heads
+            .iter()
+            .filter(|index| decoded[**index].0.segment_block_first)
+            .count()
+            * 2
+            < heads.len()
+    {
+        return None;
+    }
+    let parsed = heads
+        .iter()
+        .map(|index| leading_numeric_token_marker(&decoded[*index].0.text))
+        .collect::<Vec<_>>();
+    if parsed
+        .iter()
+        .zip(markers)
+        .any(|(parsed, marker)| parsed.is_some_and(|parsed| parsed != *marker))
+        || parsed.iter().filter(|marker| marker.is_some()).count() * 2 >= markers.len()
+    {
+        return None;
+    }
+    Some(heads)
+}
+
+fn scanned_glyph_author_note_candidate(text: &str) -> bool {
+    let lower = normalize_text(text);
+    [
+        "b.a.",
+        "j.d.",
+        "ll.m.",
+        "s.j.d.",
+        "professor of law",
+        "university",
+    ]
+    .iter()
+    .any(|cue| lower.contains(cue))
+}
+
 /// Recover flattened law-review superscripts before the permissive local
 /// callout overlay sees them as one-digit notes. Performing the guarded page
 /// sequence alignment on source lines preserves the corrected marker through
@@ -12038,6 +12600,13 @@ fn apply_decoded_page_sequence_callout_recovery(
         }
     }
 
+    apply_decoded_page_sequence_callout_recovery_from_rows(decoded, marker_rows_by_page)
+}
+
+fn apply_decoded_page_sequence_callout_recovery_from_rows(
+    decoded: &mut [(DeepLiquidSourceLine, Lm2Action)],
+    marker_rows_by_page: BTreeMap<usize, Vec<(usize, u16)>>,
+) -> usize {
     let mut body_indices_by_page = BTreeMap::<usize, Vec<usize>>::new();
     for (index, (line, _)) in decoded.iter().enumerate() {
         if !line.in_footnote_zone
@@ -12512,12 +13081,7 @@ fn rescue_omitted_keep_source_lines(
 ) {
     let assembled = sources
         .iter()
-        .flat_map(|source| {
-            source
-                .lines
-                .iter()
-                .filter_map(|line| line.id.clone())
-        })
+        .flat_map(|source| source.lines.iter().filter_map(|line| line.id.clone()))
         .collect::<HashSet<_>>();
     let keep_ids = decoded
         .iter()
@@ -12639,7 +13203,7 @@ fn note_start_line_ids_for_scope(
         })
         .collect::<HashSet<_>>();
 
-    let mut by_article: BTreeMap<usize, Vec<(&String, u16)>> = BTreeMap::new();
+    let mut by_article: BTreeMap<usize, Vec<(usize, usize, &String, u16)>> = BTreeMap::new();
     for (index, (line, action)) in decoded.iter().enumerate() {
         if *action != Lm2Action::Marginalia {
             continue;
@@ -12658,27 +13222,34 @@ fn note_start_line_ids_for_scope(
         let Some(number) = number else {
             continue;
         };
-        by_article
-            .entry(article_index)
-            .or_default()
-            .push((&line.id, number));
+        by_article.entry(article_index).or_default().push((
+            line.page_index,
+            line.line_index,
+            &line.id,
+            number,
+        ));
     }
 
     let mut starts = HashSet::new();
-    for candidates in by_article.into_values() {
+    for mut candidates in by_article.into_values() {
+        // Decoder storage order is not a reading-order contract. In old bound
+        // volumes, leaving this unsorted allowed a late reporter page such as
+        // `875` to enter the longest ascending subsequence ahead of the real
+        // local note run.
+        candidates.sort_by_key(|(page_index, line_index, _, _)| (*page_index, *line_index));
         if candidates.len() < NOTE_SEQUENCE_MIN_CANDIDATES {
-            starts.extend(candidates.into_iter().map(|(id, _)| id.clone()));
+            starts.extend(candidates.into_iter().map(|(_, _, id, _)| id.clone()));
             continue;
         }
         let numbers = candidates
             .iter()
-            .map(|(_, number)| *number)
+            .map(|(_, _, _, number)| *number)
             .collect::<Vec<_>>();
         let keep = longest_ascending_run(&numbers);
         // A run explaining less than half the candidates is not strong enough
         // evidence to reinterpret local note heads.
         if keep.len() * 2 < candidates.len() {
-            starts.extend(candidates.into_iter().map(|(id, _)| id.clone()));
+            starts.extend(candidates.into_iter().map(|(_, _, id, _)| id.clone()));
             continue;
         }
         starts.extend(
@@ -12686,7 +13257,7 @@ fn note_start_line_ids_for_scope(
                 .into_iter()
                 .enumerate()
                 .filter(|(position, _)| keep.contains(position))
-                .map(|(_, (id, _))| id.clone()),
+                .map(|(_, (_, _, id, _))| id.clone()),
         );
     }
     starts
@@ -26620,6 +27191,67 @@ mod tests {
     }
 
     #[test]
+    fn runtime_residual_features_append_baseline_action_in_training_order() {
+        let line = lm2_test_source_line("p0:l0", 0, "Line", 1.0, false, None);
+        let decoded = vec![(line, Lm2Action::Keep)];
+        let probabilities = vec![[0.1, 0.8, 0.1]];
+
+        for (action, expected) in [
+            (Lm2Action::HideNoise, [1.0, 0.0, 0.0]),
+            (Lm2Action::Keep, [0.0, 1.0, 0.0]),
+            (Lm2Action::Marginalia, [0.0, 0.0, 1.0]),
+        ] {
+            let features =
+                lm2_context_runtime_residual_feature_vector(&decoded, &probabilities, action, 0);
+            assert_eq!(features.len(), LM2_CONTEXT_RESIDUAL_FEATURE_COUNT_V3);
+            assert_eq!(&features[LM2_CONTEXT_ARBITER_FEATURE_COUNT_V2..], &expected);
+        }
+    }
+
+    #[test]
+    fn runtime_residual_rescue_requires_substantive_text() {
+        assert!(!lm2_context_has_substantive_text("\""));
+        assert!(!lm2_context_has_substantive_text("123 --"));
+        assert!(lm2_context_has_substantive_text(
+            "which he controlled, was more than $6,800,000"
+        ));
+
+        let calibration = Lm2ContextArbiterCalibration {
+            rescue_keep_threshold: 0.9999,
+            demote_to_marginalia_threshold: 1.0,
+            demote_to_noise_threshold: 1.0,
+            reclassify_nonkeep_threshold: 1.0,
+        };
+        assert_eq!(
+            lm2_context_runtime_residual_policy(
+                Lm2Action::HideNoise,
+                [0.0, 1.0, 0.0],
+                &calibration,
+                "\"",
+            ),
+            Lm2Action::HideNoise
+        );
+        assert_eq!(
+            lm2_context_runtime_residual_policy(
+                Lm2Action::HideNoise,
+                [0.0, 1.0, 0.0],
+                &calibration,
+                "which he controlled",
+            ),
+            Lm2Action::Keep
+        );
+        assert_eq!(
+            lm2_context_runtime_residual_policy(
+                Lm2Action::Keep,
+                [1.0, 0.0, 0.0],
+                &calibration,
+                "body text",
+            ),
+            Lm2Action::Keep
+        );
+    }
+
+    #[test]
     fn context_arbiter_policy_is_asymmetric_about_body_text() {
         let calibration = Lm2ContextArbiterCalibration {
             rescue_keep_threshold: 0.8,
@@ -29040,6 +29672,184 @@ mod tests {
         );
     }
 
+    fn scanned_glyph_test_body(line_index: usize, marker: u16) -> DeepLiquidSourceLine {
+        let mut line = lm2_test_source_line(
+            &format!("p12:l{line_index}"),
+            line_index,
+            &format!("The body proposition is established.{marker} It continues."),
+            1.0,
+            false,
+            Some(LiquidBlockRole::Paragraph),
+        );
+        line.page_index = 12;
+        line.page_width = 400.0;
+        line.page_height = 600.0;
+        line.left = 30.0;
+        line.right = 360.0;
+        line
+    }
+
+    fn scanned_glyph_test_note(
+        line_index: usize,
+        left: f32,
+        text: &str,
+        segment_first: bool,
+    ) -> DeepLiquidSourceLine {
+        let mut line = lm2_test_source_line(
+            &format!("p12:l{line_index}"),
+            line_index,
+            text,
+            0.8,
+            false,
+            Some(LiquidBlockRole::Marginalia),
+        );
+        line.page_index = 12;
+        line.page_width = 400.0;
+        line.page_height = 600.0;
+        line.left = left;
+        line.right = 360.0;
+        line.font_ratio_page_ref = 0.76;
+        line.in_footnote_zone = true;
+        line.segment_block_footnote_like = true;
+        line.segment_block_shape = "footnote".to_owned();
+        line.segment_block_first = segment_first;
+        line
+    }
+
+    #[test]
+    fn scanned_glyph_sequence_bridge_recovers_only_complete_exact_page_pair() {
+        let mut decoded = (67..=70)
+            .enumerate()
+            .map(|(position, marker)| {
+                (
+                    scanned_glyph_test_body(position + 1, marker),
+                    Lm2Action::Keep,
+                )
+            })
+            .collect::<Vec<_>>();
+        decoded.push((
+            scanned_glyph_test_note(20, 29.5, "continuation of an earlier note", false),
+            Lm2Action::Marginalia,
+        ));
+        for (position, text) in [
+            "\"See note 12 supra.",
+            "mSupra p. 270.",
+            "nSEN. Doc. No. 8.",
+            "\"Legis. (1941) 41 Col. L. Rev. 946.",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            decoded.push((
+                scanned_glyph_test_note(21 + position, 37.2, text, position != 1),
+                Lm2Action::HideNoise,
+            ));
+        }
+        decoded.push((
+            scanned_glyph_test_note(25, 29.7, "continuation of note 70", false),
+            Lm2Action::Marginalia,
+        ));
+
+        assert_eq!(
+            scanned_glyph_body_marker_sequence(&decoded, &[0, 1, 2, 3]),
+            Some(vec![67, 68, 69, 70])
+        );
+        assert_eq!(
+            scanned_glyph_note_head_rows(
+                &decoded,
+                &(0..decoded.len()).collect::<Vec<_>>(),
+                &[67, 68, 69, 70],
+            ),
+            Some(vec![5, 6, 7, 8])
+        );
+        assert_eq!(
+            apply_scanned_glyph_note_sequence_bridge(Path::new("synthetic.pdf"), &mut decoded),
+            4
+        );
+        for (position, marker) in (67..=70).enumerate() {
+            let note = &decoded[5 + position];
+            assert_eq!(note.0.doc_note_marker, marker);
+            assert_eq!(note.1, Lm2Action::Marginalia);
+        }
+        for (position, marker) in (67..=70).enumerate() {
+            assert!(
+                decoded[position]
+                    .0
+                    .text
+                    .contains(&format!("{CALLOUT_START}{marker}{CALLOUT_END}"))
+            );
+        }
+        assert_eq!(
+            apply_decoded_page_sequence_callout_recovery(&mut decoded),
+            0
+        );
+    }
+
+    #[test]
+    fn scanned_glyph_sequence_bridge_rejects_mismatched_readable_heads() {
+        let mut decoded = (1..=4)
+            .enumerate()
+            .map(|(position, marker)| {
+                (
+                    scanned_glyph_test_body(position + 1, marker),
+                    Lm2Action::Keep,
+                )
+            })
+            .collect::<Vec<_>>();
+        decoded.push((
+            scanned_glyph_test_note(20, 29.0, "continuation", false),
+            Lm2Action::Marginalia,
+        ));
+        for (position, marker) in (77..=80).enumerate() {
+            decoded.push((
+                scanned_glyph_test_note(21 + position, 37.0, &format!("{marker}. Id."), true),
+                Lm2Action::Marginalia,
+            ));
+        }
+
+        assert_eq!(
+            apply_scanned_glyph_note_sequence_bridge(Path::new("synthetic.pdf"), &mut decoded),
+            0
+        );
+        assert!(decoded.iter().all(|(line, _)| line.doc_note_marker == 0));
+    }
+
+    #[test]
+    fn scanned_glyph_sequence_bridge_rejects_indented_quote_continuations() {
+        let mut decoded = (20..=23)
+            .enumerate()
+            .map(|(position, marker)| {
+                (
+                    scanned_glyph_test_body(position + 1, marker),
+                    Lm2Action::Keep,
+                )
+            })
+            .collect::<Vec<_>>();
+        decoded.push((
+            scanned_glyph_test_note(20, 120.0, "ordinary note continuation", true),
+            Lm2Action::Marginalia,
+        ));
+        for (position, text) in [
+            "The quoted passage begins here",
+            "and continues on the next row",
+            "with the same block indentation",
+            "until its final quoted sentence.",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            decoded.push((
+                scanned_glyph_test_note(21 + position, 132.0, text, false),
+                Lm2Action::Marginalia,
+            ));
+        }
+
+        assert_eq!(
+            apply_scanned_glyph_note_sequence_bridge(Path::new("synthetic.pdf"), &mut decoded),
+            0
+        );
+    }
+
     #[test]
     fn decoded_page_sequence_collapses_premature_one_digit_sentinels() {
         let mut first = lm2_test_source_line(
@@ -30281,6 +31091,45 @@ mod tests {
     }
 
     #[test]
+    fn note_start_sequence_uses_source_order_not_decoder_storage_order() {
+        let mut decoded = Vec::new();
+        // The reporter-page impostor is last in decoder storage but sits
+        // between 40 and 41 in physical reading order. Storage-order LIS would
+        // incorrectly keep it after the real 39-42 run.
+        for (line_index, marker) in [
+            (0, 39),
+            (1, 40),
+            (3, 41),
+            (4, 42),
+            (5, 43),
+            (6, 44),
+            (7, 45),
+            (2, 875),
+        ] {
+            let id = format!("p8:l{line_index}:n{marker}");
+            let mut line = lm2_test_source_line(
+                &id,
+                line_index,
+                &format!("{marker}. Citation text"),
+                0.8,
+                false,
+                Some(LiquidBlockRole::Marginalia),
+            );
+            line.page_index = 8;
+            line.in_footnote_zone = true;
+            decoded.push((line, Lm2Action::Marginalia));
+        }
+
+        let starts = note_start_line_ids_for_scope(&decoded, &[]);
+
+        assert_eq!(starts.len(), 7);
+        assert!(!starts.contains("p8:l2:n875"));
+        for marker in 39..=45 {
+            assert!(starts.iter().any(|id| id.ends_with(&format!("n{marker}"))));
+        }
+    }
+
+    #[test]
     fn article_coordinate_lookup_handles_midpage_boundaries() {
         let spans = vec![
             ArticleSpan {
@@ -30431,10 +31280,7 @@ mod tests {
             None,
         );
         let noise = lm2_test_source_line("noise", 1, "1", 0.6, false, None);
-        let decoded = vec![
-            (keep, Lm2Action::Keep),
-            (noise, Lm2Action::HideNoise),
-        ];
+        let decoded = vec![(keep, Lm2Action::Keep), (noise, Lm2Action::HideNoise)];
         let mut blocks = Vec::new();
         let mut sources = Vec::new();
         rescue_omitted_keep_source_lines(&mut blocks, &mut sources, &decoded);

@@ -22,10 +22,13 @@ struct NoteHead {
     block_index: usize,
     marker: u16,
     page_index: Option<usize>,
+    line_index: Option<usize>,
+    explicit_source: bool,
 }
 
 pub fn attach_footnote_links(document: &mut LiquidDocument) {
     restore_source_backed_plain_callouts(&mut document.blocks, &document.block_source_lines);
+    restore_visual_callout_hints(document);
     let (links, integrity) = resolve_footnote_links_in_articles(
         &document.blocks,
         &document.block_source_lines,
@@ -104,10 +107,154 @@ fn source_callout_anchors(text: &str) -> Vec<(u16, String)> {
     anchors
 }
 
+/// Optional high-precision visual/callout hints from
+/// `LAWPDF_VISUAL_CALLOUT_HINTS` (JSONL). Each line is
+/// `{"pdf":"...","page_index":0,"line_index":4,"marker":12,"anchor":"Though"}`.
+/// A hint is applied only when `marker` + following `anchor` word is unique
+/// in both the named source line (or page, for legacy hints) and its body block.
+/// Years, citation volumes, and other pages in a merged block stay untouched.
+fn restore_visual_callout_hints(document: &mut LiquidDocument) {
+    let Ok(path) = std::env::var("LAWPDF_VISUAL_CALLOUT_HINTS") else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let hints = parse_visual_callout_hints(&text);
+    apply_visual_callout_hints(
+        &mut document.blocks,
+        &document.block_source_lines,
+        &document.source_signature,
+        &hints,
+    );
+}
+
+#[derive(Debug, Clone)]
+struct VisualCalloutHint {
+    pdf_stem: String,
+    page_index: usize,
+    line_index: Option<usize>,
+    marker: u16,
+    anchor: String,
+}
+
+fn parse_visual_callout_hints(text: &str) -> Vec<VisualCalloutHint> {
+    let mut hints = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(marker) = value
+            .get("marker")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u16::try_from(v).ok())
+        else {
+            continue;
+        };
+        if !(1..=MAX_NOTE_MARKER).contains(&marker) {
+            continue;
+        }
+        let anchor = value
+            .get("anchor")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .chars()
+            .filter(|ch| ch.is_alphabetic())
+            .take(24)
+            .collect::<String>();
+        if anchor.len() < 2 {
+            continue;
+        }
+        let pdf = value.get("pdf").and_then(|v| v.as_str()).unwrap_or("");
+        let stem = std::path::Path::new(pdf)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(pdf)
+            .to_owned();
+        let page_index = value
+            .get("page_index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let line_index = value
+            .get("line_index")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| usize::try_from(v).ok());
+        hints.push(VisualCalloutHint {
+            pdf_stem: stem,
+            page_index,
+            line_index,
+            marker,
+            anchor,
+        });
+    }
+    hints
+}
+
+fn apply_visual_callout_hints(
+    blocks: &mut [LiquidBlock],
+    block_source_lines: &[LiquidBlockSourceLines],
+    source_signature: &str,
+    hints: &[VisualCalloutHint],
+) -> usize {
+    let signature_l = source_signature.to_ascii_lowercase();
+    let mut applied = 0usize;
+    for hint in hints {
+        if !hint.pdf_stem.is_empty() {
+            let stem_l = hint.pdf_stem.to_ascii_lowercase();
+            if !signature_l.contains(&stem_l) && !stem_l.is_empty() {
+                continue;
+            }
+        }
+        for source in block_source_lines {
+            let source_occurrences = source
+                .lines
+                .iter()
+                .filter(|line| {
+                    line.page_index == hint.page_index
+                        && hint.line_index.is_none_or(|index| line.line_index == index)
+                })
+                .map(|line| plain_callout_candidates(&line.text, hint.marker, &hint.anchor).len())
+                .sum::<usize>();
+            if source_occurrences != 1 {
+                continue;
+            }
+            let Some(block) = blocks.get_mut(source.block_index) else {
+                continue;
+            };
+            if !body_role(block.role) {
+                continue;
+            }
+            if callout_markers(&block.text).contains(&hint.marker) {
+                continue;
+            }
+            if restore_plain_callout_before_anchor(&mut block.text, hint.marker, &hint.anchor) {
+                applied += 1;
+                break;
+            }
+        }
+    }
+    applied
+}
+
 fn restore_plain_callout_before_anchor(text: &mut String, marker: u16, anchor: &str) -> bool {
+    let candidates = plain_callout_candidates(text, marker, anchor);
+    let [(start, end)] = candidates.as_slice() else {
+        return false;
+    };
+    text.replace_range(
+        *start..*end,
+        &format!("{CALLOUT_START}{marker}{CALLOUT_END}"),
+    );
+    true
+}
+
+fn plain_callout_candidates(text: &str, marker: u16, anchor: &str) -> Vec<(usize, usize)> {
     let digits = marker.to_string();
-    let candidates = text
-        .match_indices(&digits)
+    text.match_indices(&digits)
         .filter_map(|(start, _)| {
             let end = start + digits.len();
             let previous = text[..start].chars().next_back();
@@ -119,15 +266,7 @@ fn restore_plain_callout_before_anchor(text: &mut String, marker: u16, anchor: &
             (boundary_before && boundary_after && remainder.starts_with(anchor))
                 .then_some((start, end))
         })
-        .collect::<Vec<_>>();
-    let [(start, end)] = candidates.as_slice() else {
-        return false;
-    };
-    text.replace_range(
-        *start..*end,
-        &format!("{CALLOUT_START}{marker}{CALLOUT_END}"),
-    );
-    true
+        .collect()
 }
 
 pub fn resolve_footnote_links(
@@ -174,13 +313,24 @@ pub fn resolve_footnote_links_in_articles(
                     block_index,
                     marker,
                     page_index,
+                    line_index: None,
+                    explicit_source: true,
                 });
             }
+        } else if let Some(marker) = super::markdown::numeric_url_note_marker(&block.text) {
+            notes.push(NoteHead {
+                block_index,
+                marker,
+                page_index,
+                line_index: None,
+                explicit_source: true,
+            });
         }
     }
     notes.sort_unstable();
     notes.dedup();
     discard_redundant_marker_only_note_heads(&mut notes, blocks);
+    discard_isolated_inferred_note_heads(&mut notes, block_source_lines, article_spans);
 
     let mut links = Vec::new();
     let mut unmatched = 0usize;
@@ -193,11 +343,8 @@ pub fn resolve_footnote_links_in_articles(
             .filter(|note| {
                 note.marker == reference.marker
                     && (article_spans.is_empty()
-                        || block_article_index(
-                            note.block_index,
-                            block_source_lines,
-                            article_spans,
-                        ) == reference_article)
+                        || block_article_index(note.block_index, block_source_lines, article_spans)
+                            == reference_article)
             })
             .copied()
             .collect::<Vec<_>>();
@@ -277,6 +424,8 @@ fn block_note_heads(
                         block_index: source.block_index,
                         marker,
                         page_index: Some(line.page_index),
+                        line_index: Some(line.line_index),
+                        explicit_source: leading_source_note_marker(&line.text) == Some(marker),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -287,6 +436,127 @@ fn block_note_heads(
                 .then_some((source.block_index, heads))
         })
         .collect()
+}
+
+/// Source-level marker inference is valuable for corrupt-font note heads, but
+/// an isolated inferred marker can also be a reporter page or Congressional
+/// Record page number. Keep printed/sentineled heads directly. An inferred
+/// head must participate in an exact three-note run in physical source order,
+/// within its detected article, before it can become a link target.
+fn discard_isolated_inferred_note_heads(
+    notes: &mut Vec<NoteHead>,
+    block_source_lines: &[LiquidBlockSourceLines],
+    article_spans: &[super::ArticleSpan],
+) {
+    let mut groups = BTreeMap::<Option<usize>, Vec<usize>>::new();
+    for (index, note) in notes.iter().enumerate() {
+        let article_index =
+            block_article_index(note.block_index, block_source_lines, article_spans);
+        groups.entry(article_index).or_default().push(index);
+    }
+    let mut sequence_backed = BTreeSet::<usize>::new();
+    for indices in groups.values_mut() {
+        indices.sort_by_key(|index| {
+            let note = notes[*index];
+            (
+                note.page_index.unwrap_or(usize::MAX),
+                note.line_index.unwrap_or(usize::MAX),
+                note.block_index,
+                note.marker,
+            )
+        });
+        for window in indices.windows(3) {
+            let [first, second, third] = window else {
+                continue;
+            };
+            if notes[*second].marker == notes[*first].marker.saturating_add(1)
+                && notes[*third].marker == notes[*second].marker.saturating_add(1)
+            {
+                sequence_backed.extend([*first, *second, *third]);
+            }
+        }
+    }
+    let mut index = 0usize;
+    notes.retain(|note| {
+        let keep = note.explicit_source || sequence_backed.contains(&index);
+        index += 1;
+        keep
+    });
+}
+
+fn leading_source_note_marker(text: &str) -> Option<u16> {
+    let trimmed = text.trim_start();
+    if let Some(tail) = trimmed.strip_prefix(CALLOUT_START) {
+        let end = tail.find(CALLOUT_END)?;
+        let marker = tail[..end].parse::<u16>().ok()?;
+        return (1..=MAX_NOTE_MARKER).contains(&marker).then_some(marker);
+    }
+    let marker = leading_note_marker(trimmed)?;
+    let digits = marker.to_string();
+    let remainder = &trimmed[digits.len()..];
+    if remainder
+        .chars()
+        .next()
+        .is_some_and(|ch| matches!(ch, '.' | ')' | ']'))
+    {
+        return Some(marker);
+    }
+    (remainder.starts_with(char::is_whitespace)
+        && !starts_with_reporter_continuation(remainder.trim_start()))
+    .then_some(marker)
+}
+
+fn starts_with_reporter_continuation(text: &str) -> bool {
+    let tokens = text
+        .split_whitespace()
+        .take(4)
+        .map(|token| {
+            token
+                .chars()
+                .filter(|ch| ch.is_ascii_alphanumeric())
+                .map(|ch| ch.to_ascii_lowercase())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let Some(first) = tokens.first().map(String::as_str) else {
+        return false;
+    };
+    if matches!(
+        first,
+        "us" | "sct"
+            | "f2d"
+            | "f3d"
+            | "f4th"
+            | "fsupp"
+            | "fsupp2d"
+            | "fsupp3d"
+            | "ne"
+            | "ne2d"
+            | "nw"
+            | "nw2d"
+            | "se"
+            | "se2d"
+            | "sw"
+            | "sw2d"
+            | "so"
+            | "so2d"
+            | "a2d"
+            | "a3d"
+            | "p2d"
+            | "p3d"
+            | "led"
+            | "led2d"
+            | "eng"
+    ) {
+        return true;
+    }
+    matches!(tokens.as_slice(), [first, second, ..]
+        if (first == "u" && second == "s")
+            || (first == "s" && second == "ct")
+            || (first == "sup" && second == "ct")
+            || (matches!(first.as_str(), "a" | "f" | "p")
+                && (second.starts_with('2') || second.starts_with('3'))))
+        || tokens.len() >= 4 && tokens[..4].iter().all(|token| token.len() == 1)
 }
 
 fn block_reference_pages(
@@ -423,7 +693,7 @@ fn block_article_index(
     article_spans.iter().find_map(|span| {
         (coordinate >= (span.start_page_index, span.start_line_index)
             && coordinate < (span.end_page_index, span.end_line_index))
-        .then_some(span.article_index)
+            .then_some(span.article_index)
     })
 }
 
@@ -452,7 +722,11 @@ mod tests {
         source_at(block_index, page_index, 0)
     }
 
-    fn source_at(block_index: usize, page_index: usize, line_index: usize) -> LiquidBlockSourceLines {
+    fn source_at(
+        block_index: usize,
+        page_index: usize,
+        line_index: usize,
+    ) -> LiquidBlockSourceLines {
         LiquidBlockSourceLines {
             block_index,
             lines: vec![LiquidSourceLineRef {
@@ -464,6 +738,143 @@ mod tests {
                 note_markers: Vec::new(),
             }],
         }
+    }
+
+    #[test]
+    fn visual_callout_hint_restores_unique_marker_anchor_pair() {
+        let mut blocks = vec![
+            block(
+                LiquidBlockRole::Paragraph,
+                "salaries rose since 1999.63 Though data is scarce.",
+            ),
+            block(LiquidBlockRole::Marginalia, "63 Biglaw salary scale."),
+        ];
+        let sources = vec![
+            LiquidBlockSourceLines {
+                block_index: 0,
+                lines: vec![LiquidSourceLineRef {
+                    id: None,
+                    page_index: 7,
+                    line_index: 4,
+                    text: blocks[0].text.clone(),
+                    role: LiquidBlockRole::Paragraph,
+                    note_markers: Vec::new(),
+                }],
+            },
+            source(1, 7),
+        ];
+        let hints = [VisualCalloutHint {
+            pdf_stem: "chicago_art6306".to_owned(),
+            page_index: 7,
+            line_index: Some(4),
+            marker: 63,
+            anchor: "Though".to_owned(),
+        }];
+        let applied =
+            apply_visual_callout_hints(&mut blocks, &sources, "sig|chicago_art6306|page7", &hints);
+        assert_eq!(applied, 1);
+        assert!(
+            blocks[0]
+                .text
+                .contains(&format!("{CALLOUT_START}63{CALLOUT_END}"))
+        );
+        assert!(!blocks[0].text.contains("1999.63 Though"));
+    }
+
+    #[test]
+    fn visual_callout_hint_ignores_years_without_matching_anchor() {
+        let mut blocks = vec![block(
+            LiquidBlockRole::Paragraph,
+            "The 1999 study and the 2001 follow-up disagree.",
+        )];
+        let sources = vec![LiquidBlockSourceLines {
+            block_index: 0,
+            lines: vec![LiquidSourceLineRef {
+                id: None,
+                page_index: 2,
+                line_index: 0,
+                text: blocks[0].text.clone(),
+                role: LiquidBlockRole::Paragraph,
+                note_markers: Vec::new(),
+            }],
+        }];
+        let hints = [VisualCalloutHint {
+            pdf_stem: String::new(),
+            page_index: 2,
+            line_index: Some(0),
+            marker: 99,
+            anchor: "Though".to_owned(),
+        }];
+        let applied = apply_visual_callout_hints(&mut blocks, &sources, "doc", &hints);
+        assert_eq!(applied, 0);
+        assert_eq!(
+            blocks[0].text,
+            "The 1999 study and the 2001 follow-up disagree."
+        );
+    }
+
+    #[test]
+    fn visual_callout_hint_does_not_cross_pages_inside_a_merged_block() {
+        let mut blocks = vec![block(
+            LiquidBlockRole::Paragraph,
+            "The first page ends here. 63 Though the next page differs.",
+        )];
+        let sources = vec![LiquidBlockSourceLines {
+            block_index: 0,
+            lines: vec![
+                LiquidSourceLineRef {
+                    id: None,
+                    page_index: 4,
+                    line_index: 22,
+                    text: "The first page ends here.".to_owned(),
+                    role: LiquidBlockRole::Paragraph,
+                    note_markers: Vec::new(),
+                },
+                LiquidSourceLineRef {
+                    id: None,
+                    page_index: 5,
+                    line_index: 0,
+                    text: "63 Though the next page differs.".to_owned(),
+                    role: LiquidBlockRole::Paragraph,
+                    note_markers: Vec::new(),
+                },
+            ],
+        }];
+        let hints = [VisualCalloutHint {
+            pdf_stem: String::new(),
+            page_index: 4,
+            line_index: Some(22),
+            marker: 63,
+            anchor: "Though".to_owned(),
+        }];
+
+        let applied = apply_visual_callout_hints(&mut blocks, &sources, "doc", &hints);
+
+        assert_eq!(applied, 0);
+        assert_eq!(
+            blocks[0].text,
+            "The first page ends here. 63 Though the next page differs."
+        );
+    }
+
+    #[test]
+    fn caption_url_note_is_a_note_head() {
+        let blocks = vec![
+            block(
+                LiquidBlockRole::Paragraph,
+                "Salaries rose.\u{E000}63\u{E001} Though data is scarce.",
+            ),
+            block(
+                LiquidBlockRole::Caption,
+                "63 Biglaw Investor, Biglaw Salary Scale, https://www.biglawinvestor.com/biglaw-salary-scale/",
+            ),
+        ];
+        let (links, integrity) = resolve_footnote_links(&blocks, &[]);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].marker, 63);
+        assert_eq!(links[0].note_block_index, 1);
+        assert_eq!(integrity.unmatched, 0);
+        assert_eq!(integrity.note_heads, 1);
     }
 
     #[test]
@@ -504,6 +915,95 @@ mod tests {
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].note_block_index, 2);
         assert_eq!(integrity.ambiguous, 0);
+    }
+
+    #[test]
+    fn isolated_inferred_reporter_page_is_not_a_note_head() {
+        let blocks = vec![
+            block(
+                LiquidBlockRole::Paragraph,
+                "Debate continued.\u{E000}875\u{E001}",
+            ),
+            block(
+                LiquidBlockRole::Marginalia,
+                "ra89 Cong. Rec. 875 (Mr. Halleck).",
+            ),
+        ];
+        let inferred_note = LiquidBlockSourceLines {
+            block_index: 1,
+            lines: vec![LiquidSourceLineRef {
+                id: Some("p10:l34".to_owned()),
+                page_index: 10,
+                line_index: 34,
+                text: "ra89 Cong. Rec. 875 (Mr. Halleck).".to_owned(),
+                role: LiquidBlockRole::Marginalia,
+                note_markers: vec![875],
+            }],
+        };
+
+        let (links, integrity) = resolve_footnote_links(&blocks, &[source(0, 10), inferred_note]);
+
+        assert!(links.is_empty());
+        assert_eq!(integrity.note_heads, 0);
+        assert_eq!(integrity.unmatched, 1);
+    }
+
+    #[test]
+    fn citation_volume_prefixes_are_not_explicit_note_heads() {
+        for (marker, text) in [
+            (232, "232 U. S. 619, 625 (1914)."),
+            (24, "24 A. (2d) 1 (Pa. 1942)."),
+            (62, "62 Sup. Ct. 608 (1942)."),
+            (27, "27 A. B. A. J. 547."),
+        ] {
+            assert_eq!(leading_source_note_marker(text), None, "{text}");
+            assert_eq!(leading_note_marker(text), Some(marker));
+        }
+        assert_eq!(
+            leading_source_note_marker("27 A useful authority."),
+            Some(27)
+        );
+        assert_eq!(leading_source_note_marker("27. 232 U.S. 619."), Some(27));
+        assert_eq!(
+            leading_source_note_marker("\u{E000}27\u{E001} corrupt glyph authority"),
+            Some(27)
+        );
+    }
+
+    #[test]
+    fn consecutive_inferred_source_heads_remain_linkable() {
+        let mut blocks = Vec::new();
+        let mut sources = Vec::new();
+        for marker in 39..=41 {
+            let body_index = blocks.len();
+            blocks.push(block(
+                LiquidBlockRole::Paragraph,
+                &format!("Claim.\u{E000}{marker}\u{E001}"),
+            ));
+            sources.push(source_at(body_index, 8, marker as usize));
+            let note_index = blocks.len();
+            blocks.push(block(
+                LiquidBlockRole::Marginalia,
+                &format!("corrupt glyph authority for note {marker}"),
+            ));
+            sources.push(LiquidBlockSourceLines {
+                block_index: note_index,
+                lines: vec![LiquidSourceLineRef {
+                    id: Some(format!("p8:l{}", marker + 20)),
+                    page_index: 8,
+                    line_index: (marker + 20) as usize,
+                    text: "corrupt glyph authority".to_owned(),
+                    role: LiquidBlockRole::Marginalia,
+                    note_markers: vec![marker],
+                }],
+            });
+        }
+
+        let (links, integrity) = resolve_footnote_links(&blocks, &sources);
+
+        assert_eq!(links.len(), 3);
+        assert_eq!(integrity.note_heads, 3);
+        assert_eq!(integrity.landing_rate, 1.0);
     }
 
     #[test]
