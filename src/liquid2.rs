@@ -21598,8 +21598,43 @@ fn partial_existing_sentinel_range(
                     let start = from.min(text.len()) + offset;
                     (start, start + sentinel.len())
                 })
+                .filter(|(start, end)| plausible_partial_existing_callout(text, *start, *end))
         })
         .min_by_key(|(start, _)| *start)
+}
+
+fn plausible_partial_existing_callout(text: &str, start: usize, end: usize) -> bool {
+    let before = &text[..start];
+    let immediately_before = before.chars().next_back();
+    let before_that = immediately_before.and_then(|ch| {
+        before[..before.len().saturating_sub(ch.len_utf8())]
+            .chars()
+            .next_back()
+    });
+    if immediately_before == Some('.') && before_that.is_some_and(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+
+    let next_visible = text[end..].chars().find(|ch| !ch.is_whitespace());
+    if matches!(
+        (immediately_before, next_visible),
+        (Some('('), Some(')')) | (Some('['), Some(']'))
+    ) {
+        return false;
+    }
+    if immediately_before.is_some_and(char::is_alphabetic) {
+        let preceding_word_len = before
+            .chars()
+            .rev()
+            .take_while(|ch| ch.is_alphabetic())
+            .count();
+        if preceding_word_len == 1
+            && next_visible.is_some_and(|ch| matches!(ch, ',' | ';' | ':' | ')' | ']'))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Match a complete multi-digit callout even when the text layer separated its
@@ -29851,6 +29886,18 @@ mod tests {
             apply_scanned_glyph_note_sequence_bridge(Path::new("synthetic.pdf"), &mut decoded),
             0
         );
+    }
+
+    #[test]
+    fn partial_existing_callout_rejects_single_letter_formula_subscript() {
+        let text = format!("sector C{CALLOUT_START}2{CALLOUT_END}, remains constant");
+        assert_eq!(partial_existing_sentinel_range(&text, "52", 0), None);
+    }
+
+    #[test]
+    fn partial_existing_callout_rejects_parenthesized_enumeration() {
+        let text = format!("first; and ({CALLOUT_START}2{CALLOUT_END}) second");
+        assert_eq!(partial_existing_sentinel_range(&text, "92", 0), None);
     }
 
     #[test]
