@@ -1584,8 +1584,17 @@ fn rewrite_inline_blocks(
         };
         let mut replacements = BTreeMap::new();
         for link in &links {
-            if let Some(occurrence) = occurrences.get(link.body_marker_ordinal)
-                && occurrence.marker == link.marker
+            let ordinal_match = occurrences
+                .get(link.body_marker_ordinal)
+                .filter(|occurrence| occurrence.marker == link.marker);
+            let identity_match = ordinal_match.or_else(|| {
+                let mut matching = occurrences
+                    .iter()
+                    .filter(|occurrence| occurrence.marker == link.marker);
+                let occurrence = matching.next()?;
+                matching.next().is_none().then_some(occurrence)
+            });
+            if let Some(occurrence) = identity_match
                 && !replacements.contains_key(&occurrence.start)
             {
                 let label = labels
@@ -4231,6 +4240,28 @@ mod tests {
                 .text
                 .contains("played out.[^418] And public opinion matters.")
         );
+    }
+
+    #[test]
+    fn unique_marker_identity_survives_an_ordinal_shift() {
+        let mut document = document(vec![
+            block(
+                LiquidBlockRole::Paragraph,
+                "Enumerated text.\u{E000}1\u{E001} Supported claim.\u{E000}98\u{E001}",
+            ),
+            block(LiquidBlockRole::Footnote, "98. Controlling authority."),
+        ]);
+        // Upstream semantic filtering can remove the first raw occurrence
+        // after links were resolved. A unique marker identity remains a safe
+        // placement key even when its raw ordinal has shifted.
+        add_link(&mut document, 0, 0, 98, 1);
+        document.footnote_link_integrity = Some(integrity(1.0));
+
+        let export = liquid_document_markdown(&document, &MarkdownOptions::default());
+
+        assert!(export.footnotes_inlined);
+        assert!(export.text.contains("Supported claim.[^98]"));
+        assert!(export.text.contains("Enumerated text.1"));
     }
 
     #[test]
