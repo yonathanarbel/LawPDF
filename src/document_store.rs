@@ -214,7 +214,9 @@ impl DocumentStore {
             if FileRevision::read(&path)? == *revision {
                 // Opening a deduplicated, old snapshot renews the pruning
                 // grace period before the UI has received its live revision.
-                File::open(&path)
+                // Windows requires write-attributes access for timestamp
+                // updates. Open the private snapshot without truncating it.
+                File::options().write(true).open(&path)
                     .and_then(|file| file.set_modified(std::time::SystemTime::now()))
                     .map_err(|error| error.to_string())?;
                 return Ok(path);
@@ -665,13 +667,31 @@ mod tests {
         assert_eq!(FileRevision::read(&source).unwrap(), revision);
     }
     #[test]
+    fn reopening_a_source_renews_its_snapshot_without_changing_bytes() {
+        let (_directory, store, source, revision) = fixture();
+        let snapshot = store.snapshot_path(&revision).unwrap();
+        let before = fs::read(&snapshot).unwrap();
+        File::options().write(true).open(&snapshot)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+        assert_eq!(store.capture(&source).unwrap(), revision);
+        assert_eq!(fs::read(&snapshot).unwrap(), before);
+        assert_eq!(FileRevision::read(&source).unwrap(), revision);
+        assert!(fs::metadata(&snapshot).unwrap().modified().unwrap()
+            > std::time::SystemTime::UNIX_EPOCH);
+        store.prune_sources(std::time::Duration::ZERO, &[]).unwrap();
+        assert!(snapshot.exists(), "reopening renews the retention grace period");
+    }
+
+    #[test]
     fn current_and_pending_sources_survive_retention() {
         let (_directory, store, source, revision) = fixture();
         store
             .journal(&source, &revision, 1, &[annotation("keep")])
             .unwrap();
         let snapshot = store.snapshot_path(&revision).unwrap();
-        File::open(&snapshot)
+        File::options().write(true).open(&snapshot)
             .unwrap()
             .set_modified(std::time::SystemTime::UNIX_EPOCH)
             .unwrap();

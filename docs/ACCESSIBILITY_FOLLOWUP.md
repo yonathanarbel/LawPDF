@@ -22,3 +22,10 @@ Logs remain outside the synced checkout at `/private/tmp/lawpdf-accessibility-fi
 ## GitHub workflow correction
 
 The first submission revealed a workflow validation failure: `runner.temp` is not available in job-level `env`. The audit job now uses an explicit temporary build path, as allowed by [GitHub's context availability reference](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#context-availability). Superseded pull-request package runs are cancelled; tagged release runs retain their existing serialization behavior. The original Android GitHub test/lint/package job passed (run `35283542181`). Desktop and exact-installer results must be recorded against the final PR head before release.
+
+
+## Windows recovery correction found in final CI
+
+The first complete Windows debug suite compiled successfully but failed 10 tests with access-denied errors. They traced to refreshing a deduplicated recovery snapshot through a read-only `File` handle. Windows [requires write-attributes access for timestamp changes](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfiletime). Reopening an already captured PDF could therefore fail to establish recovery, and a repeated saved revision could fail before writing.
+
+The private snapshot is now opened with write access and no create/truncate option before refreshing its timestamp. Source PDF contents and permissions are not modified by that operation. A dedicated regression captures the same source again, checks unchanged bytes and revision, and verifies that the renewed snapshot survives retention. The retention fixture also requests the access needed to set its test timestamp. Final CI must pass with this correction before the Windows release gate is closed.
