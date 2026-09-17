@@ -1,3 +1,4 @@
+mod accessibility;
 mod annotation_saving;
 mod annotation_session;
 mod chat_ui;
@@ -362,6 +363,7 @@ pub struct PdfEditorApp {
     pending_page_renders: HashMap<usize, PageRenderKey>,
     pending_thumbnail_renders: HashMap<usize, ThumbnailRenderKey>,
     pending_native_text: HashSet<usize>,
+    pending_accessible_text: HashSet<(u64, usize)>,
     pending_text_chars: HashSet<usize>,
     texture_access_counter: u64,
     last_zoom_change: Option<Instant>,
@@ -1180,6 +1182,7 @@ impl PdfEditorApp {
             pending_page_renders: HashMap::new(),
             pending_thumbnail_renders: HashMap::new(),
             pending_native_text: HashSet::new(),
+            pending_accessible_text: HashSet::new(),
             pending_text_chars: HashSet::new(),
             texture_access_counter: 0,
             last_zoom_change: None,
@@ -1672,6 +1675,8 @@ impl PdfEditorApp {
         self.tabs.remove(tab_index);
         self.render_tx.set_live_documents(self.tabs.iter().map(|tab| tab.document_epoch));
         self.sbs_pane_states.remove(&closing_epoch);
+        self.pending_accessible_text
+            .retain(|(epoch, _)| *epoch != closing_epoch);
         self.sbs_page_textures
             .retain(|(document_epoch, _), _| *document_epoch != closing_epoch);
         self.sbs_pending_page_renders
@@ -2784,6 +2789,7 @@ impl PdfEditorApp {
                     self.pending_page_renders.clear();
                     self.pending_thumbnail_renders.clear();
                     self.pending_native_text.clear();
+                    self.pending_accessible_text.clear();
                     self.pending_text_chars.clear();
                     self.pending_document_enrichments.clear();
                     // A panicked Rust task must not permanently disable the
@@ -3079,7 +3085,23 @@ impl PdfEditorApp {
                     page_index,
                     result,
                 } => {
+                    self.pending_accessible_text.remove(&(document_epoch, page_index));
                     if !self.is_current_document(document_epoch, &path) {
+                        // A visible side-by-side pane, or a tab switched while
+                        // text was loading, still owns its text result.
+                        if let Some(tab) = self.tabs.iter_mut().find(|tab| {
+                            tab.document_epoch == document_epoch && tab.document.path == path
+                        }) {
+                            if let Ok(text) = &result {
+                                if let Some(slot) = tab.document.native_text.get_mut(page_index) {
+                                    slot.clone_from(text);
+                                }
+                            }
+                            if let Some(slot) = tab.document.native_text_loaded.get_mut(page_index) {
+                                *slot = true;
+                            }
+                            ctx.request_repaint();
+                        }
                         continue;
                     }
                     self.pending_native_text.remove(&page_index);
@@ -4957,11 +4979,15 @@ impl PdfEditorApp {
                             } else {
                                 RichText::new(title).color(title_color)
                             };
-                            if ui
+                            let tab_response = ui
                                 .add(egui::Label::new(title).sense(Sense::click()))
-                                .on_hover_text(tab.document.path.display().to_string())
-                                .clicked()
-                            {
+                                .on_hover_text(tab.document.path.display().to_string());
+                            tab_response.widget_info(|| {
+                                egui::WidgetInfo::selected(
+                                    egui::WidgetType::Button, true, is_active, tab.title(),
+                                )
+                            });
+                            if tab_response.clicked() {
                                 switch_to = Some(index);
                             }
                             if let Some(side) = sbs_side {
@@ -4982,18 +5008,26 @@ impl PdfEditorApp {
                             } else {
                                 Color32::from_rgb(128, 122, 112)
                             });
-                            if ui
+                            let close_response = ui
                                 .add(egui::Button::new(close_text).small().frame(false))
-                                .on_hover_text("Close tab")
-                                .clicked()
-                            {
+                                .on_hover_text("Close tab");
+                            close_response.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button, true, format!("Close {}", tab.title()),
+                                )
+                            });
+                            if close_response.clicked() {
                                 close_tab = Some(index);
                             }
                         });
                     });
             }
 
-            if ui.small_button("+").on_hover_text("Open PDF").clicked() {
+            let open_response = ui.small_button("+").on_hover_text("Open PDF");
+            open_response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Open PDF in a new tab")
+            });
+            if open_response.clicked() {
                 self.open_dialog(ctx);
             }
         });
@@ -5439,6 +5473,9 @@ impl PdfEditorApp {
                                     .horizontal_align(Align::Center),
                             )
                             .on_disabled_hover_text("Type a page number and press Enter");
+                        ui.ctx().accesskit_node_builder(page_input_response.id, |node| {
+                            node.set_label("Page number");
+                        });
                         if page_input_response.changed() {
                             page_number_text.retain(|character| character.is_ascii_digit());
                         }
@@ -6147,16 +6184,16 @@ impl PdfEditorApp {
                 } else {
                     Stroke::new(1.0_f32, Color32::from_rgb(210, 200, 184))
                 };
-                if ui
+                let response = ui
                     .add(
                         egui::Button::new("")
                             .fill(color_from_rgb(preset.color_rgb, 235))
                             .stroke(stroke)
                             .min_size(Vec2::splat(20.0)),
                     )
-                    .on_hover_text(preset.label)
-                    .clicked()
-                {
+                    .on_hover_text(preset.label);
+                accessibility::name_color_choice(&response, preset.label, selected);
+                if response.clicked() {
                     self.comment_color_index = index;
                 }
             }
@@ -7058,6 +7095,9 @@ impl PdfEditorApp {
         ui.add_space(6.0);
         let available = ui.available_size();
         let (response, painter) = ui.allocate_painter(available, Sense::hover());
+        if let Some(path) = path.as_ref() {
+            self.expose_page_text(&response, self.document_epoch, path, page_index);
+        }
         if let Some(texture) = self.page_textures.get(&page_index) {
             let dest = if let Some(page) = page.as_ref() {
                 let scale = (response.rect.width() / page.width)
@@ -9770,9 +9810,10 @@ try {
                             };
                             let response = ui.interact(
                                 rect,
-                                ui.id().with(("document-page", page_index)),
+                                ui.id().with(("document-page", self.document_epoch, page_index)),
                                 Sense::click_and_drag(),
                             );
+                            self.expose_page_text(&response, self.document_epoch, &path, page_index);
                             let response = if let Some(url) =
                                 self.hovered_web_link_url(&response, &placement, page_index)
                             {
@@ -10285,6 +10326,9 @@ try {
                         ui.id()
                             .with(("sbs-page", document.document_epoch, page_index)),
                         Sense::click(),
+                    );
+                    self.expose_page_text(
+                        &response, document.document_epoch, &document.path, page_index,
                     );
                     page_clicked |= response.clicked();
                     let painter = ui.painter();
@@ -11187,16 +11231,16 @@ try {
                                     } else {
                                         Stroke::new(1.0_f32, Color32::from_rgb(210, 200, 184))
                                     };
-                                    if ui
+                                    let response = ui
                                         .add(
                                             egui::Button::new("")
                                                 .fill(color)
                                                 .stroke(stroke)
                                                 .min_size(Vec2::splat(20.0)),
                                         )
-                                        .on_hover_text(preset.label)
-                                        .clicked()
-                                    {
+                                        .on_hover_text(preset.label);
+                                    accessibility::name_color_choice(&response, preset.label, selected);
+                                    if response.clicked() {
                                         selected_color = Some((index, preset.color_rgb));
                                     }
                                 }
@@ -11997,7 +12041,9 @@ try {
                 .stroke(stroke)
                 .min_size(Vec2::new(24.0, 18.0)),
             };
-            if ui.add(button).on_hover_text(preset.label).clicked() {
+            let response = ui.add(button).on_hover_text(preset.label);
+            accessibility::name_color_choice(&response, preset.label, selected);
+            if response.clicked() {
                 self.marker_preset_index = index;
                 self.status = format!("Marker set to {}", preset.label);
             }

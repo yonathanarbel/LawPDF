@@ -40,7 +40,7 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/lawpdf-audit-target
+      CARGO_TARGET_DIR: /tmp/lawpdf-audit-target
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install dependency auditor
