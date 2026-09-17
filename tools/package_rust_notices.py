@@ -16,12 +16,12 @@ def main():
     args = parser.parse_args()
     source_root = Path(__file__).resolve().parents[1]
     supplement_path = source_root / "third_party/rust-extra/manifest.json"
-    supplements = {name: record for record in json.loads(supplement_path.read_text())
+    supplements = {name: record for record in json.loads(supplement_path.read_text(encoding="utf-8"))
                    for name in record["packages"]}
     metadata = json.loads(subprocess.check_output([
         "cargo", "metadata", "--locked", "--format-version", "1",
         "--filter-platform", args.target,
-    ], text=True))
+    ], encoding="utf-8"))
     resolved = {node["id"] for node in metadata["resolve"]["nodes"]}
     packages = sorted((package for package in metadata["packages"]
                        if package["id"] in resolved and package["source"]),

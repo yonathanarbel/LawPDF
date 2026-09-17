@@ -20,7 +20,7 @@ def main():
     files = set(map(Path, [
         ".gitattributes", ".gitignore", "AGENTS.md", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "build.rs",
         "LICENSE", "README.md", "THIRD_PARTY_NOTICES.md", "THIRD_PARTY_RUST_LICENSES.csv", "release-manifest.json",
-        "docs/PRIVACY.md", "docs/CODE_SIGNING.md", "docs/RELEASING.md", "docs/PRODUCTION_PLAN.md", "docs/PRODUCTION_VALIDATION.md",
+        "docs/PRIVACY.md", "docs/CODE_SIGNING.md", "docs/RELEASING.md", "docs/PRODUCTION_PLAN.md", "docs/PRODUCTION_VALIDATION.md", "docs/ACCESSIBILITY_FOLLOWUP.md",
         "packaging/update-public-key.hex", "packaging/windows/LawPDF.iss",
         "android/README.md", "android/build.gradle", "android/gradle.properties", "android/settings.gradle",
         "android/build.ps1", "android/build.sh", "android/gradlew", "android/gradlew.bat",
@@ -39,12 +39,12 @@ def main():
         files.update(path.relative_to(root) for path in root.glob(pattern) if path.is_file())
     # Only exact file exceptions in the reviewed promotion allowlist qualify.
     # Being tracked by Git is not authorization to publish research artifacts.
-    for rule in (root / ".gitignore").read_text().splitlines():
+    for rule in (root / ".gitignore").read_text(encoding="utf-8").splitlines():
         if rule.startswith("!/profile-models/") and not rule.endswith("/"):
             if any(character in rule for character in "*?["):
                 raise SystemExit("Model publication requires an exact file allowlist: " + rule)
             files.add(Path(rule[2:]))
-    manifest = json.loads((root / "release-manifest.json").read_text())
+    manifest = json.loads((root / "release-manifest.json").read_text(encoding="utf-8"))
     for asset in manifest["runtime_assets"].values():
         if isinstance(asset, dict) and isinstance(asset.get("path"), str):
             files.add(Path(asset["path"]))
