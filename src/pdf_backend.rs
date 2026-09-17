@@ -1,8 +1,8 @@
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use anyhow::{Context, Result, anyhow};
 use image::RgbaImage;
@@ -19,25 +19,55 @@ use crate::model::{
 };
 use crate::performance_cache::{CachedDocumentMetadata, PerformanceCache};
 
-pub struct PdfEngine {
+#[cfg(not(test))]
+pub use crate::native_process::PdfEngine;
+#[cfg(test)]
+pub type PdfEngine = NativePdfEngine;
+
+pub struct NativePdfEngine {
     pdfium: &'static Pdfium,
     open_documents: RefCell<VecDeque<OpenPdfDocument>>,
     performance_cache: PerformanceCache,
+    editor_performance_cache: PerformanceCache,
 }
 
 struct OpenPdfDocument {
     path: PathBuf,
     document: PdfDocument<'static>,
+    editor_annotation_indices: HashMap<usize, Vec<usize>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AnnotationVisibilityGuard<'a>(Vec<(PdfPageAnnotation<'a>, bool)>);
+
+impl AnnotationVisibilityGuard<'_> {
+    fn restore(&mut self) -> Result<()> {
+        for (annotation, was_hidden) in &mut self.0 {
+            annotation.set_is_hidden(*was_hidden)?;
+        }
+        self.0.clear();
+        Ok(())
+    }
+}
+
+impl Drop for AnnotationVisibilityGuard<'_> {
+    fn drop(&mut self) {
+        // Restore on error paths too, before the cached document is reused.
+        for (annotation, was_hidden) in &mut self.0 {
+            let _ = annotation.set_is_hidden(*was_hidden);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RenderQuality {
     Crisp,
     Fast,
 }
 
 /// RGB page raster for LiquidVision (LmV tier), plus page size in points.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct VisionPage {
+    #[serde(skip)]
     pub rgb: Vec<u8>,
     pub width: usize,
     pub height: usize,
@@ -47,12 +77,30 @@ pub struct VisionPage {
 
 const OPEN_DOCUMENT_CACHE_CAP: usize = 3;
 static PDFIUM: OnceLock<Result<&'static Pdfium, String>> = OnceLock::new();
+// pdfium-render 0.8's `sync` feature locks library *lifetimes*, not individual
+// calls through a shared instance. Our process-wide instance therefore needs
+// an operation lock too, including document destruction on worker teardown.
+static PDFIUM_ACCESS: Mutex<()> = Mutex::new(());
+
+fn lock_pdfium() -> MutexGuard<'static, ()> {
+    PDFIUM_ACCESS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+impl Drop for NativePdfEngine {
+    fn drop(&mut self) {
+        let _native_access = lock_pdfium();
+        self.open_documents.get_mut().clear();
+    }
+}
+
 pub const LAWPDF_COMMENT_ID_PREFIX: &str = "LawPDF-comment-";
-const LAWPDF_CROPBOX_LOCAL_COORDS_ENV: &str = "LAWPDF_CROPBOX_LOCAL_COORDS";
 const LAWPDF_WIDE_FOOTNOTE_DIVIDERS_ENV: &str = "LAWPDF_WIDE_FOOTNOTE_DIVIDERS";
 
-impl PdfEngine {
+impl NativePdfEngine {
     pub fn new() -> Result<Self> {
+        let _native_access = lock_pdfium();
         let pdfium = PDFIUM
             .get_or_init(|| {
                 bind_pdfium()
@@ -68,6 +116,7 @@ impl PdfEngine {
             pdfium,
             open_documents: RefCell::new(VecDeque::new()),
             performance_cache: PerformanceCache::new(),
+            editor_performance_cache: PerformanceCache::new().for_editor(),
         })
     }
 
@@ -96,19 +145,11 @@ impl PdfEngine {
                     .pages()
                     .get(page_index as u16)
                     .with_context(|| format!("failed to read page {}", page_index + 1))?;
-                let crop_box = cropbox_local_coords_enabled()
-                    .then(|| page_crop_box_if_distinct_from_media(&page))
-                    .flatten();
-                let width = crop_box
-                    .map(|box_| visible_page_extent(box_.width(), page.width().value))
-                    .unwrap_or(page.width().value);
-                let height = crop_box
-                    .map(|box_| visible_page_extent(box_.height(), page.height().value))
-                    .unwrap_or(page.height().value);
+                let geometry = native_page_geometry(&page);
+                let width = page.width().value;
+                let height = page.height().value;
                 let mut page_info = PageInfo::with_footnote_divider_y_from_top(width, height, None);
-                if let Some(box_) = crop_box {
-                    page_info = page_info.with_coordinate_offset(box_.left, box_.bottom);
-                }
+                map_page_geometry(&mut page_info, geometry);
                 pages.push(page_info);
             }
             Ok(CachedDocumentMetadata {
@@ -171,15 +212,10 @@ impl PdfEngine {
                     .get(page_index as u16)
                     .with_context(|| format!("failed to read page {}", page_index + 1))?;
 
-                let crop_box = cropbox_local_coords_enabled()
-                    .then(|| page_crop_box_if_distinct_from_media(&page))
-                    .flatten();
-                let width = crop_box
-                    .map(|box_| visible_page_extent(box_.width(), page.width().value))
-                    .unwrap_or(page.width().value);
-                let height = crop_box
-                    .map(|box_| visible_page_extent(box_.height(), page.height().value))
-                    .unwrap_or(page.height().value);
+                let geometry = native_page_geometry(&page);
+                let width = page.width().value;
+                let height = page.height().value;
+                let crop_box = None;
                 let mut page_info = PageInfo::with_footnote_divider_y_from_top(
                     width,
                     height,
@@ -207,9 +243,7 @@ impl PdfEngine {
                     vector_rules.vertical_rules,
                     vector_rules.ruled_cells,
                 );
-                if let Some(box_) = crop_box {
-                    page_info = page_info.with_coordinate_offset(box_.left, box_.bottom);
-                }
+                map_page_geometry(&mut page_info, geometry);
                 pages.push(page_info);
                 native_text.push(String::new());
                 native_text_loaded.push(false);
@@ -279,7 +313,12 @@ impl PdfEngine {
                 .text()
                 .with_context(|| format!("failed to read text on page {}", page_index + 1))?;
 
-            Ok(extract_text_chars(&text_page))
+            let geometry = native_page_geometry(&page);
+            let mut chars = extract_text_chars(&text_page);
+            for character in &mut chars {
+                character.rect = character.rect.map(|rect| geometry.rect(rect, false));
+            }
+            Ok(chars)
         })?;
         self.performance_cache
             .save_page_text_chars(path, page_index, &chars);
@@ -287,7 +326,7 @@ impl PdfEngine {
     }
 
     pub fn render_page(&self, path: &Path, page_index: usize, zoom: f32) -> Result<RenderedPage> {
-        self.render_page_with_quality(path, page_index, zoom, RenderQuality::Crisp)
+        self.render_page_internal(path, page_index, zoom, RenderQuality::Crisp, false)
     }
 
     pub fn render_page_with_quality(
@@ -297,20 +336,54 @@ impl PdfEngine {
         zoom: f32,
         quality: RenderQuality,
     ) -> Result<RenderedPage> {
+        self.render_page_internal(path, page_index, zoom, quality, true)
+    }
+
+    pub(crate) fn render_page_internal(
+        &self,
+        path: &Path,
+        page_index: usize,
+        zoom: f32,
+        quality: RenderQuality,
+        editor: bool,
+    ) -> Result<RenderedPage> {
         let fast = quality == RenderQuality::Fast;
-        if let Some(rendered) = self
-            .performance_cache
-            .load_rendered_page(path, page_index, zoom, fast)
-        {
+        let cache = if editor {
+            &self.editor_performance_cache
+        } else {
+            &self.performance_cache
+        };
+        if let Some(rendered) = cache.load_rendered_page(path, page_index, zoom, fast) {
             return Ok(rendered);
         }
-        let rendered = self.with_open_document(path, |document| {
-            let page = document
+        let rendered = self.with_open_document_data(path, |open| {
+            let page = open
+                .document
                 .pages()
                 .get(page_index as u16)
                 .with_context(|| format!("failed to read page {}", page_index + 1))?;
 
-            let target_width = (page.width().value * zoom).round().clamp(64.0, 8192.0) as i32;
+            let width = page.width().value;
+            let height = page.height().value;
+            anyhow::ensure!(
+                width.is_finite()
+                    && height.is_finite()
+                    && width > 0.0
+                    && height > 0.0
+                    && zoom.is_finite()
+                    && zoom > 0.0,
+                "This page has invalid dimensions."
+            );
+            // Limit both axes and the full raster allocation, including unusually
+            // tall pages. A width-only cap permits enormous native allocations.
+            let limit_by_area = (16_000_000.0_f32 * width / height).sqrt();
+            let limit_by_height = 8192.0 * width / height;
+            let target_width = (width * zoom)
+                .round()
+                .min(8192.0)
+                .min(limit_by_area)
+                .min(limit_by_height)
+                .max(1.0) as i32;
             let config = match quality {
                 RenderQuality::Crisp => PdfRenderConfig::new()
                     .set_target_width(target_width)
@@ -328,9 +401,27 @@ impl PdfEngine {
                     .set_image_smoothing(false),
             };
 
-            let bitmap = page
-                .render_with_config(&config)
-                .with_context(|| format!("failed to render page {}", page_index + 1))?;
+            // LawPDF draws editable annotations as overlays. Hide only the
+            // successfully decoded owned annotations in this in-memory render;
+            // third-party annotations and exported rasters remain visible.
+            let mut hidden = AnnotationVisibilityGuard(Vec::new());
+            if editor {
+                for &index in open
+                    .editor_annotation_indices
+                    .get(&page_index)
+                    .into_iter()
+                    .flatten()
+                {
+                    let mut annotation = page.annotations().get(index as _)?;
+                    let was_hidden = annotation.is_hidden();
+                    annotation.set_is_hidden(true)?;
+                    hidden.0.push((annotation, was_hidden));
+                }
+            }
+            let bitmap = page.render_with_config(&config);
+            hidden.restore()?;
+            let bitmap =
+                bitmap.with_context(|| format!("failed to render page {}", page_index + 1))?;
 
             #[cfg(feature = "bench-image-conversion")]
             let (width, height, rgba) = {
@@ -353,8 +444,7 @@ impl PdfEngine {
                 rgba,
             })
         })?;
-        self.performance_cache
-            .save_rendered_page(path, &rendered, zoom, fast);
+        cache.save_rendered_page(path, &rendered, zoom, fast);
         Ok(rendered)
     }
 
@@ -367,6 +457,10 @@ impl PdfEngine {
         page_index: usize,
         imgsz: u32,
     ) -> Result<VisionPage> {
+        anyhow::ensure!(
+            (1..=4096).contains(&imgsz),
+            "The requested analysis raster exceeds the size limit."
+        );
         self.with_open_document(path, |document| {
             let page = document
                 .pages()
@@ -413,6 +507,7 @@ impl PdfEngine {
     }
 
     pub fn close_document(&self, path: &Path) {
+        let _native_access = lock_pdfium();
         self.open_documents
             .borrow_mut()
             .retain(|open| open.path != path);
@@ -423,6 +518,15 @@ impl PdfEngine {
         path: &Path,
         operation: impl FnOnce(&PdfDocument<'static>) -> Result<T>,
     ) -> Result<T> {
+        self.with_open_document_data(path, |open| operation(&open.document))
+    }
+
+    fn with_open_document_data<T>(
+        &self,
+        path: &Path,
+        operation: impl FnOnce(&OpenPdfDocument) -> Result<T>,
+    ) -> Result<T> {
+        let _native_access = lock_pdfium();
         let mut open_documents = self.open_documents.borrow_mut();
         if let Some(position) = open_documents.iter().position(|open| open.path == path) {
             if position != 0 {
@@ -435,9 +539,14 @@ impl PdfEngine {
                 .pdfium
                 .load_pdf_from_file(path, None)
                 .with_context(|| format!("failed to open {}", path.display()))?;
+            anyhow::ensure!(
+                document.pages().len() as usize <= 20_000,
+                "This PDF exceeds the 20,000-page limit."
+            );
             open_documents.push_front(OpenPdfDocument {
                 path: path.to_path_buf(),
                 document,
+                editor_annotation_indices: editor_annotation_indices(path).unwrap_or_default(),
             });
             while open_documents.len() > OPEN_DOCUMENT_CACHE_CAP {
                 open_documents.pop_back();
@@ -447,8 +556,38 @@ impl PdfEngine {
         let open_document = open_documents
             .front()
             .ok_or_else(|| anyhow!("internal PDF cache is empty"))?;
-        operation(&open_document.document)
+        operation(open_document)
     }
+}
+
+fn editor_annotation_indices(path: &Path) -> Result<HashMap<usize, Vec<usize>>> {
+    let document = Document::load(path)?;
+    let mut indices = HashMap::new();
+    for (number, page_id) in document.get_pages() {
+        let page = document.get_object(page_id)?.as_dict()?;
+        let Ok(annots) = page.get(b"Annots") else {
+            continue;
+        };
+        let annots = match annots {
+            Object::Reference(id) => document.get_object(*id)?,
+            annots => annots,
+        };
+        let Ok(annots) = annots.as_array() else {
+            continue;
+        };
+        let page_index = number as usize - 1;
+        let owned = annots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, annot)| {
+                lawpdf_owned_annotation_from_pdf(&document, annot, page_index).map(|_| index)
+            })
+            .collect::<Vec<_>>();
+        if !owned.is_empty() {
+            indices.insert(page_index, owned);
+        }
+    }
+    Ok(indices)
 }
 
 fn loaded_document_from_metadata(path: &Path, metadata: CachedDocumentMetadata) -> LoadedDocument {
@@ -500,36 +639,50 @@ fn page_media_box(page: &PdfPage<'_>) -> PdfRect {
         .unwrap_or_else(|_| PdfRect::new(0.0, 0.0, page.width().value, page.height().value))
 }
 
-fn page_crop_box_if_distinct_from_media(page: &PdfPage<'_>) -> Option<PdfRect> {
-    let crop_box = page_crop_box(page);
-    (!pdf_rect_close(crop_box, page_media_box(page))).then_some(crop_box)
-}
-
-fn pdf_rect_close(left: PdfRect, right: PdfRect) -> bool {
-    const EPSILON: f32 = 0.01;
-    (left.left - right.left).abs() <= EPSILON
-        && (left.bottom - right.bottom).abs() <= EPSILON
-        && (left.right - right.right).abs() <= EPSILON
-        && (left.top - right.top).abs() <= EPSILON
-}
-
-fn visible_page_extent(crop_extent: f32, fallback_extent: f32) -> f32 {
-    if crop_extent.is_finite() && crop_extent > 0.0 {
-        crop_extent
-    } else {
-        fallback_extent
+fn native_page_geometry(page: &PdfPage<'_>) -> crate::page_geometry::PageGeometry {
+    let crop = page_crop_box(page);
+    let media = page_media_box(page);
+    crate::page_geometry::PageGeometry {
+        bounds: PdfRect::new(
+            crop.left.max(media.left),
+            crop.bottom.max(media.bottom),
+            crop.right.min(media.right),
+            crop.top.min(media.top),
+        ),
+        rotation: page
+            .rotation()
+            .map(|rotation| rotation.as_degrees() as i64)
+            .unwrap_or(0),
     }
 }
 
-fn cropbox_local_coords_enabled() -> bool {
-    std::env::var(LAWPDF_CROPBOX_LOCAL_COORDS_ENV)
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+fn map_page_geometry(page: &mut PageInfo, geometry: crate::page_geometry::PageGeometry) {
+    for rectangles in [
+        &mut page.path_object_rects,
+        &mut page.image_object_rects,
+        &mut page.thin_horizontal_object_rects,
+        &mut page.thin_vertical_object_rects,
+        &mut page.vector_horizontal_rule_rects,
+        &mut page.vector_vertical_rule_rects,
+        &mut page.vector_ruled_cell_rects,
+    ] {
+        for rect in rectangles {
+            *rect = geometry.rect(*rect, false);
+        }
+    }
+    if geometry.rotation % 180 != 0 {
+        std::mem::swap(
+            &mut page.thin_horizontal_object_rects,
+            &mut page.thin_vertical_object_rects,
+        );
+        std::mem::swap(
+            &mut page.vector_horizontal_rule_rects,
+            &mut page.vector_vertical_rule_rects,
+        );
+    }
+    if geometry.rotation != 0 || geometry.bounds.bottom != 0.0 {
+        page.footnote_divider_y_from_top = None;
+    }
 }
 
 fn crop_local_visible_rect(rect: PdfRect, crop_box: PdfRect) -> Option<PdfRect> {
@@ -1250,9 +1403,12 @@ fn pdfium_library_names() -> Vec<&'static str> {
 pub fn save_rgba_png(path: &Path, width: u32, height: u32, rgba: Vec<u8>) -> Result<()> {
     let image = RgbaImage::from_raw(width, height, rgba)
         .ok_or_else(|| anyhow!("rendered page buffer has invalid dimensions"))?;
-    image
-        .save(path)
-        .with_context(|| format!("failed to save PNG {}", path.display()))
+    crate::atomic_file::replace_with(path, |file| {
+        image
+            .write_to(file, image::ImageFormat::Png)
+            .map_err(std::io::Error::other)
+    })
+    .with_context(|| format!("failed to save PNG {}", path.display()))
 }
 
 pub fn export_text(path: &Path, document: &LoadedDocument, ocr_text: &[String]) -> Result<()> {
@@ -1286,16 +1442,250 @@ pub fn export_text(path: &Path, document: &LoadedDocument, ocr_text: &[String]) 
         output.push('\n');
     }
 
-    fs::write(path, output).with_context(|| format!("failed to write {}", path.display()))
+    crate::atomic_file::write(path, output.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// What a successful annotation save did beyond writing `destination`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SaveReport {
+    /// A copy of the previous file contents, written before an in-place save.
+    pub backup: Option<PathBuf>,
+    /// The source carried an owner password (empty user password) and the
+    /// copy written to a new destination no longer does.
+    pub owner_password_removed: bool,
+    /// Hash of the exact bytes written, not a later read of a cloud-synced file.
+    pub revision: Option<crate::document_store::FileRevision>,
+    pub recovery_warning: Option<String>,
+}
+
+impl SaveReport {
+    pub fn status_suffix(&self) -> String {
+        let mut notes = Vec::new();
+        if self.owner_password_removed {
+            notes.push("owner password removed from the copy".to_owned());
+        }
+        if let Some(backup) = &self.backup {
+            notes.push(format!("previous version kept at {}", backup.display()));
+        }
+        if notes.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", notes.join("; "))
+        }
+    }
+}
+
+/// Why LawPDF refuses to rewrite a PDF in place through lopdf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewriteHazard {
+    /// The source is protected, including files automatically decrypted with an
+    /// empty user password. A full rewrite must not silently remove protection.
+    Encrypted,
+    /// The file carries a digital signature. A full rewrite changes the bytes
+    /// the signature's `/ByteRange` covers, which invalidates it.
+    Signed,
+}
+
+impl RewriteHazard {
+    fn in_place_message(self, path: &Path) -> String {
+        match self {
+            Self::Encrypted => format!(
+                "{} is protected by an owner password. LawPDF cannot automatically preserve \
+                 that protection when saving. Use Save As to write an unlocked copy.",
+                path.display()
+            ),
+            Self::Signed => format!(
+                "{} is digitally signed. Saving annotations into it would invalidate the \
+                 signature. Use Save As to write an annotated copy.",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// Detect the conditions under which rewriting `document` would damage it.
+pub fn rewrite_hazard(document: &Document) -> Option<RewriteHazard> {
+    if document.is_encrypted() || document.was_encrypted() {
+        return Some(RewriteHazard::Encrypted);
+    }
+    let is_signature = |dictionary: &Dictionary| {
+        let named = |key: &[u8], expected: &[u8]| {
+            dictionary
+                .get(key)
+                .ok()
+                .and_then(|object| object.as_name().ok())
+                .is_some_and(|name| name == expected)
+        };
+        named(b"Type", b"Sig") || (named(b"FT", b"Sig") && dictionary.has(b"V"))
+    };
+    let signed = document.objects.values().any(|object| match object {
+        Object::Dictionary(dictionary) => is_signature(dictionary),
+        Object::Stream(stream) => is_signature(&stream.dict),
+        _ => false,
+    });
+    signed.then_some(RewriteHazard::Signed)
+}
+
+/// Drop the owner-password wrapper from a document lopdf has already decrypted,
+/// so that saving it produces a readable, unencrypted file.
+fn strip_owner_password(document: &mut Document) -> Result<()> {
+    if document.encryption_state.is_none() {
+        return Err(anyhow!(
+            "this PDF requires a password to open; LawPDF cannot save changes into it"
+        ));
+    }
+    let encrypt_id = document
+        .trailer
+        .remove(b"Encrypt")
+        .and_then(|object| object.as_reference().ok());
+    if let Some(id) = encrypt_id {
+        document.objects.remove(&id);
+    }
+    document.encryption_state = None;
+    document.max_id = document
+        .objects
+        .keys()
+        .map(|(number, _)| *number)
+        .max()
+        .unwrap_or(0);
+    Ok(())
+}
+
+/// Apply the rewrite policy before `document` is written to `destination`.
+///
+/// In place (`source == destination`): refuse when a hazard exists, and keep a
+/// copy of the previous file first. To a new path: allow, stripping an owner
+/// password so the copy is readable, and report what happened.
+fn prepare_rewrite(
+    document: &mut Document,
+    source: &Path,
+    destination: &Path,
+) -> Result<SaveReport> {
+    let mut report = SaveReport::default();
+    let in_place = same_file(source, destination);
+    match rewrite_hazard(document) {
+        Some(hazard) if in_place => return Err(anyhow!(hazard.in_place_message(source))),
+        Some(RewriteHazard::Encrypted) => {
+            strip_owner_password(document)?;
+            report.owner_password_removed = true;
+        }
+        Some(RewriteHazard::Signed) | None => {}
+    }
+    if in_place {
+        report.backup = backup_before_rewrite(source)?;
+    }
+    Ok(report)
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+const REWRITE_BACKUP_DIR: &str = "backups";
+const REWRITE_BACKUP_LIMIT: usize = 40;
+
+/// Copy `source` into `<app data>/backups/` before it is rewritten in place.
+///
+/// One rolling copy is kept per document (the newest pre-save contents), and
+/// the folder is bounded so it cannot grow without limit. Returns the backup
+/// path, or `None` when no app data directory is available.
+fn backup_before_rewrite(source: &Path) -> Result<Option<PathBuf>> {
+    let Some(root) = rewrite_backup_dir() else {
+        return Ok(None);
+    };
+    backup_before_rewrite_in(source, &root)
+}
+
+fn backup_before_rewrite_in(source: &Path, root: &Path) -> Result<Option<PathBuf>> {
+    fs::create_dir_all(root)
+        .with_context(|| format!("failed to create backup folder {}", root.display()))?;
+    let key = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    let digest = crate::hashing::sha256_hex(key.to_string_lossy().as_bytes());
+    let file_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("document.pdf");
+    let backup = root.join(format!("{}-{file_name}", &digest[..12]));
+    crate::atomic_file::replace_with(&backup, |file| {
+        let mut input = fs::File::open(source)?;
+        std::io::copy(&mut input, file).map(|_| ())
+    })
+    .with_context(|| format!("failed to back up {} before saving", source.display()))?;
+    prune_rewrite_backups(root, REWRITE_BACKUP_LIMIT);
+    Ok(Some(backup))
+}
+
+fn rewrite_backup_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("LAWPDF_BACKUP_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    crate::settings::app_data_dir().map(|dir| dir.join(REWRITE_BACKUP_DIR))
+}
+
+fn prune_rewrite_backups(root: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let mut files = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            metadata
+                .is_file()
+                .then(|| (metadata.modified().ok(), entry.path()))
+        })
+        .collect::<Vec<_>>();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    for (_, path) in files.into_iter().skip(keep) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 pub fn save_with_annotations(
     source: &Path,
     destination: &Path,
     annotations: &[EditorAnnotation],
-) -> Result<()> {
-    let mut document = Document::load(source)
+) -> Result<SaveReport> {
+    let revision =
+        crate::document_store::FileRevision::read(source).map_err(|error| anyhow!(error))?;
+    save_with_annotations_checked(source, destination, annotations, &revision)
+}
+
+pub fn save_with_annotations_checked(
+    source: &Path,
+    destination: &Path,
+    annotations: &[EditorAnnotation],
+    expected: &crate::document_store::FileRevision,
+) -> Result<SaveReport> {
+    use crate::document_store::{FileRevision, MAX_DOCUMENT_BYTES, read_limited};
+    crate::document_store::validate_annotations(annotations).map_err(|error| anyhow!(error))?;
+    let source_bytes = read_limited(source, MAX_DOCUMENT_BYTES).map_err(|error| anyhow!(error))?;
+    if FileRevision::from_bytes(&source_bytes) != *expected {
+        return Err(anyhow!(
+            "The PDF changed outside LawPDF. Your changes remain in recovery; save a separate copy."
+        ));
+    }
+    let in_place = same_file(source, destination);
+    let destination_revision = if in_place {
+        Some(expected.clone())
+    } else if destination.exists() {
+        Some(FileRevision::read(destination).map_err(|error| anyhow!(error))?)
+    } else {
+        None
+    };
+    let mut document = Document::load_mem(&source_bytes)
         .with_context(|| format!("failed to load source PDF {}", source.display()))?;
+    let mut report = prepare_rewrite(&mut document, source, destination)?;
     remove_lawpdf_owned_annotations(&mut document)?;
     let pages = document.get_pages();
 
@@ -1305,27 +1695,68 @@ pub fn save_with_annotations(
             .get(&page_number)
             .ok_or_else(|| anyhow!("PDF has no page {}", page_number))?;
         let annotation_id = document.new_object_id();
-        let object = annotation_to_pdf_object(annotation);
+        let mut annotation = annotation.clone();
+        pdf_page_geometry(&document, page_id)?.annotation(&mut annotation, true);
+        let object = annotation_to_pdf_object(&annotation);
         document.objects.insert(annotation_id, object);
         append_annotation(&mut document, page_id, annotation_id)?;
     }
 
     document.prune_objects();
     document.compress();
-    if source == destination {
-        save_document_in_place(&mut document, destination)?;
-    } else {
-        document
-            .save(destination)
-            .with_context(|| format!("failed to save {}", destination.display()))?;
+    let mut bytes = Vec::new();
+    document.save_to(&mut bytes)?;
+    if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
+        return Err(anyhow!(
+            "The annotated PDF exceeds the 512 MB document limit."
+        ));
     }
+    let revision = if in_place {
+        crate::document_store::DocumentStore::new()
+            .and_then(|store| store.preserve_bytes(&bytes))
+            .map_err(anyhow::Error::msg)?
+    } else {
+        FileRevision::from_bytes(&bytes)
+    };
+    crate::atomic_file::replace_with_guard(
+        destination,
+        |writer| std::io::Write::write_all(writer, &bytes),
+        || match &destination_revision {
+            Some(previous) => previous
+                .require_current(destination)
+                .map_err(std::io::Error::other),
+            None if destination.exists() => Err(std::io::Error::other(
+                "A file appeared at the chosen destination. Choose another filename.",
+            )),
+            None => Ok(()),
+        },
+    )?;
+    report.revision = Some(revision);
 
-    Ok(())
+    Ok(report)
 }
 
 pub fn rotate_pdf_page(source: &Path, page_index: usize, clockwise: bool) -> Result<i64> {
-    let mut document = Document::load(source)
+    let expected = crate::document_store::FileRevision::read(source).map_err(anyhow::Error::msg)?;
+    rotate_pdf_page_checked(source, page_index, clockwise, &expected).map(|(rotation, _)| rotation)
+}
+
+pub fn rotate_pdf_page_checked(
+    source: &Path,
+    page_index: usize,
+    clockwise: bool,
+    expected: &crate::document_store::FileRevision,
+) -> Result<(i64, crate::document_store::FileRevision)> {
+    let bytes =
+        crate::document_store::read_limited(source, crate::document_store::MAX_DOCUMENT_BYTES)
+            .map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        crate::document_store::FileRevision::from_bytes(&bytes) == *expected,
+        "This PDF changed outside LawPDF. Reopen it before rotating a page."
+    );
+    let mut document = Document::load_mem(&bytes)
         .with_context(|| format!("failed to load source PDF {}", source.display()))?;
+    prepare_rewrite(&mut document, source, source)?;
     let page_number = page_index as u32 + 1;
     let page_id = document
         .get_pages()
@@ -1342,8 +1773,25 @@ pub fn rotate_pdf_page(source: &Path, page_index: usize, clockwise: bool) -> Res
         .set("Rotate", Object::Integer(rotation));
     document.prune_objects();
     document.compress();
-    save_document_in_place(&mut document, source)?;
-    Ok(rotation)
+    let mut output = Vec::new();
+    document.save_to(&mut output)?;
+    anyhow::ensure!(
+        output.len() as u64 <= crate::document_store::MAX_DOCUMENT_BYTES,
+        "The rotated PDF exceeds the document size limit."
+    );
+    let revision = crate::document_store::DocumentStore::new()
+        .and_then(|store| store.preserve_bytes(&output))
+        .map_err(anyhow::Error::msg)?;
+    crate::atomic_file::replace_with_guard(
+        source,
+        |file| std::io::Write::write_all(file, &output),
+        || {
+            expected
+                .require_current(source)
+                .map_err(std::io::Error::other)
+        },
+    )?;
+    Ok((rotation, revision))
 }
 
 fn inherited_page_rotation(document: &Document, page_id: ObjectId) -> Result<i64> {
@@ -1370,15 +1818,55 @@ fn inherited_page_rotation(document: &Document, page_id: ObjectId) -> Result<i64
     Err(anyhow!("PDF page tree is too deeply nested"))
 }
 
-fn pdf_integer(document: &Document, value: &Object) -> Option<i64> {
-    match value {
-        Object::Integer(value) => Some(*value),
-        Object::Reference(id) => document
-            .get_object(*id)
-            .ok()
-            .and_then(|value| pdf_integer(document, value)),
-        _ => None,
+fn pdf_integer<'a>(document: &'a Document, mut value: &'a Object) -> Option<i64> {
+    for _ in 0..64 {
+        match value {
+            Object::Integer(value) => return Some(*value),
+            Object::Reference(id) => value = document.get_object(*id).ok()?,
+            _ => return None,
+        }
     }
+    None
+}
+
+fn pdf_page_geometry(
+    document: &Document,
+    page_id: ObjectId,
+) -> Result<crate::page_geometry::PageGeometry> {
+    let inherited_rect = |key: &[u8]| -> Option<PdfRect> {
+        let mut id = page_id;
+        for _ in 0..64 {
+            let dict = document.get_object(id).ok()?.as_dict().ok()?;
+            if let Ok(value) = dict.get(key) {
+                let value = match value {
+                    Object::Reference(id) => document.get_object(*id).ok()?,
+                    value => value,
+                };
+                return pdf_rect_from_object(value);
+            }
+            id = dict.get(b"Parent").ok()?.as_reference().ok()?;
+        }
+        None
+    };
+    let media =
+        inherited_rect(b"MediaBox").ok_or_else(|| anyhow!("PDF page has no valid MediaBox"))?;
+    let crop = inherited_rect(b"CropBox").unwrap_or(media);
+    let bounds = PdfRect::new(
+        crop.left.max(media.left),
+        crop.bottom.max(media.bottom),
+        crop.right.min(media.right),
+        crop.top.min(media.top),
+    );
+    anyhow::ensure!(
+        bounds.width() > 0.0 && bounds.height() > 0.0,
+        "PDF page has an empty visible area"
+    );
+    let rotation = inherited_page_rotation(document, page_id)?;
+    anyhow::ensure!(
+        rotation % 90 == 0,
+        "PDF page rotation must be a multiple of 90 degrees"
+    );
+    Ok(crate::page_geometry::PageGeometry { bounds, rotation })
 }
 
 pub fn load_pdf_web_links(source: &Path, page_count: usize) -> Result<Vec<Vec<PageLink>>> {
@@ -1401,6 +1889,10 @@ pub fn load_pdf_web_links(source: &Path, page_count: usize) -> Result<Vec<Vec<Pa
         };
 
         append_pdf_web_links_from_annots(&document, &annots, &mut links[page_index]);
+        let geometry = pdf_page_geometry(&document, page_id)?;
+        for link in &mut links[page_index] {
+            link.rect = geometry.rect(link.rect, false);
+        }
     }
 
     Ok(links)
@@ -1413,6 +1905,7 @@ pub fn load_lawpdf_annotations(source: &Path) -> Result<Vec<EditorAnnotation>> {
     let mut annotations = Vec::new();
 
     for (page_number, page_id) in pages {
+        let first_annotation = annotations.len();
         let page_index = page_number.saturating_sub(1) as usize;
         let annots = {
             let page = document.get_object(page_id)?.as_dict()?;
@@ -1451,6 +1944,12 @@ pub fn load_lawpdf_annotations(source: &Path) -> Result<Vec<EditorAnnotation>> {
                 }
             }
         }
+        if first_annotation < annotations.len() {
+            let geometry = pdf_page_geometry(&document, page_id)?;
+            for annotation in &mut annotations[first_annotation..] {
+                geometry.annotation(annotation, false);
+            }
+        }
     }
 
     Ok(annotations)
@@ -1467,6 +1966,7 @@ fn load_lawpdf_comments(source: &Path) -> Result<Vec<EditorAnnotation>> {
 pub fn sync_lawpdf_comments(source: &Path, comments: &[EditorAnnotation]) -> Result<usize> {
     let mut document = Document::load(source)
         .with_context(|| format!("failed to load source PDF {}", source.display()))?;
+    prepare_rewrite(&mut document, source, source)?;
     remove_lawpdf_comment_annotations(&mut document)?;
     let pages = document.get_pages();
     let mut saved = 0usize;
@@ -1481,7 +1981,9 @@ pub fn sync_lawpdf_comments(source: &Path, comments: &[EditorAnnotation]) -> Res
             continue;
         };
         let annotation_id = document.new_object_id();
-        let object = annotation_to_pdf_object(annotation);
+        let mut annotation = annotation.clone();
+        pdf_page_geometry(&document, page_id)?.annotation(&mut annotation, true);
+        let object = annotation_to_pdf_object(&annotation);
         document.objects.insert(annotation_id, object);
         append_annotation(&mut document, page_id, annotation_id)?;
         saved += 1;
@@ -1499,17 +2001,16 @@ pub fn save_with_ocr_text(
     destination: &Path,
     page_sizes: &[(f32, f32)],
     ocr_text: &[String],
-) -> Result<()> {
+) -> Result<SaveReport> {
     let mut document = Document::load(source)
         .with_context(|| format!("failed to load source PDF {}", source.display()))?;
+    let report = prepare_rewrite(&mut document, source, destination)?;
     append_ocr_text_layers(&mut document, page_sizes, ocr_text)?;
     document.prune_objects();
     document.compress();
-    document
-        .save(destination)
-        .with_context(|| format!("failed to save {}", destination.display()))?;
+    save_document_in_place(&mut document, destination)?;
 
-    Ok(())
+    Ok(report)
 }
 
 fn append_ocr_text_layers(
@@ -1766,7 +2267,9 @@ fn annotation_to_pdf_object(annotation: &EditorAnnotation) -> Object {
             "Subtype" => Object::Name(b"FreeText".to_vec()),
             "Rect" => rect_array(annotation.rect),
             "Contents" => literal(text),
-            "DA" => literal(format!("/Helv {font_size} Tf 0 0 0 rg")),
+            "DA" => literal(format!("/Helv {font_size} Tf {} {} {} rg", color_rgb[0], color_rgb[1], color_rgb[2])),
+            "LawPDF" => Object::Boolean(true),
+            "LawFontSize" => Object::Real(*font_size),
             "C" => color_array(*color_rgb),
             "F" => Object::Integer(4),
         }),
@@ -1775,8 +2278,8 @@ fn annotation_to_pdf_object(annotation: &EditorAnnotation) -> Object {
             text,
             color_rgb,
             updated_at,
+            created_at,
             anchor,
-            ..
         } => Object::Dictionary(dictionary! {
             "Type" => Object::Name(b"Annot".to_vec()),
             "Subtype" => Object::Name(b"Text".to_vec()),
@@ -1785,6 +2288,7 @@ fn annotation_to_pdf_object(annotation: &EditorAnnotation) -> Object {
             "T" => literal("LawPDF"),
             "NM" => literal(id),
             "M" => literal(updated_at),
+            "CreationDate" => literal(created_at),
             "Name" => Object::Name(b"Comment".to_vec()),
             "Open" => Object::Boolean(false),
             "C" => color_array(*color_rgb),
@@ -1808,6 +2312,9 @@ fn annotation_to_pdf_object(annotation: &EditorAnnotation) -> Object {
                 "Subtype" => Object::Name(b"Ink".to_vec()),
                 "Rect" => rect_array(annotation.rect),
                 "InkList" => ink_list(strokes),
+                "LawPDF" => Object::Boolean(true),
+                "LawSigner" => literal(signer),
+                "LawSignedAt" => literal(signed_at),
                 "C" => color_array([0.0, 0.0, 0.0]),
                 "Border" => Object::Array(vec![0.into(), 0.into(), 1.into()]),
                 "Contents" => literal(contents),
@@ -1844,7 +2351,11 @@ fn lawpdf_comment_from_annotation(
         .ok()
         .and_then(pdf_object_text)
         .unwrap_or_default();
-    let created_at = updated_at.clone();
+    let created_at = dict
+        .get(b"CreationDate")
+        .ok()
+        .and_then(pdf_object_text)
+        .unwrap_or_else(|| updated_at.clone());
     // Older files (and non-LawPDF readers) won't have the anchor; fall back to
     // the card's center so the leader still points somewhere sensible.
     let anchor = dict
@@ -1883,33 +2394,78 @@ fn lawpdf_owned_annotation_from_pdf(
         return None;
     }
     let subtype = dict.get(b"Subtype").ok().and_then(pdf_object_text)?;
-    let style = if subtype.eq_ignore_ascii_case("Highlight") {
-        MarkerStyle::Highlight
-    } else if subtype.eq_ignore_ascii_case("Underline") {
-        MarkerStyle::Underline
-    } else {
-        return None;
-    };
     let rect = dict.get(b"Rect").ok().and_then(pdf_rect_from_object)?;
     let color_rgb = dict
         .get(b"C")
         .ok()
         .and_then(pdf_color_from_object)
         .unwrap_or([1.0, 0.93, 0.45]);
-    let opacity = dict
-        .get(b"CA")
-        .ok()
-        .and_then(pdf_number)
-        .unwrap_or(0.42)
-        .clamp(0.0, 1.0);
+    let kind = match subtype.as_str() {
+        "Highlight" | "Underline" => AnnotationKind::Marker {
+            color_rgb,
+            opacity: dict
+                .get(b"CA")
+                .ok()
+                .and_then(pdf_number)
+                .unwrap_or(0.42)
+                .clamp(0.0, 1.0),
+            style: if subtype == "Highlight" {
+                MarkerStyle::Highlight
+            } else {
+                MarkerStyle::Underline
+            },
+        },
+        "FreeText" => AnnotationKind::TextBox {
+            text: dict
+                .get(b"Contents")
+                .ok()
+                .and_then(pdf_object_text)
+                .unwrap_or_default(),
+            font_size: dict
+                .get(b"LawFontSize")
+                .ok()
+                .and_then(pdf_number)
+                .unwrap_or(12.0),
+            color_rgb,
+        },
+        "Ink" => {
+            let strokes = dict
+                .get(b"InkList")
+                .ok()?
+                .as_array()
+                .ok()?
+                .iter()
+                .map(|stroke| {
+                    let values = stroke.as_array().ok()?;
+                    if values.len() % 2 != 0 {
+                        return None;
+                    }
+                    values
+                        .chunks_exact(2)
+                        .map(|pair| Some((pdf_number(&pair[0])?, pdf_number(&pair[1])?)))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .collect::<Option<Vec<_>>>()?;
+            AnnotationKind::Signature {
+                signer: dict
+                    .get(b"LawSigner")
+                    .ok()
+                    .and_then(pdf_object_text)
+                    .unwrap_or_default(),
+                signed_at: dict
+                    .get(b"LawSignedAt")
+                    .ok()
+                    .and_then(pdf_object_text)
+                    .unwrap_or_default(),
+                strokes,
+            }
+        }
+        _ => return None,
+    };
     Some(EditorAnnotation {
         page_index,
         rect,
-        kind: AnnotationKind::Marker {
-            color_rgb,
-            opacity,
-            style,
-        },
+        kind,
     })
 }
 
@@ -2096,7 +2652,11 @@ fn is_matching_lawpdf_annotation(
     include_owned: bool,
 ) -> bool {
     annotation_dict(document, annotation).is_some_and(|dict| {
-        is_lawpdf_comment_dict(dict) || (include_owned && is_lawpdf_owned_dict(dict))
+        if include_owned {
+            lawpdf_owned_annotation_from_pdf(document, annotation, 0).is_some()
+        } else {
+            is_lawpdf_comment_dict(dict)
+        }
     })
 }
 
@@ -2184,6 +2744,14 @@ fn color_array(rgb: [f32; 3]) -> Object {
 
 fn pdf_object_text(object: &Object) -> Option<String> {
     match object {
+        Object::String(bytes, _) if bytes.starts_with(&[0xfe, 0xff]) => {
+            Some(String::from_utf16_lossy(
+                &bytes[2..]
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                    .collect::<Vec<_>>(),
+            ))
+        }
         Object::String(bytes, _) => Some(String::from_utf8_lossy(bytes).to_string()),
         Object::Name(bytes) => Some(String::from_utf8_lossy(bytes).to_string()),
         _ => None,
@@ -2248,34 +2816,20 @@ fn ink_list(strokes: &[Vec<(f32, f32)>]) -> Object {
 }
 
 fn literal(value: impl AsRef<str>) -> Object {
-    Object::String(value.as_ref().as_bytes().to_vec(), StringFormat::Literal)
+    let text = value.as_ref();
+    let bytes = if text.is_ascii() {
+        text.as_bytes().to_vec()
+    } else {
+        let mut bytes = vec![0xfe, 0xff];
+        bytes.extend(text.encode_utf16().flat_map(u16::to_be_bytes));
+        bytes
+    };
+    Object::String(bytes, StringFormat::Literal)
 }
 
 fn save_document_in_place(document: &mut Document, destination: &Path) -> Result<()> {
-    let temp = temp_pdf_path(destination);
-    if temp.exists() {
-        let _ = fs::remove_file(&temp);
-    }
-
-    document
-        .save(&temp)
-        .with_context(|| format!("failed to write temporary PDF {}", temp.display()))?;
-    fs::copy(&temp, destination)
-        .with_context(|| format!("failed to replace {}", destination.display()))?;
-    let _ = fs::remove_file(&temp);
-    Ok(())
-}
-
-fn temp_pdf_path(destination: &Path) -> PathBuf {
-    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = destination
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("document.pdf");
-    parent.join(format!(
-        ".{file_name}.{}.lawpdf-comments.tmp",
-        std::process::id()
-    ))
+    crate::atomic_file::replace_with(destination, |file| document.save_to(file))
+        .with_context(|| format!("failed to save {}", destination.display()))
 }
 
 pub fn sidecar_path_for_export(source: &Path, suffix: &str, extension: &str) -> PathBuf {
@@ -2289,6 +2843,47 @@ pub fn sidecar_path_for_export(source: &Path, suffix: &str, extension: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marks_round_trip_on_cropped_rotated_pages_and_after_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        for rotation in [0, 90, 180, 270] {
+            let path = directory.path().join(format!("rotation-{rotation}.pdf"));
+            write_blank_pdf(&path);
+            let mut pdf = Document::load(&path).unwrap();
+            let page_id = pdf.get_pages()[&1];
+            let page = pdf.get_object_mut(page_id).unwrap().as_dict_mut().unwrap();
+            page.set("Rotate", Object::Integer(rotation));
+            page.set(
+                "CropBox",
+                Object::Array(vec![20.into(), 40.into(), 600.into(), 760.into()]),
+            );
+            save_document_in_place(&mut pdf, &path).unwrap();
+            let mark = EditorAnnotation {
+                page_index: 0,
+                rect: PdfRect::new(50.0, 100.0, 180.0, 130.0),
+                kind: AnnotationKind::Marker {
+                    color_rgb: [1.0, 0.9, 0.2],
+                    opacity: 0.4,
+                    style: MarkerStyle::Highlight,
+                },
+            };
+            save_with_annotations(&path, &path, &[mark.clone()]).unwrap();
+            assert_eq!(load_lawpdf_annotations(&path).unwrap(), vec![mark.clone()]);
+            let before = Document::load(&path).unwrap();
+            let geometry = pdf_page_geometry(&before, before.get_pages()[&1]).unwrap();
+            let raw_rect = geometry.rect(mark.rect, true);
+            rotate_pdf_page(&path, 0, true).unwrap();
+            let after = Document::load(&path).unwrap();
+            let new_geometry = pdf_page_geometry(&after, after.get_pages()[&1]).unwrap();
+            let mut expected = mark;
+            expected.rect = new_geometry.rect(raw_rect, false);
+            let loaded = load_lawpdf_annotations(&path).unwrap();
+            assert_eq!(loaded, vec![expected]);
+            save_with_annotations(&path, &path, &loaded).unwrap();
+            assert_eq!(load_lawpdf_annotations(&path).unwrap(), loaded);
+        }
+    }
 
     #[test]
     fn rotate_pdf_page_persists_and_normalizes_quarter_turns() {
@@ -2461,6 +3056,309 @@ mod tests {
                 .any(|annotation| matches!(annotation.kind, AnnotationKind::Comment { .. }))
         );
         let _ = fs::remove_file(path);
+    }
+
+    /// One page, an owner password, an empty user password: the "no copy"
+    /// restriction found on court filings and journal downloads.
+    const OWNER_PASSWORD_PDF: &[u8] = include_bytes!("../tests/fixtures/owner-password.pdf");
+
+    fn temp_pdf_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "lawpdf-{label}-{}-{}.pdf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    fn highlight_annotation() -> EditorAnnotation {
+        EditorAnnotation {
+            page_index: 0,
+            rect: PdfRect::new(20.0, 90.0, 180.0, 110.0),
+            kind: AnnotationKind::Marker {
+                color_rgb: [1.0, 0.93, 0.45],
+                opacity: 0.42,
+                style: MarkerStyle::Highlight,
+            },
+        }
+    }
+
+    #[test]
+    fn every_annotation_kind_survives_save_reopen_edit_and_delete() {
+        let source = temp_pdf_path("all-annotations");
+        write_blank_pdf(&source);
+        let rect = PdfRect::new(72.0, 650.0, 220.0, 668.0);
+        let mut annotations = vec![
+            highlight_annotation(),
+            EditorAnnotation {
+                page_index: 0,
+                rect,
+                kind: AnnotationKind::Marker {
+                    color_rgb: [0.2, 0.3, 0.4],
+                    opacity: 0.7,
+                    style: MarkerStyle::Underline,
+                },
+            },
+            EditorAnnotation {
+                page_index: 0,
+                rect,
+                kind: AnnotationKind::TextBox {
+                    text: "Café § 2 — שלום".to_owned(),
+                    font_size: 16.0,
+                    color_rgb: [0.2, 0.3, 0.4],
+                },
+            },
+            EditorAnnotation {
+                page_index: 0,
+                rect,
+                kind: AnnotationKind::Signature {
+                    signer: "Zoë".to_owned(),
+                    signed_at: "2026-09-17".to_owned(),
+                    strokes: vec![vec![(72.0, 651.0), (100.0, 660.0), (210.0, 653.0)]],
+                },
+            },
+            EditorAnnotation {
+                page_index: 0,
+                rect,
+                kind: AnnotationKind::Comment {
+                    id: "LawPDF-comment-roundtrip-all".to_owned(),
+                    text: "Check § 2".to_owned(),
+                    color_rgb: [1.0, 0.8, 0.3],
+                    created_at: "first".to_owned(),
+                    updated_at: "later".to_owned(),
+                    anchor: (210.0, 659.0),
+                },
+            },
+        ];
+        // An unrelated annotation must survive every LawPDF rewrite.
+        let mut pdf = Document::load(&source).unwrap();
+        let page = *pdf.get_pages().values().next().unwrap();
+        let foreign = pdf.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Text", "Rect" => rect_array(rect),
+            "Contents" => literal("Other reader's note"),
+        });
+        append_annotation(&mut pdf, page, foreign).unwrap();
+        pdf.save(&source).unwrap();
+        for _ in 0..2 {
+            save_with_annotations(&source, &source, &annotations).unwrap();
+            assert_eq!(load_lawpdf_annotations(&source).unwrap(), annotations);
+            let pdf = Document::load(&source).unwrap();
+            let page = *pdf.get_pages().values().next().unwrap();
+            assert_eq!(
+                pdf.get_object(page)
+                    .unwrap()
+                    .as_dict()
+                    .unwrap()
+                    .get(b"Annots")
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                annotations.len() + 1
+            );
+        }
+        annotations.clear();
+        save_with_annotations(&source, &source, &annotations).unwrap();
+        assert!(load_lawpdf_annotations(&source).unwrap().is_empty());
+        let pdf = Document::load(&source).unwrap();
+        let page = *pdf.get_pages().values().next().unwrap();
+        assert_eq!(
+            pdf.get_object(page)
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get(b"Annots")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn concurrent_engines_render_and_close_annotated_documents_safely() {
+        let source = temp_pdf_path("concurrent-engines");
+        write_blank_pdf(&source);
+        save_with_annotations(&source, &source, &[highlight_annotation()]).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+        std::thread::scope(|scope| {
+            for _ in 0..6 {
+                let source = &source;
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    let engine = PdfEngine::new().unwrap();
+                    barrier.wait();
+                    for zoom in [0.25, 0.3, 0.35] {
+                        let page = engine.render_page(source, 0, zoom).unwrap();
+                        assert!(!page.rgba.is_empty());
+                        engine.close_document(source);
+                    }
+                    // Leave a native document cached so Drop is exercised while
+                    // the other engines may still be rendering or closing.
+                    engine.load_document(source).unwrap();
+                });
+            }
+        });
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn editor_does_not_double_paint_saved_marks_but_export_keeps_them() {
+        let source = temp_pdf_path("annotation-render");
+        write_blank_pdf(&source);
+        let engine = PdfEngine::new().expect("PDFium is required for release QA");
+        let blank = engine.render_page(&source, 0, 0.5).unwrap();
+        engine.close_document(&source);
+        save_with_annotations(&source, &source, &[highlight_annotation()]).unwrap();
+        let exported = engine.render_page(&source, 0, 0.5).unwrap();
+        let editor = engine
+            .render_page_with_quality(&source, 0, 0.5, RenderQuality::Crisp)
+            .unwrap();
+        assert_ne!(
+            exported.rgba, blank.rgba,
+            "export includes the saved highlight"
+        );
+        assert_eq!(
+            editor.rgba, blank.rgba,
+            "editor draws the highlight separately"
+        );
+        // Force an uncached full render after the editor render: hidden flags
+        // must not leak into subsequent exports from the same native document.
+        let full_again = engine.render_page(&source, 0, 0.51).unwrap();
+        assert!(full_again.rgba.chunks_exact(4).any(|p| p[0] != p[2]));
+        engine.close_document(&source);
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn owner_password_pdf_is_refused_in_place_and_unlocked_on_save_as() {
+        let source = temp_pdf_path("owner-password");
+        fs::write(&source, OWNER_PASSWORD_PDF).unwrap();
+        let loaded = Document::load(&source).unwrap();
+        assert_eq!(rewrite_hazard(&loaded), Some(RewriteHazard::Encrypted));
+
+        let error = save_with_annotations(&source, &source, &[highlight_annotation()])
+            .expect_err("in-place save into a protected PDF must be refused");
+        assert!(
+            error.to_string().contains("owner password"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            fs::read(&source).unwrap(),
+            OWNER_PASSWORD_PDF,
+            "a refused save must leave the original untouched"
+        );
+
+        let copy = temp_pdf_path("owner-password-copy");
+        let report = save_with_annotations(&source, &copy, &[highlight_annotation()]).unwrap();
+        assert!(report.owner_password_removed);
+        assert!(report.backup.is_none());
+        let unlocked = Document::load(&copy).unwrap();
+        assert!(unlocked.trailer.get(b"Encrypt").is_err());
+        assert!(unlocked.encryption_state.is_none());
+        let page_id = *unlocked.get_pages().get(&1).unwrap();
+        let content = unlocked.get_page_content(page_id).unwrap();
+        assert!(
+            content
+                .windows(15)
+                .any(|window| window == b"HELLO PLAINTEXT"),
+            "the copy must carry readable page content"
+        );
+        assert_eq!(load_lawpdf_annotations(&copy).unwrap().len(), 1);
+
+        let _ = fs::remove_file(source);
+        let _ = fs::remove_file(copy);
+    }
+
+    #[test]
+    fn signed_pdf_is_refused_in_place_but_copies() {
+        let source = temp_pdf_path("signed");
+        write_blank_pdf(&source);
+        let mut document = Document::load(&source).unwrap();
+        assert_eq!(rewrite_hazard(&document), None);
+        let signature_id = document.new_object_id();
+        document.objects.insert(
+            signature_id,
+            Object::Dictionary(dictionary! {
+                "Type" => Object::Name(b"Sig".to_vec()),
+                "Filter" => Object::Name(b"Adobe.PPKLite".to_vec()),
+                "ByteRange" => Object::Array(vec![Object::Integer(0), Object::Integer(1)]),
+            }),
+        );
+        document
+            .trailer
+            .set("LawPDFTestSignature", Object::Reference(signature_id));
+        document.save(&source).unwrap();
+        let signed = Document::load(&source).unwrap();
+        assert_eq!(rewrite_hazard(&signed), Some(RewriteHazard::Signed));
+
+        let before = fs::read(&source).unwrap();
+        let error = save_with_annotations(&source, &source, &[highlight_annotation()])
+            .expect_err("in-place save into a signed PDF must be refused");
+        assert!(
+            error.to_string().contains("signed"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(fs::read(&source).unwrap(), before);
+
+        let copy = temp_pdf_path("signed-copy");
+        let report = save_with_annotations(&source, &copy, &[highlight_annotation()]).unwrap();
+        assert!(!report.owner_password_removed);
+        assert_eq!(load_lawpdf_annotations(&copy).unwrap().len(), 1);
+
+        let _ = fs::remove_file(source);
+        let _ = fs::remove_file(copy);
+    }
+
+    #[test]
+    fn in_place_save_keeps_a_rolling_backup_of_the_previous_bytes() {
+        let backup_root = std::env::temp_dir().join(format!(
+            "lawpdf-backups-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let source = temp_pdf_path("backup-source");
+        write_blank_pdf(&source);
+        let original = fs::read(&source).unwrap();
+
+        let backup = backup_before_rewrite_in(&source, &backup_root)
+            .unwrap()
+            .unwrap();
+        assert!(backup.starts_with(&backup_root));
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        assert!(
+            backup.file_name().and_then(|n| n.to_str()).is_some_and(
+                |name| name.ends_with(source.file_name().and_then(|n| n.to_str()).unwrap())
+            )
+        );
+
+        // A second backup of the same document replaces the first: one rolling
+        // copy per path, not one per save.
+        fs::write(&source, b"%PDF-1.5 changed").unwrap();
+        let again = backup_before_rewrite_in(&source, &backup_root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(again, backup);
+        assert_eq!(fs::read(&again).unwrap(), b"%PDF-1.5 changed");
+        assert_eq!(fs::read_dir(&backup_root).unwrap().count(), 1);
+
+        // The folder is bounded.
+        for index in 0..3 {
+            let extra = backup_root.join(format!("extra-{index}.pdf"));
+            fs::write(&extra, b"x").unwrap();
+        }
+        prune_rewrite_backups(&backup_root, 2);
+        assert_eq!(fs::read_dir(&backup_root).unwrap().count(), 2);
+
+        let _ = fs::remove_dir_all(backup_root);
+        let _ = fs::remove_file(source);
     }
 
     #[test]

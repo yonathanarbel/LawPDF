@@ -1,4 +1,9 @@
+mod annotation_saving;
+mod annotation_session;
 mod chat_ui;
+mod close_ui;
+mod document_opening;
+mod recovery_ui;
 mod search_state;
 mod selection_state;
 mod settings_ui;
@@ -6,6 +11,7 @@ mod tts_controller;
 mod update_ui;
 
 use chat_ui::{ChatState, ChatUi, estimate_tokens};
+use close_ui::CloseTarget;
 use search_state::SearchState;
 use selection_state::SelectionState;
 use settings_ui::SettingsUi;
@@ -48,8 +54,7 @@ use crate::ocr::{
     OcrEvent, load_ocr_cache, save_ocr_cache, spawn_ocr_job, spawn_openrouter_ocr_save_job,
 };
 use crate::pdf_backend::{
-    LAWPDF_COMMENT_ID_PREFIX, PdfEngine, export_text, load_lawpdf_annotations,
-    save_with_annotations, sidecar_path_for_export,
+    LAWPDF_COMMENT_ID_PREFIX, PdfEngine, export_text, sidecar_path_for_export,
 };
 use crate::render_worker::{
     PageRenderKey, RenderEvent, RenderRequest, ThumbnailRenderKey, spawn_render_worker,
@@ -60,11 +65,10 @@ use crate::review_reading::{
     is_review_margin_note_block, is_review_note_display_block, opening_pages_ready_for_review,
     review_all_pages_ready, review_allows_automatic_full_prepare,
     review_collect_margin_note_indices, review_column_layout, review_contents_navigation_entries,
-    review_document_plain_text, review_footnote_superscript, review_gate_automatic_full,
-    review_hidden_display_mask, review_opening_page_count, review_paragraph_display_parts,
-    review_prepare_flags_after_restart, review_prepare_next_action,
-    review_skips_block_as_furniture, review_table_figure_crop, should_apply_review_event,
-    should_precompute_review_on_open, split_fused_review_notes,
+    review_footnote_superscript, review_gate_automatic_full, review_hidden_display_mask,
+    review_opening_page_count, review_paragraph_display_parts, review_prepare_flags_after_restart,
+    review_prepare_next_action, review_skips_block_as_furniture, review_table_figure_crop,
+    should_apply_review_event, should_precompute_review_on_open, split_fused_review_notes,
 };
 use crate::settings::{
     AppSettings, app_data_dir, effective_groq_api_key, effective_openai_api_key,
@@ -110,7 +114,7 @@ const UPDATE_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const UPDATE_SUCCESS_NOTICE_DURATION: Duration = Duration::from_secs(15);
 const NOTICE_CAPACITY: usize = 5;
 const INFO_NOTICE_DURATION: Duration = Duration::from_secs(6);
-const COMMENT_AUTOSAVE_DELAY: Duration = Duration::from_millis(650);
+const ANNOTATION_AUTOSAVE_DELAY: Duration = Duration::from_millis(650);
 const COMMENT_CARD_WIDTH: f32 = 324.0;
 const COMMENT_CARD_GAP: f32 = 14.0;
 const LIQUID_MARGIN_NOTE_GAP: f32 = 16.0;
@@ -345,7 +349,7 @@ pub struct PdfEditorApp {
     sbs_page_textures: HashMap<(u64, usize), PageTexture>,
     sbs_pending_page_renders: HashMap<(u64, usize), PageRenderKey>,
     thumbnail_textures: HashMap<usize, ThumbnailTexture>,
-    render_tx: Sender<RenderRequest>,
+    render_tx: crate::render_worker::RenderSender,
     render_rx: Receiver<RenderEvent>,
     document_links_tx: Sender<DocumentLinksEvent>,
     document_links_rx: Receiver<DocumentLinksEvent>,
@@ -353,7 +357,7 @@ pub struct PdfEditorApp {
     pending_document_enrichments: HashSet<(u64, PathBuf)>,
     incoming_paths_rx: Receiver<Vec<PathBuf>>,
     #[cfg(target_os = "macos")]
-    _macos_open_files: crate::macos_open_files::OpenDocumentsRegistration,
+    _macos_open_files: Option<crate::macos_open_files::OpenDocumentsRegistration>,
     queued_open_paths: VecDeque<PathBuf>,
     pending_page_renders: HashMap<usize, PageRenderKey>,
     pending_thumbnail_renders: HashMap<usize, ThumbnailRenderKey>,
@@ -403,8 +407,13 @@ pub struct PdfEditorApp {
     marker_opacity: f32,
     marker_preset_index: usize,
     comment_color_index: usize,
-    pending_comment_saves: HashMap<PathBuf, PendingCommentSave>,
-    active_comment_saves: HashMap<PathBuf, u64>,
+    pending_annotation_saves: HashMap<PathBuf, PendingAnnotationSave>,
+    active_annotation_saves: HashMap<PathBuf, PendingAnnotationSave>,
+    annotation_save_generation: u64,
+    annotation_sessions: HashMap<u64, annotation_session::AnnotationSession>,
+    pending_document_opens: HashMap<PathBuf, document_opening::OpenOptions>,
+    open_into_sbs: bool,
+    recovery_ui: recovery_ui::RecoveryUi,
     page_rotation_in_flight: bool,
     text_box_text: String,
     signer_name: String,
@@ -423,8 +432,13 @@ pub struct PdfEditorApp {
     status: String,
     #[cfg(target_os = "macos")]
     show_default_reader_prompt: bool,
-    show_unsaved_close_prompt: bool,
+    pending_close: Option<CloseTarget>,
     allow_window_close: bool,
+    review_derived: ReviewDerivedCache,
+    review_source_geometry: Option<ReviewSourceGeometry>,
+    /// Document epoch whose Review fast cache has already been probed on disk.
+    liquid_mode2_fast_cache_probed_epoch: Option<u64>,
+    settings_save_due: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -620,9 +634,50 @@ enum LiquidState {
     Idle,
     PreparingText,
     Preparing,
-    Ready(LiquidDocument),
+    /// The finished document is shared, not owned: the draw loop and the
+    /// per-tab snapshots clone this state every frame, and an `Arc` makes that
+    /// a reference-count bump instead of a copy of every block and source line.
+    Ready(Arc<LiquidDocument>),
     Failed(String),
 }
+
+/// Per-document values the Review Mode draw loop needs on every frame but that
+/// only change when the document itself changes: the footnote popover index,
+/// the hidden-contents mask, and the contents-rail outline. Keyed by the
+/// `Arc` identity of the ready document; a `Weak` keeps the allocation from
+/// being reused for a different document while the key is held.
+#[derive(Default)]
+struct ReviewDerivedCache {
+    key: Option<std::sync::Weak<LiquidDocument>>,
+    hidden_contents: Arc<Vec<bool>>,
+    outline: Arc<Vec<LiquidOutlineItem>>,
+    title: String,
+}
+
+impl ReviewDerivedCache {
+    fn is_for(&self, document: &Arc<LiquidDocument>) -> bool {
+        self.key
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|cached| Arc::ptr_eq(&cached, document))
+    }
+}
+
+/// Source-line geometry for the loaded PDF, used to map Review Mode blocks
+/// back to page rectangles (table crops, provenance highlights). Extracting it
+/// walks every page and runs the layout hint models, so it is computed once
+/// per document and refreshed only when more pages finish loading.
+#[derive(Debug, Clone)]
+struct ReviewSourceGeometry {
+    document_epoch: u64,
+    loaded_pages: usize,
+    rects: Arc<HashMap<(usize, usize), PdfRect>>,
+}
+
+/// Trailing debounce for settings writes triggered by continuous input
+/// (zoom). Each write is an atomic replace with an fsync, which is far too
+/// expensive to do on every wheel notch on the UI thread.
+const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(750);
 
 #[derive(Debug, Clone)]
 enum MarkdownDestination {
@@ -647,7 +702,7 @@ enum MarkdownPreparationOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LiquidOutlineItem {
+pub(crate) struct LiquidOutlineItem {
     block_index: usize,
     level: usize,
     text: String,
@@ -869,11 +924,11 @@ struct CommentColorPreset {
 }
 
 #[derive(Debug, Clone)]
-struct PendingCommentSave {
+struct PendingAnnotationSave {
     document_epoch: u64,
     path: PathBuf,
     generation: u64,
-    comments: Vec<EditorAnnotation>,
+    annotations: Vec<EditorAnnotation>,
     due_at: Instant,
 }
 
@@ -994,6 +1049,7 @@ struct DocumentTab {
     pending_document_scroll_offset: Option<Vec2>,
     visible_page_ranges: Vec<VisiblePageRange>,
     status: String,
+    review_source_geometry: Option<ReviewSourceGeometry>,
 }
 
 impl DocumentTab {
@@ -1004,17 +1060,22 @@ impl DocumentTab {
 
 impl PdfEditorApp {
     pub fn new(
-        cc: &eframe::CreationContext<'_>,
+        ctx: &Context,
         startup_paths: Vec<PathBuf>,
         incoming_paths_rx: Receiver<Vec<PathBuf>>,
-        #[cfg(target_os = "macos")]
-        macos_open_files: crate::macos_open_files::OpenDocumentsRegistration,
+        #[cfg(target_os = "macos")] macos_open_files: Option<
+            crate::macos_open_files::OpenDocumentsRegistration,
+        >,
     ) -> Self {
-        install_eb_garamond(&cc.egui_ctx);
-        install_paper_theme(&cc.egui_ctx);
+        #[cfg(feature = "devtools")]
+        let isolated = cfg!(test) || crate::shutdown_smoke::running();
+        #[cfg(not(feature = "devtools"))]
+        let isolated = cfg!(test);
+        install_eb_garamond(ctx);
+        install_paper_theme(ctx);
 
         let (ocr_tx, ocr_rx) = unbounded();
-        let (render_tx, render_rx) = spawn_render_worker(Some(cc.egui_ctx.clone()));
+        let (render_tx, render_rx) = spawn_render_worker(Some(ctx.clone()));
         let (document_links_tx, document_links_rx) = unbounded();
         let (liquid_tx, liquid_rx) = unbounded();
         let (liquid_mode2_tx, liquid_mode2_rx) = unbounded();
@@ -1022,9 +1083,17 @@ impl PdfEditorApp {
         let chat_ui = ChatUi::new();
         let (update_tx, update_rx) = unbounded();
         let tts_controller = TtsController::new();
-        updater::spawn_update_check(update_tx.clone());
-        let installed_update = updater::take_installed_update();
-        let update_error = updater::take_update_error();
+        if !isolated {
+            updater::spawn_update_check(update_tx.clone());
+        }
+        let (installed_update, update_error) = if isolated {
+            (None, None)
+        } else {
+            (
+                updater::take_installed_update(),
+                updater::take_update_error(),
+            )
+        };
         let update_notice = if let Some(version) = installed_update.as_ref() {
             Some(UpdateNotice::new(
                 format!("LawPDF {version} installed successfully"),
@@ -1043,9 +1112,13 @@ impl PdfEditorApp {
         } else {
             "Ready".to_owned()
         };
-        let settings = load_settings();
+        let settings = if isolated {
+            AppSettings::default()
+        } else {
+            load_settings()
+        };
         #[cfg(target_os = "macos")]
-        let show_default_reader_prompt = should_offer_macos_default_reader(&settings);
+        let show_default_reader_prompt = !isolated && should_offer_macos_default_reader(&settings);
         let initial_zoom = normalized_pdf_zoom(settings.last_pdf_zoom);
         let settings_ui = SettingsUi::new(&settings);
         let mut app = Self {
@@ -1143,8 +1216,13 @@ impl PdfEditorApp {
             marker_opacity: 0.45,
             marker_preset_index: 0,
             comment_color_index: 0,
-            pending_comment_saves: HashMap::new(),
-            active_comment_saves: HashMap::new(),
+            pending_annotation_saves: HashMap::new(),
+            active_annotation_saves: HashMap::new(),
+            annotation_save_generation: 0,
+            annotation_sessions: HashMap::new(),
+            pending_document_opens: HashMap::new(),
+            open_into_sbs: false,
+            recovery_ui: recovery_ui::RecoveryUi::new(ctx, isolated),
             page_rotation_in_flight: false,
             text_box_text: String::new(),
             signer_name: String::new(),
@@ -1163,15 +1241,27 @@ impl PdfEditorApp {
             status: initial_status,
             #[cfg(target_os = "macos")]
             show_default_reader_prompt,
-            show_unsaved_close_prompt: false,
+            pending_close: None,
             allow_window_close: false,
+            review_derived: ReviewDerivedCache::default(),
+            review_source_geometry: None,
+            liquid_mode2_fast_cache_probed_epoch: None,
+            settings_save_due: None,
         };
 
         if !startup_paths.is_empty() {
-            app.open_paths_in_tabs(startup_paths, &cc.egui_ctx, true);
+            app.open_paths_in_tabs(startup_paths, ctx, true);
         }
 
-        app.apply_startup_view_mode(&cc.egui_ctx);
+        if !cfg!(test) {
+            app.apply_startup_view_mode(ctx);
+        }
+        if !isolated {
+            app.start_storage_maintenance(false, ctx);
+            if let Some(error) = app.settings.credential_error.clone() {
+                app.push_error_notice(error);
+            }
+        }
 
         app
     }
@@ -1276,6 +1366,7 @@ impl PdfEditorApp {
             pending_document_scroll_offset: self.pending_document_scroll_offset,
             visible_page_ranges: self.visible_page_ranges.clone(),
             status: self.status.clone(),
+            review_source_geometry: self.review_source_geometry.clone(),
         }
     }
 
@@ -1356,6 +1447,8 @@ impl PdfEditorApp {
         self.document_viewport_state = None;
         self.visible_page_ranges = tab.visible_page_ranges;
         self.status = tab.status;
+        self.review_source_geometry = tab.review_source_geometry;
+        self.refresh_review_search();
         ctx.request_repaint();
     }
 
@@ -1449,6 +1542,8 @@ impl PdfEditorApp {
                 return;
             };
             self.load_document_with_options(path, ctx, false, false, false);
+            self.open_into_sbs = true;
+            return;
         }
 
         if self.tabs.len() < 2 {
@@ -1538,11 +1633,30 @@ impl PdfEditorApp {
     }
 
     fn close_tab(&mut self, tab_index: usize, ctx: &Context) {
+        if self.pending_close.is_some() {
+            return;
+        }
+        self.save_active_tab_state();
+        let Some(tab) = self.tabs.get(tab_index) else {
+            return;
+        };
+        if tab.annotations_dirty
+            || self.close_target_is_saving(CloseTarget::Tab(tab.document_epoch))
+        {
+            self.pending_close = Some(CloseTarget::Tab(tab.document_epoch));
+            ctx.request_repaint();
+            return;
+        }
+        self.close_tab_without_saving(tab_index, ctx);
+    }
+
+    fn close_tab_without_saving(&mut self, tab_index: usize, ctx: &Context) {
         if tab_index >= self.tabs.len() {
             return;
         }
 
         let closing_epoch = self.tabs[tab_index].document_epoch;
+        self.annotation_sessions.remove(&closing_epoch);
         let closing_pending_markdown = self
             .pending_markdown_request
             .as_ref()
@@ -1556,6 +1670,7 @@ impl PdfEditorApp {
         }
 
         self.tabs.remove(tab_index);
+        self.render_tx.set_live_documents(self.tabs.iter().map(|tab| tab.document_epoch));
         self.sbs_pane_states.remove(&closing_epoch);
         self.sbs_page_textures
             .retain(|(document_epoch, _), _| *document_epoch != closing_epoch);
@@ -1686,7 +1801,27 @@ impl PdfEditorApp {
     }
 
     fn open_paths_in_tabs(&mut self, paths: Vec<PathBuf>, ctx: &Context, defer_background: bool) {
-        let (mut paths, converted, conversion_errors) = prepare_open_paths(paths);
+        if paths.is_empty() {
+            return;
+        }
+        if paths.len() > 256 {
+            self.push_error_notice("Open at most 256 documents at a time.");
+            return;
+        }
+        match self.render_tx.send(RenderRequest::PrepareSources { paths, defer_background }) {
+            Ok(()) => { self.status = "Preparing documents…".to_owned(); ctx.request_repaint_after(RENDER_POLL_INTERVAL); }
+            Err(_) => self.push_error_notice("The document queue is full. Let the current work finish, then open these files again."),
+        }
+    }
+
+    fn open_prepared_paths_in_tabs(
+        &mut self,
+        mut paths: Vec<PathBuf>,
+        converted: usize,
+        conversion_errors: Vec<String>,
+        ctx: &Context,
+        defer_background: bool,
+    ) {
         if !conversion_errors.is_empty() {
             self.status = conversion_errors.join("; ");
         } else if converted > 0 {
@@ -1716,7 +1851,7 @@ impl PdfEditorApp {
             }
         }
         if opened > 1 {
-            self.status = format!("Opened {opened} PDFs in tabs.");
+            self.status = format!("Opening {opened} PDFs in tabs…");
         }
     }
 
@@ -1727,9 +1862,8 @@ impl PdfEditorApp {
 
         self.load_document_with_options(path, ctx, false, false, false);
         let remaining = self.queued_open_paths.len();
-        if remaining == 0 {
+        if remaining == 0 && self.pending_document_opens.is_empty() {
             self.prefetch_small_document_pages(ctx);
-            self.status = format!("Opened {} PDFs in tabs.", self.tabs.len());
         } else {
             self.status = format!("Opening PDFs in tabs... {remaining} remaining");
             ctx.request_repaint_after(RENDER_POLL_INTERVAL);
@@ -1773,6 +1907,9 @@ impl PdfEditorApp {
                     }
                 }
                 UpdateEvent::Detected { version } => {
+                    self.update_ui.manual_download_version = None;
+                    self.update_ui.manual_check = false;
+                    self.update_ui.last_check_error = None;
                     self.update_ui.check_in_flight = true;
                     self.update_ui.state = UpdateUiState::Downloading;
                     self.update_ui.download_version = Some(version.clone());
@@ -1784,12 +1921,50 @@ impl PdfEditorApp {
                     self.status = format!("LawPDF {version} is available. Downloading…");
                     ctx.request_repaint();
                 }
+                UpdateEvent::CheckDeferred(message) => {
+                    self.update_ui.check_in_flight = false;
+                    self.update_ui.next_check = Some(Instant::now() + UPDATE_RETRY_INTERVAL);
+                    self.update_ui.last_check_error = Some(message);
+                    if self.update_ui.manual_check {
+                        self.update_ui.manual_check = false;
+                        self.update_ui.notice = Some(UpdateNotice::new(
+                            "Could not reach the update service. You can keep reading; LawPDF will retry later.",
+                            UpdateNoticeKind::Error,
+                        ));
+                    }
+                    if matches!(self.update_ui.state, UpdateUiState::Checking) {
+                        self.update_ui.state = UpdateUiState::Idle;
+                    }
+                }
                 UpdateEvent::NotAvailable => {
+                    self.update_ui.manual_download_version = None;
+                    self.update_ui.last_check_error = None;
+                    if self.update_ui.manual_check {
+                        self.update_ui.manual_check = false;
+                        self.update_ui.notice = Some(UpdateNotice::new(
+                            "LawPDF is up to date.",
+                            UpdateNoticeKind::Success,
+                        ));
+                    }
                     self.update_ui.check_in_flight = false;
                     self.update_ui.next_check = Some(Instant::now() + UPDATE_CHECK_INTERVAL);
                     if matches!(self.update_ui.state, UpdateUiState::Checking) {
                         self.update_ui.state = UpdateUiState::Idle;
                     }
+                }
+                UpdateEvent::ManualDownload { version } => {
+                    self.update_ui.manual_check = false;
+                    self.update_ui.check_in_flight = false;
+                    self.update_ui.last_check_error = None;
+                    self.update_ui.state = UpdateUiState::Idle;
+                    self.update_ui.next_check = Some(Instant::now() + UPDATE_CHECK_INTERVAL);
+                    self.update_ui.manual_download_version = Some(version.clone());
+                    self.update_ui.notice = Some(UpdateNotice::persistent(
+                        format!(
+                            "LawPDF {version} is available on GitHub. This release requires a manual download."
+                        ),
+                        UpdateNoticeKind::Success,
+                    ));
                 }
                 UpdateEvent::Downloading {
                     downloaded_bytes,
@@ -1888,8 +2063,7 @@ impl PdfEditorApp {
     }
 
     fn install_ready_update(&mut self, pending: updater::PendingUpdate, ctx: &Context) {
-        let save_in_flight =
-            !self.pending_comment_saves.is_empty() || !self.active_comment_saves.is_empty();
+        let save_in_flight = self.close_target_is_saving(CloseTarget::Window);
         if self.has_unsaved_annotations() || save_in_flight {
             self.status = format!(
                 "LawPDF {} is ready and will install on next launch.",
@@ -1934,72 +2108,22 @@ impl PdfEditorApp {
         }
     }
 
-    fn load_document_with_options(
+    fn tab_for_new_document(
         &mut self,
-        path: PathBuf,
-        ctx: &Context,
-        activate: bool,
-        render_first_page: bool,
-        prefetch_pages: bool,
-    ) -> bool {
-        if let Some(tab_index) = self.tab_index_for_path(&path) {
-            if activate {
-                self.switch_to_tab(tab_index, ctx);
-                self.status = format!("Switched to {}", path.display());
-            } else {
-                self.status = format!("Already open {}", path.display());
-            }
-            return true;
-        }
-
-        let result = self.load_document_on_worker(path.clone());
-
-        match result {
-            Ok(document) => {
-                let title = document.title.clone();
-                let tab = self.tab_for_new_document(document);
-                let should_activate = activate || self.active_tab.is_none();
-                if should_activate {
-                    self.save_active_tab_state();
-                }
-                self.startup_error = None;
-                self.tabs.push(tab);
-                let tab_index = self.tabs.len() - 1;
-                if should_activate {
-                    let tab = self.tabs[tab_index].clone();
-                    self.active_tab = Some(tab_index);
-                    self.apply_tab_state(tab, ctx);
-                    if render_first_page {
-                        self.render_first_page_before_repaint(ctx);
-                    }
-                    self.request_document_links();
-                    if prefetch_pages {
-                        self.prefetch_small_document_pages(ctx);
-                    }
-                    self.start_review_precompute_if_eligible(ctx);
-                } else {
-                    self.status = format!("Added {title} to tabs");
-                }
-                ctx.request_repaint();
-                true
-            }
-            Err(error) => {
-                self.startup_error = Some(error.clone());
-                self.visible_page_ranges.clear();
-                self.push_error_notice(error);
-                false
-            }
-        }
-    }
-
-    fn tab_for_new_document(&mut self, document: LoadedDocument) -> DocumentTab {
+        opened: crate::render_worker::OpenedDocument,
+    ) -> Result<DocumentTab, String> {
+        let crate::render_worker::OpenedDocument {
+            document,
+            revision,
+            annotations,
+            recovery_pending,
+        } = opened;
         let page_count = document.page_count;
         let title = document.title.clone();
         let optimized = document.optimized;
         let zoom = self.zoom_for_document(&document.path);
         let ocr_states = load_ocr_cache(&document.path, page_count)
             .unwrap_or_else(|| vec![OcrPageState::Idle; page_count]);
-        let annotations = load_lawpdf_annotations(&document.path).unwrap_or_default();
         let liquid_feedback = load_liquid_feedback(&document.path).unwrap_or_default();
         let comment_count = annotations
             .iter()
@@ -2013,10 +2137,14 @@ impl PdfEditorApp {
             .iter()
             .filter(|state| matches!(state, OcrPageState::Done(_)))
             .count();
-        DocumentTab {
+        let epoch = self.allocate_document_epoch();
+        let mut session = annotation_session::AnnotationSession::new(revision, annotations.clone());
+        session.recovery_pending = recovery_pending;
+        self.annotation_sessions.insert(epoch, session);
+        Ok(DocumentTab {
             document,
             page_index: 0,
-            document_epoch: self.allocate_document_epoch(),
+            document_epoch: epoch,
             view_mode: DocumentViewMode::Pdf,
             liquid_state: LiquidState::Idle,
             liquid_mode2_state: LiquidState::Idle,
@@ -2073,43 +2201,22 @@ impl PdfEditorApp {
                 feedback_count,
                 optimized,
             ),
-        }
-    }
-
-    fn save_as_dialog(&mut self) {
-        let Some(document) = self.document.as_ref() else {
-            return;
-        };
-
-        let file_name = default_output_name(&document.path, "edited", "pdf");
-        if let Some(destination) =
-            self.pick_save_path("Save edited PDF", &file_name, "PDF", &["pdf"])
-        {
-            match save_with_annotations(&document.path, &destination, &self.annotations) {
-                Ok(()) => self.status = format!("Saved {}", destination.display()),
-                Err(error) => self.push_error_notice(error.to_string()),
-            }
-        }
+            review_source_geometry: None,
+        })
     }
 
     fn save_current_annotations(&mut self) -> Result<(), String> {
-        let Some(document) = self.document.as_ref() else {
+        let Some(document) = &self.document else {
             return Ok(());
         };
-        let path = document.path.clone();
-        save_with_annotations(&path, &path, &self.annotations)
-            .map_err(|error| error.to_string())?;
-        self.annotations_dirty = false;
-        self.pending_comment_saves.remove(&path);
-        self.active_comment_saves.remove(&path);
-        if let Some(tab_index) = self.active_tab
-            && let Some(tab) = self.tabs.get_mut(tab_index)
-        {
-            tab.annotations = self.annotations.clone();
-            tab.annotations_dirty = false;
+        if !self.annotations_dirty {
+            return Ok(());
         }
-        self.status = format!("Saved annotations to {}", path.display());
-        Ok(())
+        self.queue_annotation_save(
+            self.document_epoch,
+            document.path.clone(),
+            self.annotations.clone(),
+        )
     }
 
     fn rotate_current_page(&mut self, clockwise: bool) {
@@ -2121,11 +2228,30 @@ impl PdfEditorApp {
         };
         let path = document.path.clone();
         let page_index = self.page_index;
+        if self.annotations_dirty
+            || self.close_target_is_saving(CloseTarget::Tab(self.document_epoch))
+        {
+            if let Err(error) = self.save_current_annotations() {
+                self.push_error_notice(error);
+            } else {
+                self.status =
+                    "Saving annotations. Rotate the page after saving finishes.".to_owned();
+            }
+            return;
+        }
+        let Some(session) = self.annotation_sessions.get(&self.document_epoch) else {
+            return;
+        };
+        if session.recovery_pending {
+            self.push_error_notice("Resolve the recovered edits before rotating this PDF.");
+            return;
+        }
         match self.render_tx.send(RenderRequest::RotatePage {
             document_epoch: self.document_epoch,
             path,
             page_index,
             clockwise,
+            expected_revision: session.revision.clone(),
         }) {
             Ok(()) => {
                 self.page_rotation_in_flight = true;
@@ -2140,24 +2266,21 @@ impl PdfEditorApp {
 
     fn save_all_dirty_annotations(&mut self) -> Result<(), String> {
         self.save_active_tab_state();
-        for tab in &mut self.tabs {
-            if !tab.annotations_dirty {
-                continue;
-            }
-            let path = tab.document.path.clone();
-            save_with_annotations(&path, &path, &tab.annotations)
-                .map_err(|error| format!("Could not save {}: {error}", path.display()))?;
-            tab.annotations_dirty = false;
-            self.pending_comment_saves.remove(&path);
-            self.active_comment_saves.remove(&path);
+        let saves = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.annotations_dirty)
+            .map(|tab| {
+                (
+                    tab.document_epoch,
+                    tab.document.path.clone(),
+                    tab.annotations.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (epoch, path, annotations) in saves {
+            self.queue_annotation_save(epoch, path, annotations)?;
         }
-        if let Some(tab_index) = self.active_tab {
-            self.annotations_dirty = self
-                .tabs
-                .get(tab_index)
-                .is_some_and(|tab| tab.annotations_dirty);
-        }
-        self.status = "Saved annotations to PDF.".to_owned();
         Ok(())
     }
 
@@ -2280,7 +2403,7 @@ impl PdfEditorApp {
         match markdown_preparation_outcome(&self.liquid_mode2_state, self.liquid_mode2_complete) {
             MarkdownPreparationOutcome::Ready => {
                 if let LiquidState::Ready(document) = self.liquid_mode2_state.clone() {
-                    self.handle_completed_markdown_document(document, ctx);
+                    self.handle_completed_markdown_document(&document, ctx);
                 }
             }
             MarkdownPreparationOutcome::Failed => {
@@ -2292,8 +2415,8 @@ impl PdfEditorApp {
         }
     }
 
-    fn handle_completed_markdown_document(&mut self, document: LiquidDocument, ctx: &Context) {
-        if liquid_document_needs_ocr(&document) {
+    fn handle_completed_markdown_document(&mut self, document: &LiquidDocument, ctx: &Context) {
+        if liquid_document_needs_ocr(document) {
             let Some((document_epoch, path, ocr_attempted)) =
                 self.pending_markdown_request.as_ref().map(|request| {
                     (
@@ -2333,7 +2456,7 @@ impl PdfEditorApp {
             }
             return;
         }
-        self.finish_pending_markdown_success(&document, ctx);
+        self.finish_pending_markdown_success(document, ctx);
     }
 
     fn finish_pending_markdown_success(&mut self, document: &LiquidDocument, ctx: &Context) {
@@ -2443,25 +2566,6 @@ impl PdfEditorApp {
     fn save_markdown_settings(&mut self) {
         if let Err(error) = save_settings(&self.settings) {
             self.push_error_notice(format!("Could not save Markdown settings: {error}"));
-        }
-    }
-
-    fn export_png_dialog(&mut self) {
-        let Some(document) = self.document.as_ref() else {
-            return;
-        };
-
-        let path = document.path.clone();
-        let page_index = self.page_index;
-        let file_name = default_output_name(&path, &format!("page-{}", page_index + 1), "png");
-
-        if let Some(destination) =
-            self.pick_save_path("Export page image", &file_name, "PNG", &["png"])
-        {
-            match self.export_page_png_on_worker(path, page_index, destination.clone(), 2.0) {
-                Ok(()) => self.status = format!("Exported {}", destination.display()),
-                Err(error) => self.push_error_notice(error),
-            }
         }
     }
 
@@ -2662,8 +2766,51 @@ impl PdfEditorApp {
     }
 
     fn poll_render_results(&mut self, ctx: &Context) {
-        while let Ok(event) = self.render_rx.try_recv() {
+        loop {
+            let event = match self.render_rx.try_recv() {
+                Ok(event) => event,
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    if !self.pending_document_opens.is_empty() {
+                        self.pending_document_opens.clear();
+                        self.open_into_sbs = false;
+                        self.push_error_notice("The PDF worker stopped while opening a document. Your recovery files were kept.");
+                    }
+                    if !self.active_annotation_saves.is_empty() {
+                        self.active_annotation_saves.clear();
+                        self.push_error_notice("The PDF worker stopped before confirming the save. Your annotations are still unsaved; keep the document open.");
+                    }
+                    self.page_rotation_in_flight = false;
+                    self.pending_page_renders.clear();
+                    self.pending_thumbnail_renders.clear();
+                    self.pending_native_text.clear();
+                    self.pending_text_chars.clear();
+                    self.pending_document_enrichments.clear();
+                    // A panicked Rust task must not permanently disable the
+                    // reader. Recovery journals retain any ambiguous save.
+                    (self.render_tx, self.render_rx) = spawn_render_worker(Some(ctx.clone()));
+                    self.render_tx.set_live_documents(self.tabs.iter().map(|tab| tab.document_epoch));
+                    self.push_error_notice("The document worker restarted. If a save or rotation was interrupted, reopen that PDF before editing; recovery copies were kept.");
+                    ctx.request_repaint_after(RENDER_POLL_INTERVAL);
+                    break;
+                }
+            };
             match event {
+                RenderEvent::DocumentOpened { path, result } => {
+                    self.finish_document_open(path, result, ctx)
+                }
+                RenderEvent::SourcesPrepared {
+                    paths,
+                    converted,
+                    errors,
+                    defer_background,
+                } => self.open_prepared_paths_in_tabs(
+                    paths,
+                    converted,
+                    errors,
+                    ctx,
+                    defer_background,
+                ),
                 RenderEvent::DocumentEnriched {
                     document_epoch,
                     path,
@@ -2763,6 +2910,9 @@ impl PdfEditorApp {
                     let sbs_cache_key = (key.document_epoch, key.page_index);
                     let is_sbs_render = self.sbs_pending_page_renders.contains_key(&sbs_cache_key);
                     if is_sbs_render {
+                        if self.sbs_pending_page_renders.get(&sbs_cache_key) != Some(&key) {
+                            continue;
+                        }
                         if self
                             .sbs_pending_page_renders
                             .get(&sbs_cache_key)
@@ -2886,10 +3036,10 @@ impl PdfEditorApp {
                     page_index,
                     result,
                 } => {
-                    self.pending_text_chars.remove(&page_index);
                     if !self.is_current_document(document_epoch, &path) {
                         continue;
                     }
+                    self.pending_text_chars.remove(&page_index);
 
                     match result {
                         Ok(chars) => {
@@ -2975,36 +3125,13 @@ impl PdfEditorApp {
                         self.ensure_liquid_mode2_started(ctx);
                     }
                 }
-                RenderEvent::CommentsSaved {
+                RenderEvent::AnnotationsSaved {
                     document_epoch,
                     path,
                     generation,
                     result,
                 } => {
-                    self.active_comment_saves.remove(&path);
-                    let newer_pending = self
-                        .pending_comment_saves
-                        .get(&path)
-                        .is_some_and(|save| save.generation > generation);
-                    if !self.is_current_document(document_epoch, &path) && newer_pending {
-                        continue;
-                    }
-
-                    match result {
-                        Ok(count) => {
-                            if !newer_pending {
-                                self.status = format!("Saved {count} comment(s) to PDF.");
-                                self.page_textures.clear();
-                                self.thumbnail_textures.clear();
-                            }
-                        }
-                        Err(error) => {
-                            if !newer_pending {
-                                self.push_error_notice(format!("Could not save comments: {error}"));
-                            }
-                        }
-                    }
-                    ctx.request_repaint();
+                    self.finish_annotation_autosave(document_epoch, path, generation, result, ctx);
                 }
                 RenderEvent::PageRotated {
                     document_epoch,
@@ -3014,16 +3141,39 @@ impl PdfEditorApp {
                 } => {
                     self.page_rotation_in_flight = false;
                     match result {
-                        Ok((document, rotation)) => self.install_rotated_document(
-                            document_epoch,
-                            &path,
-                            page_index,
-                            document,
-                            rotation,
-                            ctx,
-                        ),
+                        Ok((document, rotation, revision, annotations)) => {
+                            if let Some(session) = self.annotation_sessions.get_mut(&document_epoch)
+                            {
+                                session.revision = revision;
+                                session.current = annotations.clone();
+                                session.undo.clear();
+                                session.redo.clear();
+                            }
+                            if let Some(tab) = self
+                                .tabs
+                                .iter_mut()
+                                .find(|tab| tab.document_epoch == document_epoch)
+                            {
+                                tab.annotations = annotations.clone();
+                            }
+                            if self.is_current_document(document_epoch, &path) {
+                                self.annotations = annotations;
+                            }
+                            self.install_rotated_document(
+                                document_epoch,
+                                &path,
+                                page_index,
+                                document,
+                                rotation,
+                                ctx,
+                            );
+                        }
                         Err(error) => {
-                            self.push_error_notice(format!("Could not rotate page: {error}"));
+                            if let Some(session) = self.annotation_sessions.get_mut(&document_epoch)
+                            {
+                                session.recovery_pending = true;
+                            }
+                            self.push_error_notice(format!("Could not finish rotating this page: {error}. Close and reopen this PDF before editing again."));
                             ctx.request_repaint();
                         }
                     }
@@ -3107,20 +3257,6 @@ impl PdfEditorApp {
         ctx.request_repaint();
     }
 
-    fn load_document_on_worker(&self, path: PathBuf) -> Result<LoadedDocument, String> {
-        let (reply_tx, reply_rx) = unbounded();
-        self.render_tx
-            .send(RenderRequest::LoadDocument {
-                path,
-                optimize_large_documents: self.settings.optimize_large_documents,
-                reply: reply_tx,
-            })
-            .map_err(|error| format!("PDF worker is not available: {error}"))?;
-        reply_rx
-            .recv_timeout(Duration::from_secs(30))
-            .map_err(|error| format!("Timed out opening PDF: {error}"))?
-    }
-
     fn request_document_links(&mut self) {
         let Some(document) = self
             .document
@@ -3149,56 +3285,6 @@ impl PdfEditorApp {
                 result,
             });
         });
-    }
-
-    fn render_page_immediate_on_worker(
-        &self,
-        path: PathBuf,
-        page_index: usize,
-        render_scale: f32,
-        fast: bool,
-    ) -> Result<RenderedPage, String> {
-        let (reply_tx, reply_rx) = unbounded();
-        self.render_tx
-            .send(RenderRequest::PageImmediate {
-                path,
-                page_index,
-                render_scale,
-                fast,
-                reply: reply_tx,
-            })
-            .map_err(|error| format!("PDF worker is not available: {error}"))?;
-        reply_rx
-            .recv_timeout(Duration::from_secs(30))
-            .map_err(|error| format!("Timed out rendering first page: {error}"))?
-    }
-
-    fn render_first_page_before_repaint(&mut self, ctx: &Context) {
-        let Some((path, page_width, page_height)) = self.document.as_ref().and_then(|document| {
-            document
-                .pages
-                .first()
-                .map(|page| (document.path.clone(), page.width, page.height))
-        }) else {
-            return;
-        };
-
-        let render_scale = self.page_render_scale(ctx, page_width, page_height);
-        match self.render_page_immediate_on_worker(path, 0, render_scale, false) {
-            Ok(rendered) => {
-                self.install_page_texture(
-                    ctx,
-                    self.document_epoch,
-                    rendered,
-                    self.zoom,
-                    render_scale,
-                );
-                self.pending_page_renders.remove(&0);
-            }
-            Err(error) => {
-                self.push_error_notice(error);
-            }
-        }
     }
 
     fn next_texture_access(&mut self) -> u64 {
@@ -3282,28 +3368,6 @@ impl PdfEditorApp {
                 self.request_page_render(ctx, &path, page_index, render_scale);
             }
         }
-    }
-
-    fn export_page_png_on_worker(
-        &self,
-        path: PathBuf,
-        page_index: usize,
-        destination: PathBuf,
-        scale: f32,
-    ) -> Result<(), String> {
-        let (reply_tx, reply_rx) = unbounded();
-        self.render_tx
-            .send(RenderRequest::ExportPagePng {
-                path,
-                page_index,
-                destination,
-                scale,
-                reply: reply_tx,
-            })
-            .map_err(|error| format!("PDF worker is not available: {error}"))?;
-        reply_rx
-            .recv_timeout(Duration::from_secs(30))
-            .map_err(|error| format!("Timed out exporting PNG: {error}"))?
     }
 
     fn is_current_document(&self, document_epoch: u64, path: &Path) -> bool {
@@ -3580,7 +3644,7 @@ impl PdfEditorApp {
                             document.noise_lines_removed
                         )
                     };
-                    (LiquidState::Ready(document), status)
+                    (LiquidState::Ready(Arc::new(document)), status)
                 }
                 Err(error) => {
                     error_notice = Some(format!("Review Mode failed: {error}"));
@@ -3625,6 +3689,7 @@ impl PdfEditorApp {
     fn reset_liquid_mode2_jobs(&mut self) {
         self.apply_review_prepare_flags(review_prepare_flags_after_restart());
         self.liquid_mode2_allow_full = false;
+        self.liquid_mode2_fast_cache_probed_epoch = None;
     }
 
     fn ensure_liquid_mode2_started(&mut self, ctx: &Context) {
@@ -3645,9 +3710,17 @@ impl PdfEditorApp {
                 request.ocr_attempted
                     && self.is_current_document(request.document_epoch, &request.path)
             });
-        if !rebuilding_from_ocr
+        // Probe the on-disk fast cache once per document, not on every frame
+        // of the "waiting for pages" phase: each probe is several syscalls
+        // plus a stat of every model asset, on the UI thread.
+        let probe_fast_cache = !rebuilding_from_ocr
             && !self.liquid_mode2_preview_spawned
             && !self.liquid_mode2_full_spawned
+            && self.liquid_mode2_fast_cache_probed_epoch != Some(self.document_epoch);
+        if probe_fast_cache {
+            self.liquid_mode2_fast_cache_probed_epoch = Some(self.document_epoch);
+        }
+        if probe_fast_cache
             && let Some(document) = self.document.as_ref().and_then(|source| {
                 load_fast_cached_liquid_mode2_document(
                     &source.path,
@@ -3657,7 +3730,7 @@ impl PdfEditorApp {
                 )
             })
         {
-            self.liquid_mode2_state = LiquidState::Ready(document);
+            self.liquid_mode2_state = LiquidState::Ready(Arc::new(document));
             self.liquid_mode2_complete = true;
             self.liquid_mode2_preview_spawned = true;
             self.liquid_mode2_full_spawned = true;
@@ -3754,6 +3827,9 @@ impl PdfEditorApp {
             &selected_text_overrides,
         );
         deep_source_lines.retain(|line| line.page_index < limit);
+        // When a separate opening-pages preview job already exists, the full
+        // job must not repeat that preview before its full pass.
+        let skip_progressive_preview = !preview_only && self.liquid_mode2_preview_spawned;
         let request = LiquidMode2Request {
             document_epoch: self.document_epoch,
             path: document.path.clone(),
@@ -3765,6 +3841,7 @@ impl PdfEditorApp {
             external_emissions_path: None,
             runtime_choice: self.liquid_mode2_runtime_choice,
             preview_only,
+            skip_progressive_preview,
         };
         if preview_only {
             self.liquid_mode2_preview_spawned = true;
@@ -3815,7 +3892,7 @@ impl PdfEditorApp {
         }) else {
             return false;
         };
-        self.liquid_mode2_state = LiquidState::Ready(document);
+        self.liquid_mode2_state = LiquidState::Ready(Arc::new(document));
         self.liquid_mode2_complete = true;
         self.liquid_mode2_preview_spawned = true;
         self.liquid_mode2_full_spawned = true;
@@ -3890,8 +3967,9 @@ impl PdfEditorApp {
                             preview_page_count.unwrap_or(0)
                         )
                     };
+                    let document = Arc::new(document);
                     if complete {
-                        completed_document = Some(document.clone());
+                        completed_document = Some(Arc::clone(&document));
                     }
                     (LiquidState::Ready(document), status)
                 }
@@ -3904,6 +3982,7 @@ impl PdfEditorApp {
             if event_is_current {
                 self.liquid_mode2_state = next_state.0;
                 self.liquid_mode2_complete = complete && completed_document.is_some();
+                self.refresh_review_search();
                 self.status = next_state.1;
                 ctx.request_repaint();
             } else if let Some(tab) = event_tab_index.and_then(|index| self.tabs.get_mut(index)) {
@@ -3919,7 +3998,7 @@ impl PdfEditorApp {
                 });
             if pending_matches {
                 if let Some(document) = completed_document {
-                    self.handle_completed_markdown_document(document, ctx);
+                    self.handle_completed_markdown_document(&document, ctx);
                 } else if let Some(error) = error_notice.as_deref() {
                     self.finish_pending_markdown_fallback(error, ctx);
                 }
@@ -3993,16 +4072,7 @@ impl PdfEditorApp {
             }
         }
         if let LiquidState::Ready(review) = &self.liquid_mode2_state {
-            for hit in find_hits_in_review_blocks(&review.blocks, query) {
-                hits.push(SearchHit {
-                    page_index: 0,
-                    source: SearchSource::ReviewText,
-                    match_start: hit.match_start,
-                    match_end: hit.match_end,
-                    snippet: hit.snippet,
-                    block_index: Some(hit.block_index),
-                });
-            }
+            hits.extend(search_state::review_search_hits(review, query));
         }
         sort_search_hits(&mut hits);
         self.search_state.hits = hits;
@@ -4027,13 +4097,10 @@ impl PdfEditorApp {
             .search_state
             .selected_hit
             .and_then(|index| self.search_state.hits.get(index).cloned());
-        self.search_state
-            .hits
-            .retain(|hit| hit.page_index != page_index);
-
+        let mut page_hits = Vec::new();
         if let Some(document) = self.document.as_ref() {
             if let Some(text) = document.native_text.get(page_index) {
-                self.search_state.hits.extend(find_hits(
+                page_hits.extend(find_hits(
                     text,
                     &query,
                     page_index,
@@ -4042,23 +4109,9 @@ impl PdfEditorApp {
             }
         }
         if let Some(text) = self.ocr_states.get(page_index).and_then(OcrPageState::text) {
-            self.search_state.hits.extend(find_hits(
-                text,
-                &query,
-                page_index,
-                SearchSource::OcrText,
-            ));
+            page_hits.extend(find_hits(text, &query, page_index, SearchSource::OcrText));
         }
-        sort_search_hits(&mut self.search_state.hits);
-        self.search_state.selected_hit = selected
-            .as_ref()
-            .and_then(|selected| {
-                self.search_state
-                    .hits
-                    .iter()
-                    .position(|hit| hit == selected)
-            })
-            .or_else(|| (!self.search_state.hits.is_empty()).then_some(0));
+        self.search_state.replace_page_hits(page_index, page_hits);
         if selected.is_none()
             && let Some(first) = self.search_state.hits.first().cloned()
         {
@@ -4159,7 +4212,7 @@ impl PdfEditorApp {
 
         self.search_state.pending_annotation = false;
         if added > 0 {
-            self.annotations_dirty = true;
+            self.mark_annotations_changed();
         }
         self.status = format!("Added {added} highlight annotation(s)");
     }
@@ -4307,7 +4360,7 @@ impl PdfEditorApp {
             render_scale,
             fast: false,
         };
-        if self.render_tx.send(request).is_err() {
+        if let Err(error) = self.render_tx.send(request) {
             if self
                 .pending_page_renders
                 .get(&page_index)
@@ -4315,7 +4368,9 @@ impl PdfEditorApp {
             {
                 self.pending_page_renders.remove(&page_index);
             }
-            self.push_error_notice("PDF render worker stopped.");
+            if !error.is_full() {
+                self.push_error_notice("PDF render worker stopped.");
+            }
         } else {
             ctx.request_repaint_after(RENDER_POLL_INTERVAL);
         }
@@ -4343,7 +4398,7 @@ impl PdfEditorApp {
             path: path.to_path_buf(),
             render_scale,
         };
-        if self.render_tx.send(request).is_err() {
+        if let Err(error) = self.render_tx.send(request) {
             if self
                 .pending_thumbnail_renders
                 .get(&page_index)
@@ -4351,7 +4406,9 @@ impl PdfEditorApp {
             {
                 self.pending_thumbnail_renders.remove(&page_index);
             }
-            self.push_error_notice("PDF render worker stopped.");
+            if !error.is_full() {
+                self.push_error_notice("PDF render worker stopped.");
+            }
         } else {
             ctx.request_repaint_after(RENDER_POLL_INTERVAL);
         }
@@ -4486,9 +4543,11 @@ impl PdfEditorApp {
             path: path.to_path_buf(),
             page_index,
         };
-        if self.render_tx.send(request).is_err() {
+        if let Err(error) = self.render_tx.send(request) {
             self.pending_native_text.remove(&page_index);
-            self.push_error_notice("PDF render worker stopped.");
+            if !error.is_full() {
+                self.push_error_notice("PDF render worker stopped.");
+            }
             false
         } else {
             true
@@ -4510,9 +4569,11 @@ impl PdfEditorApp {
             path: path.to_path_buf(),
             page_index,
         };
-        if self.render_tx.send(request).is_err() {
+        if let Err(error) = self.render_tx.send(request) {
             self.pending_text_chars.remove(&page_index);
-            self.push_error_notice("PDF render worker stopped.");
+            if !error.is_full() {
+                self.push_error_notice("PDF render worker stopped.");
+            }
             false
         } else {
             true
@@ -4580,9 +4641,33 @@ impl PdfEditorApp {
         if !changed {
             return;
         }
+        self.queue_settings_save();
+    }
 
+    /// Persist settings shortly after the last change rather than on every
+    /// change. `flush_settings_if_due` runs each frame and on exit.
+    fn queue_settings_save(&mut self) {
+        self.settings_save_due = Some(Instant::now() + SETTINGS_SAVE_DEBOUNCE);
+    }
+
+    fn flush_settings_if_due(&mut self, ctx: &Context) {
+        let Some(due) = self.settings_save_due else {
+            return;
+        };
+        let now = Instant::now();
+        if now < due {
+            ctx.request_repaint_after(due - now);
+            return;
+        }
+        self.flush_settings_now();
+    }
+
+    fn flush_settings_now(&mut self) {
+        if self.settings_save_due.take().is_none() {
+            return;
+        }
         if let Err(error) = save_settings(&self.settings) {
-            self.push_error_notice(format!("Could not save zoom setting: {error}"));
+            self.push_error_notice(format!("Could not save settings: {error}"));
         }
     }
 
@@ -4667,6 +4752,7 @@ impl PdfEditorApp {
                 color_rgb: [0.05, 0.05, 0.05],
             },
         });
+        self.mark_annotations_changed();
         self.start_text_box_edit(annotation_index);
         self.status = "Text box added. Type in the box.".to_owned();
     }
@@ -4712,7 +4798,7 @@ impl PdfEditorApp {
             },
         });
         self.start_comment_edit(annotation_index);
-        self.schedule_comment_autosave_now(ctx);
+        self.schedule_annotation_autosave_now(ctx);
         self.status = "Comment added.".to_owned();
     }
 
@@ -4755,68 +4841,8 @@ impl PdfEditorApp {
         self.annotations.remove(annotation_index);
         self.clear_comment_selection();
         self.clear_text_box_selection();
-        self.schedule_comment_autosave_now(ctx);
+        self.schedule_annotation_autosave_now(ctx);
         self.status = "Comment deleted.".to_owned();
-    }
-
-    fn schedule_comment_autosave(&mut self, ctx: &Context) {
-        self.schedule_comment_autosave_with_delay(ctx, COMMENT_AUTOSAVE_DELAY);
-    }
-
-    fn schedule_comment_autosave_now(&mut self, ctx: &Context) {
-        self.schedule_comment_autosave_with_delay(ctx, Duration::ZERO);
-        self.start_due_comment_saves(ctx);
-    }
-
-    fn schedule_comment_autosave_with_delay(&mut self, ctx: &Context, delay: Duration) {
-        let _ = delay;
-        self.annotations_dirty = true;
-        ctx.request_repaint();
-    }
-
-    fn start_due_comment_saves(&mut self, ctx: &Context) {
-        let now = Instant::now();
-        let due_paths = self
-            .pending_comment_saves
-            .iter()
-            .filter(|(path, save)| {
-                save.due_at <= now && !self.active_comment_saves.contains_key(*path)
-            })
-            .map(|(path, _)| path.clone())
-            .collect::<Vec<_>>();
-
-        for path in due_paths {
-            let Some(save) = self.pending_comment_saves.remove(&path) else {
-                continue;
-            };
-            let generation = save.generation;
-            self.active_comment_saves.insert(path.clone(), generation);
-            if self
-                .render_tx
-                .send(RenderRequest::SyncComments {
-                    document_epoch: save.document_epoch,
-                    path: save.path,
-                    generation,
-                    comments: save.comments,
-                })
-                .is_err()
-            {
-                self.active_comment_saves.remove(&path);
-                self.push_error_notice("PDF worker is not available; comment was not saved.");
-            } else {
-                self.status = "Saving comments...".to_owned();
-                ctx.request_repaint_after(RENDER_POLL_INTERVAL);
-            }
-        }
-
-        if let Some(next_due) = self
-            .pending_comment_saves
-            .values()
-            .map(|save| save.due_at)
-            .min()
-        {
-            ctx.request_repaint_after(next_due.saturating_duration_since(now));
-        }
     }
 
     fn select_text_box(&mut self, annotation_index: usize) {
@@ -4863,6 +4889,7 @@ impl PdfEditorApp {
         }
 
         self.annotations.remove(annotation_index);
+        self.mark_annotations_changed();
         self.clear_text_box_selection();
         self.status = "Text box deleted.".to_owned();
     }
@@ -4892,9 +4919,9 @@ impl PdfEditorApp {
                     Color32::from_rgb(229, 224, 214)
                 };
                 let tab_stroke = if is_active {
-                    Stroke::new(1.4, Color32::from_rgb(151, 105, 48))
+                    Stroke::new(1.4_f32, Color32::from_rgb(151, 105, 48))
                 } else {
-                    Stroke::new(1.0, Color32::from_rgb(204, 198, 187))
+                    Stroke::new(1.0_f32, Color32::from_rgb(204, 198, 187))
                 };
                 let title_color = if is_active { INK } else { MUTED_INK };
 
@@ -4984,12 +5011,16 @@ impl PdfEditorApp {
                 egui::Frame::NONE
                     .fill(BAR_FILL)
                     .inner_margin(Margin::symmetric(10, 8))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(222, 218, 208))),
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(222, 218, 208))),
             )
             .show(ctx, |ui| {
                 // Keep text and painted-icon actions on one predictable row.
                 ui.spacing_mut().interact_size.y = TOOLBAR_CONTROL_HEIGHT;
                 self.draw_tab_strip(ui, ctx);
+                ui.horizontal_wrapped(|ui| {
+                    self.annotation_history_buttons(ui, ctx);
+                    self.recovery_button(ui, ctx);
+                });
                 ui.add_space(6.0);
 
                 let has_document = self.document.is_some();
@@ -5032,7 +5063,7 @@ impl PdfEditorApp {
                             "Export this PDF as another document or image format",
                             |ui| {
                                 if ui.button("Save PDF copy").clicked() {
-                                    self.save_as_dialog();
+                                    self.save_as_dialog(ctx);
                                     ui.close();
                                 }
                                 if ui.button("Text").clicked() {
@@ -5044,7 +5075,7 @@ impl PdfEditorApp {
                                     ui.close();
                                 }
                                 if ui.button("PNG").clicked() {
-                                    self.export_png_dialog();
+                                    self.export_png_dialog(ctx);
                                     ui.close();
                                 }
                             },
@@ -5319,6 +5350,7 @@ impl PdfEditorApp {
                                         ToolbarIcon::Rotate,
                                         toolbar_icon_color(ui, &rotate_response, rotation_enabled),
                                     );
+                                    rotate_response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, rotation_enabled, "Rotate page"));
                                     toolbar_tooltip(
                                         rotate_response,
                                         "Rotate the current page by 90° (saved in this PDF)",
@@ -5557,7 +5589,7 @@ impl PdfEditorApp {
                 egui::Frame::NONE
                     .fill(PANEL_FILL)
                     .inner_margin(Margin::symmetric(10, 10))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(220, 216, 207))),
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(220, 216, 207))),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -5654,7 +5686,7 @@ impl PdfEditorApp {
                             painter.rect_stroke(
                                 thumb_rect,
                                 2,
-                                Stroke::new(1.0, PAPER_STROKE),
+                                Stroke::new(1.0_f32, PAPER_STROKE),
                                 egui::StrokeKind::Inside,
                             );
 
@@ -5707,7 +5739,7 @@ impl PdfEditorApp {
                                     visible_rect,
                                     1,
                                     Stroke::new(
-                                        1.4,
+                                        1.4_f32,
                                         Color32::from_rgba_unmultiplied(146, 103, 52, 190),
                                     ),
                                     egui::StrokeKind::Inside,
@@ -5747,10 +5779,14 @@ impl PdfEditorApp {
             return;
         }
         let ready = match &self.liquid_mode2_state {
-            LiquidState::Ready(document) => Some((
-                document.title.clone(),
-                liquid_outline_items(&document.blocks),
-            )),
+            LiquidState::Ready(document) => {
+                let document = Arc::clone(document);
+                self.refresh_review_derived(&document);
+                Some((
+                    self.review_derived.title.clone(),
+                    Arc::clone(&self.review_derived.outline),
+                ))
+            }
             _ => None,
         };
         let dark = matches!(self.liquid_theme, LiquidTheme::Dark);
@@ -5776,7 +5812,7 @@ impl PdfEditorApp {
                 egui::Frame::NONE
                     .fill(fill)
                     .inner_margin(Margin::symmetric(14, 12))
-                    .stroke(Stroke::new(1.0, stroke)),
+                    .stroke(Stroke::new(1.0_f32, stroke)),
             )
             .show(ctx, |ui| {
                 ui.label(RichText::new("CONTENTS").size(11.0).strong().color(muted));
@@ -5802,7 +5838,7 @@ impl PdfEditorApp {
                     .id_salt("review_outline_rail_list")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for item in outline {
+                        for item in outline.iter() {
                             let is_active = active == Some(item.block_index);
                             ui.horizontal(|ui| {
                                 ui.add_space(12.0 * item.level.saturating_sub(1) as f32);
@@ -6107,9 +6143,9 @@ impl PdfEditorApp {
             for (index, preset) in COMMENT_COLOR_PRESETS.iter().enumerate() {
                 let selected = self.comment_color_index == index;
                 let stroke = if selected {
-                    Stroke::new(2.0, Color32::from_rgb(72, 48, 26))
+                    Stroke::new(2.0_f32, Color32::from_rgb(72, 48, 26))
                 } else {
-                    Stroke::new(1.0, Color32::from_rgb(210, 200, 184))
+                    Stroke::new(1.0_f32, Color32::from_rgb(210, 200, 184))
                 };
                 if ui
                     .add(
@@ -6307,7 +6343,7 @@ impl PdfEditorApp {
                 egui::Frame::NONE
                     .fill(BAR_FILL)
                     .inner_margin(Margin::symmetric(10, 6))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(222, 218, 208))),
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(222, 218, 208))),
             )
             .show(ctx, |ui| {
                 let page_count = self
@@ -6337,44 +6373,17 @@ impl PdfEditorApp {
                     ui.separator();
                     ui.label(RichText::new(self.active_tool.label()).color(INK));
                     ui.separator();
+                    let saving = self.document.as_ref().is_some_and(|document|
+                        self.pending_annotation_saves.contains_key(&document.path)
+                            || self.active_annotation_saves.contains_key(&document.path));
+                    let save_label = if saving { "Saving…" } else if self.annotations_dirty { "Not saved" } else { "Saved" };
+                    ui.label(RichText::new(save_label).color(if self.annotations_dirty && !saving { Color32::DARK_RED } else { MUTED_INK }))
+                        .on_hover_text("Annotations save automatically. Keep the document open if saving fails; use Save As for a protected PDF.");
+                    ui.separator();
                     ui.label(RichText::new(self.ocr_summary()).color(MUTED_INK));
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         ui.label(RichText::new(&self.status).color(MUTED_INK));
                     });
-                });
-            });
-    }
-
-    fn draw_unsaved_close_prompt(&mut self, ctx: &Context) {
-        if !self.show_unsaved_close_prompt {
-            return;
-        }
-        egui::Window::new("Save changes before closing?")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.label("Highlights or comments have not been saved into their PDF files.");
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Save and close").clicked() {
-                        match self.save_all_dirty_annotations() {
-                            Ok(()) => {
-                                self.show_unsaved_close_prompt = false;
-                                self.allow_window_close = true;
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            }
-                            Err(error) => self.push_error_notice(error),
-                        }
-                    }
-                    if ui.button("Don't save").clicked() {
-                        self.show_unsaved_close_prompt = false;
-                        self.allow_window_close = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.show_unsaved_close_prompt = false;
-                    }
                 });
             });
     }
@@ -6429,7 +6438,7 @@ impl PdfEditorApp {
                         egui::Frame::NONE
                             .fill(Color32::from_rgba_unmultiplied(255, 254, 250, alpha))
                             .stroke(Stroke::new(
-                                1.0,
+                                1.0_f32,
                                 Color32::from_rgba_unmultiplied(
                                     accent.r(),
                                     accent.g(),
@@ -6501,7 +6510,7 @@ impl PdfEditorApp {
             .show(ctx, |ui| {
                 egui::Frame::NONE
                     .fill(Color32::from_rgba_unmultiplied(255, 254, 250, 246))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(205, 197, 181)))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(205, 197, 181)))
                     .corner_radius(8)
                     .inner_margin(Margin::symmetric(16, 12))
                     .show(ui, |ui| {
@@ -6551,6 +6560,9 @@ impl PdfEditorApp {
                                     .desired_width(298.0),
                             );
                         }
+                        if self.update_ui.manual_download_version.is_some() {
+                            ui.hyperlink_to("Download from GitHub", updater::RELEASES_PAGE);
+                        }
                         if matches!(self.update_ui.state, UpdateUiState::Ready)
                             && self.update_ui.pending.is_some()
                         {
@@ -6595,7 +6607,7 @@ impl PdfEditorApp {
             .show(ctx, |ui| {
                 egui::Frame::NONE
                     .fill(Color32::from_rgba_unmultiplied(255, 254, 250, 238))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(205, 197, 181)))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(205, 197, 181)))
                     .corner_radius(8)
                     .inner_margin(Margin::symmetric(14, 12))
                     .show(ui, |ui| {
@@ -6726,9 +6738,9 @@ impl PdfEditorApp {
             Color32::from_rgb(250, 248, 242)
         };
         let stroke = if hovering_drop {
-            Stroke::new(1.8, Color32::from_rgb(164, 119, 63))
+            Stroke::new(1.8_f32, Color32::from_rgb(164, 119, 63))
         } else {
-            Stroke::new(1.0, Color32::from_rgb(211, 205, 193))
+            Stroke::new(1.0_f32, Color32::from_rgb(211, 205, 193))
         };
 
         let painter = ui.painter();
@@ -7085,7 +7097,7 @@ impl PdfEditorApp {
                     painter.rect_stroke(
                         rect,
                         2.0,
-                        Stroke::new(1.5, Color32::from_rgba_unmultiplied(38, 92, 158, 190)),
+                        Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(38, 92, 158, 190)),
                         egui::StrokeKind::Inside,
                     );
                 }
@@ -7170,8 +7182,7 @@ impl PdfEditorApp {
                                         self.draw_liquid_tts_controls(ui, &document);
                                     });
                                 });
-                                self.liquid_footnote_index =
-                                    build_liquid_footnote_index(&document.blocks);
+                                self.refresh_review_derived(&document);
                                 if liquid_document_needs_ocr(&document) {
                                     self.draw_liquid_ocr_actions(ui, ctx, true);
                                 } else if let Some(hint) = liquid_reflow_low_confidence(&document) {
@@ -7179,7 +7190,8 @@ impl PdfEditorApp {
                                     self.draw_liquid_reflow_gate(ui, ctx, hint);
                                 }
                                 let notes = liquid_note_blocks(&document.blocks);
-                                let hidden_contents = review_hidden_display_mask(&document.blocks);
+                                let hidden_contents =
+                                    Arc::clone(&self.review_derived.hidden_contents);
                                 let mut block_index = 0usize;
                                 while block_index < document.blocks.len() {
                                     let block = &document.blocks[block_index];
@@ -7370,7 +7382,7 @@ impl PdfEditorApp {
             .show(ctx, |ui| {
                 egui::Frame::NONE
                     .fill(fill)
-                    .stroke(Stroke::new(1.0, stroke))
+                    .stroke(Stroke::new(1.0_f32, stroke))
                     .corner_radius(10)
                     .inner_margin(Margin::symmetric(14, 12))
                     .shadow(egui::epaint::Shadow {
@@ -7670,31 +7682,76 @@ impl PdfEditorApp {
     }
 
     fn liquid_block_provenance_rects(
-        &self,
+        &mut self,
         document: &LiquidDocument,
         block_index: usize,
     ) -> Vec<(usize, PdfRect)> {
-        let Some(loaded) = self.document.as_ref() else {
-            return Vec::new();
-        };
         let refs = liquid_block_source_lines(document, block_index);
         if refs.is_empty() {
             return Vec::new();
         }
-        let deep =
-            crate::layout_roles::deep_source_lines_for_pages(&loaded.pages, &loaded.text_chars);
-        let mut rects = Vec::new();
-        for source in &refs {
-            if let Some(line) = deep.iter().find(|line| {
-                line.page_index == source.page_index && line.line_index == source.line_index
-            }) {
-                rects.push((
-                    line.page_index,
-                    PdfRect::new(line.left, line.bottom, line.right, line.top),
-                ));
+        let Some(geometry) = self.review_source_geometry_for_current_document() else {
+            return Vec::new();
+        };
+        refs.iter()
+            .filter_map(|source| {
+                geometry
+                    .get(&(source.page_index, source.line_index))
+                    .map(|rect| (source.page_index, *rect))
+            })
+            .collect()
+    }
+
+    /// Source-line rectangles for the loaded document, extracted once and
+    /// refreshed only when more pages have finished loading text.
+    fn review_source_geometry_for_current_document(
+        &mut self,
+    ) -> Option<Arc<HashMap<(usize, usize), PdfRect>>> {
+        let loaded = self.document.as_ref()?;
+        let loaded_pages = loaded
+            .text_chars
+            .iter()
+            .filter(|chars| chars.is_some())
+            .count();
+        let fresh = self
+            .review_source_geometry
+            .as_ref()
+            .is_some_and(|geometry| {
+                geometry.document_epoch == self.document_epoch
+                    && geometry.loaded_pages == loaded_pages
+            });
+        if !fresh {
+            let deep =
+                crate::layout_roles::deep_source_lines_for_pages(&loaded.pages, &loaded.text_chars);
+            let mut rects = HashMap::with_capacity(deep.len());
+            for line in &deep {
+                rects
+                    .entry((line.page_index, line.line_index))
+                    .or_insert_with(|| PdfRect::new(line.left, line.bottom, line.right, line.top));
             }
+            self.review_source_geometry = Some(ReviewSourceGeometry {
+                document_epoch: self.document_epoch,
+                loaded_pages,
+                rects: Arc::new(rects),
+            });
         }
-        rects
+        self.review_source_geometry
+            .as_ref()
+            .map(|geometry| Arc::clone(&geometry.rects))
+    }
+
+    /// Rebuild the per-document Review caches when the ready document changes.
+    fn refresh_review_derived(&mut self, document: &Arc<LiquidDocument>) {
+        if self.review_derived.is_for(document) {
+            return;
+        }
+        self.liquid_footnote_index = build_liquid_footnote_index(&document.blocks);
+        self.review_derived = ReviewDerivedCache {
+            key: Some(Arc::downgrade(document)),
+            hidden_contents: Arc::new(review_hidden_display_mask(&document.blocks)),
+            outline: Arc::new(liquid_outline_items(&document.blocks)),
+            title: document.title.clone(),
+        };
     }
 
     /// #29: render a normally-hidden "furniture" block (header/footer/TOC/noise/table) as a
@@ -7744,7 +7801,7 @@ impl PdfEditorApp {
             painter.rect_stroke(
                 rect,
                 2.0,
-                Stroke::new(1.5, Color32::from_rgba_unmultiplied(38, 92, 158, 190)),
+                Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(38, 92, 158, 190)),
                 egui::StrokeKind::Inside,
             );
         }
@@ -7862,7 +7919,7 @@ impl PdfEditorApp {
         ui.allocate_ui_with_layout(Vec2::new(width, 0.0), egui::Layout::top_down(align), |ui| {
             egui::Frame::NONE
                 .fill(fill)
-                .stroke(Stroke::new(1.0, stroke))
+                .stroke(Stroke::new(1.0_f32, stroke))
                 .corner_radius(4)
                 .inner_margin(Margin::symmetric(8, 7))
                 .show(ui, |ui| {
@@ -7898,11 +7955,13 @@ impl PdfEditorApp {
         }
         #[cfg(target_os = "macos")]
         {
-            let tmp = std::env::temp_dir().join("lawpdf-tts.txt");
-            if let Err(error) = std::fs::write(&tmp, &text) {
-                self.push_error_notice(format!("Could not prepare speech: {error}"));
-                return;
-            }
+            let tmp = match crate::tts::write_private_speech_text(&text) {
+                Ok(path) => path,
+                Err(error) => {
+                    self.push_error_notice(format!("Could not prepare speech: {error}"));
+                    return;
+                }
+            };
             match std::process::Command::new("say")
                 .arg("-f")
                 .arg(&tmp)
@@ -7914,6 +7973,7 @@ impl PdfEditorApp {
                     self.status = "Reading aloud…".to_owned();
                 }
                 Err(error) => {
+                    let _ = std::fs::remove_file(&tmp);
                     self.push_error_notice(format!("Text-to-speech unavailable: {error}"));
                 }
             }
@@ -7942,17 +8002,14 @@ try {
     exit 1
 }
 "#;
-            let stamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_millis())
-                .unwrap_or_default();
-            let tmp =
-                std::env::temp_dir().join(format!("lawpdf-tts-{}-{stamp}.txt", std::process::id()));
+            let tmp = match crate::tts::write_private_speech_text(&text) {
+                Ok(path) => path,
+                Err(error) => {
+                    self.push_error_notice(format!("Could not prepare speech: {error}"));
+                    return;
+                }
+            };
             let error_path = tmp.with_extension("error.txt");
-            if let Err(error) = std::fs::write(&tmp, &text) {
-                self.push_error_notice(format!("Could not prepare speech: {error}"));
-                return;
-            }
             let _ = std::fs::remove_file(&error_path);
             let mut command = std::process::Command::new("powershell.exe");
             command
@@ -8194,14 +8251,14 @@ try {
             DocumentViewMode::Liquid => (
                 "legacy_liquid",
                 match &self.liquid_state {
-                    LiquidState::Ready(document) => document.clone(),
+                    LiquidState::Ready(document) => LiquidDocument::clone(document),
                     _ => return None,
                 },
             ),
             DocumentViewMode::LiquidMode2 => (
                 "liquid_mode2",
                 match &self.liquid_mode2_state {
-                    LiquidState::Ready(document) => document.clone(),
+                    LiquidState::Ready(document) => LiquidDocument::clone(document),
                     _ => return None,
                 },
             ),
@@ -8395,7 +8452,7 @@ try {
         let mut go_fixed = false;
         egui::Frame::NONE
             .fill(fill)
-            .stroke(Stroke::new(1.0, stroke))
+            .stroke(Stroke::new(1.0_f32, stroke))
             .corner_radius(6)
             .inner_margin(Margin::symmetric(12, 10))
             .show(ui, |ui| {
@@ -8603,7 +8660,7 @@ try {
             .frame(
                 egui::Frame::popup(ui.style())
                     .fill(fill)
-                    .stroke(Stroke::new(1.0, stroke)),
+                    .stroke(Stroke::new(1.0_f32, stroke)),
             )
             .show(|ui| {
                 ui.set_max_width(320.0);
@@ -8882,8 +8939,11 @@ try {
                     ui.add_space((ui.available_width() - 120.0).max(0.0) / 2.0);
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(120.0, 1.0), egui::Sense::hover());
-                    ui.painter()
-                        .hline(rect.x_range(), rect.center().y, Stroke::new(1.0, muted));
+                    ui.painter().hline(
+                        rect.x_range(),
+                        rect.center().y,
+                        Stroke::new(1.0_f32, muted),
+                    );
                 });
                 ui.add_space(16.0);
             }
@@ -8996,7 +9056,7 @@ try {
         let body_text = callout_body_text(label, text);
         egui::Frame::NONE
             .fill(fill)
-            .stroke(Stroke::new(1.0, stroke_color))
+            .stroke(Stroke::new(1.0_f32, stroke_color))
             .corner_radius(6)
             .inner_margin(Margin::symmetric(14, 10))
             .show(ui, |ui| {
@@ -9358,13 +9418,22 @@ try {
     ) {
         match &mut self.liquid_mode2_state {
             LiquidState::Ready(document) => {
-                let _ = apply_live_review_correction(document, block_index, expected_role);
+                let _ = apply_live_review_correction(
+                    Arc::make_mut(document),
+                    block_index,
+                    expected_role,
+                );
+                self.review_derived = ReviewDerivedCache::default();
             }
             _ => {}
         }
         match &mut self.liquid_state {
             LiquidState::Ready(document) => {
-                let _ = apply_live_review_correction(document, block_index, expected_role);
+                let _ = apply_live_review_correction(
+                    Arc::make_mut(document),
+                    block_index,
+                    expected_role,
+                );
             }
             _ => {}
         }
@@ -9729,7 +9798,7 @@ try {
                             painter.rect_stroke(
                                 rect,
                                 3,
-                                Stroke::new(1.0, PAPER_STROKE),
+                                Stroke::new(1.0_f32, PAPER_STROKE),
                                 egui::StrokeKind::Inside,
                             );
 
@@ -10051,9 +10120,9 @@ try {
         let mut open_solo = false;
         let mut page_clicked = false;
         let pane_stroke = if focused {
-            Stroke::new(2.0, Color32::from_rgb(167, 113, 50))
+            Stroke::new(2.0_f32, Color32::from_rgb(167, 113, 50))
         } else {
-            Stroke::new(1.0, Color32::from_rgb(202, 197, 187))
+            Stroke::new(1.0_f32, Color32::from_rgb(202, 197, 187))
         };
         let pane = egui::Frame::NONE
             .fill(Color32::from_rgb(237, 235, 229))
@@ -10230,7 +10299,7 @@ try {
                     painter.rect_stroke(
                         rect,
                         2,
-                        Stroke::new(1.0, PAPER_STROKE),
+                        Stroke::new(1.0_f32, PAPER_STROKE),
                         egui::StrokeKind::Inside,
                     );
                     if let Some(texture_id) = self.ensure_sbs_page_texture(
@@ -10295,7 +10364,8 @@ try {
         render_scale: f32,
     ) {
         let cache_key = (document.document_epoch, page_index);
-        let key = PageRenderKey::new(document.document_epoch, page_index, render_scale);
+        let mut key = PageRenderKey::new(document.document_epoch, page_index, render_scale);
+        key.editor_annotations = false;
         if self
             .sbs_pending_page_renders
             .get(&cache_key)
@@ -10311,9 +10381,11 @@ try {
             render_scale,
             fast: false,
         };
-        if self.render_tx.send(request).is_err() {
+        if let Err(error) = self.render_tx.send(request) {
             self.sbs_pending_page_renders.remove(&cache_key);
-            self.push_error_notice("PDF render worker stopped.");
+            if !error.is_full() {
+                self.push_error_notice("PDF render worker stopped.");
+            }
         } else {
             ctx.request_repaint_after(RENDER_POLL_INTERVAL);
         }
@@ -10651,7 +10723,7 @@ try {
                             let y = rect.bottom() - 2.0;
                             painter.line_segment(
                                 [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
-                                Stroke::new(2.0, color),
+                                Stroke::new(2.0_f32, color),
                             );
                         }
                     }
@@ -10665,7 +10737,7 @@ try {
                     painter.rect_stroke(
                         rect,
                         0.0,
-                        Stroke::new(1.0, Color32::from_rgb(72, 106, 180)),
+                        Stroke::new(1.0_f32, Color32::from_rgb(72, 106, 180)),
                         egui::StrokeKind::Inside,
                     );
                     painter.text(
@@ -10703,7 +10775,7 @@ try {
                             painter,
                             placement,
                             stroke,
-                            Stroke::new(2.0, Color32::BLACK),
+                            Stroke::new(2.0_f32, Color32::BLACK),
                         );
                     }
                     if !signer.trim().is_empty() {
@@ -10749,7 +10821,7 @@ try {
                     painter.rect_stroke(
                         rect,
                         0.0,
-                        Stroke::new(1.0, Color32::from_rgb(72, 106, 180)),
+                        Stroke::new(1.0_f32, Color32::from_rgb(72, 106, 180)),
                         egui::StrokeKind::Inside,
                     );
                 }
@@ -10762,7 +10834,7 @@ try {
                 painter,
                 placement,
                 &self.active_signature_stroke,
-                Stroke::new(2.0, Color32::BLACK),
+                Stroke::new(2.0_f32, Color32::BLACK),
             );
         }
     }
@@ -10874,6 +10946,7 @@ try {
                     .is_some_and(|drag| drag.annotation_index == annotation_index)
             {
                 self.text_box_drag = None;
+                self.mark_annotations_changed();
                 self.status = "Text box moved.".to_owned();
             }
 
@@ -10882,7 +10955,7 @@ try {
                 painter.rect_stroke(
                     screen_rect.expand(3.0),
                     2,
-                    Stroke::new(1.6, Color32::from_rgb(146, 103, 52)),
+                    Stroke::new(1.6_f32, Color32::from_rgb(146, 103, 52)),
                     egui::StrokeKind::Outside,
                 );
             }
@@ -11020,7 +11093,7 @@ try {
             .show(ctx, |ui| {
                 egui::Frame::NONE
                     .fill(Color32::from_rgba_unmultiplied(255, 253, 247, 248))
-                    .stroke(Stroke::new(1.3, Color32::from_rgb(184, 141, 68)))
+                    .stroke(Stroke::new(1.3_f32, Color32::from_rgb(184, 141, 68)))
                     .corner_radius(7)
                     .inner_margin(Margin::symmetric(10, 9))
                     .show(ui, |ui| {
@@ -11110,9 +11183,9 @@ try {
                                     let color = color_from_rgb(preset.color_rgb, 235);
                                     let selected = close_rgb(*color_rgb, preset.color_rgb);
                                     let stroke = if selected {
-                                        Stroke::new(2.0, Color32::from_rgb(72, 48, 26))
+                                        Stroke::new(2.0_f32, Color32::from_rgb(72, 48, 26))
                                     } else {
-                                        Stroke::new(1.0, Color32::from_rgb(210, 200, 184))
+                                        Stroke::new(1.0_f32, Color32::from_rgb(210, 200, 184))
                                     };
                                     if ui
                                         .add(
@@ -11146,7 +11219,7 @@ try {
             CommentSide::Left => Pos2::new(editor_rect.right(), leader_y),
             CommentSide::Right => Pos2::new(editor_rect.left(), leader_y),
         };
-        let leader_stroke = Stroke::new(1.3, Color32::from_rgb(150, 120, 70));
+        let leader_stroke = Stroke::new(1.3_f32, Color32::from_rgb(150, 120, 70));
         ui.painter().extend(egui::Shape::dashed_line(
             &[anchor_screen, leader_end],
             leader_stroke,
@@ -11164,7 +11237,7 @@ try {
             {
                 *updated_at = comment_timestamp();
             }
-            self.schedule_comment_autosave_now(ctx);
+            self.schedule_annotation_autosave_now(ctx);
             self.status = "Comment moved.".to_owned();
         }
         if self.comment_drag.is_some() {
@@ -11190,9 +11263,9 @@ try {
                 *updated_at = comment_timestamp();
             }
             if color_changed {
-                self.schedule_comment_autosave_now(ctx);
+                self.schedule_annotation_autosave_now(ctx);
             } else {
-                self.schedule_comment_autosave(ctx);
+                self.schedule_annotation_autosave(ctx);
             }
         }
 
@@ -11201,7 +11274,7 @@ try {
                 && ctx.input(|input| input.key_pressed(egui::Key::Escape)))
         {
             self.finish_comment_edit();
-            self.schedule_comment_autosave_now(ctx);
+            self.schedule_annotation_autosave_now(ctx);
         }
         if delete_clicked {
             self.delete_comment(ctx, annotation_index);
@@ -11224,7 +11297,7 @@ try {
             .show(ctx, |ui| {
                 egui::Frame::NONE
                     .fill(Color32::from_rgba_unmultiplied(255, 254, 250, 245))
-                    .stroke(Stroke::new(1.4, Color32::from_rgb(72, 106, 180)))
+                    .stroke(Stroke::new(1.4_f32, Color32::from_rgb(72, 106, 180)))
                     .corner_radius(2)
                     .inner_margin(Margin::same(5))
                     .show(ui, |ui| {
@@ -11251,6 +11324,12 @@ try {
                     });
             });
 
+        if editor_response
+            .as_ref()
+            .is_some_and(|response| response.changed())
+        {
+            self.mark_annotations_changed();
+        }
         if self.text_box_focus_request == Some(annotation_index) {
             self.text_box_focus_request = None;
         }
@@ -11300,7 +11379,7 @@ try {
             .show(ctx, |ui| {
                 egui::Frame::NONE
                     .fill(Color32::from_rgba_unmultiplied(250, 249, 245, 240))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(205, 198, 184)))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(205, 198, 184)))
                     .corner_radius(6)
                     .inner_margin(Margin::symmetric(6, 4))
                     .show(ui, |ui| {
@@ -11356,7 +11435,7 @@ try {
         painter.rect_stroke(
             rect,
             2,
-            Stroke::new(1.0, Color32::from_rgb(58, 112, 180)),
+            Stroke::new(1.0_f32, Color32::from_rgb(58, 112, 180)),
             egui::StrokeKind::Inside,
         );
     }
@@ -11535,6 +11614,7 @@ try {
                                 strokes: vec![stroke],
                             },
                         });
+                        self.mark_annotations_changed();
                         self.status = "Signature added.".to_owned();
                     } else {
                         self.active_signature_stroke.clear();
@@ -11705,7 +11785,7 @@ try {
             .show(ctx, |ui| {
                 egui::Frame::NONE
                     .fill(Color32::from_rgba_unmultiplied(250, 249, 245, 238))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(205, 198, 184)))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(205, 198, 184)))
                     .corner_radius(6)
                     .inner_margin(Margin::symmetric(6, 4))
                     .show(ui, |ui| {
@@ -11899,9 +11979,9 @@ try {
             let color = color_from_rgb(preset.color_rgb, 210);
             let selected = self.marker_preset_index == index;
             let stroke = if selected {
-                Stroke::new(1.6, Color32::from_rgb(88, 66, 38))
+                Stroke::new(1.6_f32, Color32::from_rgb(88, 66, 38))
             } else {
-                Stroke::new(1.0, Color32::from_rgb(210, 202, 188))
+                Stroke::new(1.0_f32, Color32::from_rgb(210, 202, 188))
             };
             let button = match preset.style {
                 MarkerStyle::Highlight => egui::Button::new("")
@@ -11964,7 +12044,7 @@ try {
             MarkerStyle::Underline => format!("Underlined selected text ({count} line segment(s))"),
         };
         if count > 0 {
-            self.annotations_dirty = true;
+            self.mark_annotations_changed();
         }
         self.clear_text_selection();
     }
@@ -12114,14 +12194,16 @@ impl eframe::App for PdfEditorApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop_liquid_tts();
+        crate::native_process::shutdown();
+        self.flush_settings_now();
     }
 
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         if ctx.input(|input| input.viewport().close_requested()) && !self.allow_window_close {
             self.save_active_tab_state();
-            if self.has_unsaved_annotations() {
+            if self.has_unsaved_annotations() || self.close_target_is_saving(CloseTarget::Window) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.show_unsaved_close_prompt = true;
+                self.pending_close = Some(CloseTarget::Window);
             }
         }
         if consume_command_shortcut(ctx, egui::Key::W) {
@@ -12133,8 +12215,10 @@ impl eframe::App for PdfEditorApp {
         self.poll_incoming_paths(ctx);
         self.poll_queued_open_paths(ctx);
         self.poll_render_results(ctx);
+        self.poll_recovery(ctx);
+        self.poll_settings_credentials(ctx);
         self.poll_document_links(ctx);
-        self.start_due_comment_saves(ctx);
+        self.start_due_annotation_saves(ctx);
         self.finish_pending_select_all_text(ctx);
         self.poll_ocr(ctx);
         self.poll_chat_results(ctx);
@@ -12153,6 +12237,7 @@ impl eframe::App for PdfEditorApp {
         self.poll_paid_tts(ctx);
         self.poll_update_events(ctx);
         self.handle_dropped_files(ctx);
+        self.flush_settings_if_due(ctx);
 
         let zoom_delta = ctx.input(|input| input.zoom_delta());
         let pdf_ctrl_wheel_zoom = self.view_mode == DocumentViewMode::Pdf
@@ -12199,6 +12284,14 @@ impl eframe::App for PdfEditorApp {
         }
         let focused_text_edit = focused_widget_is_text_edit(ctx);
         let document_shortcuts_allowed = document_shortcuts_allowed(focused_text_edit);
+        if document_shortcuts_allowed {
+            let shift = ctx.input(|input| input.modifiers.shift);
+            if consume_command_shortcut_or_key_event(ctx, egui::Key::Z) {
+                self.restore_annotation_history(shift, ctx);
+            } else if consume_command_shortcut_or_key_event(ctx, egui::Key::Y) {
+                self.restore_annotation_history(true, ctx);
+            }
+        }
         if document_shortcuts_allowed && consume_command_shortcut_or_key_event(ctx, egui::Key::A) {
             surrender_focused_non_text_edit(ctx);
             self.select_all_current_view_text(ctx);
@@ -12291,6 +12384,7 @@ impl eframe::App for PdfEditorApp {
         self.draw_review_feedback_ui(ctx);
         self.draw_settings_window(ctx);
         self.draw_unsaved_close_prompt(ctx);
+        self.draw_recovery(ctx);
         self.draw_default_reader_prompt(ctx);
         self.draw_update_notice(ctx);
         self.draw_notices(ctx);
@@ -12303,10 +12397,11 @@ impl eframe::App for PdfEditorApp {
             || !self.pending_text_chars.is_empty()
             || !self.pending_document_links.is_empty()
             || self.selection_state.pending_select_all
-            || !self.pending_comment_saves.is_empty()
-            || !self.active_comment_saves.is_empty()
+            || !self.pending_annotation_saves.is_empty()
+            || !self.active_annotation_saves.is_empty()
             || self.page_rotation_in_flight
             || !self.queued_open_paths.is_empty()
+            || !self.pending_document_opens.is_empty()
             || self.update_ui.state.is_busy()
             || self.chat_ui.state.in_flight
             || self.ocr_is_active()
@@ -12585,7 +12680,7 @@ fn format_download_progress(
 fn toolbar_group(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::NONE
         .fill(Color32::from_rgb(244, 241, 235))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(224, 219, 209)))
+        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(224, 219, 209)))
         .corner_radius(6)
         .inner_margin(Margin::symmetric(6, 4))
         .show(ui, |ui| {
@@ -12698,7 +12793,7 @@ fn paint_toolbar_icon(
 ) {
     let center = button_rect.center();
     let point = |x: f32, y: f32| Pos2::new(center.x + x, center.y + y);
-    let stroke = Stroke::new(1.65, color);
+    let stroke = Stroke::new(1.65_f32, color);
 
     match icon {
         ToolbarIcon::Open => {
@@ -12718,10 +12813,10 @@ fn paint_toolbar_icon(
             painter.rect_stroke(
                 Rect::from_min_max(point(-4.0, -6.0), point(3.5, -1.5)),
                 0.5,
-                Stroke::new(1.2, color),
+                Stroke::new(1.2_f32, color),
                 egui::StrokeKind::Inside,
             );
-            painter.circle_stroke(point(0.0, 3.5), 2.6, Stroke::new(1.2, color));
+            painter.circle_stroke(point(0.0, 3.5), 2.6, Stroke::new(1.2_f32, color));
         }
         ToolbarIcon::Export => {
             painter.rect_stroke(
@@ -12846,7 +12941,10 @@ fn paint_toolbar_icon(
                 point(7.0, 0.2),
             ];
             painter.add(egui::Shape::line(signature, stroke));
-            painter.line_segment([point(-7.0, 6.2), point(7.0, 6.2)], Stroke::new(1.0, color));
+            painter.line_segment(
+                [point(-7.0, 6.2), point(7.0, 6.2)],
+                Stroke::new(1.0_f32, color),
+            );
         }
         ToolbarIcon::Rotate => {
             let arc = (0..=18)
@@ -13432,15 +13530,6 @@ fn send_review_feedback(submission: &ReviewFeedbackSubmission) -> Result<(), Str
     }
 }
 
-#[cfg(test)]
-fn comment_annotations_for_save_from(annotations: &[EditorAnnotation]) -> Vec<EditorAnnotation> {
-    annotations
-        .iter()
-        .filter(|annotation| matches!(annotation.kind, AnnotationKind::Comment { .. }))
-        .cloned()
-        .collect()
-}
-
 fn lerp_color(from: Color32, to: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     let lerp_channel = |from: u8, to: u8| {
@@ -13619,7 +13708,7 @@ fn draw_comment_marker(
     painter.rect_stroke(
         rect,
         5,
-        Stroke::new(if selected { 2.0 } else { 1.1 }, stroke_color),
+        Stroke::new(if selected { 2.0_f32 } else { 1.1_f32 }, stroke_color),
         egui::StrokeKind::Inside,
     );
     let fold = 7.0_f32.min(rect.width() * 0.34).min(rect.height() * 0.34);
@@ -13628,7 +13717,7 @@ fn draw_comment_marker(
             Pos2::new(rect.right() - fold, rect.top()),
             Pos2::new(rect.right(), rect.top() + fold),
         ],
-        Stroke::new(1.0, Color32::from_rgba_unmultiplied(88, 60, 30, 130)),
+        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(88, 60, 30, 130)),
     );
     painter.text(
         rect.center(),
@@ -13839,7 +13928,7 @@ fn draw_pdf_stroke(
     }
 }
 
-fn prepare_open_paths(paths: Vec<PathBuf>) -> (Vec<PathBuf>, usize, Vec<String>) {
+pub(crate) fn prepare_open_paths(paths: Vec<PathBuf>) -> (Vec<PathBuf>, usize, Vec<String>) {
     let mut seen = HashSet::new();
     let mut clean = Vec::new();
     let mut converted = 0usize;
@@ -13896,38 +13985,15 @@ fn search_hit_rects_for_chars(text: &str, chars: &[PageTextChar], hit: &SearchHi
 }
 
 fn find_hits(text: &str, query: &str, page_index: usize, source: SearchSource) -> Vec<SearchHit> {
-    let needle = query.to_lowercase();
-    if needle.is_empty() {
-        return Vec::new();
-    }
-
-    let mut haystack = String::new();
-    let mut original_starts = Vec::new();
-    let mut original_ends = Vec::new();
-    for (original_start, ch) in text.char_indices() {
-        let original_end = original_start + ch.len_utf8();
-        let folded = ch.to_lowercase().collect::<String>();
-        haystack.push_str(&folded);
-        for _ in 0..folded.len() {
-            original_starts.push(original_start);
-            original_ends.push(original_end);
-        }
-    }
-
-    haystack
-        .match_indices(&needle)
-        .filter_map(|(folded_start, value)| {
-            let folded_end = folded_start + value.len();
-            let start = *original_starts.get(folded_start)?;
-            let end = *original_ends.get(folded_end.checked_sub(1)?)?;
-            Some(SearchHit {
-                page_index,
-                source,
-                match_start: start,
-                match_end: end,
-                snippet: snippet(text, start, end),
-                block_index: None,
-            })
+    crate::text_search::match_ranges(text, query)
+        .into_iter()
+        .map(|range| SearchHit {
+            page_index,
+            source,
+            match_start: range.start,
+            match_end: range.end,
+            snippet: crate::text_search::snippet(text, range, 42),
+            block_index: None,
         })
         .collect()
 }
@@ -13936,35 +14002,15 @@ fn sort_search_hits(hits: &mut [SearchHit]) {
     hits.sort_by_key(|hit| {
         (
             hit.page_index,
-            hit.match_start,
             match hit.source {
                 SearchSource::NativeText => 0,
                 SearchSource::OcrText => 1,
                 SearchSource::ReviewText => 2,
             },
+            hit.block_index.unwrap_or(0),
+            hit.match_start,
         )
     });
-}
-
-fn snippet(text: &str, start: usize, end: usize) -> String {
-    let start_chars = text[..floor_char_boundary(text, start.min(text.len()))]
-        .chars()
-        .count();
-    let end_chars = text[..floor_char_boundary(text, end.min(text.len()))]
-        .chars()
-        .count();
-    let chars = text.chars().collect::<Vec<_>>();
-    let left = start_chars.saturating_sub(42);
-    let right = (end_chars + 42).min(chars.len());
-    let mut value = chars[left..right].iter().collect::<String>();
-    value = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if left > 0 {
-        value.insert_str(0, "...");
-    }
-    if right < chars.len() {
-        value.push_str("...");
-    }
-    value
 }
 
 fn floor_char_boundary(value: &str, index: usize) -> usize {
@@ -14090,7 +14136,7 @@ fn push_liquid_copy_part(parts: &mut Vec<String>, text: &str) {
     parts.push(text.to_owned());
 }
 
-fn liquid_outline_items(blocks: &[LiquidBlock]) -> Vec<LiquidOutlineItem> {
+pub(crate) fn liquid_outline_items(blocks: &[LiquidBlock]) -> Vec<LiquidOutlineItem> {
     let hidden_contents = review_hidden_display_mask(blocks);
     let mut outline = Vec::new();
     let has_explicit_abstract = blocks
@@ -15132,7 +15178,7 @@ fn split_numbered_list_marker(text: &str) -> Option<(&str, &str, usize)> {
 /// against this map to drive the tap-to-view popover. First occurrence of a number
 /// wins — footnote numbering can restart per section, but the rendered `LiquidBlock`
 /// carries no page/order to disambiguate on (only upstream source lines do).
-fn build_liquid_footnote_index(blocks: &[LiquidBlock]) -> HashMap<u16, String> {
+pub(crate) fn build_liquid_footnote_index(blocks: &[LiquidBlock]) -> HashMap<u16, String> {
     let mut index = HashMap::new();
     for block in blocks {
         if !is_review_note_display_block(block) {
@@ -16717,11 +16763,11 @@ mod app_tests {
             MarkdownPreparationOutcome::Wait
         );
         assert_eq!(
-            markdown_preparation_outcome(&LiquidState::Ready(document.clone()), false),
+            markdown_preparation_outcome(&LiquidState::Ready(Arc::new(document.clone())), false),
             MarkdownPreparationOutcome::Wait
         );
         assert_eq!(
-            markdown_preparation_outcome(&LiquidState::Ready(document), true),
+            markdown_preparation_outcome(&LiquidState::Ready(Arc::new(document)), true),
             MarkdownPreparationOutcome::Ready
         );
         assert_eq!(
@@ -16791,38 +16837,6 @@ mod app_tests {
         assert!(preview.ends_with("..."));
         assert!(preview.chars().count() <= 44);
         assert!(!preview.contains('\n'));
-    }
-
-    #[test]
-    fn autosave_payload_keeps_only_comments() {
-        let annotations = vec![
-            EditorAnnotation {
-                page_index: 0,
-                rect: PdfRect::new(1.0, 2.0, 3.0, 4.0),
-                kind: AnnotationKind::Marker {
-                    color_rgb: [1.0, 1.0, 0.0],
-                    opacity: 0.4,
-                    style: MarkerStyle::Highlight,
-                },
-            },
-            EditorAnnotation {
-                page_index: 0,
-                rect: PdfRect::new(10.0, 10.0, 38.0, 38.0),
-                kind: AnnotationKind::Comment {
-                    id: "LawPDF-comment-test".to_owned(),
-                    text: "Review this cite.".to_owned(),
-                    color_rgb: [1.0, 0.78, 0.28],
-                    created_at: "now".to_owned(),
-                    updated_at: "now".to_owned(),
-                    anchor: (24.0, 24.0),
-                },
-            },
-        ];
-
-        let comments = comment_annotations_for_save_from(&annotations);
-
-        assert_eq!(comments.len(), 1);
-        assert!(matches!(comments[0].kind, AnnotationKind::Comment { .. }));
     }
 
     #[test]

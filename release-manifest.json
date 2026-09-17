@@ -2,7 +2,7 @@
   "schema_version": "lawpdf-public-release-manifest-v1",
   "product": {
     "name": "LawPDF",
-    "version": "0.2.29"
+    "version": "0.2.32"
   },
   "runtime_assets": {
     "fasttab_model": {
@@ -39,6 +39,20 @@
         "path": "profile-models/lm2-native-catboost-runtime/catboostmodel.dll",
         "sha256": "668d8867940a0832accaad6004e249f11ecc48eb63eb1d65551cfdd37c1939ad",
         "fetched_during_release": true
+      }
+    },
+    "pdfium_libraries": {
+      "macos": {
+        "path": "vendor/libpdfium.dylib",
+        "sha256": "818c96da82396168b6dd6e79e2a28065f3ac1d97e0f72d214b41be9decb7075a",
+        "release": "chromium/8057",
+        "source": "https://github.com/bblanchon/pdfium-binaries/releases/tag/chromium/8057"
+      },
+      "windows": {
+        "path": "vendor/pdfium.dll",
+        "sha256": "55e7ebef29a1ec9523d1adb8b260a73e7dfb0f64d3f0285121d20ecd6148ef18",
+        "release": "chromium/8057",
+        "source": "https://github.com/bblanchon/pdfium-binaries/releases/tag/chromium/8057"
       }
     }
   },

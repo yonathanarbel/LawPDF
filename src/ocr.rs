@@ -45,7 +45,7 @@ pub fn spawn_ocr_job(
     pdf_path: PathBuf,
     page_count: usize,
     tx: Sender<OcrEvent>,
-    render_tx: Sender<RenderRequest>,
+    render_tx: crate::render_worker::RenderSender,
 ) {
     thread::spawn(move || {
         for page_index in 0..page_count {
@@ -155,7 +155,7 @@ pub fn spawn_openrouter_ocr_save_job(
     initial_ocr_text: Vec<Option<String>>,
     openrouter_api_key: String,
     tx: Sender<OcrEvent>,
-    render_tx: Sender<RenderRequest>,
+    render_tx: crate::render_worker::RenderSender,
 ) {
     thread::spawn(move || {
         let client = match reqwest::blocking::Client::builder()
@@ -287,7 +287,7 @@ pub fn spawn_openrouter_ocr_save_job(
             format!("Embedding OCR text in {}", destination.display()),
         );
         match save_with_ocr_text(&pdf_path, &destination, &page_sizes, &ocr_text) {
-            Ok(()) => send_ocr_status(
+            Ok(_report) => send_ocr_status(
                 &tx,
                 document_epoch,
                 &pdf_path,
@@ -304,7 +304,7 @@ pub fn spawn_openrouter_ocr_save_job(
 }
 
 fn ocr_page(
-    render_tx: &Sender<RenderRequest>,
+    render_tx: &crate::render_worker::RenderSender,
     pdf_path: &PathBuf,
     page_index: usize,
 ) -> Result<String, String> {
@@ -379,7 +379,7 @@ fn run_tesseract_image(image_path: &Path) -> Result<String, String> {
 }
 
 fn export_ocr_image(
-    render_tx: &Sender<RenderRequest>,
+    render_tx: &crate::render_worker::RenderSender,
     pdf_path: PathBuf,
     page_index: usize,
     image_path: PathBuf,
@@ -419,7 +419,7 @@ struct OcrStatusTarget<'a> {
 
 fn openrouter_ocr_pages(
     client: &reqwest::blocking::Client,
-    render_tx: &Sender<RenderRequest>,
+    render_tx: &crate::render_worker::RenderSender,
     pdf_path: &PathBuf,
     page_indices: &[usize],
     api_key: &str,
@@ -494,7 +494,7 @@ fn openrouter_ocr_pages(
 
 fn openrouter_ocr_single_page(
     client: &reqwest::blocking::Client,
-    render_tx: &Sender<RenderRequest>,
+    render_tx: &crate::render_worker::RenderSender,
     pdf_path: &PathBuf,
     page_index: usize,
     api_key: &str,
@@ -549,7 +549,7 @@ fn openrouter_ocr_request_body(content: Vec<serde_json::Value>) -> serde_json::V
 }
 
 fn page_data_url(
-    render_tx: &Sender<RenderRequest>,
+    render_tx: &crate::render_worker::RenderSender,
     pdf_path: &PathBuf,
     page_index: usize,
 ) -> Result<String, String> {

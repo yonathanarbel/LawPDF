@@ -16,9 +16,9 @@ const GITHUB_LATEST_RELEASE_URL: &str =
 const PORTABLE_ASSET_NAME: &str = "LawPDF-windows-portable-x64.zip";
 const INSTALLER_ASSET_NAME: &str = "LawPDFSetup-x64.exe";
 const MACOS_ASSET_NAME: &str = "LawPDF-macos.zip";
-const SHA256SUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
 const USER_AGENT: &str = concat!("LawPDF/", env!("CARGO_PKG_VERSION"));
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const RELEASES_PAGE: &str = "https://github.com/yonathanarbel/LawPDF/releases/latest";
 
 #[derive(Debug, Clone)]
 pub enum UpdateEvent {
@@ -27,6 +27,10 @@ pub enum UpdateEvent {
         version: String,
     },
     NotAvailable,
+    ManualDownload {
+        version: String,
+    },
+    CheckDeferred(String),
     Downloading {
         downloaded_bytes: u64,
         total_bytes: Option<u64>,
@@ -43,6 +47,10 @@ pub struct PendingUpdate {
     pub release_url: String,
     #[serde(default)]
     pub expected_sha256: String,
+    #[serde(default)]
+    pub signed_manifest: String,
+    #[serde(default)]
+    pub manifest_signature: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,7 +63,6 @@ pub enum UpdatePackageKind {
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
-    html_url: String,
     prerelease: bool,
     draft: bool,
     assets: Vec<GithubAsset>,
@@ -71,7 +78,7 @@ pub fn spawn_update_check(tx: Sender<UpdateEvent>) {
     thread::spawn(move || {
         let _ = tx.send(UpdateEvent::Checking);
         if let Err(error) = check_and_stage_update(&tx) {
-            write_last_check("failed", None);
+            write_last_check_detail("failed", None, Some(&error));
             let _ = tx.send(UpdateEvent::Failed(error));
         }
     });
@@ -79,7 +86,7 @@ pub fn spawn_update_check(tx: Sender<UpdateEvent>) {
 
 pub fn load_pending_update() -> Option<PendingUpdate> {
     let path = pending_update_path()?;
-    let bytes = std::fs::read(&path).ok()?;
+    let bytes = crate::document_store::read_limited(&path, 512 * 1024).ok()?;
     let pending = match serde_json::from_slice::<PendingUpdate>(&bytes) {
         Ok(pending) => pending,
         Err(_) => {
@@ -177,7 +184,14 @@ fn check_and_stage_update(tx: &Sender<UpdateEvent>) -> Result<(), String> {
         return Ok(());
     }
 
-    let release = fetch_latest_release()?;
+    let release = match fetch_latest_release() {
+        Ok(release) => release,
+        Err(error) => {
+            write_last_check_detail("deferred", None, Some(&error));
+            let _ = tx.send(UpdateEvent::CheckDeferred(error));
+            return Ok(());
+        }
+    };
     if release.draft || release.prerelease {
         let _ = tx.send(UpdateEvent::NotAvailable);
         return Ok(());
@@ -190,13 +204,6 @@ fn check_and_stage_update(tx: &Sender<UpdateEvent>) -> Result<(), String> {
         return Ok(());
     }
 
-    // Tell the UI immediately. Waiting until the 30–40 MB package is staged
-    // made older copies look like they never checked for updates.
-    write_last_check("available", Some(&version));
-    let _ = tx.send(UpdateEvent::Detected {
-        version: version.clone(),
-    });
-
     let package_kind = preferred_package_kind();
     let asset_name = match package_kind {
         UpdatePackageKind::PortableZip => PORTABLE_ASSET_NAME,
@@ -208,36 +215,43 @@ fn check_and_stage_update(tx: &Sender<UpdateEvent>) -> Result<(), String> {
         .iter()
         .find(|asset| asset.name.eq_ignore_ascii_case(asset_name))
         .ok_or_else(|| format!("Release {version} does not include {asset_name}."))?;
-    let Some(checksums_asset) = release
+    let manifest_asset = release
         .assets
         .iter()
-        .find(|asset| asset.name.eq_ignore_ascii_case(SHA256SUMS_ASSET_NAME))
-    else {
-        let _ = tx.send(UpdateEvent::Failed(
-            "Release is missing SHA256SUMS.txt; not updating.".to_owned(),
-        ));
+        .find(|asset| asset.name == crate::update_trust::MANIFEST_NAME);
+    let signature_asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == crate::update_trust::SIGNATURE_NAME);
+    let (Some(manifest_asset), Some(signature_asset)) = (manifest_asset, signature_asset) else {
+        // Older releases have only unsigned checksums. Offer the official
+        // download page, but never silently execute their installers.
+        write_last_check("manual_download", Some(&version));
+        let _ = tx.send(UpdateEvent::ManualDownload { version });
         return Ok(());
     };
-    let checksums = download_text_asset(checksums_asset)?;
-    let expected_sha256 = parse_sha256sums(&checksums)
-        .into_iter()
-        .find(|(_, name)| name.eq_ignore_ascii_case(&asset.name))
-        .map(|(hash, _)| hash)
-        .ok_or_else(|| {
-            format!(
-                "SHA256SUMS.txt does not contain a checksum for {}.",
-                asset.name
-            )
-        })?;
-    if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(format!(
-            "SHA256SUMS.txt contains an invalid checksum for {}.",
-            asset.name
-        ));
+    for item in [asset, manifest_asset, signature_asset] {
+        require_release_asset_url(item, &version)?;
     }
+    let signed_manifest = download_text_asset(manifest_asset)?;
+    let manifest_signature = download_text_asset(signature_asset)?;
+    let trusted = crate::update_trust::verify(&signed_manifest, &manifest_signature)?;
+    if trusted.version != version {
+        return Err("The signed release version does not match the advertised update.".to_owned());
+    }
+    let signed_asset = trusted
+        .assets
+        .iter()
+        .find(|signed| signed.name == asset_name)
+        .ok_or_else(|| "The signed release does not authorize this package.".to_owned())?;
+    let expected_sha256 = signed_asset.sha256.clone();
+    let expected_size = signed_asset.bytes;
+    write_last_check("available", Some(&version));
+    let _ = tx.send(UpdateEvent::Detected {
+        version: version.clone(),
+    });
 
-    let asset_path = download_asset(tx, &version, asset)?;
+    let asset_path = download_asset(tx, &version, asset, expected_size)?;
     let actual_sha256 = match sha256_hex_of_file(&asset_path) {
         Ok(hash) => hash,
         Err(error) => {
@@ -253,11 +267,13 @@ fn check_and_stage_update(tx: &Sender<UpdateEvent>) -> Result<(), String> {
         return Ok(());
     }
     let pending = PendingUpdate {
-        version,
+        version: version.clone(),
         package_kind,
         asset_path,
-        release_url: release.html_url,
+        release_url: format!("https://github.com/yonathanarbel/LawPDF/releases/tag/v{version}"),
         expected_sha256: expected_sha256.to_ascii_lowercase(),
+        signed_manifest,
+        manifest_signature,
     };
     write_pending_update(&pending)?;
     let _ = tx.send(UpdateEvent::Ready(pending));
@@ -265,7 +281,8 @@ fn check_and_stage_update(tx: &Sender<UpdateEvent>) -> Result<(), String> {
 }
 
 fn fetch_latest_release() -> Result<GithubRelease, String> {
-    reqwest::blocking::Client::builder()
+    let response = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|error| format!("Could not create update client: {error}"))?
@@ -273,29 +290,56 @@ fn fetch_latest_release() -> Result<GithubRelease, String> {
         .header(reqwest::header::USER_AGENT, USER_AGENT)
         .send()
         .and_then(|response| response.error_for_status())
-        .map_err(|error| format!("Could not check for updates: {error}"))?
-        .json::<GithubRelease>()
-        .map_err(|error| format!("Could not read update metadata: {error}"))
+        .map_err(|error| format!("Could not check for updates: {error}"))?;
+    let mut bytes = Vec::new();
+    response
+        .take(2 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > 2 * 1024 * 1024 {
+        return Err("Update metadata exceeds the supported size.".to_owned());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "Could not read update metadata.".to_owned())
+}
+
+fn require_release_asset_url(asset: &GithubAsset, version: &str) -> Result<(), String> {
+    let expected = format!(
+        "https://github.com/yonathanarbel/LawPDF/releases/download/v{version}/{}",
+        asset.name
+    );
+    if crate::update_trust::version(version).is_none() || asset.browser_download_url != expected {
+        return Err("The update points outside the official release location.".to_owned());
+    }
+    Ok(())
 }
 
 fn download_text_asset(asset: &GithubAsset) -> Result<String, String> {
-    reqwest::blocking::Client::builder()
+    let response = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
         .build()
-        .map_err(|error| format!("Could not create checksum downloader: {error}"))?
+        .map_err(|error| format!("Could not create manifest downloader: {error}"))?
         .get(&asset.browser_download_url)
         .header(reqwest::header::USER_AGENT, USER_AGENT)
         .send()
         .and_then(|response| response.error_for_status())
-        .map_err(|error| format!("Could not download SHA256SUMS.txt: {error}"))?
-        .text()
-        .map_err(|error| format!("Could not read SHA256SUMS.txt: {error}"))
+        .map_err(|error| format!("Could not download release authentication: {error}"))?;
+    let mut bytes = Vec::new();
+    response
+        .take(crate::update_trust::MAX_MANIFEST_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > crate::update_trust::MAX_MANIFEST_BYTES {
+        return Err("Update manifest exceeds the supported size.".to_owned());
+    }
+    String::from_utf8(bytes).map_err(|_| "The update manifest is not UTF-8.".to_owned())
 }
 
 fn download_asset(
     tx: &Sender<UpdateEvent>,
     version: &str,
     asset: &GithubAsset,
+    expected_size: u64,
 ) -> Result<PathBuf, String> {
     let update_dir = updates_dir()
         .ok_or_else(|| "Could not find a writable update directory.".to_owned())?
@@ -303,9 +347,8 @@ fn download_asset(
     std::fs::create_dir_all(&update_dir)
         .map_err(|error| format!("Could not create update folder: {error}"))?;
     let asset_path = update_dir.join(&asset.name);
-    let partial_path = update_dir.join(format!("{}.download", asset.name));
-
     let mut response = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(120))
         .build()
         .map_err(|error| format!("Could not create update downloader: {error}"))?
@@ -314,34 +357,38 @@ fn download_asset(
         .send()
         .and_then(|response| response.error_for_status())
         .map_err(|error| format!("Could not download update: {error}"))?;
-    let total_bytes = response.content_length();
     let mut downloaded_bytes = 0_u64;
-
-    let mut file = std::fs::File::create(&partial_path)
-        .map_err(|error| format!("Could not create update package: {error}"))?;
-    let mut buffer = [0_u8; 64 * 1024];
-
-    loop {
-        let read = response
-            .read(&mut buffer)
-            .map_err(|error| format!("Could not read update package: {error}"))?;
-        if read == 0 {
-            break;
+    let mut last_progress = std::time::Instant::now();
+    crate::atomic_file::replace_with(&asset_path, |file| {
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = response.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            downloaded_bytes = downloaded_bytes.saturating_add(read as u64);
+            if downloaded_bytes > expected_size {
+                return Err(std::io::Error::other("The update exceeds its signed size."));
+            }
+            file.write_all(&buffer[..read])?;
+            if last_progress.elapsed() >= Duration::from_millis(100) {
+                let _ = tx.send(UpdateEvent::Downloading {
+                    downloaded_bytes,
+                    total_bytes: Some(expected_size),
+                });
+                last_progress = std::time::Instant::now();
+            }
         }
-        file.write_all(&buffer[..read])
-            .map_err(|error| format!("Could not save update package: {error}"))?;
-        downloaded_bytes = downloaded_bytes.saturating_add(read as u64);
-        let _ = tx.send(UpdateEvent::Downloading {
-            downloaded_bytes,
-            total_bytes,
-        });
-    }
-
-    std::fs::rename(&partial_path, &asset_path)
-        .map_err(|error| format!("Could not stage update package: {error}"))?;
+        if downloaded_bytes != expected_size {
+            return Err(std::io::Error::other("The update download was incomplete."));
+        }
+        Ok(())
+    })
+    .map_err(|error| format!("Could not stage the update: {error}"))?;
     Ok(asset_path)
 }
 
+#[cfg(test)]
 fn parse_sha256sums(text: &str) -> Vec<(String, String)> {
     text.lines()
         .filter_map(|line| {
@@ -359,21 +406,61 @@ fn parse_sha256sums(text: &str) -> Vec<(String, String)> {
 }
 
 fn verify_pending_update(pending: &PendingUpdate) -> Result<(), String> {
-    let expected = pending.expected_sha256.trim();
-    if expected.is_empty() {
-        return Err("Staged update has no trusted SHA-256 checksum; it was discarded.".to_owned());
+    let manifest =
+        crate::update_trust::verify(&pending.signed_manifest, &pending.manifest_signature)?;
+    if manifest.version != pending.version
+        || !is_newer_version(&pending.version, CURRENT_VERSION)
+        || !package_kind_is_supported(pending.package_kind)
+    {
+        return Err("The staged update has an invalid version or platform.".to_owned());
+    }
+    let name = match pending.package_kind {
+        UpdatePackageKind::PortableZip => PORTABLE_ASSET_NAME,
+        UpdatePackageKind::Installer => INSTALLER_ASSET_NAME,
+        UpdatePackageKind::MacAppZip => MACOS_ASSET_NAME,
+    };
+    let asset = manifest
+        .assets
+        .iter()
+        .find(|asset| asset.name == name)
+        .ok_or_else(|| "The signed manifest does not include this installer.".to_owned())?;
+    let root = updates_dir().ok_or_else(|| "Update storage is unavailable.".to_owned())?;
+    if pending.asset_path != root.join(&pending.version).join(name)
+        || !pending
+            .asset_path
+            .canonicalize()
+            .map_err(|error| error.to_string())?
+            .starts_with(root.canonicalize().map_err(|error| error.to_string())?)
+    {
+        return Err("The staged update is outside its expected folder.".to_owned());
+    }
+    if std::fs::metadata(&pending.asset_path)
+        .map_err(|error| error.to_string())?
+        .len()
+        != asset.bytes
+        || !pending.expected_sha256.eq_ignore_ascii_case(&asset.sha256)
+    {
+        return Err("The staged update does not match its signed manifest.".to_owned());
     }
     let actual = sha256_hex_of_file(&pending.asset_path)?;
-    if !actual.eq_ignore_ascii_case(expected) {
-        return Err(format!(
-            "Staged update checksum mismatch; expected {expected}, found {actual}. It was discarded."
-        ));
+    if !actual.eq_ignore_ascii_case(&asset.sha256) {
+        return Err(
+            "The staged update was changed after downloading. It was discarded.".to_owned(),
+        );
     }
     Ok(())
 }
 
 fn discard_pending_update(pending: &PendingUpdate, manifest_path: &Path) {
-    if updates_dir().is_some_and(|dir| pending.asset_path.starts_with(dir)) {
+    if updates_dir()
+        .and_then(|dir| dir.canonicalize().ok())
+        .is_some_and(|dir| {
+            pending
+                .asset_path
+                .canonicalize()
+                .is_ok_and(|path| path.starts_with(dir))
+        })
+    {
         let _ = std::fs::remove_file(&pending.asset_path);
     }
     let _ = std::fs::remove_file(manifest_path);
@@ -428,10 +515,15 @@ fn write_pending_update(pending: &PendingUpdate) -> Result<(), String> {
     }
     let bytes = serde_json::to_vec_pretty(pending)
         .map_err(|error| format!("Could not encode update state: {error}"))?;
-    std::fs::write(path, bytes).map_err(|error| format!("Could not save update state: {error}"))
+    crate::atomic_file::write(&path, &bytes)
+        .map_err(|error| format!("Could not save update state: {error}"))
 }
 
 fn write_last_check(result: &str, latest: Option<&str>) {
+    write_last_check_detail(result, latest, None);
+}
+
+fn write_last_check_detail(result: &str, latest: Option<&str>, detail: Option<&str>) {
     let Some(path) = updates_dir().map(|dir| dir.join("last-check.json")) else {
         return;
     };
@@ -442,9 +534,11 @@ fn write_last_check(result: &str, latest: Option<&str>) {
         "current": CURRENT_VERSION,
         "latest": latest,
         "result": result,
+        "detail": detail,
+        "checked_at": time::OffsetDateTime::now_utc().unix_timestamp(),
     });
     if let Ok(bytes) = serde_json::to_vec_pretty(&payload) {
-        let _ = std::fs::write(path, bytes);
+        let _ = crate::atomic_file::write(&path, &bytes);
     }
 }
 
@@ -660,7 +754,15 @@ bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$candidate/C
 [ "$bundle_id" = 'design.yarbel.lawpdf' ] || fail_update "The downloaded app has the wrong bundle identifier."
 bundle_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$candidate/Contents/Info.plist" 2>/dev/null) || fail_update "The downloaded app has no version."
 [ "$bundle_version" = "$installed_version" ] || fail_update "The downloaded app version does not match the release."
+minimum_os=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$candidate/Contents/Info.plist" 2>/dev/null) || fail_update "The downloaded app does not declare its macOS requirement."
+current_os=$(/usr/bin/sw_vers -productVersion)
+/usr/bin/awk -v required="$minimum_os" -v current="$current_os" 'BEGIN {{
+    if (required !~ /^[0-9]+[.][0-9]+([.][0-9]+)?$/) exit 1;
+    split(required, r, "."); split(current, c, ".");
+    for (i = 1; i <= 3; i++) {{ if (c[i]+0 > r[i]+0) exit 0; if (c[i]+0 < r[i]+0) exit 1; }}
+}}' || fail_update "This update requires a newer version of macOS. Your existing app was kept."
 /usr/bin/codesign --verify --deep --strict "$candidate" >/dev/null 2>&1 || fail_update "The downloaded app failed code-signature validation."
+"$candidate/Contents/MacOS/LawPDF" --lm2-runtime-status --require-native --require-context --require-arbiter --require-note-head --require-link-ranker >/dev/null 2>&1 || fail_update "The downloaded app failed its runtime check. Your existing app was kept."
 
 /usr/bin/ditto "$candidate" "$replacement_app" || fail_update "Could not copy the update beside the installed app."
 /usr/bin/codesign --verify --deep --strict "$replacement_app" >/dev/null 2>&1 || fail_update "The copied update failed code-signature validation."
@@ -670,11 +772,17 @@ if ! /bin/mv "$replacement_app" "$current_app"; then
     fail_update "Could not put the updated LawPDF app in Applications."
 fi
 
-/bin/rm -rf "$backup_app" "$extract_dir"
+/bin/rm -rf "$extract_dir"
 /bin/rm -f "$manifest" "$archive"
-/usr/bin/printf '%s\n' "$installed_version" > "$installed_path"
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$current_app" >/dev/null 2>&1 || true
-/usr/bin/open -n "$current_app"{relaunch_suffix}
+if ! /usr/bin/open -n "$current_app"{relaunch_suffix}; then
+    /bin/mv "$current_app" "$replacement_app" || fail_update "Could not launch the updated app. Restore the saved backup beside LawPDF.app."
+    /bin/mv "$backup_app" "$current_app" || fail_update "Could not restore the saved app. Restore the backup beside LawPDF.app."
+    fail_update "Could not launch the updated app. The previous version was restored."
+fi
+/usr/bin/printf '%s\n' "$installed_version" > "$installed_path"
+# Keep the previous bundle until the next update, including if the newly
+# launched process exits after LaunchServices has accepted the launch.
 "#,
         pid = std::process::id(),
         archive = sh_string(&pending.asset_path),
@@ -786,7 +894,13 @@ fn normalize_version(version: &str) -> String {
 }
 
 fn is_newer_version(candidate: &str, current: &str) -> bool {
-    version_numbers(candidate) > version_numbers(current)
+    match (
+        crate::update_trust::version(&normalize_version(candidate)),
+        crate::update_trust::version(&normalize_version(current)),
+    ) {
+        (Some(candidate), Some(current)) => candidate > current,
+        _ => false,
+    }
 }
 
 fn version_numbers(version: &str) -> Vec<u64> {
@@ -877,7 +991,8 @@ mod tests {
         assert!(is_newer_version("0.2.10", "0.2.9"));
         assert!(is_newer_version("0.2.24", "0.2.23"));
         assert!(!is_newer_version("0.2.24", "0.2.24"));
-        assert!(is_newer_version("0.3", "0.2.6"));
+        assert!(!is_newer_version("0.3", "0.2.6"));
+        assert!(is_newer_version("0.3.0", "0.2.6"));
         assert!(!is_newer_version("garbage", "0.2.6"));
         assert!(!is_newer_version("garbage", "also-garbage"));
     }

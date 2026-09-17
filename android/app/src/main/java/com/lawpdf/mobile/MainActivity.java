@@ -232,6 +232,15 @@ public final class MainActivity extends Activity {
 
     private void launchSavePicker() {
         if (pdfPageList == null) return;
+        new AlertDialog.Builder(this)
+                .setTitle("Export a marked copy")
+                .setMessage("Your marks already save automatically inside LawPDF. The exported PDF turns every page into an image, including its marks. Searchable text, links, forms, and digital signatures will not be retained. Your original PDF stays unchanged.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Choose destination", (dialog, which) -> launchConfirmedSavePicker())
+                .show();
+    }
+
+    private void launchConfirmedSavePicker() {
         Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("application/pdf");
@@ -261,6 +270,10 @@ public final class MainActivity extends Activity {
     }
 
     private void saveAnnotatedCopy(Uri destination) {
+        if (currentDocumentUri != null && currentDocumentUri.normalizeScheme().equals(destination.normalizeScheme())) {
+            chrome.setStatus("Choose a different file to preserve the original PDF.");
+            return;
+        }
         PdfPageList pages = pdfPageList;
         if (pages == null) return;
         chrome.setDocumentEnabled(false);
@@ -357,6 +370,11 @@ public final class MainActivity extends Activity {
             }
 
             @Override
+            public void onPersistenceError(Exception error) {
+                if (pdfPageList == pages) chrome.setStatus("The edit could not be saved and was not applied: " + safeMessage(error));
+            }
+
+            @Override
             public void onChromeToggleRequested() {
                 if (pdfPageList == pages) chrome.toggleCollapsed();
             }
@@ -371,7 +389,9 @@ public final class MainActivity extends Activity {
                 chrome.setSelectedTool(AnnotationStore.Tool.PAN);
                 String pageSummary = getResources().getQuantityString(
                         R.plurals.pdf_status, pageCount, pageCount);
-                chrome.setStatus(getString(R.string.pdf_ready_status, pageSummary));
+                chrome.setStatus(pages.isRecoverySource()
+                        ? "Reading the local recovery copy. Edits save automatically in LawPDF; use Save copy to export."
+                        : getString(R.string.pdf_ready_status, pageSummary));
             }
 
             @Override public void onError(Exception error) {

@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::model::{PageInfo, PageLink, PageTextChar, RenderedPage};
 
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 5;
 static TEMP_FILE_NONCE: AtomicU64 = AtomicU64::new(1);
 static RENDER_WRITES: AtomicU64 = AtomicU64::new(0);
 
@@ -29,6 +29,12 @@ pub struct PerformanceCache {
 impl PerformanceCache {
     pub fn new() -> Self {
         Self { root: cache_root() }
+    }
+
+    pub fn for_editor(&self) -> Self {
+        Self {
+            root: self.root.as_ref().map(|root| root.join("editor-v1")),
+        }
     }
 
     #[cfg(test)]
@@ -220,15 +226,17 @@ fn cache_root() -> Option<PathBuf> {
         return None;
     }
 
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
-        .map(|path| path.join("LawPDF").join("performance-cache"))
-        .or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .map(|path| path.join(".lawpdf").join("performance-cache"))
-        })
+    #[cfg(windows)]
+    if !cfg!(test) {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            return Some(
+                PathBuf::from(local)
+                    .join("LawPDF")
+                    .join("performance-cache"),
+            );
+        }
+    }
+    crate::settings::app_data_dir().map(|path| path.join("performance-cache"))
 }
 
 fn document_key(source: &Path) -> Option<String> {

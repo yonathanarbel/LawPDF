@@ -2,9 +2,12 @@
 
 mod app;
 mod article_segments;
+mod atomic_file;
 #[cfg(feature = "devtools")]
 mod benchmark;
 mod chat;
+mod credentials;
+mod document_store;
 mod hashing;
 mod layout_roles;
 mod liquid;
@@ -15,17 +18,22 @@ mod liquidvision;
 #[cfg(target_os = "macos")]
 mod macos_open_files;
 mod model;
+mod native_process;
 mod ocr;
+mod page_geometry;
 mod pdf_backend;
 mod performance_cache;
-#[cfg(feature = "devtools")]
-mod profile_dataset;
 mod render_worker;
 mod review_reading;
 mod settings;
+#[cfg(feature = "devtools")]
+mod shutdown_smoke;
 mod single_instance;
+mod storage_maintenance;
 mod text_conversion;
+mod text_search;
 mod tts;
+mod update_trust;
 mod updater;
 
 use std::ffi::{OsStr, OsString};
@@ -41,6 +49,22 @@ const APP_TITLE: &str = concat!(
 
 fn main() -> eframe::Result<()> {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    // The child has no UI, update service, credentials, or document-write
+    // commands. Anonymous pipes carry its bounded request/response protocol.
+    if args.len() == 1 && args[0] == "--pdf-worker" {
+        if native_process::run_worker().is_err() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    macos_open_files::install_appkit_crash_workarounds();
+    install_panic_log_hook();
+
+    #[cfg(feature = "devtools")]
+    if args.iter().any(|arg| arg == "--smoke-shutdown") {
+        return shutdown_smoke::run();
+    }
 
     if args.iter().any(|arg| arg == "--lm2-runtime-status") {
         if let Err(error) = liquid2::run_lm2_runtime_status(args.clone().into_iter()) {
@@ -93,6 +117,14 @@ fn main() -> eframe::Result<()> {
             incoming_paths_rx,
         } => (incoming_paths_tx, incoming_paths_rx),
         single_instance::InstanceMode::SecondarySent => return Ok(()),
+        single_instance::InstanceMode::Unavailable(message) => {
+            rfd::MessageDialog::new()
+                .set_title("LawPDF is already open")
+                .set_description(message)
+                .set_level(rfd::MessageLevel::Error)
+                .show();
+            return Ok(());
+        }
     };
     #[cfg(target_os = "macos")]
     let macos_open_files = macos_open_files::install(incoming_paths_tx);
@@ -125,11 +157,11 @@ fn main() -> eframe::Result<()> {
             }
             single_instance::set_repaint_context(&cc.egui_ctx);
             Ok(Box::new(PdfEditorApp::new(
-                cc,
+                &cc.egui_ctx,
                 startup_paths.clone(),
                 incoming_paths_rx.clone(),
                 #[cfg(target_os = "macos")]
-                macos_open_files,
+                Some(macos_open_files),
             )))
         }),
     )
@@ -146,6 +178,32 @@ struct DevCommand {
 
 #[cfg(feature = "devtools")]
 const DEV_COMMANDS: &[DevCommand] = &[
+    DevCommand {
+        flags: &["--smoke-credential-store"],
+        handler: |_| credentials::verify_native_store(),
+    },
+    DevCommand {
+        flags: &["--verify-update-manifest"],
+        handler: |args| {
+            let index = args.iter().position(|arg| arg == "--verify-update-manifest").unwrap();
+            let manifest = args.get(index + 1).ok_or("Provide a manifest and signature path")?;
+            let signature = args.get(index + 2).ok_or("Provide a manifest and signature path")?;
+            let manifest = std::fs::read_to_string(manifest).map_err(|error| error.to_string())?;
+            let signature = std::fs::read_to_string(signature).map_err(|error| error.to_string())?;
+            let release = update_trust::verify(&manifest, &signature)?;
+            println!("Authenticated LawPDF {} manifest for {}", release.version, release.commit);
+            Ok(())
+        },
+    },
+    DevCommand {
+        flags: &["--smoke-pdf-isolation"],
+        handler: |_| {
+            native_process::verify_supervision(
+                &smoke_pdf_path().map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())
+        },
+    },
     DevCommand {
         flags: &["--smoke-open-default"],
         handler: dev_smoke_open_default,
@@ -187,32 +245,12 @@ const DEV_COMMANDS: &[DevCommand] = &[
         handler: dev_lm2_eval,
     },
     DevCommand {
-        flags: &["--dump-lm2-features"],
-        handler: dev_lm2_feature_dump,
-    },
-    DevCommand {
         flags: &["--dump-char-metrics"],
         handler: dev_char_metrics_dump,
     },
     DevCommand {
-        flags: &["--dump-lm2-training"],
-        handler: dev_lm2_training_export,
-    },
-    DevCommand {
-        flags: &["--dump-lm2-decoder-lattice"],
-        handler: dev_lm2_decoder_lattice_dump,
-    },
-    DevCommand {
-        flags: &["--lm2-draft"],
-        handler: dev_lm2_draft,
-    },
-    DevCommand {
         flags: &["--lm2-source-smoke"],
         handler: dev_lm2_source_smoke,
-    },
-    DevCommand {
-        flags: &["--profile-dataset"],
-        handler: dev_profile_dataset,
     },
 ];
 
@@ -285,38 +323,13 @@ fn dev_lm2_eval(args: Vec<OsString>) -> Result<(), String> {
 }
 
 #[cfg(feature = "devtools")]
-fn dev_lm2_feature_dump(args: Vec<OsString>) -> Result<(), String> {
-    liquid2::run_lm2_feature_dump(args.into_iter())
-}
-
-#[cfg(feature = "devtools")]
 fn dev_char_metrics_dump(args: Vec<OsString>) -> Result<(), String> {
     liquid_smoke::run_char_metrics_dump(args.into_iter()).map_err(|error| format!("{error:#}"))
 }
 
 #[cfg(feature = "devtools")]
-fn dev_lm2_training_export(args: Vec<OsString>) -> Result<(), String> {
-    liquid2::run_lm2_training_export(args.into_iter())
-}
-
-#[cfg(feature = "devtools")]
-fn dev_lm2_decoder_lattice_dump(args: Vec<OsString>) -> Result<(), String> {
-    liquid2::run_lm2_decoder_lattice_dump(args.into_iter())
-}
-
-#[cfg(feature = "devtools")]
-fn dev_lm2_draft(args: Vec<OsString>) -> Result<(), String> {
-    liquid2::run_lm2_draft(args.into_iter())
-}
-
-#[cfg(feature = "devtools")]
 fn dev_lm2_source_smoke(args: Vec<OsString>) -> Result<(), String> {
     liquid2::run_lm2_source_smoke(args.into_iter())
-}
-
-#[cfg(feature = "devtools")]
-fn dev_profile_dataset(args: Vec<OsString>) -> Result<(), String> {
-    profile_dataset::run_profile_dataset(args.into_iter()).map_err(|error| format!("{error:#}"))
 }
 
 fn convert_sources_from_args(args: &[OsString]) -> Option<Vec<PathBuf>> {
@@ -527,4 +540,49 @@ fn smoke_pdf_path() -> anyhow::Result<std::path::PathBuf> {
         .map_err(|_| {
             anyhow::anyhow!("Set LAWPDF_SMOKE_PDF to a PDF path before running smoke tests.")
         })
+}
+
+/// Record every panic to `<app data>/panic.log` before the default hook runs.
+///
+/// Release builds on Windows use the `windows` subsystem, so a panic message
+/// printed to stderr goes nowhere and the app simply vanishes (or, for a
+/// worker thread, silently stops answering). The log gives the user, and a bug
+/// report, something to point at.
+fn install_panic_log_hook() {
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let location = info
+            .location()
+            .map(|location| format!("{}:{}", location.file(), location.line()))
+            .unwrap_or_else(|| "unknown location".to_owned());
+        let line = format!(
+            "{} LawPDF {} thread={} at {}\n",
+            time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_else(|_| "unknown-time".to_owned()),
+            env!("CARGO_PKG_VERSION"),
+            thread.name().unwrap_or("unnamed"),
+            location
+        );
+        if let Some(dir) = settings::app_data_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("panic.log");
+            // Never persist panic payloads: they can contain PDF text or keys.
+            if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 64 * 1024) {
+                let _ = std::fs::remove_file(&path);
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            if let Ok(mut file) = options.open(path) {
+                use std::io::Write;
+                let _ = file.write_all(line.as_bytes());
+            }
+        }
+        eprintln!("LawPDF encountered an unexpected error at {location}. Check document recovery when reopening the app.");
+    }));
 }

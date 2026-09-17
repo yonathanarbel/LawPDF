@@ -368,8 +368,59 @@ struct Lm2TimingDocument {
     fast_reopen_hit: bool,
     lm2: LiquidMode2Timing,
     markdown_render_ms: f64,
+    /// Cost of the values the Review Mode draw loop used to recompute on
+    /// every frame (now computed once per document). Median of 20 runs.
+    review_frame: Option<ReviewFrameTiming>,
     warnings: Vec<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ReviewFrameTiming {
+    document_clone_ms: f64,
+    footnote_index_ms: f64,
+    hidden_mask_ms: f64,
+    outline_ms: f64,
+    per_frame_total_ms: f64,
+}
+
+fn median_ms(mut samples: Vec<f64>) -> f64 {
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    samples.get(samples.len() / 2).copied().unwrap_or(0.0)
+}
+
+fn measure_review_frame(document: &crate::liquid::LiquidDocument) -> ReviewFrameTiming {
+    const RUNS: usize = 20;
+    let time = |work: &dyn Fn()| {
+        let mut samples = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let started = Instant::now();
+            work();
+            samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        median_ms(samples)
+    };
+    let document_clone_ms = time(&|| {
+        std::hint::black_box(document.clone());
+    });
+    let footnote_index_ms = time(&|| {
+        std::hint::black_box(crate::app::build_liquid_footnote_index(&document.blocks));
+    });
+    let hidden_mask_ms = time(&|| {
+        std::hint::black_box(crate::review_reading::review_hidden_display_mask(
+            &document.blocks,
+        ));
+    });
+    let outline_ms = time(&|| {
+        std::hint::black_box(crate::app::liquid_outline_items(&document.blocks));
+    });
+    ReviewFrameTiming {
+        document_clone_ms,
+        footnote_index_ms,
+        hidden_mask_ms,
+        outline_ms,
+        per_frame_total_ms: document_clone_ms + footnote_index_ms + hidden_mask_ms + outline_ms,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -850,6 +901,7 @@ fn measure_lm2_timing_document(
         external_emissions_path: None,
         runtime_choice: crate::liquid2::Lm2RuntimeChoice::Automatic,
         preview_only: false,
+        skip_progressive_preview: false,
     };
     let (preview_page_count, preview_lm2) = lm2_progressive_preview_request(&request)
         .and_then(|(preview_request, page_count)| {
@@ -888,6 +940,7 @@ fn measure_lm2_timing_document(
             .map(|block| (block.role.prompt_name(), block.text.as_str())),
     );
     let markdown_render_ms = markdown_started.elapsed().as_secs_f64() * 1000.0;
+    let review_frame = Some(measure_review_frame(&liquid));
     let liquify_total_ms =
         text_extraction_ms + line_geometry_ms + lm2.total_ms + markdown_render_ms;
     let _ = save_fast_cached_lm2_document(
@@ -925,6 +978,7 @@ fn measure_lm2_timing_document(
         fast_reopen_hit,
         lm2,
         markdown_render_ms,
+        review_frame,
         warnings: liquid.warnings,
         error: None,
     }
@@ -948,6 +1002,7 @@ fn failed_timing_document(path: &Path, error: String) -> Lm2TimingDocument {
         fast_reopen_ms: 0.0,
         fast_reopen_hit: false,
         lm2: LiquidMode2Timing::default(),
+        review_frame: None,
         markdown_render_ms: 0.0,
         warnings: Vec::new(),
         error: Some(error),
@@ -1570,6 +1625,7 @@ fn smoke_document(
             external_emissions_path: lm2_external_emissions_path.map(Path::to_path_buf),
             runtime_choice: crate::liquid2::Lm2RuntimeChoice::Automatic,
             preview_only: false,
+            skip_progressive_preview: false,
         })
     } else {
         prepare_liquid_document(LiquidRequest {

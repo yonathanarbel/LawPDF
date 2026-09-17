@@ -54,7 +54,7 @@
     <string name="saving_document">Creating annotated PDF copy&#8230;</string>
     <string name="saved_document">Saved %1$s</string>
     <string name="save_error">Could not save the PDF: %1$s</string>
-    <string name="pdf_ready_status">%1$s · Tap the page for focus · Pinch or double-tap to zoom.</string>
+    <string name="pdf_ready_status">%1$s · Marks save automatically in LawPDF. Save copy exports flattened pages.</string>
     <string name="already_pdf_default">LawPDF is already your PDF default.</string>
     <string name="another_pdf_app">another PDF app</string>
     <string name="switch_pdf_default_title">Change the PDF default?</string>

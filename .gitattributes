@@ -22,3 +22,9 @@ profile-models/lm2-link-ranker-runtime/lm2-footnote-link-ranker-hgb-v1.json bina
 *.onnx binary
 *.png binary
 *.ttf binary
+
+# Runtime model hashes cover exact bytes on every platform.
+profile-models/**/*.json binary
+*.pdf binary
+
+android/gradlew text eol=lf

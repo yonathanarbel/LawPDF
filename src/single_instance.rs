@@ -5,14 +5,14 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded};
 
-const LAWPDF_INSTANCE_ADDR: &str = "127.0.0.1:47471";
 const MAGIC: &[u8] = b"LAWPDF_OPEN_V1\0";
 const ACK: &[u8; 3] = b"OK\n";
 const MAX_PATHS_PER_MESSAGE: usize = 256;
 const MAX_PATH_BYTES: usize = 32 * 1024;
 const IPC_TIMEOUT: Duration = Duration::from_secs(2);
+static INSTANCE_LOCK: OnceLock<std::fs::File> = OnceLock::new();
 static REPAINT_CONTEXT: OnceLock<egui::Context> = OnceLock::new();
 
 pub enum InstanceMode {
@@ -21,30 +21,71 @@ pub enum InstanceMode {
         incoming_paths_rx: Receiver<Vec<PathBuf>>,
     },
     SecondarySent,
+    Unavailable(String),
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Endpoint {
+    port: u16,
+    token: [u8; 32],
 }
 
 pub fn initialize(startup_paths: &[PathBuf]) -> InstanceMode {
-    match TcpListener::bind(LAWPDF_INSTANCE_ADDR) {
-        Ok(listener) => {
-            let (incoming_paths_tx, incoming_paths_rx) = unbounded();
-            spawn_listener(listener, incoming_paths_tx.clone());
-            InstanceMode::Primary {
-                incoming_paths_tx,
-                incoming_paths_rx,
-            }
-        }
-        Err(_) if send_paths_to_primary(startup_paths) => InstanceMode::SecondarySent,
-        Err(_) => {
-            let (incoming_paths_tx, incoming_paths_rx) = unbounded();
-            InstanceMode::Primary {
-                incoming_paths_tx,
-                incoming_paths_rx,
-            }
-        }
+    match initialize_checked(startup_paths) {
+        Ok(mode) => mode,
+        Err(_) => InstanceMode::Unavailable("LawPDF could not contact the existing reader or lock its local data. Close the other LawPDF window and try again. No second editor was started, so your recovery files remain protected.".to_owned()),
     }
 }
 
-fn spawn_listener(listener: TcpListener, incoming_paths_tx: Sender<Vec<PathBuf>>) {
+fn initialize_checked(startup_paths: &[PathBuf]) -> io::Result<InstanceMode> {
+    let root = crate::settings::app_data_dir()
+        .ok_or_else(|| io::Error::other("No private instance folder"))?;
+    std::fs::create_dir_all(&root)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options.open(root.join("instance.lock"))?;
+    let endpoint_path = root.join("instance.json");
+    if lock.try_lock().is_err() {
+        // Startup can briefly hold the lock before publishing its endpoint.
+        for _ in 0..10 {
+            if let Ok(bytes) = crate::document_store::read_limited(&endpoint_path, 4096)
+                && let Ok(endpoint) = serde_json::from_slice::<Endpoint>(&bytes)
+                && send_paths_to_primary(startup_paths, &endpoint)
+            {
+                return Ok(InstanceMode::SecondarySent);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        return Err(io::Error::other("Existing reader is unavailable"));
+    }
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let mut token = [0u8; 32];
+    getrandom::fill(&mut token).map_err(|_| io::Error::other("Could not initialize local IPC"))?;
+    let endpoint = Endpoint {
+        port: listener.local_addr()?.port(),
+        token,
+    };
+    crate::atomic_file::write(
+        &endpoint_path,
+        &serde_json::to_vec(&endpoint).map_err(io::Error::other)?,
+    )?;
+    INSTANCE_LOCK
+        .set(lock)
+        .map_err(|_| io::Error::other("Reader already initialized"))?;
+    let (incoming_paths_tx, incoming_paths_rx) = bounded(16);
+    spawn_listener(listener, token, incoming_paths_tx.clone());
+    Ok(InstanceMode::Primary {
+        incoming_paths_tx,
+        incoming_paths_rx,
+    })
+}
+
+fn spawn_listener(listener: TcpListener, token: [u8; 32], incoming_paths_tx: Sender<Vec<PathBuf>>) {
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else {
@@ -52,12 +93,15 @@ fn spawn_listener(listener: TcpListener, incoming_paths_tx: Sender<Vec<PathBuf>>
             };
             let _ = stream.set_read_timeout(Some(IPC_TIMEOUT));
             let _ = stream.set_write_timeout(Some(IPC_TIMEOUT));
-
+            let mut supplied = [0u8; 32];
+            if stream.read_exact(&mut supplied).is_err() || supplied != token {
+                continue;
+            }
             let Ok(paths) = read_message(&mut stream) else {
                 continue;
             };
-            if incoming_paths_tx.send(paths).is_err() {
-                break;
+            if incoming_paths_tx.try_send(paths).is_err() {
+                continue;
             }
             request_repaint();
             let _ = stream.write_all(ACK);
@@ -75,14 +119,15 @@ pub fn request_repaint() {
     }
 }
 
-fn send_paths_to_primary(paths: &[PathBuf]) -> bool {
-    let Ok(mut stream) = TcpStream::connect(LAWPDF_INSTANCE_ADDR) else {
+fn send_paths_to_primary(paths: &[PathBuf], endpoint: &Endpoint) -> bool {
+    let address = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, endpoint.port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, IPC_TIMEOUT) else {
         return false;
     };
     let _ = stream.set_read_timeout(Some(IPC_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IPC_TIMEOUT));
 
-    if write_message(&mut stream, paths).is_err() {
+    if stream.write_all(&endpoint.token).is_err() || write_message(&mut stream, paths).is_err() {
         return false;
     }
 
@@ -112,7 +157,7 @@ fn write_message(stream: &mut impl Write, paths: &[PathBuf]) -> io::Result<()> {
 fn read_message(stream: &mut impl Read) -> io::Result<Vec<PathBuf>> {
     let mut magic = vec![0_u8; MAGIC.len()];
     stream.read_exact(&mut magic)?;
-    if &magic != MAGIC {
+    if magic != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unexpected LawPDF IPC magic",

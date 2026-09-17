@@ -73,18 +73,120 @@ pub(super) fn lm2_fast_cache_path(
     use_pymupdf_blocks.hash(&mut hasher);
     use_pp_footnote_regions.hash(&mut hasher);
     runtime_choice.hash(&mut hasher);
-    let mut runtime_env = std::env::vars_os()
-        .filter_map(|(name, value)| {
-            let name = name.to_string_lossy();
-            (name.starts_with("LAWPDF_LM2_") || name == "LAWPDF_LMV")
-                .then_some((name.into_owned(), value.to_string_lossy().into_owned()))
-        })
-        .collect::<Vec<_>>();
-    runtime_env.sort();
-    runtime_env.hash(&mut hasher);
+    runtime_fingerprint().hash(&mut hasher);
     let key = hasher.finish();
     app_data_dir().map(|dir| {
         dir.join("liquid2-fast-cache")
             .join(format!("{key:016x}.pointer"))
     })
+}
+
+pub(super) fn runtime_fingerprint() -> u64 {
+    use super::*;
+    let mut environment = std::env::vars_os()
+        .filter(|(name, _)| {
+            let name = name.to_string_lossy();
+            name.starts_with("LAWPDF_LM2_") || name == "LAWPDF_LMV" || name == "LAWPDF_MODEL_DIR"
+        })
+        .collect::<Vec<_>>();
+    environment.sort();
+    let mut assets = Vec::new();
+    for (directory, name) in [
+        (
+            LM2_NATIVE_CATBOOST_RUNTIME_DIR,
+            LM2_NATIVE_CATBOOST_MODEL_FILE,
+        ),
+        (
+            LM2_NATIVE_CATBOOST_RUNTIME_DIR,
+            lm2_native_catboost_library_file(),
+        ),
+        (LM2_FASTTAB_RUNTIME_DIR, LM2_FASTTAB_MODEL_FILE),
+        (
+            LM2_CONTEXT_TWOPASS_RUNTIME_DIR,
+            LM2_CONTEXT_TWOPASS_MODEL_FILE,
+        ),
+        (
+            LM2_CONTEXT_TWOPASS_RUNTIME_DIR,
+            LM2_CONTEXT_ARBITER_MODEL_FILE,
+        ),
+        (LM2_NOTE_HEAD_RUNTIME_DIR, LM2_NOTE_HEAD_MODEL_FILE),
+        (LM2_LINK_RANKER_RUNTIME_DIR, LM2_LINK_RANKER_MODEL_FILE),
+        ("profile-models/lm2-current", "lm2-model.json"),
+    ] {
+        assets.extend(lm2_runtime_asset_candidates(directory, name));
+    }
+    assets.extend(
+        environment
+            .iter()
+            .map(|(_, value)| PathBuf::from(value))
+            .filter(|path| path.is_file()),
+    );
+    fingerprint_for(
+        LM2_ASSEMBLY_CACHE_VERSION,
+        include_bytes!("../../release-manifest.json"),
+        &environment,
+        &assets,
+    )
+}
+
+fn fingerprint_for(
+    assembly: &str,
+    manifest: &[u8],
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+    assets: &[PathBuf],
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    assembly.hash(&mut hasher);
+    env!("CARGO_PKG_VERSION").hash(&mut hasher);
+    manifest.hash(&mut hasher);
+    environment.hash(&mut hasher);
+    for path in assets {
+        path.hash(&mut hasher);
+        std::fs::metadata(path)
+            .ok()
+            .map(|metadata| (metadata.len(), metadata.modified().ok()))
+            .hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_identity_changes_with_assembly_manifest_and_runtime_assets() {
+        let path = std::env::temp_dir().join(format!(
+            "lawpdf-cache-model-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let assets = vec![path.clone()];
+        let before = fingerprint_for("assembly-1", b"release-1", &[], &assets);
+        assert_ne!(
+            before,
+            fingerprint_for("assembly-2", b"release-1", &[], &assets)
+        );
+        assert_ne!(
+            before,
+            fingerprint_for("assembly-1", b"release-2", &[], &assets)
+        );
+        std::fs::write(&path, b"model one").unwrap();
+        let present = fingerprint_for("assembly-1", b"release-1", &[], &assets);
+        assert_ne!(before, present);
+        std::fs::write(&path, b"replacement model two").unwrap();
+        assert_ne!(
+            present,
+            fingerprint_for("assembly-1", b"release-1", &[], &assets)
+        );
+        let environment = vec![("LAWPDF_MODEL_DIR".into(), "alternative-models".into())];
+        assert_ne!(
+            fingerprint_for("assembly-1", b"release-1", &[], &assets),
+            fingerprint_for("assembly-1", b"release-1", &environment, &assets)
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 }

@@ -1,29 +1,35 @@
 name: Release
 
 on:
+  pull_request:
   push:
     tags:
       - "v*"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   windows:
     name: Windows x64
+    timeout-minutes: 90
     runs-on: windows-latest
     env:
       CARGO_TARGET_DIR: C:\tmp\lawpdf-target
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Configure Rust
         shell: pwsh
         run: |
-          rustup default stable
+          rustup show active-toolchain
           rustup target add x86_64-pc-windows-msvc
 
       - name: Fetch pinned CatBoost runtime
@@ -43,11 +49,10 @@ jobs:
           }
           python @arguments
 
-      - name: Run updater and settings regression tests
+      - name: Run all regression tests
         shell: pwsh
         run: |
-          cargo test --release --locked --target x86_64-pc-windows-msvc settings::tests
-          cargo test --release --locked --target x86_64-pc-windows-msvc updater::tests
+          cargo test --release --locked --target x86_64-pc-windows-msvc
 
       - name: Build release
         shell: pwsh
@@ -98,36 +103,52 @@ jobs:
           }
           Set-Content -LiteralPath dist\SHA256SUMS-windows.txt -Value $lines -Encoding ascii
 
+      - name: Install the exact Windows release and verify it
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $installer = 'dist/LawPDFSetup-x64.exe'
+          $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+          ./scripts/verify-windows-install.ps1 -Installer $installer -ExpectedVersion $version -ExpectedSha256 $hash
+
+      - name: Upload Windows installation evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: LawPDF-Windows-installation-evidence
+          path: C:/tmp/lawpdf-install-evidence
+          retention-days: 14
+
       - name: Upload portable artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: LawPDF-windows-portable-x64
           path: dist/LawPDF-windows-portable-x64.zip
 
       - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: LawPDFSetup-x64
           path: dist/LawPDFSetup-x64.exe
 
       - name: Upload Windows checksum fragment
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: LawPDF-SHA256SUMS-windows
           path: dist/SHA256SUMS-windows.txt
 
   macos:
     name: macOS arm64
+    timeout-minutes: 90
     runs-on: macos-15
     env:
       CARGO_TARGET_DIR: /tmp/lawpdf-target
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Configure Rust
-        run: rustup default stable
+        run: rustup show active-toolchain
 
       - name: Verify release manifest and assets
         run: |
@@ -137,10 +158,9 @@ jobs:
           fi
           python3 tools/verify_release_manifest.py "${args[@]}"
 
-      - name: Run updater and settings regression tests
+      - name: Run all regression tests
         run: |
-          cargo test --release --locked settings::tests
-          cargo test --release --locked updater::tests
+          cargo test --release --locked
 
       - name: Build and verify app bundle
         run: bash scripts/package-macos.sh
@@ -149,50 +169,57 @@ jobs:
         run: (cd dist && shasum -a 256 LawPDF-macos.zip > SHA256SUMS-macos.txt)
 
       - name: Upload macOS artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: LawPDF-macos
           path: dist/LawPDF-macos.zip
 
       - name: Upload macOS checksum fragment
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: LawPDF-SHA256SUMS-macos
           path: dist/SHA256SUMS-macos.txt
 
   publish:
-    name: Publish tagged release
+    name: Prepare tagged release for maintainer signing
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    timeout-minutes: 20
     if: startsWith(github.ref, 'refs/tags/')
     needs: [windows, macos]
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout manifest utility
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Download Windows portable
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: LawPDF-windows-portable-x64
           path: dist
 
       - name: Download Windows installer
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: LawPDFSetup-x64
           path: dist
 
       - name: Download macOS package
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: LawPDF-macos
           path: dist
 
       - name: Download Windows checksum fragment
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: LawPDF-SHA256SUMS-windows
           path: checksums
 
       - name: Download macOS checksum fragment
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: LawPDF-SHA256SUMS-macos
           path: checksums
@@ -201,6 +228,14 @@ jobs:
         run: |
           cat checksums/SHA256SUMS-windows.txt checksums/SHA256SUMS-macos.txt > dist/SHA256SUMS.txt
           (cd dist && sha256sum --check SHA256SUMS.txt)
+
+      - name: Create release authentication payload
+        run: python tools/make_update_manifest.py --directory dist --version "${GITHUB_REF_NAME#v}" --commit "$GITHUB_SHA"
+
+      - name: Attest package provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: 'dist/LawPDF*'
 
       - name: Publish GitHub release
         env:
@@ -212,11 +247,13 @@ jobs:
             dist/LawPDFSetup-x64.exe
             dist/LawPDF-macos.zip
             dist/SHA256SUMS.txt
+            dist/UPDATE-MANIFEST.json
           )
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+            echo "A release already exists. Refusing to overwrite published artifacts." >&2
+            exit 1
           else
-            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" --draft \
               --title "LawPDF $GITHUB_REF_NAME" \
-              --notes "Verified Windows x64 and macOS packages."
+              --notes "Release candidate awaiting maintainer review and UPDATE-MANIFEST.sig. See docs/RELEASING.md for signing, installation evidence, and publication gates."
           fi

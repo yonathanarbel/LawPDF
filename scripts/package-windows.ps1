@@ -7,7 +7,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-$targetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $repoRoot "target" }
+$targetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { 'C:\tmp\lawpdf-target' }
 $targetDir = Join-Path $targetRoot $Configuration
 $exeName = "lawpdf.exe"
 $exePath = Join-Path $targetDir $exeName
@@ -65,7 +65,11 @@ Copy-Item -LiteralPath (Join-Path $repoRoot "vendor\pdfium.dll") -Destination (J
 Copy-Item -LiteralPath (Join-Path $repoRoot "vendor\fonts\EBGaramond.ttf") -Destination (Join-Path $portableDir "fonts\EBGaramond.ttf") -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot "LICENSE") -Destination (Join-Path $portableDir "LICENSE") -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot "THIRD_PARTY_NOTICES.md") -Destination (Join-Path $portableDir "THIRD_PARTY_NOTICES.md") -Force
-Copy-Item -LiteralPath (Join-Path $repoRoot "THIRD_PARTY_RUST_LICENSES.csv") -Destination (Join-Path $portableDir "THIRD_PARTY_RUST_LICENSES.csv") -Force
+Push-Location $repoRoot
+try {
+    python tools/package_rust_notices.py --target x86_64-pc-windows-msvc --destination $portableDir
+    if ($LASTEXITCODE -ne 0) { throw "Rust license packaging failed." }
+} finally { Pop-Location }
 Copy-Item -LiteralPath (Join-Path $repoRoot "release-manifest.json") -Destination (Join-Path $portableDir "release-manifest.json") -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot "third_party") -Destination (Join-Path $portableDir "third_party") -Recurse -Force
 

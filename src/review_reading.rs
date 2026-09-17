@@ -1016,7 +1016,6 @@ pub fn find_hits_in_review_blocks(blocks: &[LiquidBlock], query: &str) -> Vec<Re
     if needle.is_empty() {
         return Vec::new();
     }
-    let needle_lower = needle.to_ascii_lowercase();
     let mut hits = Vec::new();
     for (block_index, block) in blocks.iter().enumerate() {
         if matches!(
@@ -1030,38 +1029,16 @@ pub fn find_hits_in_review_blocks(blocks: &[LiquidBlock], query: &str) -> Vec<Re
         {
             continue;
         }
-        let haystack = block.text.to_ascii_lowercase();
-        let mut from = 0usize;
-        while let Some(rel) = haystack[from..].find(&needle_lower) {
-            let match_start = from + rel;
-            let match_end = match_start + needle_lower.len();
+        for range in crate::text_search::match_ranges(&block.text, needle) {
             hits.push(ReviewSearchHit {
                 block_index,
-                match_start,
-                match_end,
-                snippet: review_hit_snippet(&block.text, match_start, match_end),
+                match_start: range.start,
+                match_end: range.end,
+                snippet: crate::text_search::snippet(&block.text, range, 24),
             });
-            from = match_end;
-            if from >= haystack.len() {
-                break;
-            }
         }
     }
     hits
-}
-
-fn review_hit_snippet(text: &str, match_start: usize, match_end: usize) -> String {
-    let start = match_start.saturating_sub(24);
-    let end = (match_end + 24).min(text.len());
-    let mut snippet = String::new();
-    if start > 0 {
-        snippet.push('…');
-    }
-    snippet.push_str(text.get(start..end).unwrap_or(text));
-    if end < text.len() {
-        snippet.push('…');
-    }
-    snippet
 }
 
 pub fn review_document_plain_text(document: &LiquidDocument) -> String {

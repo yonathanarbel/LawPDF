@@ -12,11 +12,12 @@ const FASTTAB_TEXT_BYTES: usize = 256;
 const FASTTAB_TEXT_HEAD_BYTES: usize = 192;
 const FASTTAB_BATCH_SIZE: usize = 128;
 
-type FastTabPlan = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+type FastTabPlan = Arc<TypedRunnableModel>;
 
 pub(super) struct Lm2FastTabModel {
     model: FastTabPlan,
     path: PathBuf,
+    asset_sha256: String,
 }
 
 impl fmt::Debug for Lm2FastTabModel {
@@ -57,12 +58,21 @@ impl Lm2FastTabModel {
             .map_err(|error| format!("Could not optimize FastTab ONNX model: {error}"))?
             .into_runnable()
             .map_err(|error| format!("Could not prepare FastTab ONNX model: {error}"))?;
-        let runtime = Self { model, path };
+        let asset_sha256 = sha256_hex_of_file(&path)?;
+        let runtime = Self {
+            model,
+            path,
+            asset_sha256,
+        };
         let probe = runtime.run_encoded(&vec![0.0; 116], &vec![0; 14], &vec![0; 256], 1)?;
         if probe.len() != 1 || !probe[0].iter().all(|value| value.is_finite()) {
             return Err("FastTab ONNX load probe returned invalid scores".to_owned());
         }
         Ok(runtime)
+    }
+
+    pub(super) fn label(&self) -> String {
+        format!("lm2-fasttab-onnx:f116c14b256d3:sha{}", self.asset_sha256)
     }
 
     pub(super) fn emission_scores(
@@ -130,7 +140,7 @@ impl Lm2FastTabModel {
         let scores = outputs
             .first()
             .ok_or_else(|| "FastTab ONNX returned no outputs".to_owned())?
-            .to_array_view::<f32>()
+            .to_plain_array_view::<f32>()
             .map_err(|error| format!("FastTab ONNX output was not f32: {error}"))?;
         if scores.shape() != [batch, 3] {
             return Err(format!(
@@ -210,6 +220,25 @@ fn encode_text(value: &str) -> [i64; FASTTAB_TEXT_BYTES] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_fasttab_model_runs_single_and_batched_inference() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("profile-models/lm2-fasttab-runtime/fasttab-v1.onnx");
+        let model = Lm2FastTabModel::load_path(path).expect("bundled FastTab model must load");
+        for batch in [1, 2] {
+            let scores = model
+                .run_encoded(
+                    &vec![0.0; 116 * batch],
+                    &vec![0; 14 * batch],
+                    &vec![0; 256 * batch],
+                    batch,
+                )
+                .expect("bundled FastTab model must execute");
+            assert_eq!(scores.len(), batch);
+            assert!(scores.iter().flatten().all(|value| value.is_finite()));
+        }
+    }
 
     #[test]
     fn category_hash_matches_training_encoder() {

@@ -1,15 +1,62 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use eframe::egui::Context;
 
+use crate::document_store::{DocumentStore, FileRevision};
 use crate::model::{EditorAnnotation, LoadedDocument, PageTextChar, RenderedPage};
-use crate::pdf_backend::{PdfEngine, RenderQuality, rotate_pdf_page, sync_lawpdf_comments};
+use crate::pdf_backend::{PdfEngine, RenderQuality, SaveReport, rotate_pdf_page_checked};
+
+#[derive(Debug)]
+pub struct OpenedDocument {
+    pub document: LoadedDocument,
+    pub revision: FileRevision,
+    pub annotations: Vec<EditorAnnotation>,
+    pub recovery_pending: bool,
+}
+
+/// UI producers never wait for capacity. Saves and explicit document commands
+/// have their own queue so speculative page/text work cannot starve them.
+#[derive(Clone)]
+pub struct RenderSender {
+    urgent: Sender<RenderRequest>,
+    background: Sender<RenderRequest>,
+    live_documents: Arc<Mutex<Option<HashSet<u64>>>>,
+}
+
+impl RenderSender {
+    /// Cancel speculative work when its tab closes. Writes are deliberately
+    /// excluded: a queued save must still report its actual outcome.
+    pub fn set_live_documents(&self, epochs: impl IntoIterator<Item = u64>) {
+        *self.live_documents.lock().unwrap_or_else(|error| error.into_inner()) = Some(epochs.into_iter().collect());
+    }
+
+    pub fn send(&self, request: RenderRequest) -> Result<(), TrySendError<RenderRequest>> {
+        if request_priority(&request) == 0 {
+            self.urgent.try_send(request)
+        } else {
+            self.background.try_send(request)
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<Sender<RenderRequest>> for RenderSender {
+    fn from(sender: Sender<RenderRequest>) -> Self {
+        Self {
+            urgent: sender.clone(),
+            background: sender,
+            live_documents: Arc::new(Mutex::new(None)),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PageRenderKey {
+    pub editor_annotations: bool,
     pub document_epoch: u64,
     pub page_index: usize,
     pub render_scale_key: u32,
@@ -18,6 +65,7 @@ pub struct PageRenderKey {
 impl PageRenderKey {
     pub fn new(document_epoch: u64, page_index: usize, render_scale: f32) -> Self {
         Self {
+            editor_annotations: true,
             document_epoch,
             page_index,
             render_scale_key: float_key(render_scale),
@@ -44,6 +92,14 @@ impl ThumbnailRenderKey {
 
 #[derive(Debug)]
 pub enum RenderRequest {
+    PrepareSources {
+        paths: Vec<PathBuf>,
+        defer_background: bool,
+    },
+    OpenDocument {
+        path: PathBuf,
+        optimize_large_documents: bool,
+    },
     LoadDocument {
         path: PathBuf,
         optimize_large_documents: bool,
@@ -89,22 +145,40 @@ pub enum RenderRequest {
         scale: f32,
         reply: Sender<Result<(), String>>,
     },
-    SyncComments {
+    SaveAnnotations {
+        source: PathBuf,
+        destination: PathBuf,
+        annotations: Vec<EditorAnnotation>,
+        reply: Sender<Result<SaveReport, String>>,
+    },
+    AutosaveAnnotations {
         document_epoch: u64,
         path: PathBuf,
         generation: u64,
-        comments: Vec<EditorAnnotation>,
+        annotations: Vec<EditorAnnotation>,
+        expected_revision: FileRevision,
     },
     RotatePage {
         document_epoch: u64,
         path: PathBuf,
         page_index: usize,
         clockwise: bool,
+        expected_revision: FileRevision,
     },
 }
 
 #[derive(Debug)]
 pub enum RenderEvent {
+    SourcesPrepared {
+        paths: Vec<PathBuf>,
+        converted: usize,
+        errors: Vec<String>,
+        defer_background: bool,
+    },
+    DocumentOpened {
+        path: PathBuf,
+        result: Result<OpenedDocument, String>,
+    },
     DocumentEnriched {
         document_epoch: u64,
         path: PathBuf,
@@ -134,44 +208,114 @@ pub enum RenderEvent {
         page_index: usize,
         result: Result<String, String>,
     },
-    CommentsSaved {
+    AnnotationsSaved {
         document_epoch: u64,
         path: PathBuf,
         generation: u64,
-        result: Result<usize, String>,
+        result: Result<SaveReport, String>,
     },
     PageRotated {
         document_epoch: u64,
         path: PathBuf,
         page_index: usize,
-        result: Result<(LoadedDocument, i64), String>,
+        result: Result<(LoadedDocument, i64, FileRevision, Vec<EditorAnnotation>), String>,
     },
+}
+
+pub fn save_annotations(
+    worker: &RenderSender,
+    source: &std::path::Path,
+    destination: &std::path::Path,
+    annotations: &[EditorAnnotation],
+) -> Result<SaveReport, String> {
+    let (reply, result) = unbounded();
+    worker
+        .send(RenderRequest::SaveAnnotations {
+            source: source.to_path_buf(),
+            destination: destination.to_path_buf(),
+            annotations: annotations.to_vec(),
+            reply,
+        })
+        .map_err(|error| format!("PDF worker is not available: {error}"))?;
+    // A timeout could report failure while a queued save still modifies the file.
+    result
+        .recv()
+        .map_err(|error| format!("PDF worker stopped before confirming the save: {error}"))?
 }
 
 pub fn spawn_render_worker(
     repaint_context: Option<Context>,
-) -> (Sender<RenderRequest>, Receiver<RenderEvent>) {
-    let (request_tx, request_rx) = unbounded();
-    let (event_tx, event_rx) = unbounded();
+) -> (RenderSender, Receiver<RenderEvent>) {
+    let (urgent_tx, urgent_rx) = bounded(64);
+    let (request_tx, request_rx) = bounded(128);
+    let (event_tx, event_rx) = bounded(8);
+    let live_documents = Arc::new(Mutex::new(None::<HashSet<u64>>));
+    let worker_documents = live_documents.clone();
 
     thread::spawn(move || {
-        let engine = match PdfEngine::new() {
-            Ok(engine) => engine,
-            Err(error) => {
-                let message = error.to_string();
-                while let Ok(request) = request_rx.recv() {
-                    let _ = event_tx.send(error_event(request, message.clone()));
-                }
-                return;
-            }
-        };
-
+        let mut engine = None;
         let mut backlog = VecDeque::new();
         loop {
-            let Some(request) = next_prioritized_request(&request_rx, &mut backlog) else {
+            let Some(request) = next_worker_request(&urgent_rx, &request_rx, &mut backlog) else {
                 break;
             };
+            let epoch = cancellable_epoch(&request);
+            let cancelled = || epoch.is_some_and(|epoch| {
+                worker_documents.lock().unwrap_or_else(|error| error.into_inner())
+                    .as_ref().is_some_and(|live| !live.contains(&epoch))
+            });
+            if cancelled() { continue; }
+            if engine.is_none() {
+                match PdfEngine::new() {
+                    Ok(ready) => engine = Some(ready),
+                    Err(error) => {
+                        let _ = event_tx.send(error_event(request, error.to_string()));
+                        if let Some(ctx) = &repaint_context {
+                            ctx.request_repaint();
+                        }
+                        continue;
+                    }
+                }
+            }
+            let engine = engine.as_ref().expect("initialized PDF worker");
             let event = match request {
+                RenderRequest::PrepareSources {
+                    paths,
+                    defer_background,
+                } => {
+                    let (paths, converted, errors) = crate::app::prepare_open_paths(paths);
+                    RenderEvent::SourcesPrepared {
+                        paths,
+                        converted,
+                        errors,
+                        defer_background,
+                    }
+                }
+                RenderRequest::OpenDocument {
+                    path,
+                    optimize_large_documents,
+                } => {
+                    engine.close_document(&path);
+                    let result = (|| {
+                        let revision = DocumentStore::new()?.capture(&path)?;
+                        let document = engine
+                            .load_document_adaptive(&path, optimize_large_documents)
+                            .map_err(|error| format!("{error:#}"))?;
+                        let annotations = crate::pdf_backend::load_lawpdf_annotations(&path)
+                            .map_err(|error| {
+                                format!("Could not read PDF annotations: {error:#}")
+                            })?;
+                        revision.require_current(&path)?;
+                        let recovery_pending = DocumentStore::new()?.pending_for(&path)?.is_some();
+                        Ok(OpenedDocument {
+                            document,
+                            revision,
+                            annotations,
+                            recovery_pending,
+                        })
+                    })();
+                    RenderEvent::DocumentOpened { path, result }
+                }
                 RenderRequest::LoadDocument {
                     path,
                     optimize_large_documents,
@@ -230,7 +374,7 @@ pub fn spawn_render_worker(
                     _zoom: zoom,
                     render_scale,
                     result: engine
-                        .render_page_with_quality(
+                        .render_page_internal(
                             &path,
                             key.page_index,
                             render_scale,
@@ -239,6 +383,7 @@ pub fn spawn_render_worker(
                             } else {
                                 RenderQuality::Crisp
                             },
+                            key.editor_annotations,
                         )
                         .map_err(|error| error.to_string()),
                 },
@@ -273,11 +418,12 @@ pub fn spawn_render_worker(
                     key,
                     path: path.clone(),
                     result: engine
-                        .render_page_with_quality(
+                        .render_page_internal(
                             &path,
                             key.page_index,
                             render_scale,
                             RenderQuality::Fast,
+                            false,
                         )
                         .map_err(|error| error.to_string()),
                 },
@@ -295,19 +441,53 @@ pub fn spawn_render_worker(
                     );
                     continue;
                 }
-                RenderRequest::SyncComments {
+                RenderRequest::SaveAnnotations {
+                    source,
+                    destination,
+                    annotations,
+                    reply,
+                } => {
+                    engine.close_document(&source);
+                    engine.close_document(&destination);
+                    let result = crate::pdf_backend::save_with_annotations(
+                        &source,
+                        &destination,
+                        &annotations,
+                    )
+                    .map_err(|error| format!("{error:#}"));
+                    let _ = reply.send(result);
+                    continue;
+                }
+                RenderRequest::AutosaveAnnotations {
                     document_epoch,
                     path,
                     generation,
-                    comments,
+                    annotations,
+                    expected_revision,
                 } => {
                     engine.close_document(&path);
-                    RenderEvent::CommentsSaved {
+                    let result = crate::pdf_backend::save_with_annotations_checked(
+                        &path,
+                        &path,
+                        &annotations,
+                        &expected_revision,
+                    )
+                    .map_err(|error| format!("{error:#}"))
+                    .map(|mut report| {
+                        if let Some(revision) = &report.revision {
+                            report.recovery_warning = DocumentStore::new()
+                                .and_then(|store| {
+                                    store.acknowledge_saved_file(&path, generation, revision)
+                                })
+                                .err();
+                        }
+                        report
+                    });
+                    RenderEvent::AnnotationsSaved {
                         document_epoch,
                         path: path.clone(),
                         generation,
-                        result: sync_lawpdf_comments(&path, &comments)
-                            .map_err(|error| error.to_string()),
+                        result,
                     }
                 }
                 RenderRequest::RotatePage {
@@ -315,15 +495,19 @@ pub fn spawn_render_worker(
                     path,
                     page_index,
                     clockwise,
+                    expected_revision,
                 } => {
                     engine.close_document(&path);
-                    let result = rotate_pdf_page(&path, page_index, clockwise)
-                        .and_then(|rotation| {
-                            engine
-                                .load_document_adaptive(&path, true)
-                                .map(|document| (document, rotation))
-                        })
-                        .map_err(|error| error.to_string());
+                    let result =
+                        rotate_pdf_page_checked(&path, page_index, clockwise, &expected_revision)
+                            .and_then(|(rotation, revision)| {
+                                let annotations =
+                                    crate::pdf_backend::load_lawpdf_annotations(&path)?;
+                                engine
+                                    .load_document_adaptive(&path, true)
+                                    .map(|document| (document, rotation, revision, annotations))
+                            })
+                            .map_err(|error| error.to_string());
                     RenderEvent::PageRotated {
                         document_epoch,
                         path: path.clone(),
@@ -333,6 +517,7 @@ pub fn spawn_render_worker(
                 }
             };
 
+            if cancelled() { continue; }
             if event_tx.send(event).is_ok() {
                 if let Some(ctx) = &repaint_context {
                     ctx.request_repaint();
@@ -341,7 +526,42 @@ pub fn spawn_render_worker(
         }
     });
 
-    (request_tx, event_rx)
+    (
+        RenderSender {
+            urgent: urgent_tx,
+            background: request_tx,
+            live_documents,
+        },
+        event_rx,
+    )
+}
+
+fn cancellable_epoch(request: &RenderRequest) -> Option<u64> {
+    match request {
+        RenderRequest::Page { key, .. } => Some(key.document_epoch),
+        RenderRequest::Thumbnail { key, .. } => Some(key.document_epoch),
+        RenderRequest::EnrichDocument { document_epoch, .. }
+        | RenderRequest::TextCharsAsync { document_epoch, .. }
+        | RenderRequest::TextPageAsync { document_epoch, .. } => Some(*document_epoch),
+        _ => None,
+    }
+}
+
+fn next_worker_request(
+    urgent: &Receiver<RenderRequest>,
+    background: &Receiver<RenderRequest>,
+    backlog: &mut VecDeque<RenderRequest>,
+) -> Option<RenderRequest> {
+    if let Ok(request) = urgent.try_recv() {
+        return Some(request);
+    }
+    if backlog.is_empty() && background.is_empty() {
+        crossbeam_channel::select_biased! {
+            recv(urgent) -> request => return request.ok(),
+            recv(background) -> request => backlog.push_back(request.ok()?),
+        }
+    }
+    next_prioritized_request(background, backlog)
 }
 
 fn next_prioritized_request(
@@ -351,7 +571,9 @@ fn next_prioritized_request(
     if backlog.is_empty() {
         backlog.push_back(request_rx.recv().ok()?);
     }
-    while let Ok(request) = request_rx.try_recv() {
+    while backlog.len() < 128
+        && let Ok(request) = request_rx.try_recv()
+    {
         push_coalesced(backlog, request);
     }
     let best = backlog
@@ -375,10 +597,13 @@ fn push_coalesced(backlog: &mut VecDeque<RenderRequest>, request: RenderRequest)
 
 fn request_priority(request: &RenderRequest) -> u8 {
     match request {
-        RenderRequest::LoadDocument { .. }
+        RenderRequest::PrepareSources { .. }
+        | RenderRequest::OpenDocument { .. }
+        | RenderRequest::LoadDocument { .. }
         | RenderRequest::PageImmediate { .. }
         | RenderRequest::ExportPagePng { .. }
-        | RenderRequest::SyncComments { .. }
+        | RenderRequest::SaveAnnotations { .. }
+        | RenderRequest::AutosaveAnnotations { .. }
         | RenderRequest::RotatePage { .. } => 0,
         RenderRequest::Page { .. } => 1,
         RenderRequest::EnrichDocument { .. } => 2,
@@ -432,6 +657,18 @@ fn coalescing_target(request: &RenderRequest) -> Option<(u64, usize, PathBuf, bo
 
 fn error_event(request: RenderRequest, message: String) -> RenderEvent {
     match request {
+        RenderRequest::PrepareSources {
+            defer_background, ..
+        } => RenderEvent::SourcesPrepared {
+            paths: Vec::new(),
+            converted: 0,
+            errors: vec![message],
+            defer_background,
+        },
+        RenderRequest::OpenDocument { path, .. } => RenderEvent::DocumentOpened {
+            path,
+            result: Err(message),
+        },
         RenderRequest::LoadDocument { reply, .. } => {
             let _ = reply.send(Err(message));
             RenderEvent::Thumbnail {
@@ -494,6 +731,14 @@ fn error_event(request: RenderRequest, message: String) -> RenderEvent {
             path,
             result: Err(message),
         },
+        RenderRequest::SaveAnnotations { reply, .. } => {
+            let _ = reply.send(Err(message));
+            RenderEvent::Thumbnail {
+                key: ThumbnailRenderKey::new(0, 0, 0.0),
+                path: PathBuf::new(),
+                result: Err("PDF worker failed before saving annotations".to_owned()),
+            }
+        }
         RenderRequest::ExportPagePng { reply, .. } => {
             let _ = reply.send(Err(message));
             RenderEvent::Thumbnail {
@@ -502,12 +747,12 @@ fn error_event(request: RenderRequest, message: String) -> RenderEvent {
                 result: Err("PDF worker failed before exporting PNG".to_owned()),
             }
         }
-        RenderRequest::SyncComments {
+        RenderRequest::AutosaveAnnotations {
             document_epoch,
             path,
             generation,
             ..
-        } => RenderEvent::CommentsSaved {
+        } => RenderEvent::AnnotationsSaved {
             document_epoch,
             path,
             generation,
@@ -695,6 +940,70 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn annotation_saves_replace_pdfs_after_pdfium_has_cached_both_paths() {
+        use crate::model::{AnnotationKind, MarkerStyle, PdfRect};
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("lawpdf-worker-save-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.pdf");
+        let destination = dir.join("destination.pdf");
+        write_blank_pdf(&source);
+        write_blank_pdf(&destination);
+        let (worker, _events) = spawn_render_worker(None);
+        let render = |path: &Path| {
+            let (reply, result) = unbounded();
+            worker
+                .send(RenderRequest::PageImmediate {
+                    path: path.to_path_buf(),
+                    page_index: 0,
+                    render_scale: 0.5,
+                    fast: false,
+                    reply,
+                })
+                .unwrap();
+            result
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap()
+        };
+        render(&source);
+        render(&destination);
+        let annotations = [EditorAnnotation {
+            page_index: 0,
+            rect: PdfRect::new(72.0, 650.0, 220.0, 668.0),
+            kind: AnnotationKind::Marker {
+                color_rgb: [1.0, 0.93, 0.45],
+                opacity: 0.42,
+                style: MarkerStyle::Highlight,
+            },
+        }];
+        save_annotations(&worker, &source, &source, &annotations).unwrap();
+        assert_eq!(
+            crate::pdf_backend::load_lawpdf_annotations(&source)
+                .unwrap()
+                .len(),
+            1
+        );
+        render(&source);
+        save_annotations(&worker, &source, &destination, &annotations).unwrap();
+        assert_eq!(
+            crate::pdf_backend::load_lawpdf_annotations(&destination)
+                .unwrap()
+                .len(),
+            1
+        );
+        render(&destination);
+        // Save again to release the reopened PDFium handle before cleanup.
+        save_annotations(&worker, &destination, &destination, &annotations).unwrap();
+        drop(worker);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -4,11 +4,26 @@ use crossbeam_channel::Sender;
 use objc2::rc::Retained;
 use objc2::runtime::Sel;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
-use objc2_foundation::{NSAppleEventDescriptor, NSAppleEventManager, NSObject, NSObjectProtocol};
+use objc2_foundation::{
+    NSAppleEventDescriptor, NSAppleEventManager, NSObject, NSObjectProtocol, NSUserDefaults,
+    ns_string,
+};
 
 const CORE_EVENT_CLASS: u32 = u32::from_be_bytes(*b"aevt");
 const OPEN_DOCUMENTS_EVENT: u32 = u32::from_be_bytes(*b"odoc");
 const DIRECT_OBJECT_KEYWORD: u32 = u32::from_be_bytes(*b"----");
+
+/// Keep AppKit from creating its automatic Touch Bar responder observer.
+///
+/// LawPDF does not provide Touch Bar controls. On affected macOS releases,
+/// AppKit's automatic observer can nevertheless remove the same KVO
+/// registration twice while the window responder chain changes, terminating
+/// the app in `_NSTouchBarFinderObservation::invalidate`. Install this default
+/// before `eframe` asks AppKit to create `NSApplication` or any windows.
+pub fn install_appkit_crash_workarounds() {
+    NSUserDefaults::standardUserDefaults()
+        .setBool_forKey(false, ns_string!("NSFunctionBarAPIEnabled"));
+}
 
 struct OpenDocumentsHandlerIvars {
     sender: Sender<Vec<PathBuf>>,
@@ -59,6 +74,15 @@ impl OpenDocumentsRegistration {
     }
 }
 
+impl Drop for OpenDocumentsRegistration {
+    fn drop(&mut self) {
+        // Unregister while the main-thread handler is still alive. AppKit must
+        // not dispatch an open-document event into an application being torn down.
+        NSAppleEventManager::sharedAppleEventManager()
+            .removeEventHandlerForEventClass_andEventID(CORE_EVENT_CLASS, OPEN_DOCUMENTS_EVENT);
+    }
+}
+
 pub fn install(sender: Sender<Vec<PathBuf>>) -> OpenDocumentsRegistration {
     let mtm = MainThreadMarker::new().expect("LawPDF must start on the macOS main thread");
     let handler: Retained<OpenDocumentsHandler> = {
@@ -82,6 +106,21 @@ fn register_handler(handler: &OpenDocumentsHandler) {
             selector,
             CORE_EVENT_CLASS,
             OPEN_DOCUMENTS_EVENT,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disables_automatic_touch_bar_integration() {
+        install_appkit_crash_workarounds();
+
+        assert!(
+            !NSUserDefaults::standardUserDefaults()
+                .boolForKey(ns_string!("NSFunctionBarAPIEnabled"))
         );
     }
 }
