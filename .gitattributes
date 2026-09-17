@@ -28,3 +28,6 @@ profile-models/**/*.json binary
 *.pdf binary
 
 android/gradlew text eol=lf
+
+# Preserve the exact upstream license bytes recorded in the supplement manifest.
+third_party/rust-extra/** -text

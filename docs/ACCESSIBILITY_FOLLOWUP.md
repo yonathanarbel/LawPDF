@@ -36,3 +36,17 @@ The private snapshot is now opened with write access and no create/truncate opti
 The corrected application passed all clean desktop suites: Mac 1,077 production / 1,081 development; Windows 1,076 production / 1,080 development, plus the Markdown checks and dependency audit. The optimized Windows suite also passed 1,076 tests and its release executable built. Packaging then failed before installer creation because Python decoded Cargo's UTF-8 JSON with Windows CP1252. The license collector now explicitly reads UTF-8, including its supplemental manifest. The public-source exporter also explicitly reads UTF-8 and includes this approved follow-up evidence document. Application Rust code and runtime assets are unchanged by this packaging correction. A completed exact-installer check is still required; passing application tests alone does not certify packaging.
 
 The corrected license collector was also run locally with Python's preferred encoding forced to **US-ASCII** (`LC_ALL=C`, UTF-8 mode disabled). It successfully packaged all **399** Mac-target dependencies from the actual Cargo metadata; this directly exercises the non-UTF-8 locale failure mode. The Windows installer pipeline must still finish with this correction.
+
+
+Windows checkout preservation
+-----------------------------
+The next final packaging run reached the license integrity check and rejected an
+upstream AccessKit license. Git's automatic Windows line-ending conversion had
+changed the extensionless license text. The supplemental upstream license tree
+now disables text conversion so each checkout preserves the exact bytes recorded
+in its SHA-256 manifest. The package integrity check remains unchanged.
+
+Final targeted verification used two fresh checkouts with `core.autocrlf=true`.
+The previous revision changed 22 of the 36 supplemental license files; the
+corrected checkout matched all 36 recorded hashes. This exercises the checkout
+behavior that caused the Windows failure without weakening the integrity check.
