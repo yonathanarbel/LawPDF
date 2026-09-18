@@ -1,6 +1,6 @@
 # Native accessibility follow-up to the 0.2.32 release candidate
 
-This work is separate from candidate commit `eeff7e311b7d39dc2211dda2b2033ffdd6fc869b`, its source archive, and the installed 0.2.32 package. Those local identities remain unchanged. The reviewed candidate was subsequently submitted with permission as GitHub commit `e700c3724d9725bf63afe92aa84961baa07a89ad` in [draft PR #21](https://github.com/yonathanarbel/LawPDF/pull/21); its tree exactly matches the reviewed local snapshot.
+This document records follow-up work after the initial candidate `eeff7e311b7d39dc2211dda2b2033ffdd6fc869b`. That snapshot was submitted with permission as GitHub commit `e700c3724d9725bf63afe92aa84961baa07a89ad` in [draft PR #21](https://github.com/yonathanarbel/LawPDF/pull/21), with an exactly matching source tree. Subsequent PR revisions supersede the original package and CI status; the PR records current validation against its head. Earlier identities below describe their stated checks, not the newest installed package.
 
 Direct inspection of the installed Mac application's native accessibility tree found that custom-painted PDF pages exposed no document text. Marker and comment swatches lacked names, the page-number entry lacked a label, and tab-close controls were announced only as “x.”
 
@@ -50,3 +50,12 @@ Final targeted verification used two fresh checkouts with `core.autocrlf=true`.
 The previous revision changed 22 of the 36 supplemental license files; the
 corrected checkout matched all 36 recorded hashes. This exercises the checkout
 behavior that caused the Windows failure without weakening the integrity check.
+
+
+## Windows installation diagnostic collection
+
+The final Windows run `35288312687` built both packages, passed all 1,076 optimized tests, packaged all 397 dependency notices and passed both portable bundled-runtime checks. The installer completed and its product/file versions and Start Menu targets passed. The verifier then read an empty runtime result before the GUI-subsystem executable finished; the script failed and its closing output pipe caused a later stdout error from the child.
+
+The installation verifier now explicitly starts and waits for that exact process, captures stdout/stderr to evidence files, checks its exit code, and only then parses the runtime JSON. It retains the same required runtime checks and prints the non-secret installation evidence after success. This follows [Microsoft's documented Start-Process wait and output-redirection behavior](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/start-process). A successful rerun is still required; the earlier installed-runtime result is not counted as a pass.
+
+The final local Mac package was installed after the user's session closed. The installed executable SHA-256 is `440b3f80395bced6f939223cf5e47fc64805687ed805be388355dbbf2d8ea681`; both version fields are 0.2.32, bundle integrity and all required runtime checks passed, and the previous copy is retained at `/Applications/.LawPDF-before-final-0.2.32-20260917.app`. The installed interface reopened the synthetic saved highlight, exposed its page text through accessibility and quit with its worker. This local bundle is ad hoc signed and not notarized; it is not a downloaded CI artifact.

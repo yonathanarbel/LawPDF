@@ -33,18 +33,26 @@ foreach ($shortcut in $shortcuts) {
     if ([IO.Path]::GetFullPath($target) -ne [IO.Path]::GetFullPath($executable)) { throw 'A Start Menu shortcut targets a different LawPDF executable.' }
 }
 New-Item -ItemType Directory -Force -Path $EvidenceDirectory | Out-Null
-$statusText = & $executable --lm2-runtime-status --require-native --require-context --require-arbiter --require-note-head --require-link-ranker
-if ($LASTEXITCODE -ne 0) { throw 'Installed runtime verification failed.' }
-$status = ($statusText -join "`n") | ConvertFrom-Json
+# PowerShell can return immediately when directly invoking a GUI-subsystem EXE.
+# Wait for this exact process and retain its streams before interpreting the result.
+$statusPath = Join-Path $EvidenceDirectory 'runtime-status.json'
+$errorPath = Join-Path $EvidenceDirectory 'runtime-stderr.log'
+$runtime = Start-Process -FilePath $executable `
+    -ArgumentList @('--lm2-runtime-status', '--require-native', '--require-context', '--require-arbiter', '--require-note-head', '--require-link-ranker') `
+    -NoNewWindow -PassThru -Wait -RedirectStandardOutput $statusPath -RedirectStandardError $errorPath
+if ($runtime.ExitCode -ne 0) { throw "Installed runtime verification exited with $($runtime.ExitCode); see $errorPath." }
+$status = Get-Content -LiteralPath $statusPath -Raw -Encoding utf8 | ConvertFrom-Json
 if ($status.requirements_met -ne $true) { throw 'Installed runtime requirements were not met.' }
-Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'runtime-status.json') -Value ($statusText -join "`n") -Encoding utf8
 $evidence = [ordered]@{
     installer_sha256 = $actualHash.ToLowerInvariant()
     product_version = $info.ProductVersion
     file_version = $info.FileVersion
     executable = $executable
     start_menu_shortcuts = $shortcuts
+    runtime_exit_code = $runtime.ExitCode
     runtime_requirements_met = $status.requirements_met
     authenticode_status = (Get-AuthenticodeSignature -FilePath $Installer).Status.ToString()
 }
 $evidence | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'installation.json') -Encoding utf8
+$evidence | ConvertTo-Json -Depth 5
+Get-Content -LiteralPath $statusPath -Raw -Encoding utf8

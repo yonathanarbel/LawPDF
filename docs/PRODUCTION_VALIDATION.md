@@ -1,4 +1,6 @@
-# LawPDF 0.2.32 production candidate: final local evidence
+# LawPDF 0.2.32 initial candidate: historical local evidence
+
+This record describes the initial local candidate and package identified below. Later changes, installation identities and GitHub results supersede its then-open gates; see [the follow-up](ACCESSIBILITY_FOLLOWUP.md) and the current validation status in [draft PR #21](https://github.com/yonathanarbel/LawPDF/pull/21). In particular, the earlier submission block was resolved and the initial Mac package has since been replaced.
 
 **Assessment date: September 17, 2026. Decision: suitable for controlled Mac testing; not yet qualified for broad production distribution.**
 
