@@ -109,7 +109,8 @@ jobs:
           $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
           $installer = 'dist/LawPDFSetup-x64.exe'
           $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
-          ./scripts/verify-windows-install.ps1 -Installer $installer -ExpectedVersion $version -ExpectedSha256 $hash
+          $executableHash = (Get-FileHash -LiteralPath 'dist/LawPDF-portable/lawpdf.exe' -Algorithm SHA256).Hash
+          ./scripts/verify-windows-install.ps1 -Installer $installer -ExpectedVersion $version -ExpectedSha256 $hash -ExpectedExecutableSha256 $executableHash
 
       - name: Upload Windows installation evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
