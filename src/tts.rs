@@ -1,5 +1,5 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::thread;
 
@@ -55,7 +55,6 @@ pub enum PaidTtsEvent {
 pub fn spawn_paid_tts_job(request: PaidTtsRequest, tx: Sender<PaidTtsEvent>) {
     thread::spawn(move || {
         if let Err(error) = run_paid_tts_job(&request, &tx) {
-            let _ = fs::remove_file(request.destination.with_extension("mp3.part"));
             let _ = tx.send(PaidTtsEvent::Failed(error));
         }
     });
@@ -66,65 +65,66 @@ fn run_paid_tts_job(request: &PaidTtsRequest, tx: &Sender<PaidTtsEvent>) -> Resu
     if chunks.is_empty() {
         return Err("Nothing to narrate.".to_owned());
     }
-    let part_path = request.destination.with_extension("mp3.part");
-    let _ = fs::remove_file(&part_path);
-    let mut output = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&part_path)
-        .map_err(|error| format!("Could not create audio file: {error}"))?;
+    if chunks.len() > 1000 {
+        return Err(
+            "This narration exceeds the supported length. Export a shorter selection.".to_owned(),
+        );
+    }
     let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(120))
         .build()
-        .map_err(|error| format!("Could not start TTS client: {error}"))?;
-
-    for (index, chunk) in chunks.iter().enumerate() {
-        let response = client
-            .post(request.provider.endpoint())
-            .bearer_auth(&request.api_key)
-            .header("Content-Type", "application/json")
-            .header("HTTP-Referer", "https://github.com/yonathanarbel/lawpdf")
-            .header("X-Title", "Review Mode")
-            .json(&json!({
-                "model": request.provider.model(),
-                "input": chunk,
-                "voice": request.voice,
-                "response_format": "mp3"
-            }))
-            .send()
-            .map_err(|error| format!("{} TTS request failed: {error}", request.provider.label()))?;
-        let status = response.status();
-        if !status.is_success() {
-            let detail = response.text().unwrap_or_default();
-            let _ = fs::remove_file(&part_path);
-            return Err(format!(
-                "{} TTS returned {status}: {}",
-                request.provider.label(),
-                compact_error(&detail)
-            ));
+        .map_err(|_| "Could not start the speech service.".to_owned())?;
+    crate::atomic_file::replace_with(&request.destination, |output| {
+        let mut total_bytes = 0usize;
+        for (index, chunk) in chunks.iter().enumerate() {
+            let response = client.post(request.provider.endpoint())
+                .bearer_auth(&request.api_key)
+                .header("HTTP-Referer", "https://github.com/yonathanarbel/LawPDF")
+                .header("X-Title", "LawPDF")
+                .json(&json!({"model": request.provider.model(), "input": chunk, "voice": request.voice, "response_format": "mp3"}))
+                .send().map_err(|_| std::io::Error::other("The speech service could not be reached. Check your connection and retry."))?;
+            if !response.status().is_success() {
+                return Err(std::io::Error::other(format!("{} speech service returned HTTP {}. Check the provider account and voice settings.", request.provider.label(), response.status().as_u16())));
+            }
+            let mut bytes = Vec::new();
+            response.take(32 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+            total_bytes = total_bytes.saturating_add(bytes.len());
+            if bytes.is_empty() || bytes.len() > 32 * 1024 * 1024 || total_bytes > 1024 * 1024 * 1024 {
+                return Err(std::io::Error::other("The speech response exceeded the supported audio size."));
+            }
+            output.write_all(&bytes)?;
+            tx.send(PaidTtsEvent::Progress { completed: index + 1, total: chunks.len() })
+                .map_err(|_| std::io::Error::other("Audio export was canceled."))?;
         }
-        let bytes = response
-            .bytes()
-            .map_err(|error| format!("Could not read TTS audio: {error}"))?;
-        output
-            .write_all(&bytes)
-            .map_err(|error| format!("Could not save TTS audio: {error}"))?;
-        let _ = tx.send(PaidTtsEvent::Progress {
-            completed: index + 1,
-            total: chunks.len(),
-        });
-    }
-    output
-        .flush()
-        .map_err(|error| format!("Could not finish TTS audio: {error}"))?;
-    drop(output);
-    if request.destination.exists() {
-        fs::remove_file(&request.destination)
-            .map_err(|error| format!("Could not replace audio file: {error}"))?;
-    }
-    fs::rename(&part_path, &request.destination)
-        .map_err(|error| format!("Could not finish audio file: {error}"))?;
+        Ok(())
+    }).map_err(|error| format!("Could not export audio: {error}"))?;
     let _ = tx.send(PaidTtsEvent::Complete(request.destination.clone()));
     Ok(())
+}
+
+pub fn write_private_speech_text(text: &str) -> std::io::Result<PathBuf> {
+    if text.len() > 16 * 1024 * 1024 {
+        return Err(std::io::Error::other("Select less text to read aloud."));
+    }
+    let root = crate::settings::app_data_dir()
+        .ok_or_else(|| std::io::Error::other("No private speech folder is available."))?
+        .join("speech-cache");
+    fs::create_dir_all(&root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    }
+    let mut file = tempfile::Builder::new()
+        .prefix("speech-")
+        .suffix(".txt")
+        .tempfile_in(root)?;
+    file.write_all(text.as_bytes())?;
+    file.as_file().sync_all()?;
+    let (file, path) = file.keep().map_err(|error| error.error)?;
+    drop(file);
+    Ok(path)
 }
 
 fn split_for_tts(text: &str, max_chars: usize) -> Vec<String> {
@@ -158,11 +158,6 @@ fn split_for_tts(text: &str, max_chars: usize) -> Vec<String> {
         chunks.push(remaining.trim().to_owned());
     }
     chunks
-}
-
-fn compact_error(value: &str) -> String {
-    let one_line = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    one_line.chars().take(240).collect()
 }
 
 #[cfg(test)]

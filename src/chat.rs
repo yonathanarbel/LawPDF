@@ -59,6 +59,7 @@ pub struct ChatMessage {
 
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
+    pub request_id: u64,
     pub document_epoch: u64,
     pub path: PathBuf,
     pub api_key: String,
@@ -69,6 +70,7 @@ pub struct ChatRequest {
 
 #[derive(Debug, Clone)]
 pub struct ChatEvent {
+    pub request_id: u64,
     pub document_epoch: u64,
     pub path: PathBuf,
     pub result: Result<String, String>,
@@ -76,10 +78,12 @@ pub struct ChatEvent {
 
 pub fn spawn_chat_job(request: ChatRequest, tx: Sender<ChatEvent>) {
     thread::spawn(move || {
+        let request_id = request.request_id;
         let document_epoch = request.document_epoch;
         let path = request.path.clone();
         let result = run_chat_request(request);
         let _ = tx.send(ChatEvent {
+            request_id,
             document_epoch,
             path,
             result,
@@ -88,6 +92,13 @@ pub fn spawn_chat_job(request: ChatRequest, tx: Sender<ChatEvent>) {
 }
 
 fn run_chat_request(request: ChatRequest) -> Result<String, String> {
+    if request
+        .document_context
+        .as_deref()
+        .is_none_or(|text| text.trim().is_empty())
+    {
+        return Err("Chat needs PDF text or OCR text first.".to_owned());
+    }
     let mut messages = Vec::new();
     messages.push(json!({
         "role": "system",
@@ -164,4 +175,26 @@ fn preview(value: &str, max_chars: usize) -> String {
     let mut value = value.chars().take(max_chars).collect::<String>();
     value.push_str("...");
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_pdf_context_is_rejected_before_any_network_request() {
+        let result = run_chat_request(ChatRequest {
+            request_id: 1,
+            document_epoch: 1,
+            path: PathBuf::from("test.pdf"),
+            api_key: String::new(),
+            model: String::new(),
+            visible_messages: Vec::new(),
+            document_context: None,
+        });
+        assert_eq!(
+            result.unwrap_err(),
+            "Chat needs PDF text or OCR text first."
+        );
+    }
 }

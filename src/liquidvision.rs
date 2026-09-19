@@ -93,7 +93,7 @@ fn route_for_class(cls: &str) -> &'static str {
     }
 }
 
-type RunModel = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+type RunModel = Arc<TypedRunnableModel>;
 
 /// One region detection in fitz page-point space (y-DOWN from the top), i.e.
 /// `y0` = top edge, `y1` = bottom edge, `y0 < y1`. This deliberately matches the
@@ -366,7 +366,7 @@ impl LiquidVision {
 
         let input = Tensor::from_shape(&[1, 3, IMGSZ, IMGSZ], &chan)?;
         let result = self.model.run(tvec!(input.into()))?;
-        let out = result[0].to_array_view::<f32>()?; // [1, 300, 6]
+        let out = result[0].to_plain_array_view::<f32>()?; // [1, 300, 6]
 
         let page_area = (page_w_pts * page_h_pts).max(1.0);
         let mut dets = Vec::new();
@@ -529,6 +529,20 @@ pub fn assign_line_features(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_vision_model_runs_with_the_current_onnx_runtime() {
+        let model = LiquidVision::load().expect("bundled vision model must load");
+        let detections = model
+            .detect_page(&vec![255; 396 * 512 * 3], 396, 512, 612.0, 792.0)
+            .expect("bundled vision model must execute");
+        for detection in detections {
+            assert!(detection.score.is_finite());
+            assert!(detection.x0 >= 0.0 && detection.x1 <= 612.0);
+            assert!(detection.y0 >= 0.0 && detection.y1 <= 792.0);
+            assert!(detection.area_norm.is_finite());
+        }
+    }
 
     fn assert_close(actual: f64, expected: f64) {
         assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");

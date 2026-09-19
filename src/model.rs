@@ -66,7 +66,7 @@ impl PdfRect {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AnnotationKind {
     Marker {
         color_rgb: [f32; 3],
@@ -96,13 +96,13 @@ pub enum AnnotationKind {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MarkerStyle {
     Highlight,
     Underline,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EditorAnnotation {
     pub page_index: usize,
     pub rect: PdfRect,
@@ -213,7 +213,7 @@ pub struct PageLink {
     pub url: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadedDocument {
     pub path: PathBuf,
     pub title: String,
@@ -229,11 +229,12 @@ pub struct LoadedDocument {
     pub optimized: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderedPage {
     pub page_index: usize,
     pub width: usize,
     pub height: usize,
+    #[serde(skip)]
     pub rgba: Vec<u8>,
 }
 

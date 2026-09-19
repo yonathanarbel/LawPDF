@@ -64,6 +64,7 @@ final class PdfPageList extends ListView implements AutoCloseable {
         void onEditStateChanged(boolean canUndo, boolean canRedo, int markCount);
         void onZoomChanged(float zoom);
         void onChromeToggleRequested();
+        void onPersistenceError(Exception error);
     }
 
     private static final int WIDTH_BUCKET = 128;
@@ -78,7 +79,7 @@ final class PdfPageList extends ListView implements AutoCloseable {
     private final ContentResolver resolver;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ThreadPoolExecutor worker = new ThreadPoolExecutor(
-            1, 1, 10, TimeUnit.SECONDS, new LinkedBlockingQueue<>());
+            1, 1, 10, TimeUnit.SECONDS, new LinkedBlockingQueue<>(64));
     private final AtomicInteger generation = new AtomicInteger();
     private final Set<CacheKey> pending = Collections.newSetFromMap(new ConcurrentHashMap<>());
     private final LruCache<CacheKey, Bitmap> cache;
@@ -102,6 +103,8 @@ final class PdfPageList extends ListView implements AutoCloseable {
     private boolean pinching;
     private boolean zoomLayoutPosted;
     private AnnotationStore.Stroke activeStroke;
+    private boolean recoverySource;
+    boolean isRecoverySource() { return recoverySource; }
 
     PdfPageList(Context context, ContentResolver resolver) {
         super(context);
@@ -214,12 +217,24 @@ final class PdfPageList extends ListView implements AutoCloseable {
         worker.execute(() -> {
             closeRenderer();
             try {
-                descriptor = resolver.openFileDescriptor(uri, "r");
+                DocumentSnapshot snapshot = DocumentSnapshot.open(context, resolver, uri);
+                descriptor = ParcelFileDescriptor.open(snapshot.file, ParcelFileDescriptor.MODE_READ_ONLY);
                 if (descriptor == null) throw new IOException("The document provider returned no PDF data.");
                 renderer = new PdfRenderer(descriptor);
                 int pages = renderer.getPageCount();
+                if (pages > 20000) throw new IOException("This PDF exceeds the 20,000-page limit.");
+                AnnotationJournal journal = new AnnotationJournal(new File(context.getFilesDir(), "annotation-journals"), snapshot.revision);
+                List<AnnotationStore.Stroke> restored = journal.read(pages);
                 main.post(() -> {
                     if (generation.get() != token) return;
+                    recoverySource = snapshot.recovered;
+                    annotations.restore(restored, marks -> {
+                        try { journal.write(marks); return true; }
+                        catch (Exception error) {
+                            if (editListener != null) editListener.onPersistenceError(error);
+                            return false;
+                        }
+                    });
                     adapter = new PageAdapter(context, pages, token);
                     setAdapter(adapter);
                     listener.onReady(pages);
@@ -234,6 +249,7 @@ final class PdfPageList extends ListView implements AutoCloseable {
 
     void saveAnnotated(Uri destination, SaveListener listener) {
         int token = generation.get();
+        if (worker.isShutdown() || worker.getQueue().size() >= 60) { listener.onError(new IOException("Let the current document tasks finish, then export again.")); return; }
         List<AnnotationStore.Stroke> marks = annotations.snapshot();
         worker.execute(() -> {
             File temporary = null;
@@ -271,7 +287,7 @@ final class PdfPageList extends ListView implements AutoCloseable {
                 try (PdfRenderer.Page source = renderer.openPage(pageIndex)) {
                     int pageWidth = Math.max(1, source.getWidth());
                     int pageHeight = Math.max(1, source.getHeight());
-                    int renderWidth = Math.min(MAX_EXPORT_WIDTH, Math.max(pageWidth, pageWidth * 2));
+                    int renderWidth = boundedWidth(pageWidth, pageHeight, Math.min(MAX_EXPORT_WIDTH, Math.max(pageWidth, pageWidth * 2)));
                     int renderHeight = Math.max(1,
                             Math.round(renderWidth * pageHeight / (float) pageWidth));
                     Bitmap bitmap = Bitmap.createBitmap(renderWidth, renderHeight, Bitmap.Config.ARGB_8888);
@@ -509,6 +525,7 @@ final class PdfPageList extends ListView implements AutoCloseable {
             if (target != null) target.showBitmap(key, cached);
             return;
         }
+        if (worker.isShutdown() || pending.size() >= 48) return;
         if (!pending.add(key)) return;
 
         worker.execute(() -> {
@@ -517,9 +534,10 @@ final class PdfPageList extends ListView implements AutoCloseable {
             try {
                 if (generation.get() != token || renderer == null) return;
                 try (PdfRenderer.Page page = renderer.openPage(pageIndex)) {
+                    int safeWidth = boundedWidth(page.getWidth(), page.getHeight(), renderWidth);
                     int height = Math.max(1,
-                            Math.round(renderWidth * page.getHeight() / (float) page.getWidth()));
-                    bitmap = Bitmap.createBitmap(renderWidth, height, Bitmap.Config.ARGB_8888);
+                            Math.round(safeWidth * page.getHeight() / (float) page.getWidth()));
+                    bitmap = Bitmap.createBitmap(safeWidth, height, Bitmap.Config.ARGB_8888);
                     bitmap.eraseColor(Color.WHITE);
                     page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
                 }
@@ -548,6 +566,13 @@ final class PdfPageList extends ListView implements AutoCloseable {
                 }
             });
         });
+    }
+
+    private static int boundedWidth(int width, int height, int requested) {
+        if (width <= 0 || height <= 0) throw new IllegalArgumentException("Invalid PDF page dimensions.");
+        double areaLimit = Math.sqrt(8000000.0 * width / height);
+        double heightLimit = 8192.0 * width / height;
+        return Math.max(1, (int) Math.min(requested, Math.min(areaLimit, heightLimit)));
     }
 
     private void closeRenderer() {

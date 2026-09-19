@@ -8,6 +8,9 @@ import java.util.List;
 
 /** Page-normalized freehand annotations with reversible edits. */
 final class AnnotationStore {
+    interface Persistence { boolean save(List<Stroke> strokes); }
+    private Persistence persistence;
+
     enum Tool { PAN, PEN, HIGHLIGHT, SIGNATURE, ERASER }
 
     static final class Point {
@@ -50,7 +53,7 @@ final class AnnotationStore {
                 float dy = point.y - previous.y;
                 if (dx * dx + dy * dy < 0.000001f) return;
             }
-            points.add(point);
+            if (points.size() < 4096) points.add(point);
         }
     }
 
@@ -103,7 +106,9 @@ final class AnnotationStore {
         if (stroke == null || stroke.points.isEmpty()) return;
         int index = strokes.size();
         strokes.add(stroke);
+        if (!persist()) { strokes.remove(index); return; }
         undo.addLast(new AddChange(stroke, index));
+        trimHistory();
         redo.clear();
     }
 
@@ -114,7 +119,9 @@ final class AnnotationStore {
             float tolerance = radius + stroke.width * 0.5f;
             if (distanceToStroke(stroke, x, y) <= tolerance) {
                 strokes.remove(index);
+                if (!persist()) { strokes.add(index, stroke); return false; }
                 undo.addLast(new RemoveChange(stroke, index));
+                trimHistory();
                 redo.clear();
                 return true;
             }
@@ -126,6 +133,7 @@ final class AnnotationStore {
         Change change = undo.pollLast();
         if (change == null) return false;
         change.undo(strokes);
+        if (!persist()) { change.redo(strokes); undo.addLast(change); return false; }
         redo.addLast(change);
         return true;
     }
@@ -134,7 +142,9 @@ final class AnnotationStore {
         Change change = redo.pollLast();
         if (change == null) return false;
         change.redo(strokes);
+        if (!persist()) { change.undo(strokes); redo.addLast(change); return false; }
         undo.addLast(change);
+        trimHistory();
         return true;
     }
 
@@ -154,7 +164,17 @@ final class AnnotationStore {
         return Collections.unmodifiableList(result);
     }
 
+    void restore(List<Stroke> restored, Persistence persistence) {
+        clear();
+        for (Stroke stroke : restored) strokes.add(new Stroke(stroke));
+        this.persistence = persistence;
+    }
+
+    private boolean persist() { return persistence == null || persistence.save(snapshot()); }
+    private void trimHistory() { while (undo.size() > 100) undo.removeFirst(); }
+
     void clear() {
+        persistence = null;
         strokes.clear();
         undo.clear();
         redo.clear();

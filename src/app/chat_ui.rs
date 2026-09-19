@@ -8,6 +8,7 @@ pub(super) struct ChatState {
     pub(super) input: String,
     pub(super) model_index: usize,
     pub(super) in_flight: bool,
+    pending_request: Option<u64>,
     pub(super) document_context: Option<String>,
     pub(super) context_estimated_tokens: Option<usize>,
     pub(super) context_warning: Option<String>,
@@ -20,6 +21,7 @@ impl Default for ChatState {
             input: String::new(),
             model_index: 0,
             in_flight: false,
+            pending_request: None,
             document_context: None,
             context_estimated_tokens: None,
             context_warning: None,
@@ -27,7 +29,34 @@ impl Default for ChatState {
     }
 }
 
+impl ChatState {
+    fn attach_context(&mut self, context: String, estimated_tokens: usize) -> Result<(), String> {
+        self.context_estimated_tokens = Some(estimated_tokens);
+        self.document_context = None;
+        let error = if context.trim().is_empty() {
+            Some("Chat needs PDF text or OCR text first.".to_owned())
+        } else if estimated_tokens > CHAT_CONTEXT_TOKEN_LIMIT {
+            Some(format!(
+                "This PDF is about {estimated_tokens} tokens, above the {CHAT_CONTEXT_TOKEN_LIMIT}-token chat limit. Open a shorter PDF or extract the relevant pages to chat about them. Your question has not been sent."
+            ))
+        } else {
+            None
+        };
+        self.context_warning = error.clone();
+        if let Some(error) = error {
+            return Err(error);
+        }
+        self.document_context = Some(context);
+        Ok(())
+    }
+
+    fn accepts(&self, event: &ChatEvent) -> bool {
+        self.in_flight && self.pending_request == Some(event.request_id)
+    }
+}
+
 pub(super) struct ChatUi {
+    next_request_id: u64,
     tx: Sender<ChatEvent>,
     rx: Receiver<ChatEvent>,
     pub(super) state: ChatState,
@@ -37,6 +66,7 @@ impl ChatUi {
     pub(super) fn new() -> Self {
         let (tx, rx) = unbounded();
         Self {
+            next_request_id: 0,
             tx,
             rx,
             state: ChatState::default(),
@@ -74,18 +104,9 @@ impl PdfEditorApp {
                 return;
             };
             let (context, estimated_tokens) = self.chat_context_for_document(document);
-            self.chat_ui.state.context_estimated_tokens = Some(estimated_tokens);
-            if context.trim().is_empty() {
-                self.status = "Chat needs PDF text or OCR text first.".to_owned();
+            if let Err(error) = self.chat_ui.state.attach_context(context, estimated_tokens) {
+                self.status = error;
                 return;
-            }
-            if estimated_tokens <= CHAT_CONTEXT_TOKEN_LIMIT {
-                self.chat_ui.state.document_context = Some(context);
-                self.chat_ui.state.context_warning = None;
-            } else {
-                self.chat_ui.state.context_warning = Some(format!(
-                    "PDF text is about {estimated_tokens} tokens, so it was not attached to the first chat message."
-                ));
             }
         }
 
@@ -95,6 +116,9 @@ impl PdfEditorApp {
         });
         self.chat_ui.state.input.clear();
         self.chat_ui.state.in_flight = true;
+        self.chat_ui.next_request_id = self.chat_ui.next_request_id.wrapping_add(1);
+        let request_id = self.chat_ui.next_request_id;
+        self.chat_ui.state.pending_request = Some(request_id);
 
         let Some(document) = self.document.as_ref() else {
             return;
@@ -107,6 +131,7 @@ impl PdfEditorApp {
             .to_owned();
         spawn_chat_job(
             ChatRequest {
+                request_id,
                 document_epoch: self.document_epoch,
                 path: document_path,
                 api_key,
@@ -123,7 +148,11 @@ impl PdfEditorApp {
         while let Ok(event) = self.chat_ui.rx.try_recv() {
             let mut error_notice = None;
             if self.is_current_document(event.document_epoch, &event.path) {
+                if !self.chat_ui.state.accepts(&event) {
+                    continue;
+                }
                 self.chat_ui.state.in_flight = false;
+                self.chat_ui.state.pending_request = None;
                 match event.result {
                     Ok(content) => {
                         self.chat_ui.state.messages.push(ChatMessage {
@@ -145,7 +174,11 @@ impl PdfEditorApp {
             } else if let Some(tab) = self.tabs.iter_mut().find(|tab| {
                 tab.document_epoch == event.document_epoch && tab.document.path == event.path
             }) {
+                if !tab.chat_state.accepts(&event) {
+                    continue;
+                }
                 tab.chat_state.in_flight = false;
+                tab.chat_state.pending_request = None;
                 match event.result {
                     Ok(content) => {
                         tab.chat_state.messages.push(ChatMessage {
@@ -172,13 +205,8 @@ impl PdfEditorApp {
     }
 
     fn chat_context_for_document(&self, document: &LoadedDocument) -> (String, usize) {
-        if let LiquidState::Ready(review) = &self.liquid_mode2_state {
-            let context = review_document_plain_text(review);
-            if !context.trim().is_empty() {
-                let estimated_tokens = estimate_tokens(&context);
-                return (context, estimated_tokens);
-            }
-        }
+        // Original page text retains page provenance and cannot be truncated to a
+        // progressive Review preview or lose content hidden by a classifier.
         let pages = self.collect_liquid_source_pages(document);
         let mut context = String::new();
         for (page_index, page) in pages.iter().enumerate() {
@@ -291,7 +319,7 @@ impl PdfEditorApp {
                         } else {
                             Color32::from_rgb(255, 254, 250)
                         })
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(222, 216, 205)))
+                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(222, 216, 205)))
                         .corner_radius(6)
                         .inner_margin(Margin::symmetric(8, 6))
                         .show(ui, |ui| {
@@ -324,4 +352,98 @@ impl PdfEditorApp {
 
 pub(super) fn estimate_tokens(text: &str) -> usize {
     (text.chars().count() / 4).max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_or_empty_context_keeps_the_unsent_question() {
+        let mut state = ChatState {
+            input: "What does the last page say?".to_owned(),
+            ..ChatState::default()
+        };
+        assert!(
+            state
+                .attach_context("large PDF".to_owned(), CHAT_CONTEXT_TOKEN_LIMIT + 1)
+                .is_err()
+        );
+        assert!(state.document_context.is_none());
+        assert!(state.messages.is_empty());
+        assert!(!state.in_flight);
+        assert_eq!(state.input, "What does the last page say?");
+        assert!(
+            state
+                .context_warning
+                .as_ref()
+                .unwrap()
+                .contains("not been sent")
+        );
+        assert!(state.attach_context(" ".to_owned(), 1).is_err());
+        state
+            .attach_context("complete PDF text".to_owned(), CHAT_CONTEXT_TOKEN_LIMIT)
+            .unwrap();
+        assert!(state.context_warning.is_none());
+        assert_eq!(state.document_context.as_deref(), Some("complete PDF text"));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn chat_uses_all_source_pages_even_when_review_is_only_a_preview() {
+        let ctx = Context::default();
+        let mut app = PdfEditorApp::new(&ctx, Vec::new(), unbounded().1);
+        let document = LoadedDocument {
+            path: PathBuf::from("context-fixture.pdf"),
+            title: "Three pages".to_owned(),
+            page_count: 3,
+            pages: vec![crate::model::PageInfo::new(612.0, 792.0); 3],
+            native_text: vec![
+                "Opening text".to_owned(),
+                String::new(),
+                "Last-page conclusion".to_owned(),
+            ],
+            native_text_loaded: vec![true; 3],
+            text_chars: vec![None; 3],
+            links: vec![Vec::new(); 3],
+            links_loaded: false,
+            optimized: true,
+        };
+        let mut review: LiquidDocument = serde_json::from_value(serde_json::json!({
+            "title": "Preview", "blocks": [], "llm_used": false, "warnings": [], "source_signature": "preview"
+        })).unwrap();
+        review.blocks.push(LiquidBlock {
+            role: LiquidBlockRole::Paragraph,
+            text: "Only an opening preview".to_owned(),
+            label: None,
+        });
+        app.liquid_mode2_state = LiquidState::Ready(std::sync::Arc::new(review));
+        app.liquid_mode2_complete = false;
+        let (context, _) = app.chat_context_for_document(&document);
+        assert!(context.contains("--- Page 1 ---\nOpening text"));
+        assert!(context.contains("--- Page 3 ---\nLast-page conclusion"));
+        assert!(!context.contains("opening preview"));
+        assert!(!context.contains("--- Page 2 ---"));
+    }
+
+    #[test]
+    fn cleared_or_restarted_chats_reject_old_responses() {
+        let event = ChatEvent {
+            request_id: 1,
+            document_epoch: 7,
+            path: PathBuf::from("test.pdf"),
+            result: Ok("stale answer".to_owned()),
+        };
+        let mut state = ChatState {
+            in_flight: true,
+            pending_request: Some(1),
+            ..ChatState::default()
+        };
+        assert!(state.accepts(&event));
+        state = ChatState::default();
+        assert!(!state.accepts(&event));
+        state.in_flight = true;
+        state.pending_request = Some(2);
+        assert!(!state.accepts(&event));
+    }
 }

@@ -9,14 +9,18 @@ pub const DEFAULT_PDF_ZOOM: f32 = 1.25;
 pub const MIN_PDF_ZOOM: f32 = 0.35;
 pub const MAX_PDF_ZOOM: f32 = 5.0;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AppSettings {
-    #[serde(default = "default_openrouter_api_key")]
+    #[serde(default = "default_openrouter_api_key", skip_serializing)]
     pub openrouter_api_key: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub openai_api_key: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub groq_api_key: String,
+    #[serde(skip)]
+    pub credential_error: Option<String>,
+    #[serde(default = "default_retention_days")]
+    pub cache_retention_days: u16,
     #[serde(default = "default_pdf_zoom")]
     pub last_pdf_zoom: f32,
     /// Last zoom selected for each PDF, keyed by its normalized absolute path.
@@ -50,6 +54,8 @@ impl Default for AppSettings {
             openrouter_api_key: default_openrouter_api_key(),
             openai_api_key: String::new(),
             groq_api_key: String::new(),
+            credential_error: None,
+            cache_retention_days: default_retention_days(),
             last_pdf_zoom: DEFAULT_PDF_ZOOM,
             pdf_zoom_by_document: BTreeMap::new(),
             reduce_motion: false,
@@ -61,6 +67,21 @@ impl Default for AppSettings {
             markdown_copy_include_metadata: false,
             macos_default_reader_prompt_dismissed: false,
         }
+    }
+}
+
+fn default_retention_days() -> u16 {
+    30
+}
+
+impl std::fmt::Debug for AppSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppSettings")
+            .field("provider_keys", &"[redacted]")
+            .field("last_pdf_zoom", &self.last_pdf_zoom)
+            .field("remembered_documents", &self.pdf_zoom_by_document.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -156,7 +177,20 @@ pub fn load_settings() -> AppSettings {
     let Some(path) = settings_path() else {
         return AppSettings::default();
     };
-    load_settings_from(&path)
+    let mut settings = load_settings_from(&path);
+    match crate::credentials::load_and_migrate(&mut settings) {
+        Ok(()) => {
+            // The native store has acknowledged every legacy key before this
+            // sanitized rewrite. No new plaintext backup is created.
+            if path.exists() {
+                if let Err(error) = save_settings_to(&settings, &path) {
+                    settings.credential_error = Some(error);
+                }
+            }
+        }
+        Err(error) => settings.credential_error = Some(error),
+    }
+    settings
 }
 
 pub(crate) fn load_settings_from(path: &Path) -> AppSettings {
@@ -165,18 +199,11 @@ pub(crate) fn load_settings_from(path: &Path) -> AppSettings {
     };
     let mut settings: AppSettings = match serde_json::from_slice(&bytes) {
         Ok(settings) => settings,
-        Err(error) => {
+        Err(_) => {
             let backup = corrupt_settings_backup_path(path);
-            match std::fs::copy(path, &backup) {
-                Ok(_) => eprintln!(
-                    "LawPDF settings parse failed ({error}); copied corrupt file to {}.",
-                    backup.display()
-                ),
-                Err(backup_error) => eprintln!(
-                    "LawPDF settings parse failed ({error}); backup to {} failed: {backup_error}.",
-                    backup.display()
-                ),
-            }
+            // The backup may contain legacy credentials. Keep it private and
+            // do not print parser payloads, filenames, or provider key text.
+            let _ = crate::atomic_file::write(&backup, &bytes);
             AppSettings::default()
         }
     };
@@ -192,6 +219,9 @@ pub(crate) fn load_settings_from(path: &Path) -> AppSettings {
 }
 
 pub fn save_settings(settings: &AppSettings) -> Result<(), String> {
+    if let Some(error) = &settings.credential_error {
+        return Err(error.clone());
+    }
     let path = settings_path().ok_or_else(|| "Could not find settings directory.".to_owned())?;
     save_settings_to(settings, &path)
 }
@@ -203,7 +233,8 @@ pub(crate) fn save_settings_to(settings: &AppSettings, path: &Path) -> Result<()
     }
     let bytes = serde_json::to_vec_pretty(settings)
         .map_err(|error| format!("Could not encode settings: {error}"))?;
-    std::fs::write(path, bytes).map_err(|error| format!("Could not save settings: {error}"))
+    crate::atomic_file::write(path, &bytes)
+        .map_err(|error| format!("Could not save settings: {error}"))
 }
 
 fn corrupt_settings_backup_path(path: &Path) -> PathBuf {
@@ -213,6 +244,14 @@ fn corrupt_settings_backup_path(path: &Path) -> PathBuf {
 }
 
 pub fn app_data_dir() -> Option<PathBuf> {
+    #[cfg(feature = "devtools")]
+    if crate::shutdown_smoke::running() {
+        return Some(std::env::temp_dir().join(format!("lawpdf-shutdown-data-{}", std::process::id())));
+    }
+    // Unit tests must never read, overwrite, or prune a user's application data.
+    if cfg!(test) {
+        return Some(std::env::temp_dir().join(format!("lawpdf-unit-data-{}", std::process::id())));
+    }
     #[cfg(windows)]
     {
         return std::env::var_os("APPDATA")
@@ -306,14 +345,18 @@ mod tests {
             markdown_copy_include_tables: false,
             markdown_copy_include_metadata: true,
             macos_default_reader_prompt_dismissed: true,
+            ..AppSettings::default()
         };
 
         save_settings_to(&expected, &path).unwrap();
         let actual = load_settings_from(&path);
 
-        assert_eq!(actual.openrouter_api_key, expected.openrouter_api_key);
-        assert_eq!(actual.openai_api_key, expected.openai_api_key);
-        assert_eq!(actual.groq_api_key, expected.groq_api_key);
+        assert!(actual.openrouter_api_key.is_empty());
+        assert!(actual.openai_api_key.is_empty());
+        assert!(actual.groq_api_key.is_empty());
+        let serialized = std::fs::read_to_string(&path).unwrap();
+        assert!(!serialized.contains("api_key"));
+        assert!(!format!("{expected:?}").contains("router"));
         assert_eq!(actual.last_pdf_zoom, expected.last_pdf_zoom);
         assert_eq!(actual.pdf_zoom_by_document, expected.pdf_zoom_by_document);
         assert_eq!(actual.reduce_motion, expected.reduce_motion);

@@ -9,7 +9,10 @@ pub(super) struct UpdateUi {
     pub(super) next_check: Option<Instant>,
     pub(super) download_version: Option<String>,
     pub(super) download_progress: Option<(u64, Option<u64>)>,
+    pub(super) manual_check: bool,
+    pub(super) last_check_error: Option<String>,
     pub(super) pending: Option<updater::PendingUpdate>,
+    pub(super) manual_download_version: Option<String>,
 }
 
 impl UpdateUi {
@@ -27,7 +30,10 @@ impl UpdateUi {
             next_check: None,
             download_version: None,
             download_progress: None,
+            manual_check: false,
+            last_check_error: None,
             pending: None,
+            manual_download_version: None,
         }
     }
 }

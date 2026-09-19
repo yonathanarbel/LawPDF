@@ -5,6 +5,8 @@ plugins {
 android {
     namespace "com.lawpdf.mobile"
     compileSdk 35
+    useLibrary "android.test.base", false
+    useLibrary "android.test.runner", false
 
     defaultConfig {
         applicationId "com.lawpdf.mobile"
@@ -13,7 +15,7 @@ android {
         versionCode 2
         versionName "0.2.0"
 
-        testInstrumentationRunner "android.test.InstrumentationTestRunner"
+        testInstrumentationRunner "com.lawpdf.mobile.ProcessDeathInstrumentation"
     }
 
     buildTypes {

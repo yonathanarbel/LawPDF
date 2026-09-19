@@ -81,6 +81,13 @@ def main() -> int:
             checked.append(asset["path"])
 
     selected_platform = host_platform() if args.platform == "host" else args.platform
+    pdfium = runtime_assets.get("pdfium_libraries", {}).get(selected_platform)
+    if not pdfium or not (root / pdfium["path"]).is_file():
+        errors.append(f"missing pinned {selected_platform} PDFium library")
+    elif sha256(root / pdfium["path"]) != pdfium["sha256"]:
+        errors.append(f"{selected_platform} PDFium library sha256 mismatch")
+    else:
+        checked.append(pdfium["path"])
     library = runtime_assets["platform_libraries"][selected_platform]
     library_path = root / library["path"]
     if library_path.is_file():

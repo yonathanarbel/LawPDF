@@ -811,15 +811,15 @@ pub fn layout_hints_and_source_lines_for_pages(
             })
         })
         .collect();
-    (hints, source_lines)
+    (hints.into_hints(), source_lines)
 }
 
 fn hints_for_enriched_lines(
     pages: &[PageInfo],
     page_ranges: &[std::ops::Range<usize>],
     all_lines: &[LayoutLine],
-) -> Vec<LiquidLayoutHint> {
-    let mut hints = Vec::new();
+) -> LayoutHintTable {
+    let mut hints = LayoutHintTable::default();
     for (page_index, page) in pages.iter().enumerate() {
         let lines = page_ranges
             .get(page_index)
@@ -2803,7 +2803,7 @@ fn can_bridge_generic_contextual_footnote_line(line: &LayoutLine) -> bool {
 }
 
 fn extend_heuristic_footnote_hints(
-    hints: &mut Vec<LiquidLayoutHint>,
+    hints: &mut LayoutHintTable,
     page: &PageInfo,
     lines: &[LayoutLine],
 ) {
@@ -2905,7 +2905,7 @@ fn is_probable_divider_footnote_line(text: &str, smallish: bool, below_divider: 
     below_divider && smallish && word_count(text) <= 42
 }
 
-fn extend_repository_cover_hints(hints: &mut Vec<LiquidLayoutHint>, lines: &[LayoutLine]) {
+fn extend_repository_cover_hints(hints: &mut LayoutHintTable, lines: &[LayoutLine]) {
     for line in lines {
         if is_repository_cover_boilerplate(line) || is_repository_cover_identifier(line) {
             push_unique_hint(hints, &line.text, LiquidBlockRole::Noise);
@@ -2913,7 +2913,7 @@ fn extend_repository_cover_hints(hints: &mut Vec<LiquidLayoutHint>, lines: &[Lay
     }
 }
 
-fn extend_page_contents_noise_hints(hints: &mut Vec<LiquidLayoutHint>, lines: &[LayoutLine]) {
+fn extend_page_contents_noise_hints(hints: &mut LayoutHintTable, lines: &[LayoutLine]) {
     let first_contents_line = lines
         .iter()
         .filter(|line| line.page_contents_like)
@@ -2938,7 +2938,7 @@ fn extend_page_contents_noise_hints(hints: &mut Vec<LiquidLayoutHint>, lines: &[
 }
 
 fn extend_model_hints(
-    hints: &mut Vec<LiquidLayoutHint>,
+    hints: &mut LayoutHintTable,
     page: &PageInfo,
     lines: &[LayoutLine],
     model: &LayoutRoleModel,
@@ -2996,7 +2996,7 @@ fn extend_model_hints(
 }
 
 fn extend_liquid_core_model_hints(
-    hints: &mut Vec<LiquidLayoutHint>,
+    hints: &mut LayoutHintTable,
     page: &PageInfo,
     lines: &[LayoutLine],
     model: &LayoutRoleModel,
@@ -3022,7 +3022,7 @@ fn extend_liquid_core_model_hints(
 }
 
 fn extend_footnote_specialist_hints(
-    hints: &mut Vec<LiquidLayoutHint>,
+    hints: &mut LayoutHintTable,
     lines: &[LayoutLine],
     model: &LayoutRoleModel,
 ) {
@@ -3037,7 +3037,7 @@ fn extend_footnote_specialist_hints(
 }
 
 fn extend_body_specialist_hints(
-    hints: &mut Vec<LiquidLayoutHint>,
+    hints: &mut LayoutHintTable,
     lines: &[LayoutLine],
     model: &LayoutRoleModel,
 ) {
@@ -3052,7 +3052,7 @@ fn extend_body_specialist_hints(
 }
 
 fn extend_heading_specialist_hints(
-    hints: &mut Vec<LiquidLayoutHint>,
+    hints: &mut LayoutHintTable,
     lines: &[LayoutLine],
     model: &LayoutRoleModel,
 ) {
@@ -3069,7 +3069,7 @@ fn extend_heading_specialist_hints(
 }
 
 fn extend_header_footer_specialist_hints(
-    hints: &mut Vec<LiquidLayoutHint>,
+    hints: &mut LayoutHintTable,
     page: &PageInfo,
     lines: &[LayoutLine],
     model: &LayoutRoleModel,
@@ -3089,7 +3089,7 @@ fn extend_header_footer_specialist_hints(
     }
 }
 
-fn extend_decoded_footnote_run_hints(hints: &mut Vec<LiquidLayoutHint>, lines: &[LayoutLine]) {
+fn extend_decoded_footnote_run_hints(hints: &mut LayoutHintTable, lines: &[LayoutLine]) {
     let mut indices = (0..lines.len()).collect::<Vec<_>>();
     indices.sort_by(|a, b| {
         lines[*a]
@@ -3448,7 +3448,7 @@ fn early_numbered_note_pair_can_be_marginalia(
 }
 
 fn decoded_adjacent_continuation_can_be_marginalia(
-    hints: &[LiquidLayoutHint],
+    hints: &(impl HintSource + ?Sized),
     line: &LayoutLine,
     prev: Option<&LayoutLine>,
 ) -> bool {
@@ -3490,7 +3490,7 @@ fn decoded_adjacent_continuation_can_be_marginalia(
 }
 
 fn same_row_right_fragment_after_marginalia_can_be_marginalia(
-    hints: &[LiquidLayoutHint],
+    hints: &(impl HintSource + ?Sized),
     line: &LayoutLine,
     prev: Option<&LayoutLine>,
 ) -> bool {
@@ -3519,7 +3519,7 @@ fn same_row_right_fragment_after_marginalia_can_be_marginalia(
 }
 
 fn list_item_core_footnote_continuation_can_be_marginalia(
-    hints: &[LiquidLayoutHint],
+    hints: &(impl HintSource + ?Sized),
     line: &LayoutLine,
 ) -> bool {
     let y0 = line.y0_ratio();
@@ -3540,7 +3540,7 @@ fn list_item_core_footnote_continuation_can_be_marginalia(
 }
 
 fn small_font_line_before_next_note_run_can_be_marginalia(
-    hints: &[LiquidLayoutHint],
+    hints: &(impl HintSource + ?Sized),
     line: &LayoutLine,
     next: Option<&LayoutLine>,
 ) -> bool {
@@ -3570,7 +3570,7 @@ fn small_font_line_before_next_note_run_can_be_marginalia(
 }
 
 fn contents_like_credential_before_note_run_can_be_marginalia(
-    hints: &[LiquidLayoutHint],
+    hints: &(impl HintSource + ?Sized),
     line: &LayoutLine,
     next: Option<&LayoutLine>,
 ) -> bool {
@@ -3612,7 +3612,7 @@ fn looks_like_author_credential_fragment(text: &str) -> bool {
 }
 
 fn metadata_credential_continuation_after_marginalia_can_be_marginalia(
-    hints: &[LiquidLayoutHint],
+    hints: &(impl HintSource + ?Sized),
     line: &LayoutLine,
     prev: Option<&LayoutLine>,
 ) -> bool {
@@ -3638,7 +3638,7 @@ fn metadata_credential_continuation_after_marginalia_can_be_marginalia(
 }
 
 fn tiny_numeric_note_cluster_can_be_marginalia<'a>(
-    hints: &[LiquidLayoutHint],
+    hints: &(impl HintSource + ?Sized),
     line: &LayoutLine,
     nearby: impl Iterator<Item = &'a LayoutLine>,
 ) -> bool {
@@ -3957,7 +3957,7 @@ fn longest_near_consecutive_run(numbers: &[usize]) -> usize {
 }
 
 fn should_decode_keep_as_marginalia(
-    hints: &[LiquidLayoutHint],
+    hints: &(impl HintSource + ?Sized),
     line: &LayoutLine,
     prev: Option<&LayoutLine>,
     next: Option<&LayoutLine>,
@@ -4131,7 +4131,7 @@ fn should_decode_keep_as_marginalia(
 }
 
 fn fragmented_publication_piece_adjacent_to_marginalia(
-    hints: &[LiquidLayoutHint],
+    hints: &(impl HintSource + ?Sized),
     line: &LayoutLine,
     prev: Option<&LayoutLine>,
     next: Option<&LayoutLine>,
@@ -4152,7 +4152,7 @@ fn fragmented_publication_piece_adjacent_to_marginalia(
 }
 
 fn plain_numeric_fragment_adjacent_to_marginalia(
-    hints: &[LiquidLayoutHint],
+    hints: &(impl HintSource + ?Sized),
     line: &LayoutLine,
     prev: Option<&LayoutLine>,
     next: Option<&LayoutLine>,
@@ -4161,7 +4161,7 @@ fn plain_numeric_fragment_adjacent_to_marginalia(
 }
 
 fn plain_numeric_fragment_near_marginalia<'a>(
-    hints: &[LiquidLayoutHint],
+    hints: &(impl HintSource + ?Sized),
     line: &LayoutLine,
     neighbors: impl IntoIterator<Item = &'a LayoutLine>,
 ) -> bool {
@@ -4178,7 +4178,7 @@ fn plain_numeric_fragment_near_marginalia<'a>(
 }
 
 fn plain_numeric_fragment_in_dense_marginalia_run(
-    hints: &[LiquidLayoutHint],
+    hints: &(impl HintSource + ?Sized),
     line: &LayoutLine,
     neighbors: &[&LayoutLine],
 ) -> bool {
@@ -4635,7 +4635,7 @@ fn numeric_lowercase_publication_note_start_can_be_marginalia(line: &LayoutLine)
 }
 
 fn numeric_year_parenthetical_continuation_can_be_marginalia(
-    hints: &[LiquidLayoutHint],
+    hints: &(impl HintSource + ?Sized),
     line: &LayoutLine,
     prev: Option<&LayoutLine>,
     next: Option<&LayoutLine>,
@@ -4692,7 +4692,7 @@ fn looks_like_numeric_year_parenthetical_continuation(text: &str) -> bool {
 }
 
 fn numeric_page_parenthetical_citation_continuation_can_be_marginalia(
-    hints: &[LiquidLayoutHint],
+    hints: &(impl HintSource + ?Sized),
     line: &LayoutLine,
     prev: Option<&LayoutLine>,
     next: Option<&LayoutLine>,
@@ -4900,7 +4900,7 @@ fn contains_four_digit_year(text: &str) -> bool {
 }
 
 fn adjacent_note_context_supports_continuation(
-    hints: &[LiquidLayoutHint],
+    hints: &(impl HintSource + ?Sized),
     neighbor: &LayoutLine,
     line: &LayoutLine,
 ) -> bool {
@@ -5825,36 +5825,129 @@ fn text_is_all_lowercase_alpha_fragment(text: &str) -> bool {
     saw_alpha
 }
 
-fn push_unique_hint(hints: &mut Vec<LiquidLayoutHint>, text: &str, role: LiquidBlockRole) {
-    let key = normalize_model_text(text);
-    if key.is_empty() {
-        return;
-    }
-    if let Some(existing) = hints
-        .iter_mut()
-        .find(|hint| normalize_model_text(&hint.text) == key)
-    {
-        if hint_priority(role) > hint_priority(existing.role) {
-            existing.role = role;
-            existing.text = text.to_owned();
-        }
-        return;
-    }
-    hints.push(LiquidLayoutHint {
-        text: text.to_owned(),
-        role,
-    });
+/// Layout hints keyed by normalized line text, with a hash index.
+///
+/// The semantics are those of the original `Vec` scan: one entry per
+/// normalized text, and a later push with a higher-priority role replaces the
+/// stored role and text. The index turns each push and lookup from a walk over
+/// every stored hint (re-normalizing each one) into a single hash probe; the
+/// walk was quadratic in the number of lines and dominated Review preparation
+/// on long articles.
+#[derive(Debug, Default, Clone)]
+pub struct LayoutHintTable {
+    items: Vec<LiquidLayoutHint>,
+    index: HashMap<String, usize>,
 }
 
-fn hint_role_for_line(hints: &[LiquidLayoutHint], line: &LayoutLine) -> Option<LiquidBlockRole> {
-    let key = normalize_model_text(&line.text);
-    if key.is_empty() {
-        return None;
+impl LayoutHintTable {
+    #[cfg(test)]
+    pub fn from_hints(items: Vec<LiquidLayoutHint>) -> Self {
+        let mut table = Self::default();
+        for hint in items {
+            table.push_unique(&hint.text, hint.role);
+        }
+        table
     }
-    hints
-        .iter()
-        .find(|hint| normalize_model_text(&hint.text) == key)
-        .map(|hint| hint.role)
+
+    pub fn into_hints(self) -> Vec<LiquidLayoutHint> {
+        self.items
+    }
+
+    #[cfg(test)]
+    pub fn iter(&self) -> impl Iterator<Item = &LiquidLayoutHint> {
+        self.items.iter()
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn push_unique(&mut self, text: &str, role: LiquidBlockRole) {
+        let key = normalize_model_text(text);
+        if key.is_empty() {
+            return;
+        }
+        if let Some(&position) = self.index.get(&key) {
+            let existing = &mut self.items[position];
+            if hint_priority(role) > hint_priority(existing.role) {
+                existing.role = role;
+                existing.text = text.to_owned();
+            }
+            return;
+        }
+        self.index.insert(key, self.items.len());
+        self.items.push(LiquidLayoutHint {
+            text: text.to_owned(),
+            role,
+        });
+    }
+
+    fn role_for_text(&self, text: &str) -> Option<LiquidBlockRole> {
+        let key = normalize_model_text(text);
+        if key.is_empty() {
+            return None;
+        }
+        self.index
+            .get(&key)
+            .map(|&position| self.items[position].role)
+    }
+}
+
+fn push_unique_hint(hints: &mut LayoutHintTable, text: &str, role: LiquidBlockRole) {
+    hints.push_unique(text, role);
+}
+
+/// Anything the hint readers can resolve a line's role from. The indexed
+/// table is the production source; plain slices and vectors keep the linear
+/// scan for tests that build a handful of hints by hand.
+pub trait HintSource {
+    fn hint_role_for_text(&self, text: &str) -> Option<LiquidBlockRole>;
+}
+
+impl std::ops::Index<usize> for LayoutHintTable {
+    type Output = LiquidLayoutHint;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.items[index]
+    }
+}
+
+impl HintSource for LayoutHintTable {
+    fn hint_role_for_text(&self, text: &str) -> Option<LiquidBlockRole> {
+        self.role_for_text(text)
+    }
+}
+
+impl HintSource for [LiquidLayoutHint] {
+    fn hint_role_for_text(&self, text: &str) -> Option<LiquidBlockRole> {
+        let key = normalize_model_text(text);
+        if key.is_empty() {
+            return None;
+        }
+        self.iter()
+            .find(|hint| normalize_model_text(&hint.text) == key)
+            .map(|hint| hint.role)
+    }
+}
+
+impl HintSource for Vec<LiquidLayoutHint> {
+    fn hint_role_for_text(&self, text: &str) -> Option<LiquidBlockRole> {
+        self.as_slice().hint_role_for_text(text)
+    }
+}
+
+impl<const N: usize> HintSource for [LiquidLayoutHint; N] {
+    fn hint_role_for_text(&self, text: &str) -> Option<LiquidBlockRole> {
+        self.as_slice().hint_role_for_text(text)
+    }
+}
+
+fn hint_role_for_line(
+    hints: &(impl HintSource + ?Sized),
+    line: &LayoutLine,
+) -> Option<LiquidBlockRole> {
+    hints.hint_role_for_text(&line.text)
 }
 
 fn hint_priority(role: LiquidBlockRole) -> u8 {
@@ -8948,10 +9041,10 @@ mod tests {
             .map(|line| format!("{}:{}", line.line_index, line.text))
             .collect::<Vec<_>>();
         assert!(leaked.is_empty(), "unexpected sequence lines: {leaked:?}");
-        let hints = vec![LiquidLayoutHint {
+        let hints = LayoutHintTable::from_hints(vec![LiquidLayoutHint {
             text: lines[1].text.clone(),
             role: LiquidBlockRole::Marginalia,
-        }];
+        }]);
         assert!(!model_line_should_be_marginalia(&lines[2]));
         assert!(!should_decode_keep_as_marginalia(
             &hints,
@@ -10381,10 +10474,10 @@ mod tests {
         for line in &mut lines {
             line.font_ratio_page_ref = 0.78;
         }
-        let mut hints = vec![LiquidLayoutHint {
+        let mut hints = LayoutHintTable::from_hints(vec![LiquidLayoutHint {
             text: lines[0].text.clone(),
             role: LiquidBlockRole::Marginalia,
-        }];
+        }]);
 
         extend_decoded_footnote_run_hints(&mut hints, &lines);
 
@@ -10463,10 +10556,10 @@ mod tests {
         for line in &mut lines {
             line.font_ratio_page_ref = 0.76;
         }
-        let mut hints = vec![LiquidLayoutHint {
+        let mut hints = LayoutHintTable::from_hints(vec![LiquidLayoutHint {
             text: lines[0].text.clone(),
             role: LiquidBlockRole::Marginalia,
-        }];
+        }]);
 
         assert!(!should_decode_keep_as_marginalia(
             &hints,
@@ -10496,7 +10589,7 @@ mod tests {
             line.font_ratio_page_ref = 0.76;
         }
         lines[3].font_ratio_page_ref = 0.67;
-        let mut hints = vec![
+        let mut hints = LayoutHintTable::from_hints(vec![
             LiquidLayoutHint {
                 text: lines[0].text.clone(),
                 role: LiquidBlockRole::Marginalia,
@@ -10513,7 +10606,7 @@ mod tests {
                 text: lines[4].text.clone(),
                 role: LiquidBlockRole::Marginalia,
             },
-        ];
+        ]);
 
         extend_decoded_footnote_run_hints(&mut hints, &lines);
 
@@ -10553,10 +10646,10 @@ mod tests {
             &lines[4], &lines
         ));
 
-        let mut hints = vec![LiquidLayoutHint {
+        let mut hints = LayoutHintTable::from_hints(vec![LiquidLayoutHint {
             text: lines[12].text.clone(),
             role: LiquidBlockRole::Marginalia,
-        }];
+        }]);
         extend_decoded_footnote_run_hints(&mut hints, &lines);
 
         assert_eq!(
@@ -10610,10 +10703,10 @@ mod tests {
             &lines[5], &lines
         ));
 
-        let mut hints = vec![LiquidLayoutHint {
+        let mut hints = LayoutHintTable::from_hints(vec![LiquidLayoutHint {
             text: lines[0].text.clone(),
             role: LiquidBlockRole::Marginalia,
-        }];
+        }]);
         extend_decoded_footnote_run_hints(&mut hints, &lines);
 
         assert_eq!(
@@ -10724,10 +10817,10 @@ mod tests {
             &lines[0], &lines
         ));
 
-        let mut hints = vec![LiquidLayoutHint {
+        let mut hints = LayoutHintTable::from_hints(vec![LiquidLayoutHint {
             text: lines[6].text.clone(),
             role: LiquidBlockRole::Marginalia,
-        }];
+        }]);
         extend_decoded_footnote_run_hints(&mut hints, &lines);
 
         assert_eq!(
@@ -11247,7 +11340,7 @@ mod tests {
         for line in &mut lines {
             line.font_ratio_page_ref = 0.78;
         }
-        let mut hints = vec![
+        let mut hints = LayoutHintTable::from_hints(vec![
             LiquidLayoutHint {
                 text: lines[0].text.clone(),
                 role: LiquidBlockRole::Marginalia,
@@ -11256,7 +11349,7 @@ mod tests {
                 text: lines[1].text.clone(),
                 role: LiquidBlockRole::Noise,
             },
-        ];
+        ]);
 
         extend_decoded_footnote_run_hints(&mut hints, &lines);
 
@@ -11283,10 +11376,10 @@ mod tests {
         for line in &mut lines {
             line.font_ratio_page_ref = 0.78;
         }
-        let mut hints = vec![LiquidLayoutHint {
+        let mut hints = LayoutHintTable::from_hints(vec![LiquidLayoutHint {
             text: lines[0].text.clone(),
             role: LiquidBlockRole::Footer,
-        }];
+        }]);
 
         extend_decoded_footnote_run_hints(&mut hints, &lines);
 
@@ -12061,10 +12154,10 @@ mod tests {
             "Burstyn, Inc. v. Wilson, 343 U.S. 495, 501-02 (1952).",
         );
         next.font_ratio_page_ref = 0.7399;
-        let hints = vec![LiquidLayoutHint {
+        let hints = LayoutHintTable::from_hints(vec![LiquidLayoutHint {
             text: next.text.clone(),
             role: LiquidBlockRole::Marginalia,
-        }];
+        }]);
 
         assert!(small_font_line_before_next_note_run_can_be_marginalia(
             &hints,
@@ -12098,10 +12191,10 @@ mod tests {
         );
         note.page_contents_like = true;
         note.font_ratio_page_ref = 0.7479;
-        let hints = vec![LiquidLayoutHint {
+        let hints = LayoutHintTable::from_hints(vec![LiquidLayoutHint {
             text: note.text.clone(),
             role: LiquidBlockRole::Marginalia,
-        }];
+        }]);
 
         assert!(contents_like_credential_before_note_run_can_be_marginalia(
             &hints,
@@ -12125,10 +12218,10 @@ mod tests {
         continuation.right = 464.5;
         continuation.bottom = 207.9;
         continuation.top = 217.9;
-        let hints = vec![LiquidLayoutHint {
+        let hints = LayoutHintTable::from_hints(vec![LiquidLayoutHint {
             text: previous.text.clone(),
             role: LiquidBlockRole::Marginalia,
-        }];
+        }]);
 
         assert!(
             metadata_credential_continuation_after_marginalia_can_be_marginalia(
@@ -12148,7 +12241,7 @@ mod tests {
         let mut target = test_line(5, 108, 553.5, 82.3, 564.1, 92.3, "81");
         target.font_ratio_page_ref = 0.6701;
 
-        let hints = vec![
+        let hints = LayoutHintTable::from_hints(vec![
             LiquidLayoutHint {
                 text: note_a.text.clone(),
                 role: LiquidBlockRole::Marginalia,
@@ -12157,7 +12250,7 @@ mod tests {
                 text: note_b.text.clone(),
                 role: LiquidBlockRole::Marginalia,
             },
-        ];
+        ]);
         assert!(tiny_numeric_note_cluster_can_be_marginalia(
             &hints,
             &target,
@@ -13306,10 +13399,10 @@ mod tests {
         let mut marker = test_line(1, 53, 82.0, 200.0, 92.0, 210.0, "2.");
         marker.page_contents_like = true;
         marker.font_ratio_page_ref = 0.74;
-        let hints = vec![LiquidLayoutHint {
+        let hints = LayoutHintTable::from_hints(vec![LiquidLayoutHint {
             text: marker.text.clone(),
             role: LiquidBlockRole::Marginalia,
-        }];
+        }]);
         assert!(should_decode_keep_as_marginalia(
             &hints,
             &citation_continuation,
@@ -13498,7 +13591,7 @@ mod tests {
             test_line(0, 2, 72.0, 620.0, 160.0, 632.0, "Volume 36 | Number 3"),
             test_line(0, 3, 72.0, 600.0, 160.0, 612.0, "Article 5"),
         ];
-        let mut hints = Vec::new();
+        let mut hints = LayoutHintTable::default();
         extend_repository_cover_hints(&mut hints, &lines);
 
         assert!(
@@ -13619,7 +13712,7 @@ mod tests {
         assert!(!model_line_should_be_marginalia(&lines[1]));
         assert!(!footnote_specialist_line_can_be_marginalia(&lines[5]));
 
-        let mut hints = Vec::new();
+        let mut hints = LayoutHintTable::default();
         extend_page_contents_noise_hints(&mut hints, &lines);
         assert!(
             hints
@@ -13719,7 +13812,7 @@ mod tests {
         mark_page_context_features(&mut lines);
 
         assert!(lines.iter().all(|line| line.page_contents_like));
-        let mut hints = Vec::new();
+        let mut hints = LayoutHintTable::default();
         extend_page_contents_noise_hints(&mut hints, &lines);
         assert_eq!(hints.len(), lines.len());
         assert!(hints.iter().all(|hint| hint.role == LiquidBlockRole::Noise));
@@ -13762,7 +13855,7 @@ mod tests {
         mark_page_context_features(&mut lines);
 
         assert!(lines.iter().all(|line| line.page_contents_like));
-        let mut hints = Vec::new();
+        let mut hints = LayoutHintTable::default();
         extend_page_contents_noise_hints(&mut hints, &lines);
         assert!(
             !hints
@@ -13816,7 +13909,7 @@ mod tests {
         assert!(looks_like_dot_leader_contents_fragment(&lines[2].text));
         assert!(!lines.iter().any(model_line_should_be_marginalia));
 
-        let mut hints = Vec::new();
+        let mut hints = LayoutHintTable::default();
         extend_page_contents_noise_hints(&mut hints, &lines);
         assert_eq!(hints.len(), lines.len());
         assert!(hints.iter().all(|hint| hint.role == LiquidBlockRole::Noise));

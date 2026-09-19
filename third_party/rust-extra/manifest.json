@@ -1,0 +1,429 @@
+[
+  {
+    "packages": [
+      "accesskit-0.21.1"
+    ],
+    "repository": "https://github.com/AccessKit/accesskit",
+    "commit": "0b6901a8c8e6fb1cb5a2dc7c19dc7bee1cc5ad09",
+    "files": [
+      {
+        "path": "third_party/rust-extra/AccessKit-accesskit-0b6901a8c8e6/LICENSE-APACHE",
+        "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/0b6901a8c8e6fb1cb5a2dc7c19dc7bee1cc5ad09/LICENSE-APACHE"
+      },
+      {
+        "path": "third_party/rust-extra/AccessKit-accesskit-0b6901a8c8e6/LICENSE.chromium",
+        "sha256": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/0b6901a8c8e6fb1cb5a2dc7c19dc7bee1cc5ad09/LICENSE.chromium"
+      },
+      {
+        "path": "third_party/rust-extra/AccessKit-accesskit-0b6901a8c8e6/LICENSE-MIT",
+        "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/0b6901a8c8e6fb1cb5a2dc7c19dc7bee1cc5ad09/LICENSE-MIT"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "accesskit_consumer-0.31.0",
+      "accesskit_macos-0.22.2",
+      "accesskit_windows-0.29.2",
+      "accesskit_winit-0.29.2"
+    ],
+    "repository": "https://github.com/AccessKit/accesskit",
+    "commit": "5801c4a49ff9b2c9ec3f77b3c31272d0da4c5cd3",
+    "files": [
+      {
+        "path": "third_party/rust-extra/AccessKit-accesskit-5801c4a49ff9/LICENSE-APACHE",
+        "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/5801c4a49ff9b2c9ec3f77b3c31272d0da4c5cd3/LICENSE-APACHE"
+      },
+      {
+        "path": "third_party/rust-extra/AccessKit-accesskit-5801c4a49ff9/LICENSE.chromium",
+        "sha256": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/5801c4a49ff9b2c9ec3f77b3c31272d0da4c5cd3/LICENSE.chromium"
+      },
+      {
+        "path": "third_party/rust-extra/AccessKit-accesskit-5801c4a49ff9/LICENSE-MIT",
+        "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+        "source": "https://raw.githubusercontent.com/AccessKit/accesskit/5801c4a49ff9b2c9ec3f77b3c31272d0da4c5cd3/LICENSE-MIT"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "blake2b_simd-1.0.4"
+    ],
+    "repository": "https://github.com/oconnor663/blake2_simd",
+    "commit": "6a94ae2e18985c7c35bada8a4d438bfe9ab0d0c0",
+    "files": [
+      {
+        "path": "third_party/rust-extra/oconnor663-blake2_simd-6a94ae2e1898/LICENSE",
+        "sha256": "27e0387973d6b8507cb15f825f6f26e0278d4d5857082c1f56b49a7b39a90183",
+        "source": "https://raw.githubusercontent.com/oconnor663/blake2_simd/6a94ae2e18985c7c35bada8a4d438bfe9ab0d0c0/LICENSE"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "block-0.1.6"
+    ],
+    "repository": "https://github.com/SSheldon/rust-block",
+    "commit": "47178790cfc9d4a8b092051d8b413b78bd31254a",
+    "files": [
+      {
+        "path": "third_party/rust-extra/SSheldon-rust-block-47178790cfc9/UPSTREAM-LICENSE-DECLARATION.txt",
+        "sha256": "24df2f33b48c9e756a4f864f882c1ab07a159b6c2b790f45af2e8162499b6719",
+        "source": "https://raw.githubusercontent.com/SSheldon/rust-block/47178790cfc9d4a8b092051d8b413b78bd31254a/Cargo.toml"
+      },
+      {
+        "path": "third_party/rust-extra/SSheldon-rust-block-47178790cfc9/LICENSE-MIT.txt",
+        "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5",
+        "source": "https://spdx.org/licenses/MIT.json"
+      }
+    ],
+    "note": "The upstream release declares MIT in Cargo.toml but supplies no license file. Includes its unmodified declaration and the standard SPDX license text; attribution is recorded in the upstream declaration."
+  },
+  {
+    "packages": [
+      "block2-0.5.1",
+      "objc-sys-0.3.5",
+      "objc2-0.5.2"
+    ],
+    "repository": "https://github.com/madsmtm/objc2",
+    "commit": "4fc083f1c6d6784577e38b0ee8dbd344481e2fd2",
+    "files": [
+      {
+        "path": "third_party/rust-extra/madsmtm-objc2-4fc083f1c6d6/LICENSE.txt",
+        "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+        "source": "https://raw.githubusercontent.com/madsmtm/objc2/4fc083f1c6d6784577e38b0ee8dbd344481e2fd2/LICENSE.txt"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "block2-0.6.2"
+    ],
+    "repository": "https://github.com/madsmtm/objc2",
+    "commit": "b4167b582b2f75f9a1be75495c41b765344fd03c",
+    "files": [
+      {
+        "path": "third_party/rust-extra/madsmtm-objc2-b4167b582b2f/LICENSE.md",
+        "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+        "source": "https://raw.githubusercontent.com/madsmtm/objc2/b4167b582b2f75f9a1be75495c41b765344fd03c/LICENSE.md"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "dispatch-0.2.0"
+    ],
+    "repository": "https://github.com/SSheldon/rust-dispatch",
+    "commit": "82d6c7a5b75dc0c71c3f46f87bb6c16a476f7748",
+    "files": [
+      {
+        "path": "third_party/rust-extra/SSheldon-rust-dispatch-82d6c7a5b75d/UPSTREAM-LICENSE-DECLARATION.txt",
+        "sha256": "05c60b829931ef7f1f130735843c11f5cf9cc69546eca5fc941d014781c68e31",
+        "source": "https://raw.githubusercontent.com/SSheldon/rust-dispatch/82d6c7a5b75dc0c71c3f46f87bb6c16a476f7748/Cargo.toml"
+      },
+      {
+        "path": "third_party/rust-extra/SSheldon-rust-dispatch-82d6c7a5b75d/LICENSE-MIT.txt",
+        "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5",
+        "source": "https://spdx.org/licenses/MIT.json"
+      }
+    ],
+    "note": "The upstream release declares MIT in Cargo.toml but supplies no license file. Includes its unmodified declaration and the standard SPDX license text; attribution is recorded in the upstream declaration."
+  },
+  {
+    "packages": [
+      "dispatch2-0.3.1",
+      "objc2-0.6.4"
+    ],
+    "repository": "https://github.com/madsmtm/objc2",
+    "commit": "8852b424193ca41602281b3d7540d7c8ed51e49a",
+    "files": [
+      {
+        "path": "third_party/rust-extra/madsmtm-objc2-8852b424193c/LICENSE.md",
+        "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+        "source": "https://raw.githubusercontent.com/madsmtm/objc2/8852b424193ca41602281b3d7540d7c8ed51e49a/LICENSE.md"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "ecolor-0.33.3",
+      "eframe-0.33.3",
+      "egui-0.33.3",
+      "egui-wgpu-0.33.3",
+      "egui-winit-0.33.3",
+      "egui_glow-0.33.3",
+      "emath-0.33.3",
+      "epaint-0.33.3",
+      "epaint_default_fonts-0.33.3"
+    ],
+    "repository": "https://github.com/emilk/egui",
+    "commit": "44cdd653e2317d300fb8a6c9c36b03f23991e803",
+    "files": [
+      {
+        "path": "third_party/rust-extra/emilk-egui-44cdd653e231/LICENSE-APACHE",
+        "sha256": "8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90",
+        "source": "https://raw.githubusercontent.com/emilk/egui/44cdd653e2317d300fb8a6c9c36b03f23991e803/LICENSE-APACHE"
+      },
+      {
+        "path": "third_party/rust-extra/emilk-egui-44cdd653e231/LICENSE-MIT",
+        "sha256": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c",
+        "source": "https://raw.githubusercontent.com/emilk/egui/44cdd653e2317d300fb8a6c9c36b03f23991e803/LICENSE-MIT"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "gpu-alloc-0.6.0",
+      "gpu-alloc-types-0.3.0"
+    ],
+    "repository": "https://github.com/zakarumych/gpu-alloc",
+    "commit": "84ca166ba69b95b69f36c2cb3b0160a6c4efa90a",
+    "files": [
+      {
+        "path": "third_party/rust-extra/zakarumych-gpu-alloc-84ca166ba69b/COPYING",
+        "sha256": "12121dfa588677007848ab922a45a1e3248868f6ff063598fceb3141d7897314",
+        "source": "https://raw.githubusercontent.com/zakarumych/gpu-alloc/84ca166ba69b95b69f36c2cb3b0160a6c4efa90a/COPYING"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "gpu-descriptor-0.3.2"
+    ],
+    "repository": "https://github.com/zakarumych/gpu-descriptor",
+    "commit": "bb28b4e55b742e0ea3e7a0968e7ee6287ba0e06a",
+    "files": [
+      {
+        "path": "third_party/rust-extra/zakarumych-gpu-descriptor-bb28b4e55b74/COPYING",
+        "sha256": "f72143f7e9d9fb8bd336b139fa22f825a299591c29f2f7338c5566347b137613",
+        "source": "https://raw.githubusercontent.com/zakarumych/gpu-descriptor/bb28b4e55b742e0ea3e7a0968e7ee6287ba0e06a/COPYING"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "gpu-descriptor-types-0.2.0"
+    ],
+    "repository": "https://github.com/zakarumych/gpu-descriptor",
+    "commit": "9f2fb9546591322e7b77ee1e79385e01effd85e4",
+    "files": [
+      {
+        "path": "third_party/rust-extra/zakarumych-gpu-descriptor-9f2fb9546591/COPYING",
+        "sha256": "f72143f7e9d9fb8bd336b139fa22f825a299591c29f2f7338c5566347b137613",
+        "source": "https://raw.githubusercontent.com/zakarumych/gpu-descriptor/9f2fb9546591322e7b77ee1e79385e01effd85e4/COPYING"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "hexf-parse-0.2.1"
+    ],
+    "repository": "https://github.com/lifthrasiir/hexf",
+    "commit": "4225763d744183d720f575ae96d04161b4d08ea0",
+    "files": [
+      {
+        "path": "third_party/rust-extra/lifthrasiir-hexf-4225763d7441/UPSTREAM-LICENSE-DECLARATION.txt",
+        "sha256": "9b75a01608d103275c0eb41a0e1c1284dbc326dd90a9d79e2039b8c69e7c3c08",
+        "source": "https://raw.githubusercontent.com/lifthrasiir/hexf/4225763d744183d720f575ae96d04161b4d08ea0/Cargo.toml"
+      },
+      {
+        "path": "third_party/rust-extra/lifthrasiir-hexf-4225763d7441/LICENSE-CC0-1.0.txt",
+        "sha256": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499",
+        "source": "https://spdx.org/licenses/CC0-1.0.json"
+      }
+    ],
+    "note": "The upstream release declares CC0-1.0 in Cargo.toml but supplies no license file. Includes its unmodified declaration and the standard SPDX license text; attribution is recorded in the upstream declaration."
+  },
+  {
+    "packages": [
+      "malloc_buf-0.0.6"
+    ],
+    "repository": "https://github.com/SSheldon/malloc_buf",
+    "commit": "a7811e5f4c6f9685dd57ad9bfe34e9bf6b0ba4f9",
+    "files": [
+      {
+        "path": "third_party/rust-extra/SSheldon-malloc_buf-a7811e5f4c6f/UPSTREAM-LICENSE-DECLARATION.txt",
+        "sha256": "1c70c91688d9850272e43cee9b189ffe3fe667151d7caf576a36a720f8b28194",
+        "source": "https://raw.githubusercontent.com/SSheldon/malloc_buf/a7811e5f4c6f9685dd57ad9bfe34e9bf6b0ba4f9/Cargo.toml"
+      },
+      {
+        "path": "third_party/rust-extra/SSheldon-malloc_buf-a7811e5f4c6f/LICENSE-MIT.txt",
+        "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5",
+        "source": "https://spdx.org/licenses/MIT.json"
+      }
+    ],
+    "note": "The upstream release declares MIT in Cargo.toml but supplies no license file. Includes its unmodified declaration and the standard SPDX license text; attribution is recorded in the upstream declaration."
+  },
+  {
+    "packages": [
+      "nom-language-0.1.0"
+    ],
+    "repository": "https://github.com/rust-bakery/nom",
+    "commit": "2cec1b3e4c9ccac62c902d60c00de6d1549ccbe1",
+    "files": [
+      {
+        "path": "third_party/rust-extra/rust-bakery-nom-2cec1b3e4c9c/LICENSE",
+        "sha256": "4dbda04344456f09a7a588140455413a9ac59b6b26a1ef7cdf9c800c012d87f0",
+        "source": "https://raw.githubusercontent.com/rust-bakery/nom/2cec1b3e4c9ccac62c902d60c00de6d1549ccbe1/LICENSE"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "objc2-app-kit-0.2.2",
+      "objc2-core-data-0.2.2",
+      "objc2-core-image-0.2.2",
+      "objc2-foundation-0.2.2",
+      "objc2-metal-0.2.2",
+      "objc2-quartz-core-0.2.2"
+    ],
+    "repository": "https://github.com/madsmtm/objc2",
+    "commit": "e282618be4c3a3b9542957e0c8540e9588472ce8",
+    "files": [
+      {
+        "path": "third_party/rust-extra/madsmtm-objc2-e282618be4c3/LICENSE.txt",
+        "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+        "source": "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "objc2-app-kit-0.3.2",
+      "objc2-core-foundation-0.3.2",
+      "objc2-core-graphics-0.3.2",
+      "objc2-core-services-0.3.2",
+      "objc2-foundation-0.3.2",
+      "objc2-io-surface-0.3.2",
+      "objc2-security-0.3.2"
+    ],
+    "repository": "https://github.com/madsmtm/objc2",
+    "commit": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+    "files": [
+      {
+        "path": "third_party/rust-extra/madsmtm-objc2-7b1abfd750a2/LICENSE.md",
+        "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+        "source": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "objc2-encode-4.1.0"
+    ],
+    "repository": "https://github.com/madsmtm/objc2",
+    "commit": "8d214f5477365ffcbcbb7de058c86ed9a518efb7",
+    "files": [
+      {
+        "path": "third_party/rust-extra/madsmtm-objc2-8d214f547736/LICENSE.md",
+        "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+        "source": "https://raw.githubusercontent.com/madsmtm/objc2/8d214f5477365ffcbcbb7de058c86ed9a518efb7/LICENSE.md"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "profiling-1.0.18"
+    ],
+    "repository": "https://github.com/aclysma/profiling",
+    "commit": "8271551172eb6fa4cba47369aedd93790c623df9",
+    "files": [
+      {
+        "path": "third_party/rust-extra/aclysma-profiling-8271551172eb/LICENSE-APACHE",
+        "sha256": "10d30a673cd5e9349bdc02aeb48f14b3386d27d0da32df8f0a555d4aa16aa551",
+        "source": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-APACHE"
+      },
+      {
+        "path": "third_party/rust-extra/aclysma-profiling-8271551172eb/LICENSE-MIT",
+        "sha256": "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333",
+        "source": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "spirv-0.3.0+sdk-1.3.268.0"
+    ],
+    "repository": "https://github.com/gfx-rs/rspirv",
+    "commit": "e91a5debc10c395b36db7721dfff6326d697a1e2",
+    "files": [
+      {
+        "path": "third_party/rust-extra/gfx-rs-rspirv-e91a5debc10c/LICENSE",
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+        "source": "https://raw.githubusercontent.com/gfx-rs/rspirv/e91a5debc10c395b36db7721dfff6326d697a1e2/LICENSE"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "tract-extra-0.23.7",
+      "tract-transformers-0.23.7"
+    ],
+    "repository": "https://github.com/snipsco/tract",
+    "commit": "3b3702a838ce04742fc0df899da5c6af00078598",
+    "files": [
+      {
+        "path": "third_party/rust-extra/snipsco-tract-3b3702a838ce/LICENSE-APACHE",
+        "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+        "source": "https://raw.githubusercontent.com/snipsco/tract/3b3702a838ce04742fc0df899da5c6af00078598/LICENSE-APACHE"
+      },
+      {
+        "path": "third_party/rust-extra/snipsco-tract-3b3702a838ce/LICENSE",
+        "sha256": "f7ef673bf046d823dcd775bdd0768432bd8855f81d0e5e1290a0a48c42e2dca3",
+        "source": "https://raw.githubusercontent.com/snipsco/tract/3b3702a838ce04742fc0df899da5c6af00078598/LICENSE"
+      },
+      {
+        "path": "third_party/rust-extra/snipsco-tract-3b3702a838ce/LICENSE-MIT",
+        "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+        "source": "https://raw.githubusercontent.com/snipsco/tract/3b3702a838ce04742fc0df899da5c6af00078598/LICENSE-MIT"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "clipboard-win-5.4.1"
+    ],
+    "repository": "https://github.com/DoumanAsh/clipboard-win",
+    "commit": "3b27cf2bfd1adcfa6e0264eb51c1025ddaf0f342",
+    "files": [
+      {
+        "path": "third_party/rust-extra/DoumanAsh-clipboard-win-3b27cf2bfd1a/LICENSE",
+        "sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566",
+        "source": "https://raw.githubusercontent.com/DoumanAsh/clipboard-win/3b27cf2bfd1adcfa6e0264eb51c1025ddaf0f342/LICENSE"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "gl_generator-0.14.0"
+    ],
+    "repository": "https://github.com/brendanzab/gl-rs",
+    "commit": "ea503e8d5fb6d73c6030e6191ce738cd3bf3433e",
+    "files": [
+      {
+        "path": "third_party/rust-extra/brendanzab-gl-rs-ea503e8d5fb6/LICENSE",
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+        "source": "https://raw.githubusercontent.com/brendanzab/gl-rs/ea503e8d5fb6d73c6030e6191ce738cd3bf3433e/LICENSE"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "khronos_api-3.1.0"
+    ],
+    "repository": "https://github.com/brendanzab/gl-rs",
+    "commit": "f150967b1c44ae888e6676f93f639ebc82771bdc",
+    "files": [
+      {
+        "path": "third_party/rust-extra/brendanzab-gl-rs-f150967b1c44/LICENSE",
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+        "source": "https://raw.githubusercontent.com/brendanzab/gl-rs/f150967b1c44ae888e6676f93f639ebc82771bdc/LICENSE"
+      }
+    ]
+  }
+]

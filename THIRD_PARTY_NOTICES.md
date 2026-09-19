@@ -1,33 +1,34 @@
 # Third-Party Notices
 
 This file summarizes third-party software distributed with LawPDF or linked into
-the Windows release build. It is a practical notice file, not legal advice.
+the desktop release builds. It is a practical notice file, not legal advice.
 
 ## Rust Dependencies
 
-Rust crate license metadata for the Windows target is generated in
-`THIRD_PARTY_RUST_LICENSES.csv` from:
+Each desktop package contains a target-specific `THIRD_PARTY_RUST_LICENSES.csv`
+and a `rust-licenses/` directory copied from the locked upstream crates by
+`tools/package_rust_notices.py`. The inventory uses `cargo metadata --locked`
+with the package's target platform. The repository's older Windows inventory
+is retained as historical reference; packaging regenerates it after dependency
+changes.
 
-```powershell
-cargo metadata --locked --filter-platform x86_64-pc-windows-msvc
-```
+Some upstream crate archives omit their workspace license files. Matching
+upstream notices are vendored in `third_party/rust-extra/` with pinned source
+revisions and SHA-256 hashes. Packaging includes those notices and their
+provenance, and fails if a required crate has no license text.
+For four older crates without an upstream license file, the supplement includes
+the upstream license declaration/author metadata and the unmodified standard
+SPDX license text; the provenance identifies this explicitly.
 
-The current Windows dependency set reports permissive licenses such as MIT,
-Apache-2.0, BSD-family licenses, ISC, Zlib, Unicode-3.0, and compatible
-multi-license expressions. The audit did not identify GPL, AGPL, or LGPL
-licensed Rust crates in the Windows target dependency graph.
+## PDFium Binaries
 
-## PDFium Binary
-
-LawPDF bundles `pdfium.dll` for Windows PDF rendering. The binary is from the
-`bblanchon/pdfium-binaries` distribution. Its license file and the third-party
-licenses included in that package are committed under:
-
-```text
-third_party/pdfium-binaries/
-```
-
-Release packages include this notice directory.
+Mac and Windows builds bundle the matching `chromium/8057` release from
+[bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries/releases/tag/chromium/8057),
+published September 14, 2026. Both downloaded archives were checked against the
+publisher's SHA-256 digests. The exact library hashes are recorded in
+`release-manifest.json` and checked before packaging. The upstream license files
+and dependency notices are distributed under `third_party/pdfium-binaries/`
+(Windows) and `third_party/pdfium-binaries-mac-arm64/` (Mac).
 
 ## EB Garamond
 

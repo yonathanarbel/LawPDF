@@ -61,4 +61,27 @@ public final class AnnotationStoreTest {
         assertEquals(1, snapshot.size());
         assertEquals(0, store.size());
     }
+    @Test
+    public void failedPersistenceRollsBackEditAndHistory() {
+        AnnotationStore store = new AnnotationStore();
+        store.restore(java.util.Collections.emptyList(), marks -> false);
+        AnnotationStore.Stroke mark = store.startStroke(0, AnnotationStore.Tool.PEN, 1, 0.004f, 0.1f, 0.1f);
+        store.commit(mark);
+        assertEquals(0, store.size());
+        assertFalse(store.canUndo());
+    }
+
+    @Test
+    public void restoredAnnotationsPersistUndoAndRedoSnapshots() {
+        AnnotationStore original = new AnnotationStore();
+        original.commit(original.startStroke(0, AnnotationStore.Tool.PEN, 1, 0.004f, 0.1f, 0.1f));
+        AnnotationStore restored = new AnnotationStore();
+        java.util.ArrayList<Integer> committedSizes = new java.util.ArrayList<>();
+        restored.restore(original.snapshot(), marks -> { committedSizes.add(marks.size()); return true; });
+        assertEquals(1, restored.size());
+        restored.commit(restored.startStroke(1, AnnotationStore.Tool.HIGHLIGHT, 2, 0.02f, 0.2f, 0.2f));
+        assertTrue(restored.undo());
+        assertTrue(restored.redo());
+        assertEquals(java.util.Arrays.asList(2, 1, 2), committedSizes);
+    }
 }

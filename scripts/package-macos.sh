@@ -37,40 +37,20 @@ if [[ -f "$ROOT/vendor/libpdfium.dylib" ]]; then
 elif [[ -n "${PDFIUM_DYNAMIC_LIB_PATH:-}" && -f "$PDFIUM_DYNAMIC_LIB_PATH" ]]; then
   cp "$PDFIUM_DYNAMIC_LIB_PATH" "$FRAMEWORKS/libpdfium.dylib"
 else
-  echo "warning: libpdfium.dylib was not bundled; set PDFIUM_DYNAMIC_LIB_PATH or place it at vendor/libpdfium.dylib" >&2
+  echo "error: libpdfium.dylib is required; set PDFIUM_DYNAMIC_LIB_PATH or place it at vendor/libpdfium.dylib" >&2
+  exit 1
 fi
 
 cp "$ROOT/assets/lawpdf.png" "$RESOURCES/lawpdf.png"
+cp "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_NOTICES.md" "$RESOURCES/"
+python3 "$ROOT/tools/package_rust_notices.py" --target aarch64-apple-darwin --destination "$RESOURCES"
+mkdir -p "$RESOURCES/third_party"
+for component in pdfium-binaries-mac-arm64 eb-garamond catboost; do
+  cp -R "$ROOT/third_party/$component" "$RESOURCES/third_party/$component"
+done
 
-if [[ "${LAWPDF_BUNDLE_PP_DOCLAYOUT:-0}" == "1" ]]; then
-  mkdir -p "$RESOURCES/tools"
-  if [[ -f "$ROOT/tools/lm2_pp_doclayout_regions.py" ]]; then
-    cp "$ROOT/tools/lm2_pp_doclayout_regions.py" "$RESOURCES/tools/lm2_pp_doclayout_regions.py"
-  fi
-
-  if [[ -d "$ROOT/.lawpdf/ppdoclayout-venv" ]]; then
-    rm -rf "$RESOURCES/ppdoclayout-venv"
-    cp -R "$ROOT/.lawpdf/ppdoclayout-venv" "$RESOURCES/ppdoclayout-venv"
-    find "$RESOURCES/ppdoclayout-venv" \( -iname "fitz" -o -iname "pymupdf" -o -iname "pymupdf-*.dist-info" -o -iname "pymupdf" \) -prune -exec rm -rf {} +
-    rm -f "$RESOURCES/ppdoclayout-venv/bin/pymupdf"
-  else
-    echo "warning: PP-DocLayout venv was not bundled; expected $ROOT/.lawpdf/ppdoclayout-venv" >&2
-  fi
-else
-  echo "PP-DocLayout sidecar assets not bundled; set LAWPDF_BUNDLE_PP_DOCLAYOUT=1 to include them" >&2
-fi
-
-if [[ -d "$ROOT/profile-models/lm2-current" ]]; then
-  mkdir -p "$RESOURCES/profile-models"
-  rm -rf "$RESOURCES/profile-models/lm2-current"
-  cp -R "$ROOT/profile-models/lm2-current" "$RESOURCES/profile-models/lm2-current"
-fi
-
-if [[ -d "$ROOT/profile-models/lm2-v20-runtime" ]]; then
-  mkdir -p "$RESOURCES/profile-models"
-  rm -rf "$RESOURCES/profile-models/lm2-v20-runtime"
-  cp -R "$ROOT/profile-models/lm2-v20-runtime" "$RESOURCES/profile-models/lm2-v20-runtime"
-fi
+# Release packages contain only the explicit runtime allowlist below. Private
+# Python environments and training directories are never copied into the app.
 
 NATIVE_RUNTIME_SOURCE="$ROOT/profile-models/lm2-native-catboost-runtime"
 FASTTAB_RUNTIME_SOURCE="$ROOT/profile-models/lm2-fasttab-runtime"
@@ -172,7 +152,7 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
   <key>CFBundleVersion</key>
   <string>__VERSION__</string>
   <key>LSMinimumSystemVersion</key>
-  <string>12.0</string>
+  <string>13.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSPrincipalClass</key>

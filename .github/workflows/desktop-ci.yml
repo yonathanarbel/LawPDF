@@ -1,0 +1,49 @@
+name: Desktop verification
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target_dir: /tmp/lawpdf-target
+          - os: windows-latest
+            target_dir: C:\tmp\lawpdf-target
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TARGET_DIR: ${{ matrix.target_dir }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Fetch Windows native runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\scripts\fetch-catboost-windows.ps1
+      - name: Test production feature set
+        run: cargo test --locked
+      - name: Test development feature set
+        run: cargo test --locked --features devtools
+      - name: Verify public runtime assets
+        run: python tools/verify_release_manifest.py --require-platform-library
+      - name: Verify Markdown exports
+        run: python -m unittest discover -s tools -p test_md_verify.py
+
+  audit:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: /tmp/lawpdf-audit-target
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install dependency auditor
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Reject known vulnerable dependencies
+        run: cargo audit
