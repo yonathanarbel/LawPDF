@@ -1,74 +1,103 @@
 # LawPDF
 
-LawPDF is a desktop PDF reader and annotation editor designed for legal reading.
+**“The world's best PDF app for lawyers and law professors.”**  
+That's the ambition behind LawPDF: a reader built around how legal scholars actually work.
 
-Its **Review Mode** reconstructs reading order and footnotes for law review articles.
-The original PDF remains available for checking citations, tables, and any text
-whose reconstruction is uncertain.
+Created by **Professor Yonathan Arbel**, LawPDF is a free, open-source desktop PDF
+reader and annotation editor for Windows and Apple-silicon Macs.
+
+Read the article, follow the footnotes, and keep your place. **Review Mode**
+reconstructs reading flow and footnotes in law review articles, while the original
+PDF remains available for checking quotations, citations, tables, and layout.
+Highlight a passage for class, leave a comment on a colleague's draft, or work
+through a case with search, annotation, and recovery tools in one application.
+
+The “world's best” line expresses the creator's vision, not an independently
+tested ranking. **Version 0.2.32 is a public beta.**
 
 ## Download
 
-Download the newest version from the
-[LawPDF releases page](https://github.com/yonathanarbel/LawPDF/releases/latest).
+[**Download LawPDF for Windows or Mac**](https://github.com/yonathanarbel/LawPDF/releases/tag/v0.2.32)
 
-### Windows
+| Platform | Download | Requirements |
+| --- | --- | --- |
+| Windows installer | [LawPDFSetup-x64.exe](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.32/LawPDFSetup-x64.exe) | 64-bit Windows; installation may request administrator approval |
+| Windows portable | [LawPDF-windows-portable-x64.zip](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.32/LawPDF-windows-portable-x64.zip) | Extract the entire ZIP, then run `lawpdf.exe` |
+| Mac | [LawPDF-macos.zip](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.32/LawPDF-macos.zip) | Apple silicon (M-series), macOS 13 or later; Intel Macs are not supported by this build |
 
-- `LawPDFSetup-x64.exe` — standard 64-bit Windows installer.
-- `LawPDF-windows-portable-x64.zip` — portable version; extract it and run
-  `lawpdf.exe`.
+Close older LawPDF versions before installing or opening the new version.
+Keep a backup of important PDFs while trying the beta.
 
-The installer registers LawPDF as a PDF-capable app and offers to open the
-Windows default-app chooser. You can reopen that chooser at any time with
-**Set as default** in the LawPDF toolbar. Windows requires you to confirm the
-`.pdf` association yourself.
+### Windows installation
 
-### macOS
+Run the installer, or choose the portable ZIP if you prefer not to install.
+The packages are not publisher-signed, so Windows may show an unknown-publisher
+or reputation warning. Download only from this repository's release page.
+The installer registers LawPDF as a PDF-capable app and offers the Windows
+default-app chooser. You can also choose **Set as default** in LawPDF;
+Windows requires you to confirm the PDF association yourself.
 
-- `LawPDF-macos.zip` — application bundle for Apple-silicon Macs running
-  macOS 13 or later (required by the bundled PDF engine).
+### Mac installation
 
-Extract the ZIP and move `LawPDF.app` to Applications. This beta uses ad hoc signing and is not notarized by Apple. macOS may require
-you to explicitly approve the first launch. GitHub distribution does not remove
-that macOS warning. No paid signing membership is bundled or required to download
-LawPDF. See the [signing policy](docs/CODE_SIGNING.md) for the current status.
+Extract the ZIP and drag `LawPDF.app` to Applications. This build is ad hoc signed
+and is **not notarized by Apple**. If macOS blocks the first launch, use Apple's
+documented per-app approval process in **System Settings → Privacy & Security**
+after attempting to open it. Do not disable Gatekeeper globally.
+See [Apple's instructions](https://support.apple.com/en-us/102445) and our
+[signing policy](docs/CODE_SIGNING.md).
 
-LawPDF offers a small, one-time prompt when it is not your default PDF reader.
-You can also change the association later with **Set as default** in the LawPDF
-toolbar.
+## Built for legal reading, research, and teaching
 
-New automatic updates require an Ed25519 signature from LawPDF's pinned release
-key, the exact package size, and its SHA-256 checksum. This authenticates the
-update separately from Apple or Windows publisher signing. Older releases without
-a signed manifest are available through the GitHub download link. Updates wait
-for document saves before restarting.
+- **Read footnote-heavy scholarship:** Review Mode reconstructs reading flow
+  and footnotes; keep the source PDF close for verification.
+- **Prepare for class and workshops:** highlight, underline, comment, add text
+  boxes, and save annotated PDFs.
+- **Find the passage you need:** native text selection, search, copy,
+  continuous multi-page viewing, and zoom.
+- **Work with scanned materials:** OCR support for documents without native text.
+- **Keep your work:** automatic annotation saving, visible save status,
+  undo/redo, recovery copies, and external-file conflict detection. Closing
+  waits for pending writes; failed writes keep the document open.
+  Protected PDFs require Save As for an annotated copy.
+- **Choose your tools:** optional AI-provider features, with provider keys stored
+  in the operating system's credential store. Review the
+  [privacy guide](docs/PRIVACY.md) before using network-backed features.
 
-## Features
+## What to expect from this beta
 
-- Review Mode for comfortable law review reading.
-- Optional Windows and macOS default-PDF-reader integration.
-- Continuous multi-page PDF viewing and zoom.
-- Native text selection, search, and copy.
-- Highlights, underlining, comments, free-text boxes, and signatures.
-- Automatic annotation saving, with a visible saved/unsaved status. Closing waits
-  for pending writes; failed writes keep the document open. Protected PDFs require
-  Save As to make an annotated copy.
-- Recovery copies for interrupted editing, external-file conflict detection, and
-  annotation undo/redo. A recovery dialog lets you export a separate marked PDF.
-- Provider keys stored in the operating system credential store, configurable
-  local cache retention, and support diagnostics that exclude document contents.
-- OCR support for scanned documents.
-- Footnote navigation and reading-flow reconstruction.
-- Export and save tools for annotated documents.
+The Windows and Mac builds passed their automated regression and packaging
+checks. The exact Windows installer was verified on a clean hosted Windows
+machine. The Mac application has also undergone local runtime and annotation
+checks.
 
-## License and notices
+Broader screen-reader workflows, real-world reliability, large-document
+performance, and signed-update replacement/recovery still need more testing.
+A reported document-opening problem remains unresolved at the interface level.
+Reading reconstruction can make mistakes: verify quotations and citations
+against the original PDF, and keep backups of important work.
 
-LawPDF is released under the [MIT License](LICENSE). Bundled third-party
-components and models are documented in
+Updates require a manifest signed by LawPDF's pinned release key plus matching
+package sizes and SHA-256 hashes. This is separate from Windows publisher
+signing and Apple notarization. Until the complete automatic-update path is
+qualified, the release-page downloads provide the manual installation route.
+
+Found a problem? [Report an issue](https://github.com/yonathanarbel/LawPDF/issues).
+Include your operating system, LawPDF version, and steps to reproduce it.
+Do not post confidential client files or private research.
+
+## Creator, license, and no warranty
+
+**Created and maintained by Professor Yonathan Arbel.**
+
+LawPDF is free and open source under the [MIT License](LICENSE).
+**It is provided “AS IS,” without warranty of any kind, express or implied,
+including merchantability, fitness for a particular purpose, and
+noninfringement.** The license also limits the authors' liability.
+No promise of error-free operation, document preservation, or suitability for a
+particular legal matter is made. See the full license for its terms.
+
+Bundled third-party components and models are credited in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-
-## Privacy and release readiness
-
-Read the [privacy guide](docs/PRIVACY.md), [release procedure](docs/RELEASING.md),
-and [production completion plan](docs/PRODUCTION_PLAN.md). A successful local
-build alone does not establish Windows, Android, or assistive-technology readiness.
-Close older LawPDF versions before opening a newly installed version.
+Technical evidence and remaining qualification work are documented in
+[the production assessment](docs/reviews/2026-09-17-production-decision.md)
+and [release procedure](docs/RELEASING.md).
