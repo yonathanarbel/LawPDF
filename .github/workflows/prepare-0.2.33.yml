@@ -1,0 +1,48 @@
+name: Prepare authorized LawPDF 0.2.33
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/prepare-0.2.33.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prepare-lawpdf-0.2.33
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'yonathanarbel/LawPDF' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Tag the approved source and request the release verification build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: yonathanarbel/LawPDF
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, tomllib
+          from pathlib import Path
+          repo = os.environ['GH_REPO']
+          sha = os.environ['GITHUB_SHA']
+          tag = 'v0.2.33'
+          assert tomllib.loads(Path('Cargo.toml').read_text())['package']['version'] == tag[1:]
+          assert json.loads(Path('release-manifest.json').read_text())['product']['version'] == tag[1:]
+          result = subprocess.run(['gh', 'api', f'repos/{repo}/git/ref/tags/{tag}'], capture_output=True, text=True)
+          if result.returncode == 0:
+              assert json.loads(result.stdout)['object']['sha'] == sha, 'Existing tag points to different source'
+          else:
+              subprocess.run(['gh', 'api', '--method', 'POST', f'repos/{repo}/git/refs', '--input', '-'],
+                             input=json.dumps({'ref': f'refs/tags/{tag}', 'sha': sha}), text=True, check=True)
+          subprocess.run(['gh', 'workflow', 'run', 'release.yml', '--repo', repo, '--ref', tag], check=True)
+          PY

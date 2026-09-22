@@ -7,6 +7,27 @@ pub(super) enum CloseTarget {
 }
 
 impl PdfEditorApp {
+    pub(super) fn request_window_close(&mut self, ctx: &Context) {
+        self.save_active_tab_state();
+        if self.has_unsaved_annotations() || self.close_target_is_saving(CloseTarget::Window) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.pending_close = Some(CloseTarget::Window);
+            ctx.request_repaint();
+        } else {
+            self.finish_close_target(CloseTarget::Window, ctx);
+        }
+    }
+
+    pub(super) fn close_active_tab_or_window(&mut self, ctx: &Context) {
+        if let Some(active_tab) = self.active_tab {
+            self.close_tab(active_tab, ctx);
+        } else {
+            // The last document leaves a useful empty reader. A second Cmd/Ctrl-W
+            // must close that window instead of silently swallowing the shortcut.
+            self.request_window_close(ctx);
+        }
+    }
+
     fn discard_close_target(&mut self, target: CloseTarget) -> Result<(), String> {
         let store = crate::document_store::DocumentStore::new()?;
         for tab in &self.tabs {
@@ -154,6 +175,52 @@ mod tests {
         app.active_tab = Some(0);
         app.tabs.push(app.active_tab_snapshot(document));
         (app, ctx)
+    }
+
+    #[test]
+    fn quit_waits_for_unsaved_changes_and_a_failed_save_keeps_the_window_open() {
+        let (mut app, ctx) = app_with_dirty_tab();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            app.request_window_close(ctx);
+        });
+        assert_eq!(app.pending_close, Some(CloseTarget::Window));
+        assert!(!app.allow_window_close);
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        assert!(app.save_close_target(CloseTarget::Window).is_err());
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.draw_unsaved_close_prompt(ctx)
+        });
+        assert!(!app.allow_window_close);
+        assert_eq!(app.tabs.len(), 1);
+        assert!(app.annotations_dirty);
+    }
+
+    #[test]
+    fn close_shortcut_closes_the_tab_then_the_empty_window() {
+        let (mut app, ctx) = app_with_dirty_tab();
+        app.annotations_dirty = false;
+        app.tabs[0].annotations_dirty = false;
+        let first = ctx.run(egui::RawInput::default(), |ctx| {
+            app.close_active_tab_or_window(ctx);
+        });
+        assert!(app.tabs.is_empty());
+        assert!(
+            !first.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close)
+        );
+        let second = ctx.run(egui::RawInput::default(), |ctx| {
+            app.close_active_tab_or_window(ctx);
+        });
+        assert!(
+            second.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close)
+        );
     }
 
     #[test]
