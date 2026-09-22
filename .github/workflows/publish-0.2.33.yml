@@ -1,0 +1,40 @@
+name: Verify and publish authorized LawPDF 0.2.33
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/publish-0.2.33.yml'
+      - 'packaging/releases/v0.2.33.sig'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-lawpdf-0.2.33
+  cancel-in-progress: false
+
+jobs:
+  verify-and-publish:
+    if: github.repository == 'yonathanarbel/LawPDF' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Verify built packages; publish only with the maintainer signature
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: yonathanarbel/LawPDF
+        run: |
+          args=(--version 0.2.33)
+          if [[ -f packaging/releases/v0.2.33.sig ]]; then
+            args+=(--publish)
+          fi
+          python3 tools/publish_signed_release.py "${args[@]}"
