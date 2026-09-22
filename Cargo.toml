@@ -1,6 +1,6 @@
 [package]
 name = "lawpdf"
-version = "0.2.32"
+version = "0.2.33"
 edition = "2024"
 description = "Native PDF reader and annotation editor for legal workflows"
 license = "MIT"
@@ -37,7 +37,8 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSAppleEventDescriptor", "NSAppleEventManager", "NSObject", "NSString", "NSUserDefaults", "NSURL", "objc2-core-services", "std"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSMenu", "NSMenuItem", "NSResponder", "std"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSAppleEventDescriptor", "NSAppleEventManager", "NSNotification", "NSObject", "NSString", "NSUserDefaults", "NSURL", "objc2-core-services", "std"] }
 
 [build-dependencies]
 winresource = { version = "0.1.31", default-features = false }

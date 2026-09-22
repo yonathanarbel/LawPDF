@@ -1,16 +1,21 @@
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 
 use crossbeam_channel::Sender;
 use objc2::rc::Retained;
 use objc2::runtime::Sel;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+use objc2_app_kit::{
+    NSApplication, NSApplicationWillFinishLaunchingNotification, NSMenu, NSMenuItem,
+};
 use objc2_foundation::{
-    NSAppleEventDescriptor, NSAppleEventManager, NSObject, NSObjectProtocol, NSUserDefaults,
-    ns_string,
+    NSAppleEventDescriptor, NSAppleEventManager, NSNotification, NSNotificationCenter, NSObject,
+    NSObjectProtocol, NSUserDefaults, ns_string,
 };
 
 const CORE_EVENT_CLASS: u32 = u32::from_be_bytes(*b"aevt");
 const OPEN_DOCUMENTS_EVENT: u32 = u32::from_be_bytes(*b"odoc");
+const QUIT_APPLICATION_EVENT: u32 = u32::from_be_bytes(*b"quit");
 const DIRECT_OBJECT_KEYWORD: u32 = u32::from_be_bytes(*b"----");
 
 /// Keep AppKit from creating its automatic Touch Bar responder observer.
@@ -27,6 +32,8 @@ pub fn install_appkit_crash_workarounds() {
 
 struct OpenDocumentsHandlerIvars {
     sender: Sender<Vec<PathBuf>>,
+    quit_requested: Cell<bool>,
+    quit_items: RefCell<Vec<Retained<NSMenuItem>>>,
 }
 
 define_class!(
@@ -41,6 +48,32 @@ define_class!(
     unsafe impl NSObjectProtocol for OpenDocumentsHandler {}
 
     impl OpenDocumentsHandler {
+        #[unsafe(method(requestQuit:))]
+        fn request_quit(&self, _sender: Option<&NSObject>) {
+            self.ivars().quit_requested.set(true);
+            crate::single_instance::request_repaint();
+        }
+
+        #[unsafe(method(handleQuitApplication:withReplyEvent:))]
+        fn handle_quit_application(
+            &self,
+            _event: &NSAppleEventDescriptor,
+            _reply: &NSAppleEventDescriptor,
+        ) {
+            self.ivars().quit_requested.set(true);
+            crate::single_instance::request_repaint();
+        }
+
+        #[unsafe(method(applicationWillFinishLaunching:))]
+        fn application_will_finish_launching(&self, _notification: &NSNotification) {
+            // NSApplication installs its default Apple-event handlers during
+            // startup, overwriting our pre-run registration. Finder's initial
+            // open-document event arrives BEFORE eframe creates the app, so
+            // registering only in its AppCreator loses the cold-launch file.
+            // Reinstall after AppKit's setup but before the initial event.
+            register_handler(self);
+        }
+
         #[unsafe(method(handleOpenDocuments:withReplyEvent:))]
         fn handle_open_documents(
             &self,
@@ -71,6 +104,14 @@ pub struct OpenDocumentsRegistration {
 impl OpenDocumentsRegistration {
     pub fn register(&self) {
         register_handler(&self._handler);
+        let app = NSApplication::sharedApplication(MainThreadMarker::from(&*self._handler));
+        if let Some(menu) = app.mainMenu() {
+            route_quit_menu(&menu, &self._handler);
+        }
+    }
+
+    pub fn take_quit_requested(&self) -> bool {
+        self._handler.ivars().quit_requested.replace(false)
     }
 }
 
@@ -80,17 +121,42 @@ impl Drop for OpenDocumentsRegistration {
         // not dispatch an open-document event into an application being torn down.
         NSAppleEventManager::sharedAppleEventManager()
             .removeEventHandlerForEventClass_andEventID(CORE_EVENT_CLASS, OPEN_DOCUMENTS_EVENT);
+        NSAppleEventManager::sharedAppleEventManager()
+            .removeEventHandlerForEventClass_andEventID(CORE_EVENT_CLASS, QUIT_APPLICATION_EVENT);
+        for item in self._handler.ivars().quit_items.borrow_mut().drain(..) {
+            // SAFETY: Clear the menu item's weak target before releasing it.
+            unsafe {
+                item.setTarget(None);
+                item.setAction(Some(sel!(terminate:)));
+            }
+        }
+        // SAFETY: The observer is retained until after it is unregistered.
+        unsafe { NSNotificationCenter::defaultCenter().removeObserver(&*self._handler) };
     }
 }
 
 pub fn install(sender: Sender<Vec<PathBuf>>) -> OpenDocumentsRegistration {
     let mtm = MainThreadMarker::new().expect("LawPDF must start on the macOS main thread");
     let handler: Retained<OpenDocumentsHandler> = {
-        let allocated =
-            OpenDocumentsHandler::alloc(mtm).set_ivars(OpenDocumentsHandlerIvars { sender });
+        let allocated = OpenDocumentsHandler::alloc(mtm).set_ivars(OpenDocumentsHandlerIvars {
+            sender,
+            quit_requested: Cell::new(false),
+            quit_items: RefCell::new(Vec::new()),
+        });
         // SAFETY: NSObject's `init` signature is correct for this subclass.
         unsafe { msg_send![super(allocated), init] }
     };
+    // Observe launch without replacing winit's NSApplication delegate.
+    // SAFETY: The selector accepts the notification argument and the observer
+    // remains alive until OpenDocumentsRegistration unregisters it.
+    unsafe {
+        NSNotificationCenter::defaultCenter().addObserver_selector_name_object(
+            &*handler,
+            sel!(applicationWillFinishLaunching:),
+            Some(NSApplicationWillFinishLaunchingNotification),
+            None,
+        );
+    }
     register_handler(&handler);
     OpenDocumentsRegistration { _handler: handler }
 }
@@ -107,6 +173,29 @@ fn register_handler(handler: &OpenDocumentsHandler) {
             CORE_EVENT_CLASS,
             OPEN_DOCUMENTS_EVENT,
         );
+        manager.setEventHandler_andSelector_forEventClass_andEventID(
+            handler,
+            sel!(handleQuitApplication:withReplyEvent:),
+            CORE_EVENT_CLASS,
+            QUIT_APPLICATION_EVENT,
+        );
+    }
+}
+
+fn route_quit_menu(menu: &NSMenu, handler: &OpenDocumentsHandler) {
+    for item in menu.itemArray() {
+        if item.action() == Some(sel!(terminate:)) {
+            // winit's native Quit bypasses egui's cancellable close/save flow.
+            // SAFETY: Our selector accepts the sender, and Drop clears this
+            // weak target before the retained handler is released.
+            unsafe {
+                item.setTarget(Some(handler));
+                item.setAction(Some(sel!(requestQuit:)));
+            }
+            handler.ivars().quit_items.borrow_mut().push(item);
+        } else if let Some(submenu) = item.submenu() {
+            route_quit_menu(&submenu, handler);
+        }
     }
 }
 

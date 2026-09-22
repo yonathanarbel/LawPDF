@@ -2486,7 +2486,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "lawpdf"
-version = "0.2.32"
+version = "0.2.33"
 dependencies = [
  "anyhow",
  "blake2b_simd",
@@ -2500,6 +2500,7 @@ dependencies = [
  "libloading 0.8.9",
  "lopdf",
  "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "pdfium-render",
  "quick-xml",

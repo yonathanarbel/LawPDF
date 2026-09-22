@@ -12246,16 +12246,18 @@ impl eframe::App for PdfEditorApp {
 
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         if ctx.input(|input| input.viewport().close_requested()) && !self.allow_window_close {
-            self.save_active_tab_state();
-            if self.has_unsaved_annotations() || self.close_target_is_saving(CloseTarget::Window) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.pending_close = Some(CloseTarget::Window);
-            }
+            self.request_window_close(ctx);
+        }
+        #[cfg(target_os = "macos")]
+        if self
+            ._macos_open_files
+            .as_ref()
+            .is_some_and(|registration| registration.take_quit_requested())
+        {
+            self.request_window_close(ctx);
         }
         if consume_command_shortcut(ctx, egui::Key::W) {
-            if let Some(active_tab) = self.active_tab {
-                self.close_tab(active_tab, ctx);
-            }
+            self.close_active_tab_or_window(ctx);
         }
 
         self.poll_incoming_paths(ctx);
