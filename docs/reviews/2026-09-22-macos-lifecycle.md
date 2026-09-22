@@ -42,3 +42,43 @@ Automated tests additionally cover failed-save cancellation and closing the
 empty window. Full screen-reader, field-reliability and update-interruption
 qualification remain separate gates. Public package checks are recorded with
 the eventual tagged release, not inferred from this local development build.
+
+
+## Optimized candidate and final public package
+
+The optimized local 0.2.33 bundle also passed repeated Finder opening of two
+PDFs, including a Unicode filename, without duplicate tabs. With a disposable
+read-only PDF, Command-Q showed the unsaved-changes prompt; a failed Save kept
+the document open; Cancel retained the edit; Command-W presented the tab-close
+prompt. Explicit discard closed that disposable tab, and a second Command-W
+closed the empty reader. The source test file and original document hashes
+remained unchanged.
+
+[Version 0.2.33](https://github.com/yonathanarbel/LawPDF/releases/tag/v0.2.33)
+was published on September 22, 2026, at 23:08 UTC as the latest public release.
+The [publication workflow](https://github.com/yonathanarbel/LawPDF/actions/runs/35795936709)
+verified all package hashes, tagged-build provenance, successful release/desktop
+checks, exact Windows installation evidence, and the signed update manifest.
+The public page returned HTTP 200 without authentication. All seven assets were
+downloaded anonymously; all three packages matched the checksum file and signed
+manifest, whose Ed25519 signature was independently verified.
+
+The exact public Mac ZIP was extracted and installed at
+`/Applications/LawPDF.app`, preserving the previous local build for rollback.
+Both bundle version fields read 0.2.33. Strict deep code-signature verification
+passed; the installed executable matched the downloaded package. Required
+native/context runtime verification exited 0 with `requirements_met: true`,
+using assets inside the installed app.
+
+- Public Mac ZIP SHA-256: `6d6d9efde842c3fed15b72a27cc634aa6fae9cf8b3693b267503eca2be3c4395`.
+- Installed Mac executable SHA-256: `30e476b4feb8ec8fcb4c5f6f1c4829256a6485a6b64b7ba97b99763ccf7fcc20`.
+- Public Windows installer SHA-256: `6e575e79c5305f4d5d03845389f78e99609a3e438a7012a69a3c63a18ab3356b`.
+- Public Windows portable SHA-256: `f2022ee3998120db0a808995dbdfd402e44171d2ea9eeb72b78124e960d4fd5e`.
+
+The Mac desktop locked after the local candidate's hands-on checks. Therefore,
+GUI retesting of the final GitHub-built package and live update/restart were not
+completed. Installation, signature, executable identity, and runtime checks of
+that exact package were completed without GUI access. Windows installation was
+verified on the clean hosted Windows runner, not the owner's Windows computer.
+This release remains a public beta; the broader qualification gates in the
+[release notes](../releases/v0.2.33.md) remain open.

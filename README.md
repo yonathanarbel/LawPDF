@@ -13,17 +13,17 @@ Highlight a passage for class, leave a comment on a colleague's draft, or work
 through a case with search, annotation, and recovery tools in one application.
 
 The “world's best” line expresses the creator's vision, not an independently
-tested ranking. **Version 0.2.32 is a public beta.**
+tested ranking. **Version 0.2.33 is a public beta.**
 
 ## Download
 
-[**Download LawPDF for Windows or Mac**](https://github.com/yonathanarbel/LawPDF/releases/tag/v0.2.32)
+[**Download LawPDF for Windows or Mac**](https://github.com/yonathanarbel/LawPDF/releases/tag/v0.2.33)
 
 | Platform | Download | Requirements |
 | --- | --- | --- |
-| Windows installer | [LawPDFSetup-x64.exe](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.32/LawPDFSetup-x64.exe) | 64-bit Windows; installation may request administrator approval |
-| Windows portable | [LawPDF-windows-portable-x64.zip](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.32/LawPDF-windows-portable-x64.zip) | Extract the entire ZIP, then run `lawpdf.exe` |
-| Mac | [LawPDF-macos.zip](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.32/LawPDF-macos.zip) | Apple silicon (M-series), macOS 13 or later; Intel Macs are not supported by this build |
+| Windows installer | [LawPDFSetup-x64.exe](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.33/LawPDFSetup-x64.exe) | 64-bit Windows; installation may request administrator approval |
+| Windows portable | [LawPDF-windows-portable-x64.zip](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.33/LawPDF-windows-portable-x64.zip) | Extract the entire ZIP, then run `lawpdf.exe` |
+| Mac | [LawPDF-macos.zip](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.33/LawPDF-macos.zip) | Apple silicon (M-series), macOS 13 or later; Intel Macs are not supported by this build |
 
 Close older LawPDF versions before installing or opening the new version.
 Keep a backup of important PDFs while trying the beta.
@@ -68,11 +68,12 @@ See [Apple's instructions](https://support.apple.com/en-us/102445) and our
 The Windows and Mac builds passed their automated regression and packaging
 checks. The exact Windows installer was verified on a clean hosted Windows
 machine. The Mac application has also undergone local runtime and annotation
-checks.
+checks. Version 0.2.33 fixes opening PDFs from Finder when LawPDF is closed,
+closing the empty window with Command-W, and routing Mac Quit through the
+save-or-cancel flow. See the [release verification](docs/releases/v0.2.33.md).
 
 Broader screen-reader workflows, real-world reliability, large-document
 performance, and signed-update replacement/recovery still need more testing.
-A reported document-opening problem remains unresolved at the interface level.
 Reading reconstruction can make mistakes: verify quotations and citations
 against the original PDF, and keep backups of important work.
 
@@ -99,5 +100,5 @@ particular legal matter is made. See the full license for its terms.
 Bundled third-party components and models are credited in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 Technical evidence and remaining qualification work are documented in
-[the production assessment](docs/reviews/2026-09-17-production-decision.md)
+[the current release evidence](docs/releases/v0.2.33.md)
 and [release procedure](docs/RELEASING.md).
