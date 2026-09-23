@@ -57,6 +57,25 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
+    #[cfg(target_os = "windows")]
+    if args.len() == 1 && args[0] == "--speech-worker" {
+        if let Err(error) = tts::run_windows_speech_worker() {
+            if let Some(path) = std::env::var_os("LAWPDF_TTS_ERROR_PATH") {
+                let _ = std::fs::write(path, error);
+            }
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if args.len() == 1 && args[0] == "--distribution-status" {
+        println!("{}", serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "channel": if updater::managed_by_store() { "microsoft-store" } else { "direct" },
+            "self_updates_enabled": !updater::managed_by_store(),
+            "package_identity": updater::windows_package_identity(),
+        }));
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     macos_open_files::install_appkit_crash_workarounds();
     install_panic_log_hook();

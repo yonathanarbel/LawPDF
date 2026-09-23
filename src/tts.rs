@@ -127,6 +127,38 @@ pub fn write_private_speech_text(text: &str) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Run speech in a disposable copy of our own executable. This works in an
+/// MSIX installation without launching PowerShell or interpreting document text.
+#[cfg(target_os = "windows")]
+pub fn run_windows_speech_worker() -> Result<(), String> {
+    use windows::Win32::Media::Speech::{ISpVoice, SPF_IS_NOT_XML, SpVoice};
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoUninitialize,
+    };
+    use windows::core::PCWSTR;
+
+    let path = std::env::var_os("LAWPDF_TTS_TEXT_PATH")
+        .ok_or("No speech text was provided.")?;
+    let bytes = crate::document_store::read_limited(
+        &PathBuf::from(path), 16 * 1024 * 1024,
+    ).map_err(|error| format!("Could not read speech text: {error}"))?;
+    let text = String::from_utf8(bytes).map_err(|_| "Speech text is not valid UTF-8.")?;
+    let wide: Vec<u16> = text.replace('\0', " ").encode_utf16().chain(Some(0)).collect();
+    // SAFETY: This dedicated child initializes COM on its sole main thread.
+    // All COM interfaces are dropped before the matching CoUninitialize call.
+    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.ok()
+        .map_err(|error| format!("Could not initialize Windows speech: {error}"))?;
+    let result = (|| -> windows::core::Result<()> {
+        let voice: ISpVoice = unsafe { CoCreateInstance(&SpVoice, None, CLSCTX_INPROC_SERVER)? };
+        // Speak synchronously; the parent can stop speech by terminating this
+        // child. Force plain text so PDF content cannot act as SAPI markup.
+        unsafe { voice.Speak(PCWSTR(wide.as_ptr()), SPF_IS_NOT_XML.0 as u32, None) }
+    })();
+    unsafe { CoUninitialize() };
+    result.map_err(|error| format!("Windows speech failed: {error}"))
+}
+
 fn split_for_tts(text: &str, max_chars: usize) -> Vec<String> {
     let normalized = text.trim();
     if normalized.is_empty() || max_chars == 0 {

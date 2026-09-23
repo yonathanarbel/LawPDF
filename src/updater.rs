@@ -20,6 +20,33 @@ const USER_AGENT: &str = concat!("LawPDF/", env!("CARGO_PKG_VERSION"));
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const RELEASES_PAGE: &str = "https://github.com/yonathanarbel/LawPDF/releases/latest";
 
+/// Store packages are immutable and are updated only by Microsoft Store.
+pub const fn managed_by_store() -> bool {
+    cfg!(feature = "microsoft-store")
+}
+
+pub fn windows_package_identity() -> Option<String> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
+        use windows::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
+        use windows::core::PWSTR;
+        let mut length = 0u32;
+        // SAFETY: The first call requests the bounded UTF-16 buffer length;
+        // the second receives a valid, initialized buffer of exactly that size.
+        if unsafe { GetCurrentPackageFullName(&mut length, None) } != ERROR_INSUFFICIENT_BUFFER
+            || length == 0 || length > 32768 { return None; }
+        let mut buffer = vec![0u16; length as usize];
+        if unsafe { GetCurrentPackageFullName(&mut length, Some(PWSTR(buffer.as_mut_ptr()))) }
+            != ERROR_SUCCESS { return None; }
+        let end = buffer.iter().position(|value| *value == 0).unwrap_or(buffer.len());
+        String::from_utf16(&buffer[..end]).ok()
+    }
+    #[cfg(not(windows))]
+    { None }
+}
+
+
 #[derive(Debug, Clone)]
 pub enum UpdateEvent {
     Checking,
@@ -75,6 +102,10 @@ struct GithubAsset {
 }
 
 pub fn spawn_update_check(tx: Sender<UpdateEvent>) {
+    if managed_by_store() {
+        let _ = tx.send(UpdateEvent::NotAvailable);
+        return;
+    }
     thread::spawn(move || {
         let _ = tx.send(UpdateEvent::Checking);
         if let Err(error) = check_and_stage_update(&tx) {
@@ -85,6 +116,7 @@ pub fn spawn_update_check(tx: Sender<UpdateEvent>) {
 }
 
 pub fn load_pending_update() -> Option<PendingUpdate> {
+    if managed_by_store() { return None; }
     let path = pending_update_path()?;
     let bytes = crate::document_store::read_limited(&path, 512 * 1024).ok()?;
     let pending = match serde_json::from_slice::<PendingUpdate>(&bytes) {
@@ -109,6 +141,7 @@ pub fn load_pending_update() -> Option<PendingUpdate> {
 }
 
 pub fn take_installed_update() -> Option<String> {
+    if managed_by_store() { return None; }
     let path = installed_update_path()?;
     let version = std::fs::read_to_string(&path).ok()?;
     let _ = std::fs::remove_file(path);
@@ -120,6 +153,7 @@ pub fn take_installed_update() -> Option<String> {
 }
 
 pub fn take_update_error() -> Option<String> {
+    if managed_by_store() { return None; }
     let path = update_error_path()?;
     let message = std::fs::read_to_string(&path).ok()?;
     let _ = std::fs::remove_file(path);
@@ -131,6 +165,9 @@ pub fn start_update_helper(
     pending: &PendingUpdate,
     relaunch_args: &[OsString],
 ) -> Result<(), String> {
+    if managed_by_store() {
+        return Err("Updates for this installation are managed by Microsoft Store.".to_owned());
+    }
     if let Err(error) = verify_pending_update(pending) {
         if let Some(path) = pending_update_path() {
             discard_pending_update(pending, &path);
@@ -178,6 +215,10 @@ pub fn start_update_helper(
 }
 
 fn check_and_stage_update(tx: &Sender<UpdateEvent>) -> Result<(), String> {
+    if managed_by_store() {
+        let _ = tx.send(UpdateEvent::NotAvailable);
+        return Ok(());
+    }
     if let Some(pending) = load_pending_update() {
         write_last_check("ready", Some(&pending.version));
         let _ = tx.send(UpdateEvent::Ready(pending));
@@ -917,6 +958,27 @@ fn version_numbers(version: &str) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "microsoft-store")]
+    #[test]
+    fn store_build_never_stages_or_launches_a_direct_update() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        spawn_update_check(tx);
+        assert!(matches!(rx.try_recv(), Ok(UpdateEvent::NotAvailable)));
+        assert!(rx.try_recv().is_err());
+        assert!(load_pending_update().is_none());
+        let pending = PendingUpdate {
+            version: "999.0.0".to_owned(),
+            package_kind: UpdatePackageKind::Installer,
+            asset_path: PathBuf::from("must-not-be-read.exe"),
+            release_url: RELEASES_PAGE.to_owned(),
+            expected_sha256: String::new(),
+            signed_manifest: String::new(),
+            manifest_signature: String::new(),
+        };
+        assert_eq!(start_update_helper(&pending, &[]).unwrap_err(),
+            "Updates for this installation are managed by Microsoft Store.");
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]

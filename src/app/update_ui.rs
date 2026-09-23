@@ -25,7 +25,7 @@ impl UpdateUi {
             tx,
             rx,
             state: UpdateUiState::Idle,
-            check_in_flight: true,
+            check_in_flight: !updater::managed_by_store(),
             notice,
             next_check: None,
             download_version: None,

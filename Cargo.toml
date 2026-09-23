@@ -1,6 +1,6 @@
 [package]
 name = "lawpdf"
-version = "0.2.33"
+version = "0.2.34"
 edition = "2024"
 description = "Native PDF reader and annotation editor for legal workflows"
 license = "MIT"
@@ -8,6 +8,7 @@ license = "MIT"
 [features]
 default = []
 devtools = []
+microsoft-store = []
 bench-image-conversion = ["devtools"]
 
 [dependencies]
@@ -39,6 +40,9 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSMenu", "NSMenuItem", "NSResponder", "std"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSAppleEventDescriptor", "NSAppleEventManager", "NSNotification", "NSObject", "NSString", "NSUserDefaults", "NSURL", "objc2-core-services", "std"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61.3", features = ["Win32_Media_Speech", "Win32_System_Com", "Win32_Storage_Packaging_Appx"] }
 
 [build-dependencies]
 winresource = { version = "0.1.31", default-features = false }
