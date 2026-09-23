@@ -19,6 +19,17 @@ $exe = Join-Path $payload 'lawpdf.exe'
 if ((Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant() -ne $evidence.executable_sha256) {
     throw 'Submission executable checksum mismatch.'
 }
+# Supply OpenGL only in this disposable screenshot copy, without changing the MSIX.
+$mesaArchive = Join-Path $env:RUNNER_TEMP 'mesa-screenshot.7z'
+$mesaDirectory = Join-Path $env:RUNNER_TEMP 'mesa-screenshot'
+Invoke-WebRequest 'https://github.com/pal1000/mesa-dist-win/releases/download/26.1.8/mesa3d-26.1.8-release-msvc.7z' -OutFile $mesaArchive
+if ((Get-FileHash $mesaArchive -Algorithm SHA256).Hash.ToLowerInvariant() -ne '4c6d32e653e0ff9ad07796e40c0bcfabf2764d849e3ce4f3b1590112c87e42f9') { throw 'Mesa archive checksum mismatch.' }
+& 7z x $mesaArchive "-o$mesaDirectory" -y | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Mesa extraction failed.' }
+foreach ($dll in @('opengl32.dll', 'libgallium_wgl.dll')) {
+    Copy-Item (Join-Path $mesaDirectory "x64/$dll") $payload
+}
+$env:GALLIUM_DRIVER = 'llvmpipe'
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
@@ -42,7 +53,7 @@ try {
     do {
         Start-Sleep -Milliseconds 500
         $process.Refresh()
-        if ($process.HasExited) { throw 'LawPDF exited before a screenshot could be taken.' }
+        if ($process.HasExited) { Get-Content (Join-Path $OutputDirectory 'launch-errors.txt'); throw 'LawPDF exited before a screenshot could be taken.' }
     } until ($process.MainWindowHandle -ne [IntPtr]::Zero -or [DateTime]::UtcNow -ge $deadline)
     if ($process.MainWindowHandle -eq [IntPtr]::Zero) { throw 'No visible LawPDF window was created.' }
     $screen = [Windows.Forms.Screen]::PrimaryScreen.Bounds
@@ -71,7 +82,7 @@ try {
         executable_sha256=$evidence.executable_sha256; sample_sha256=(Get-FileHash $SamplePdf -Algorithm SHA256).Hash.ToLowerInvariant();
         capture='Actual Windows app window, unmodified pixels'; width=$w; height=$h;
         scope='Unsigned submission payload extracted on a disposable runner. Not a Store-install test.';
-        visual_review_required=$true
+        visual_review_required=$true; renderer='Mesa 26.1.8 llvmpipe, temporary app-local CI dependency only'
     } | ConvertTo-Json | Set-Content (Join-Path $OutputDirectory 'screenshot-evidence.json') -Encoding utf8
 } finally {
     if ($process -and -not $process.HasExited) {
