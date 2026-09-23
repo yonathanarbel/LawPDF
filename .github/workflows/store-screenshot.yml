@@ -1,0 +1,34 @@
+name: Microsoft Store screenshot capture
+on:
+  push:
+    branches: [codex/microsoft-store-screenshots]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  capture:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: LawPDF-Microsoft-Store-package
+          run-id: 35870380673
+          github-token: ${{ github.token }}
+          path: C:/tmp/lawpdf-screenshot-package
+      - name: Capture actual Windows app using a synthetic reading sample
+        shell: pwsh
+        run: |
+          $sample = Join-Path $env:RUNNER_TEMP 'LawPDF-Reading-Sample.pdf'
+          [IO.File]::WriteAllBytes($sample,[Convert]::FromBase64String((Get-Content packaging/microsoft-store/reading-sample.pdf.base64 -Raw)))
+          ./scripts/capture-store-screenshot.ps1 -PackageDirectory C:/tmp/lawpdf-screenshot-package -SamplePdf $sample -OutputDirectory C:/tmp/lawpdf-store-screenshots
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: LawPDF-Windows-Store-screenshot
+          path: C:/tmp/lawpdf-store-screenshots
+          retention-days: 30
