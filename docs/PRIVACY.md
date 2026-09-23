@@ -4,7 +4,7 @@ LawPDF reads and annotates PDFs locally. An ordinary open, search, highlight, or
 
 ## When information leaves the device
 
-- Desktop update checks contact GitHub and disclose the connection's IP address and LawPDF's version in its user-agent. Downloads contact GitHub's artifact delivery infrastructure. Document contents and API keys are not included.
+- Direct-download desktop update checks contact GitHub and disclose the connection's IP address and LawPDF's version in its user-agent. Downloads contact GitHub's artifact delivery infrastructure. Document contents and API keys are not included. Microsoft Store builds disable these GitHub update checks and receive updates through Microsoft Store.
 - Asking a document chat question sends the question, conversation context, and selected document context to OpenRouter and its selected model provider.
 - Choosing cloud OCR sends page images to OpenRouter and its selected vision provider. Operating-system OCR runs locally.
 - Choosing a cloud-assisted reading feature sends the text needed for that feature to its named provider. Local Review Mode reconstruction uses bundled models on the device.
@@ -20,7 +20,9 @@ Desktop preferences, per-document zoom, OCR and reading caches, raster caches, l
 
 API keys are stored in macOS Keychain or Windows Credential Manager. The supported Linux backend uses Secret Service. Legacy settings-file keys are removed only after the native credential store confirms migration. A failed migration leaves the existing file and displays an error. Old settings backups created by earlier versions may still contain keys; remove those backups after confirming that secure migration succeeded. Environment-supplied keys are read from the launching environment and are not written into settings.
 
-Settings provides a retention period for cached content and old backup copies, and **Clear cached text and images** removes regenerable caches and unused recovery sources. It preserves active document sources, pending recovery records, preferences, and local corrections. A brief grace period protects files still opening. Cached content may be regenerated while documents remain open. Corrections and their local event log can be removed by deleting the `liquid-feedback` folder after quitting. Uninstalling the desktop executable does not delete document data or native-store credentials.
+Settings provides a retention period for cached content and old backup copies, and **Clear cached text and images** removes regenerable caches and unused recovery sources. It preserves active document sources, pending recovery records, preferences, and local corrections. A brief grace period protects files still opening. Cached content may be regenerated while documents remain open. Corrections and their local event log can be removed by deleting the `liquid-feedback` folder after quitting. Uninstalling a direct-download desktop installation does not delete document data or native-store credentials.
+
+For Microsoft Store installations, Windows can remove package-private application data when the app is uninstalled or reset, including cached content and recovery copies. Save or export pending edits to ordinary document files before uninstalling or resetting. PDFs saved outside the package's application-data folders are separate from the installed app. Existing data from a direct-download installation and native-store credentials can remain. See [Microsoft's description of packaged desktop app storage](https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-behind-the-scenes).
 
 The support-diagnostics export contains only an explicit list of version, platform, job counts, and success/failure flags. It excludes document paths and text, keys, raw server responses, environment variables, and crash payloads. Nothing is sent automatically when creating this file.
 

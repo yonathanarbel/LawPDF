@@ -1085,7 +1085,7 @@ impl PdfEditorApp {
         let chat_ui = ChatUi::new();
         let (update_tx, update_rx) = unbounded();
         let tts_controller = TtsController::new();
-        if !isolated {
+        if !isolated && !updater::managed_by_store() {
             updater::spawn_update_check(update_tx.clone());
         }
         let (installed_update, update_error) = if isolated {
@@ -1903,6 +1903,7 @@ impl PdfEditorApp {
     }
 
     fn poll_update_events(&mut self, ctx: &Context) {
+        if updater::managed_by_store() { return; }
         while let Ok(event) = self.update_ui.rx.try_recv() {
             match event {
                 UpdateEvent::Checking => {
@@ -8023,25 +8024,6 @@ impl PdfEditorApp {
             use std::os::windows::process::CommandExt;
 
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            const WINDOWS_SPEECH_SCRIPT: &str = r#"
-$ErrorActionPreference = 'Stop'
-try {
-    Add-Type -AssemblyName System.Speech
-    $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
-    try {
-        $text = [System.IO.File]::ReadAllText($env:LAWPDF_TTS_TEXT_PATH)
-        $synth.Speak($text)
-    } finally {
-        $synth.Dispose()
-    }
-} catch {
-    [System.IO.File]::WriteAllText(
-        $env:LAWPDF_TTS_ERROR_PATH,
-        $_.Exception.Message
-    )
-    exit 1
-}
-"#;
             let tmp = match crate::tts::write_private_speech_text(&text) {
                 Ok(path) => path,
                 Err(error) => {
@@ -8051,17 +8033,17 @@ try {
             };
             let error_path = tmp.with_extension("error.txt");
             let _ = std::fs::remove_file(&error_path);
-            let mut command = std::process::Command::new("powershell.exe");
+            let executable = match std::env::current_exe() {
+                Ok(path) => path,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    self.push_error_notice(format!("Could not start speech: {error}"));
+                    return;
+                }
+            };
+            let mut command = std::process::Command::new(executable);
             command
-                .args([
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    WINDOWS_SPEECH_SCRIPT,
-                ])
+                .arg("--speech-worker")
                 .env("LAWPDF_TTS_TEXT_PATH", &tmp)
                 .env("LAWPDF_TTS_ERROR_PATH", &error_path)
                 .stdin(std::process::Stdio::null())
@@ -12508,8 +12490,11 @@ fn open_windows_default_pdf_settings() -> Result<(), String> {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(feature = "microsoft-store")))]
 const WINDOWS_DEFAULT_APPS_URI: &str = "ms-settings:defaultapps?registeredAppMachine=LawPDF";
+
+#[cfg(all(target_os = "windows", feature = "microsoft-store"))]
+const WINDOWS_DEFAULT_APPS_URI: &str = "ms-settings:defaultapps";
 
 #[cfg(target_os = "windows")]
 fn shell_execute_succeeded(result: isize) -> bool {
@@ -15668,7 +15653,7 @@ mod app_tests {
     fn windows_default_apps_uri_targets_lawpdf_registration() {
         assert_eq!(
             WINDOWS_DEFAULT_APPS_URI,
-            "ms-settings:defaultapps?registeredAppMachine=LawPDF"
+            if updater::managed_by_store() { "ms-settings:defaultapps" } else { "ms-settings:defaultapps?registeredAppMachine=LawPDF" }
         );
     }
 

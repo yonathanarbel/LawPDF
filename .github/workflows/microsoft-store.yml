@@ -1,0 +1,74 @@
+name: Microsoft Store package verification
+
+on:
+  push:
+    branches: [codex/microsoft-store-distribution]
+  pull_request:
+    paths:
+      - '.github/workflows/microsoft-store.yml'
+      - 'packaging/microsoft-store/**'
+      - 'scripts/*microsoft-store.ps1'
+      - 'src/**'
+      - 'Cargo.*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: microsoft-store-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_DIR: C:\tmp\lawpdf-store-target
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Fetch the pinned Windows native runtime
+        shell: pwsh
+        run: ./scripts/fetch-catboost-windows.ps1
+      - name: Test and build the Microsoft Store feature set
+        shell: pwsh
+        run: |
+          cargo test --release --locked --features microsoft-store
+          if ($LASTEXITCODE -ne 0) { throw 'Store regression tests failed.' }
+          cargo build --release --locked --features microsoft-store
+          if ($LASTEXITCODE -ne 0) { throw 'Store build failed.' }
+      - name: Stage the complete Store runtime
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 -Configuration release -PackageRoot C:/tmp/lawpdf-store-portable
+      - name: Package the Store submission or a clearly labeled validation package
+        shell: pwsh
+        run: |
+          $identity='packaging/microsoft-store/identity.json'
+          $args=@{
+            PortableDirectory='C:/tmp/lawpdf-store-portable/LawPDF-portable'
+            OutputDirectory='C:/tmp/lawpdf-store-dist'
+          }
+          if (-not (Test-Path $identity)) {
+            $identity=Join-Path $env:RUNNER_TEMP 'lawpdf-validation-identity.json'
+            @{
+              identity_name='LawPDF.Validation'; publisher='CN=LawPDF CI Validation';
+              publisher_display_name='LawPDF CI Validation'; package_version='1.2.34.0'
+            } | ConvertTo-Json | Set-Content $identity -Encoding utf8
+            $args.ValidationOnly=$true
+          }
+          ./scripts/package-microsoft-store.ps1 -IdentityFile $identity @args
+      - name: Install and verify the exact MSIX payload on the disposable runner
+        shell: pwsh
+        run: |
+          $version=(cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          ./scripts/verify-microsoft-store.ps1 -PackageDirectory C:/tmp/lawpdf-store-dist -ExpectedAppVersion $version
+      - name: Retain unsigned submission package and verification evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: LawPDF-Microsoft-Store-package
+          path: |
+            C:/tmp/lawpdf-store-dist/*.msix
+            C:/tmp/lawpdf-store-dist/*.json
+          retention-days: 30

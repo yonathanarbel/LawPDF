@@ -145,6 +145,9 @@ impl PdfEditorApp {
                 }
                 if self.settings_ui.saving_credentials { ui.disable(); }
                 ui.label(RichText::new(APP_VERSION_LABEL).size(12.0).color(MUTED_INK));
+                if updater::managed_by_store() {
+                    ui.label("Microsoft Store manages updates for this installation.");
+                } else {
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(
@@ -172,6 +175,7 @@ impl PdfEditorApp {
                         .on_hover_text(error);
                 }
                 ui.hyperlink_to("Download LawPDF from GitHub", updater::RELEASES_PAGE);
+                }
                 ui.add_space(12.0);
                 ui.label(RichText::new("Local document data").strong());
                 ui.label("Cached text and images and old backup copies expire after the selected period. Unsaved edits and their source PDFs stay until you recover or discard them.");

@@ -500,6 +500,7 @@ mod tests {
         assert!(!app.notices.is_empty());
     }
 
+    #[cfg(not(feature = "microsoft-store"))]
     #[test]
     fn background_update_network_failure_is_quiet_but_integrity_failure_is_visible() {
         let (mut app, ctx, _rx) = fixture();
@@ -523,6 +524,7 @@ mod tests {
         assert!(app.update_ui.notice.is_some());
     }
 
+    #[cfg(not(feature = "microsoft-store"))]
     #[test]
     fn manual_update_check_always_finishes_with_a_visible_result() {
         let (mut app, ctx, _rx) = fixture();
@@ -542,5 +544,20 @@ mod tests {
         assert!(app.update_ui.last_check_error.is_none());
         assert!(!app.update_ui.manual_check);
         assert!(app.update_ui.notice.is_some());
+    }
+
+    #[cfg(feature = "microsoft-store")]
+    #[test]
+    fn store_build_ignores_direct_update_events_without_disrupting_edits() {
+        let (mut app, ctx, _rx) = fixture();
+        app.add_text_box_annotation(0, PdfRect::new(10.0, 20.0, 200.0, 60.0));
+        app.update_ui.tx.send(UpdateEvent::Checking).unwrap();
+        app.update_ui.tx.send(UpdateEvent::Failed("direct channel must be ignored".to_owned())).unwrap();
+        app.poll_update_events(&ctx);
+        assert!(app.annotations_dirty);
+        assert!(app.update_ui.notice.is_none());
+        assert!(app.update_ui.next_check.is_none());
+        assert!(!app.update_ui.check_in_flight);
+        assert!(app.notices.is_empty());
     }
 }
