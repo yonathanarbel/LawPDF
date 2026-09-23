@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: microsoft-store-${{ github.ref }}
+  group: microsoft-store-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:

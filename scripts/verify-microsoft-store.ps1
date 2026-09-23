@@ -50,17 +50,20 @@ try {
     $process=Start-Process $exe -ArgumentList @('--lm2-runtime-status','--require-native','--require-context','--require-arbiter','--require-note-head','--require-link-ranker') -Wait -PassThru -NoNewWindow -RedirectStandardOutput $runtimeFile
     $runtime=Get-Content -LiteralPath $runtimeFile -Raw | ConvertFrom-Json
     if ($process.ExitCode -ne 0 -or $runtime.requirements_met -ne $true -or $runtime.app_version -ne $ExpectedAppVersion) { throw 'Installed MSIX runtime verification failed.' }
-    foreach ($property in $runtime.PSObject.Properties) {
-        if ($property.Name.EndsWith('_path') -and $property.Value) {
-            $path=[IO.Path]::GetFullPath([string]$property.Value)
-            if (-not $path.StartsWith($installed.InstallLocation,[StringComparison]::OrdinalIgnoreCase)) { throw "Runtime escaped the installed package: $($property.Name)" }
-        }
+    $installPrefix=$installed.InstallLocation.TrimEnd('\')+'\'
+    foreach ($field in @('fasttab_model_path','native_model_path','native_library_path','context_model_path','context_arbiter_model_path','note_head_model_path','link_ranker_model_path')) {
+        $reportedPath=[string]$runtime.$field
+        if ([string]::IsNullOrWhiteSpace($reportedPath) -or -not [IO.Path]::IsPathFullyQualified($reportedPath)) { throw "Installed runtime did not report an absolute path for $field." }
+        $path=[IO.Path]::GetFullPath($reportedPath)
+        if (-not $path.StartsWith($installPrefix,[StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Runtime asset is missing or outside the installed package: $field" }
     }
     $aumid="$($installed.PackageFamilyName)!LawPDF"
     $start=Get-StartApps | Where-Object AppID -eq $aumid
     if (-not $start) { throw 'Installed app missing from Start Menu.' }
     $manifest=Get-AppxPackageManifest -Package $installed.PackageFullName
-    if ($manifest.OuterXml -notmatch '<uap:FileType>\.pdf</uap:FileType>') { throw 'Packaged PDF association missing.' }
+    $namespaces=[Xml.XmlNamespaceManager]::new($manifest.NameTable)
+    $namespaces.AddNamespace('uap','http://schemas.microsoft.com/appx/manifest/uap/windows10')
+    if (-not $manifest.SelectSingleNode('//uap:FileTypeAssociation/uap:SupportedFileTypes/uap:FileType[text()=".pdf"]',$namespaces)) { throw 'Packaged PDF association missing.' }
     [ordered]@{
         schema='lawpdf-msix-installation-v1'; app_version=$ExpectedAppVersion;
         package_version=$installed.Version; package_full_name=$installed.PackageFullName;
