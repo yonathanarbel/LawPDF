@@ -115,23 +115,32 @@ impl PdfEditorApp {
         }
     }
 
+    /// Undo and redo as icons for the markup bar.
     pub(super) fn annotation_history_buttons(&mut self, ui: &mut egui::Ui, ctx: &Context) {
         let session = self.annotation_sessions.get(&self.document_epoch);
         let enabled = session.is_some_and(|session| !session.recovery_pending)
             && !self.page_rotation_in_flight;
         let undo = enabled && session.is_some_and(|session| !session.undo.is_empty());
         let redo = enabled && session.is_some_and(|session| !session.redo.is_empty());
-        if ui
-            .add_enabled(undo, egui::Button::new("Undo"))
-            .on_hover_text("Undo annotation change (⌘Z / Ctrl+Z)")
-            .clicked()
+        if toolbar_icon_button(
+            ui,
+            ToolbarIcon::Undo,
+            false,
+            undo,
+            "Undo annotation change (⌘Z / Ctrl+Z)",
+        )
+        .clicked()
         {
             self.restore_annotation_history(false, ctx);
         }
-        if ui
-            .add_enabled(redo, egui::Button::new("Redo"))
-            .on_hover_text("Redo annotation change (⇧⌘Z / Ctrl+Y)")
-            .clicked()
+        if toolbar_icon_button(
+            ui,
+            ToolbarIcon::Redo,
+            false,
+            redo,
+            "Redo annotation change (⇧⌘Z / Ctrl+Y)",
+        )
+        .clicked()
         {
             self.restore_annotation_history(true, ctx);
         }

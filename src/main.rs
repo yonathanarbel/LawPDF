@@ -24,6 +24,8 @@ mod page_geometry;
 mod pdf_backend;
 mod performance_cache;
 mod render_worker;
+mod review_margin;
+mod review_masthead;
 mod review_reading;
 mod settings;
 #[cfg(feature = "devtools")]

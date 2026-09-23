@@ -324,14 +324,13 @@ impl PdfEditorApp {
         }
     }
 
-    pub(super) fn recovery_button(&mut self, ui: &mut egui::Ui, ctx: &Context) {
-        if ui
-            .add_enabled(!self.recovery_ui.busy, egui::Button::new("Recover edits…"))
-            .clicked()
-        {
-            self.recovery_ui.error = None;
-            self.recovery_ui.visible = true;
-            self.recovery_ui.refresh(ctx);
-        }
+    pub(super) fn recovery_is_busy(&self) -> bool {
+        self.recovery_ui.busy
+    }
+
+    pub(super) fn open_recovery_dialog(&mut self, ctx: &Context) {
+        self.recovery_ui.error = None;
+        self.recovery_ui.visible = true;
+        self.recovery_ui.refresh(ctx);
     }
 }
