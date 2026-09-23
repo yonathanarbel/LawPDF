@@ -29,7 +29,6 @@ pub const REVIEW_MARGIN_GAP: f32 = 16.0;
 // made every detected bound volume look low-confidence and silently unioned
 // article-local note starts with the unsafe file-global result.
 pub const REVIEW_HIGH_CONFIDENCE_ARTICLE_SPAN: f32 = 0.85;
-pub const REVIEW_OUTLINE_RAIL_DEFAULT_WIDTH: f32 = 236.0;
 
 /// Hide printed tables of contents from the Review reading column.
 pub fn review_hidden_display_mask(blocks: &[LiquidBlock]) -> Vec<bool> {
@@ -935,12 +934,6 @@ pub fn is_review_note_display_block(block: &LiquidBlock) -> bool {
     ) || (block.role == LiquidBlockRole::Noise && noise_block_is_review_note(&block.text))
 }
 
-/// Marginalia and rescued Noise notes sit in the side rail, not the body.
-pub fn is_review_margin_note_block(block: &LiquidBlock) -> bool {
-    block.role == LiquidBlockRole::Marginalia
-        || (block.role == LiquidBlockRole::Noise && noise_block_is_review_note(&block.text))
-}
-
 pub fn noise_block_is_review_note(text: &str) -> bool {
     let (marker, body) = split_leading_note_marker(text.trim());
     let Some(marker) = marker else {
@@ -965,29 +958,6 @@ pub fn review_skips_block_as_furniture(block: &LiquidBlock, hidden_by_mask: bool
         return false;
     }
     hidden_by_mask || should_hide_contents_block_for_display(block)
-}
-
-/// Consecutive margin notes from `start`, skipping true furniture only.
-pub fn review_collect_margin_note_indices(
-    blocks: &[LiquidBlock],
-    mut index: usize,
-    hidden: &[bool],
-) -> (Vec<usize>, usize) {
-    let mut notes = Vec::new();
-    while index < blocks.len() {
-        let block = &blocks[index];
-        let is_hidden = hidden.get(index).copied().unwrap_or(false);
-        if review_skips_block_as_furniture(block, is_hidden) {
-            index += 1;
-            continue;
-        }
-        if !is_review_margin_note_block(block) {
-            break;
-        }
-        notes.push(index);
-        index += 1;
-    }
-    (notes, index)
 }
 
 pub fn article_spans_may_revoke_global_note_starts(spans: &[ArticleSpan]) -> bool {
@@ -1574,14 +1544,15 @@ mod tests {
         assert!(review_skips_block_as_furniture(&header, false));
         let blocks = vec![rescued, follow, header, body];
         let hidden = review_hidden_display_mask(&blocks);
-        let (notes, next) = review_collect_margin_note_indices(&blocks, 0, &hidden);
-        assert_eq!(
-            notes,
-            vec![0, 1],
-            "rescued 279 must enter the margin run with 280–282"
+        // Review Mode routes every note display block to the margin, so the
+        // rescued 279 must join 280–282 there, while the running head stays hidden.
+        assert!(
+            is_review_note_display_block(&blocks[0]),
+            "rescued 279 must reach the margin with 280–282"
         );
-        assert_eq!(next, 3);
-        assert!(is_review_margin_note_block(&blocks[0]));
+        assert!(is_review_note_display_block(&blocks[1]));
+        assert!(review_skips_block_as_furniture(&blocks[2], hidden[2]));
+        assert!(!is_review_note_display_block(&blocks[3]));
     }
 
     #[test]

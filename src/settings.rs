@@ -46,6 +46,16 @@ pub struct AppSettings {
     /// Suppress the one-time, non-modal macOS default-reader suggestion.
     #[serde(default)]
     pub macos_default_reader_prompt_dismissed: bool,
+    /// Side panel (pages, search, chat, notes) in the original PDF view.
+    #[serde(default = "default_true")]
+    pub sidebar_in_pdf: bool,
+    /// Side panel in Review Mode. Off by default: the margins hold the notes.
+    #[serde(default)]
+    pub sidebar_in_review: bool,
+    /// Where the reader dragged the markup bar, as an offset from its home at
+    /// the bottom centre of the page area. `None` keeps it at home.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markup_bar_offset: Option<[f32; 2]>,
 }
 
 impl Default for AppSettings {
@@ -66,6 +76,9 @@ impl Default for AppSettings {
             markdown_copy_include_tables: true,
             markdown_copy_include_metadata: false,
             macos_default_reader_prompt_dismissed: false,
+            sidebar_in_pdf: true,
+            sidebar_in_review: false,
+            markup_bar_offset: None,
         }
     }
 }

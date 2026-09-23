@@ -2,9 +2,11 @@ mod accessibility;
 mod annotation_saving;
 mod annotation_session;
 mod chat_ui;
+mod chrome;
 mod close_ui;
 mod document_opening;
 mod recovery_ui;
+mod review_margin_ui;
 mod search_state;
 mod selection_state;
 mod settings_ui;
@@ -12,7 +14,9 @@ mod tts_controller;
 mod update_ui;
 
 use chat_ui::{ChatState, ChatUi, estimate_tokens};
+use chrome::ChromeState;
 use close_ui::CloseTarget;
+use review_margin_ui::ReviewMarginCollector;
 use search_state::SearchState;
 use selection_state::SelectionState;
 use settings_ui::SettingsUi;
@@ -28,8 +32,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui::{
     self, Align, Align2, Color32, Context, CursorIcon, FontData, FontDefinitions, FontFamily,
-    FontId, Margin, Pos2, Rect, RichText, Sense, Shadow, Stroke, TextureHandle, TextureId,
-    TextureOptions, Vec2,
+    FontId, Margin, Pos2, Rect, RichText, Sense, Shadow, Stroke, TextFormat, TextureHandle,
+    TextureId, TextureOptions, Vec2, text::LayoutJob,
 };
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
@@ -61,15 +65,14 @@ use crate::render_worker::{
     PageRenderKey, RenderEvent, RenderRequest, ThumbnailRenderKey, spawn_render_worker,
 };
 use crate::review_reading::{
-    REVIEW_OUTLINE_RAIL_DEFAULT_WIDTH, REVIEW_PARAGRAPH_GAP, ReviewPrepareAction,
-    ReviewPrepareFlags, apply_live_review_correction, find_hits_in_review_blocks,
-    is_review_margin_note_block, is_review_note_display_block, opening_pages_ready_for_review,
-    review_all_pages_ready, review_allows_automatic_full_prepare,
-    review_collect_margin_note_indices, review_column_layout, review_contents_navigation_entries,
-    review_footnote_superscript, review_gate_automatic_full, review_hidden_display_mask,
-    review_opening_page_count, review_paragraph_display_parts, review_prepare_flags_after_restart,
-    review_prepare_next_action, review_skips_block_as_furniture, review_table_figure_crop,
-    should_apply_review_event, should_precompute_review_on_open, split_fused_review_notes,
+    REVIEW_MARGIN_GAP, REVIEW_MARGIN_MIN_WIDTH, REVIEW_PARAGRAPH_GAP, ReviewPrepareAction, ReviewPrepareFlags,
+    apply_live_review_correction, find_hits_in_review_blocks, is_review_note_display_block,
+    opening_pages_ready_for_review, review_all_pages_ready, review_allows_automatic_full_prepare,
+    review_column_layout, review_contents_navigation_entries, review_footnote_superscript,
+    review_gate_automatic_full, review_hidden_display_mask, review_opening_page_count,
+    review_paragraph_display_parts, review_prepare_flags_after_restart, review_prepare_next_action,
+    review_skips_block_as_furniture, review_table_figure_crop, should_apply_review_event,
+    should_precompute_review_on_open, split_fused_review_notes,
 };
 use crate::settings::{
     AppSettings, app_data_dir, effective_groq_api_key, effective_openai_api_key,
@@ -79,19 +82,18 @@ use crate::text_conversion;
 use crate::tts::{PaidTtsEvent, PaidTtsProvider, PaidTtsRequest, spawn_paid_tts_job};
 use crate::updater::{self, UpdateEvent};
 
-const CANVAS_FILL: Color32 = Color32::from_rgb(232, 230, 224);
-const PANEL_FILL: Color32 = Color32::from_rgb(246, 244, 239);
-const BAR_FILL: Color32 = Color32::from_rgb(250, 249, 245);
+const CANVAS_FILL: Color32 = Color32::from_rgb(234, 227, 212);
+const PANEL_FILL: Color32 = Color32::from_rgb(244, 239, 228);
+const BAR_FILL: Color32 = Color32::from_rgb(251, 248, 241);
 const APP_VERSION_LABEL: &str = concat!("LawPDF v", env!("CARGO_PKG_VERSION"));
-const PAPER_FILL: Color32 = Color32::from_rgb(255, 254, 250);
+const PAPER_FILL: Color32 = Color32::from_rgb(255, 253, 248);
 const PAPER_STROKE: Color32 = Color32::from_rgb(205, 201, 192);
 const INK: Color32 = Color32::from_rgb(42, 38, 32);
-const MUTED_INK: Color32 = Color32::from_rgb(105, 99, 90);
+const MUTED_INK: Color32 = Color32::from_rgb(106, 99, 88);
 const RENDER_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const ZOOM_RENDER_DEBOUNCE: Duration = Duration::from_millis(180);
 const ZOOM_ANIMATION_EPSILON: f32 = 0.001;
 const ZOOM_ANIMATION_SPEED: f32 = 18.0;
-const TOOLBAR_CONTROL_HEIGHT: f32 = 30.0;
 const TOOLBAR_ICON_SIZE: f32 = 30.0;
 const MAX_LIQUID_OUTLINE_ITEMS: usize = 80;
 const THUMBNAIL_SCROLL_SECONDS: f32 = 0.28;
@@ -118,8 +120,12 @@ const INFO_NOTICE_DURATION: Duration = Duration::from_secs(6);
 const ANNOTATION_AUTOSAVE_DELAY: Duration = Duration::from_millis(650);
 const COMMENT_CARD_WIDTH: f32 = 324.0;
 const COMMENT_CARD_GAP: f32 = 14.0;
-const LIQUID_MARGIN_NOTE_GAP: f32 = 16.0;
-const LIQUID_MARGIN_NOTE_MAX_CHARS: usize = 260;
+/// Canvas left showing on each side of the Review sheet.
+const REVIEW_SHEET_GUTTER: f32 = 36.0;
+/// Review column width: about seventy characters of body text.
+const REVIEW_DEFAULT_MAX_WIDTH: f32 = 760.0;
+/// Narrowest body column Review Mode accepts to keep notes in the margins.
+const REVIEW_NARROW_BODY_MIN_WIDTH: f32 = 540.0;
 // "Laying-down ink" highlight animation. The stroke wipes on left-to-right in
 // reading direction, then a brief sheen relaxes as the ink "dries". Multi-line
 // selections stagger so a paragraph fills like a hand sweeping down the page.
@@ -231,23 +237,22 @@ const COMMENT_COLOR_PRESETS: [CommentColorPreset; 5] = [
 ];
 
 fn install_eb_garamond(ctx: &Context) {
-    let Some(font_bytes) = eb_garamond_candidates()
+    let mut fonts = FontDefinitions::default();
+    chrome::install_masthead_font(&mut fonts);
+    if let Some(font_bytes) = eb_garamond_candidates()
         .into_iter()
         .find_map(|path| std::fs::read(path).ok())
-    else {
-        return;
-    };
-
-    let mut fonts = FontDefinitions::default();
-    fonts.font_data.insert(
-        "EB Garamond".to_owned(),
-        Arc::new(FontData::from_owned(font_bytes)),
-    );
-    fonts
-        .families
-        .entry(FontFamily::Proportional)
-        .or_default()
-        .insert(0, "EB Garamond".to_owned());
+    {
+        fonts.font_data.insert(
+            "EB Garamond".to_owned(),
+            Arc::new(FontData::from_owned(font_bytes)),
+        );
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, "EB Garamond".to_owned());
+    }
     ctx.set_fonts(fonts);
 }
 
@@ -291,7 +296,7 @@ fn install_paper_theme(ctx: &Context) {
     style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(242, 239, 232);
     style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(232, 227, 216);
     style.visuals.widgets.active.bg_fill = Color32::from_rgb(220, 214, 202);
-    style.visuals.selection.bg_fill = Color32::from_rgb(185, 143, 84);
+    style.visuals.selection.bg_fill = Color32::from_rgb(199, 165, 116);
     style.scroll_animation = egui::style::ScrollAnimation::duration(THUMBNAIL_SCROLL_SECONDS);
     style.spacing.scroll.bar_width = 13.0;
     style.spacing.scroll.floating_width = 3.5;
@@ -441,6 +446,7 @@ pub struct PdfEditorApp {
     /// Document epoch whose Review fast cache has already been probed on disk.
     liquid_mode2_fast_cache_probed_epoch: Option<u64>,
     settings_save_due: Option<Instant>,
+    chrome: ChromeState,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -653,7 +659,6 @@ struct ReviewDerivedCache {
     key: Option<std::sync::Weak<LiquidDocument>>,
     hidden_contents: Arc<Vec<bool>>,
     outline: Arc<Vec<LiquidOutlineItem>>,
-    title: String,
 }
 
 impl ReviewDerivedCache {
@@ -708,18 +713,6 @@ pub(crate) struct LiquidOutlineItem {
     block_index: usize,
     level: usize,
     text: String,
-}
-
-impl LiquidState {
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Idle => "Liquid idle",
-            Self::PreparingText => "Liquid text preparing",
-            Self::Preparing => "Liquid preparing",
-            Self::Ready(_) => "Liquid ready",
-            Self::Failed(_) => "Liquid failed",
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1151,7 +1144,7 @@ impl PdfEditorApp {
             review_feedback_tx,
             review_feedback_rx,
             liquid_text_scale: 1.0,
-            liquid_max_width: 920.0,
+            liquid_max_width: REVIEW_DEFAULT_MAX_WIDTH,
             liquid_theme: LiquidTheme::Paper,
             liquid_tx,
             liquid_rx,
@@ -1250,6 +1243,7 @@ impl PdfEditorApp {
             review_source_geometry: None,
             liquid_mode2_fast_cache_probed_epoch: None,
             settings_save_due: None,
+            chrome: ChromeState::default(),
         };
 
         if !startup_paths.is_empty() {
@@ -4917,654 +4911,6 @@ impl PdfEditorApp {
         self.status = "Text box deleted.".to_owned();
     }
 
-    fn draw_tab_strip(&mut self, ui: &mut egui::Ui, ctx: &Context) {
-        let mut switch_to = None;
-        let mut close_tab = None;
-
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(APP_VERSION_LABEL).strong().color(INK));
-            ui.add_space(4.0);
-
-            for (index, tab) in self.tabs.iter().enumerate() {
-                let is_active = self.active_tab == Some(index);
-                let sbs_side = self.sbs_mode.and_then(|mode| {
-                    if mode.left_epoch == tab.document_epoch {
-                        Some("L")
-                    } else if mode.right_epoch == tab.document_epoch {
-                        Some("R")
-                    } else {
-                        None
-                    }
-                });
-                let tab_fill = if is_active {
-                    Color32::from_rgb(255, 254, 250)
-                } else {
-                    Color32::from_rgb(229, 224, 214)
-                };
-                let tab_stroke = if is_active {
-                    Stroke::new(1.4_f32, Color32::from_rgb(151, 105, 48))
-                } else {
-                    Stroke::new(1.0_f32, Color32::from_rgb(204, 198, 187))
-                };
-                let title_color = if is_active { INK } else { MUTED_INK };
-
-                egui::Frame::NONE
-                    .fill(tab_fill)
-                    .stroke(tab_stroke)
-                    .corner_radius(6)
-                    .inner_margin(if is_active {
-                        Margin::symmetric(10, 5)
-                    } else {
-                        Margin::symmetric(9, 4)
-                    })
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let mut title = tab.title();
-                            let dirty = if is_active {
-                                self.annotations_dirty
-                            } else {
-                                tab.annotations_dirty
-                            };
-                            if dirty {
-                                title.push_str(" •");
-                            }
-                            const MAX_TAB_CHARS: usize = 28;
-                            if title.chars().count() > MAX_TAB_CHARS {
-                                title = format!(
-                                    "{}...",
-                                    title.chars().take(MAX_TAB_CHARS - 3).collect::<String>()
-                                );
-                            }
-                            let title = if is_active {
-                                RichText::new(title).strong().color(title_color)
-                            } else {
-                                RichText::new(title).color(title_color)
-                            };
-                            let tab_response = ui
-                                .add(egui::Label::new(title).sense(Sense::click()))
-                                .on_hover_text(tab.document.path.display().to_string());
-                            tab_response.widget_info(|| {
-                                egui::WidgetInfo::selected(
-                                    egui::WidgetType::Button, true, is_active, tab.title(),
-                                )
-                            });
-                            if tab_response.clicked() {
-                                switch_to = Some(index);
-                            }
-                            if let Some(side) = sbs_side {
-                                ui.label(
-                                    RichText::new(side)
-                                        .small()
-                                        .strong()
-                                        .color(Color32::from_rgb(145, 94, 35)),
-                                )
-                                .on_hover_text(if side == "L" {
-                                    "Shown in the left SbS pane"
-                                } else {
-                                    "Shown in the right SbS pane"
-                                });
-                            }
-                            let close_text = RichText::new("x").color(if is_active {
-                                Color32::from_rgb(104, 75, 43)
-                            } else {
-                                Color32::from_rgb(128, 122, 112)
-                            });
-                            let close_response = ui
-                                .add(egui::Button::new(close_text).small().frame(false))
-                                .on_hover_text("Close tab");
-                            close_response.widget_info(|| {
-                                egui::WidgetInfo::labeled(
-                                    egui::WidgetType::Button, true, format!("Close {}", tab.title()),
-                                )
-                            });
-                            if close_response.clicked() {
-                                close_tab = Some(index);
-                            }
-                        });
-                    });
-            }
-
-            let open_response = ui.small_button("+").on_hover_text("Open PDF");
-            open_response.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Open PDF in a new tab")
-            });
-            if open_response.clicked() {
-                self.open_dialog(ctx);
-            }
-        });
-
-        if let Some(index) = close_tab {
-            self.close_tab(index, ctx);
-        } else if let Some(index) = switch_to {
-            self.switch_to_tab(index, ctx);
-        }
-    }
-
-    fn draw_toolbar(&mut self, ctx: &Context) {
-        egui::TopBottomPanel::top("toolbar")
-            .frame(
-                egui::Frame::NONE
-                    .fill(BAR_FILL)
-                    .inner_margin(Margin::symmetric(10, 8))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(222, 218, 208))),
-            )
-            .show(ctx, |ui| {
-                // Keep text and painted-icon actions on one predictable row.
-                ui.spacing_mut().interact_size.y = TOOLBAR_CONTROL_HEIGHT;
-                self.draw_tab_strip(ui, ctx);
-                ui.horizontal_wrapped(|ui| {
-                    self.annotation_history_buttons(ui, ctx);
-                    self.recovery_button(ui, ctx);
-                });
-                ui.add_space(6.0);
-
-                let has_document = self.document.is_some();
-                let page_count = self
-                    .document
-                    .as_ref()
-                    .map(|document| document.page_count)
-                    .unwrap_or_default();
-
-                ui.horizontal_wrapped(|ui| {
-                    toolbar_group(ui, |ui| {
-                        if toolbar_icon_button(
-                            ui,
-                            ToolbarIcon::Open,
-                            false,
-                            true,
-                            "Open PDF",
-                        )
-                        .clicked()
-                        {
-                            self.open_dialog(ctx);
-                        }
-                        if toolbar_icon_button(
-                            ui,
-                            ToolbarIcon::Save,
-                            false,
-                            has_document,
-                            "Save highlights and comments into this PDF",
-                        )
-                        .clicked()
-                        {
-                            if let Err(error) = self.save_current_annotations() {
-                                self.push_error_notice(error);
-                            }
-                        }
-                        toolbar_icon_menu_button(
-                            ui,
-                            ToolbarIcon::Export,
-                            has_document,
-                            "Export this PDF as another document or image format",
-                            |ui| {
-                                if ui.button("Save PDF copy").clicked() {
-                                    self.save_as_dialog(ctx);
-                                    ui.close();
-                                }
-                                if ui.button("Text").clicked() {
-                                    self.export_text_dialog(ctx);
-                                    ui.close();
-                                }
-                                if ui.button("Markdown (.md)").clicked() {
-                                    self.export_markdown_dialog(ctx);
-                                    ui.close();
-                                }
-                                if ui.button("PNG").clicked() {
-                                    self.export_png_dialog(ctx);
-                                    ui.close();
-                                }
-                            },
-                        );
-                        let markdown_busy = self.pending_markdown_request.is_some();
-                        if markdown_busy {
-                            ui.spinner();
-                        }
-                        let mut markdown_settings_changed = false;
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 0.0;
-                            if toolbar_icon_button(
-                                ui,
-                                ToolbarIcon::Markdown,
-                                false,
-                                has_document && !markdown_busy,
-                                "Copy the whole article as Markdown for pasting into an AI chat\nCtrl/Cmd+Shift+C",
-                            )
-                            .clicked()
-                            {
-                                self.request_markdown_copy(ctx);
-                            }
-                            toolbar_icon_menu_button(
-                                ui,
-                                ToolbarIcon::More,
-                                has_document && !markdown_busy,
-                                "Markdown options",
-                                |ui| {
-                                    ui.label(RichText::new("Markdown copy").strong());
-                                    ui.separator();
-                                    ui.label("Footnotes");
-                                    markdown_settings_changed |= ui
-                                        .selectable_value(
-                                            &mut self.settings.markdown_copy_footnotes,
-                                            FootnoteMode::Inline,
-                                            "Inline",
-                                        )
-                                        .changed();
-                                    markdown_settings_changed |= ui
-                                        .selectable_value(
-                                            &mut self.settings.markdown_copy_footnotes,
-                                            FootnoteMode::Endnotes,
-                                            "Endnotes",
-                                        )
-                                        .changed();
-                                    markdown_settings_changed |= ui
-                                        .selectable_value(
-                                            &mut self.settings.markdown_copy_footnotes,
-                                            FootnoteMode::Omit,
-                                            "Omit",
-                                        )
-                                        .changed();
-                                    ui.separator();
-                                    markdown_settings_changed |= ui
-                                        .checkbox(
-                                            &mut self.settings.markdown_copy_include_tables,
-                                            "Include tables",
-                                        )
-                                        .changed();
-                                    markdown_settings_changed |= ui
-                                        .checkbox(
-                                            &mut self.settings.markdown_copy_include_metadata,
-                                            "Include metadata",
-                                        )
-                                        .changed();
-                                },
-                            );
-                        });
-                        if markdown_settings_changed {
-                            self.save_markdown_settings();
-                        }
-                        #[cfg(target_os = "windows")]
-                        if toolbar_icon_button(
-                            ui,
-                            ToolbarIcon::DefaultApp,
-                            false,
-                            true,
-                            "Open Windows Settings to choose LawPDF as the default PDF reader",
-                        )
-                        .clicked()
-                        {
-                            match open_windows_default_pdf_settings() {
-                                Ok(()) => {
-                                    self.status =
-                                        "Windows Settings opened. Choose LawPDF for .pdf files."
-                                            .to_owned();
-                                }
-                                Err(error) => {
-                                    self.push_error_notice(format!(
-                                        "Could not open Windows default-app settings: {error}"
-                                    ));
-                                }
-                            }
-                        }
-                        #[cfg(target_os = "macos")]
-                        if toolbar_icon_button(
-                            ui,
-                            ToolbarIcon::DefaultApp,
-                            false,
-                            true,
-                            "Make LawPDF the default macOS PDF reader",
-                        )
-                        .clicked()
-                        {
-                            match set_macos_default_pdf_reader() {
-                                Ok(()) => {
-                                    self.status =
-                                        "LawPDF is now the default PDF reader on macOS.".to_owned();
-                                }
-                                Err(error) => {
-                                    self.push_error_notice(format!(
-                                        "Could not make LawPDF the default PDF reader: {error}"
-                                    ));
-                                }
-                            }
-                        }
-                    });
-
-                    ui.add_space(6.0);
-
-                    toolbar_group(ui, |ui| {
-                        if toolbar_icon_button(
-                            ui,
-                            ToolbarIcon::Ocr,
-                            false,
-                            has_document,
-                            "Use OpenRouter OCR and save a searchable PDF copy",
-                        )
-                        .clicked()
-                        {
-                            self.sidebar_tab = SidebarTab::Search;
-                            self.start_openrouter_ocr_save();
-                        }
-                    });
-
-                    ui.add_space(6.0);
-
-                    toolbar_group(ui, |ui| {
-                        let sbs_active = self.sbs_mode.is_some();
-                        let pdf_active = !sbs_active && self.view_mode == DocumentViewMode::Pdf;
-                        if toolbar_icon_button(
-                            ui,
-                            ToolbarIcon::Pdf,
-                            pdf_active,
-                            has_document,
-                            "Original PDF view",
-                        )
-                        .clicked()
-                        {
-                            // #30: leaving a reflow view for the fixed layout is a doc-level
-                            // "reflow rejected" signal.
-                            if matches!(
-                                self.view_mode,
-                                DocumentViewMode::Liquid | DocumentViewMode::LiquidMode2
-                            ) {
-                                self.log_reflow_rejected(self.view_mode);
-                            }
-                            if sbs_active {
-                                self.exit_sbs_mode(ctx);
-                            }
-                            self.review_pdf_split = false;
-                            self.set_view_mode(DocumentViewMode::Pdf, ctx);
-                        }
-                        let review_active =
-                            !sbs_active && self.view_mode == DocumentViewMode::LiquidMode2;
-                        let review = ui
-                            .add_enabled(
-                                has_document,
-                                egui::Button::new("Review").selected(review_active),
-                            )
-                            .on_hover_text(
-                                "Open Review Mode. Wide windows show notes beside the paragraph.",
-                            );
-                        if review.clicked() {
-                            if sbs_active {
-                                self.exit_sbs_mode(ctx);
-                            }
-                            self.set_view_mode(DocumentViewMode::LiquidMode2, ctx);
-                        }
-                        if toolbar_icon_button(
-                            ui,
-                            ToolbarIcon::SideBySide,
-                            sbs_active || self.review_pdf_split,
-                            has_document,
-                            "Review beside the source page, or two PDFs if another tab is open",
-                        )
-                        .clicked()
-                        {
-                            self.toggle_review_or_pdf_split(ctx);
-                        }
-                        if let Some(mut mode) = self.sbs_mode
-                            && toolbar_icon_button(
-                                ui,
-                                ToolbarIcon::Swap,
-                                false,
-                                true,
-                                "Swap the left and right PDFs",
-                            )
-                                .clicked()
-                        {
-                            std::mem::swap(&mut mode.left_epoch, &mut mode.right_epoch);
-                            self.sbs_mode = Some(mode);
-                            ctx.request_repaint();
-                        }
-                        if matches!(
-                            self.liquid_mode2_state,
-                            LiquidState::PreparingText | LiquidState::Preparing
-                        ) {
-                            ui.spinner();
-                        }
-                    });
-
-                    ui.add_space(6.0);
-
-                    toolbar_group(ui, |ui| {
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                for tool in Tool::ALL {
-                                    let selected = self.active_tool == tool;
-                                    let annotation_enabled = self.sbs_mode.is_none();
-                                    if toolbar_icon_button(
-                                        ui,
-                                        ToolbarIcon::for_tool(tool),
-                                        selected,
-                                        annotation_enabled,
-                                        if annotation_enabled {
-                                            tool.tooltip()
-                                        } else {
-                                            "Open either pane solo to edit or annotate it"
-                                        },
-                                    )
-                                    .clicked()
-                                    {
-                                        self.active_tool = tool;
-                                    }
-                                }
-
-                                let rotation_enabled = has_document
-                                    && self.view_mode == DocumentViewMode::Pdf
-                                    && !self.page_rotation_in_flight;
-                                ui.add_enabled_ui(rotation_enabled, |ui| {
-                                    let (rotate_response, _) =
-                                        egui::containers::menu::MenuButton::from_button(
-                                            egui::Button::new("")
-                                                .min_size(Vec2::splat(TOOLBAR_ICON_SIZE)),
-                                        )
-                                        .ui(ui, |ui| {
-                                            if ui
-                                                .button("Rotate 90° left")
-                                                .on_hover_text(
-                                                    "Turn the current page 90° counterclockwise and save it in this PDF",
-                                                )
-                                                .clicked()
-                                            {
-                                                self.rotate_current_page(false);
-                                                ui.close();
-                                            }
-                                            if ui
-                                                .button("Rotate 90° right")
-                                                .on_hover_text(
-                                                    "Turn the current page 90° clockwise and save it in this PDF",
-                                                )
-                                                .clicked()
-                                            {
-                                                self.rotate_current_page(true);
-                                                ui.close();
-                                            }
-                                        });
-                                    paint_toolbar_icon(
-                                        ui.painter(),
-                                        rotate_response.rect,
-                                        ToolbarIcon::Rotate,
-                                        toolbar_icon_color(ui, &rotate_response, rotation_enabled),
-                                    );
-                                    rotate_response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, rotation_enabled, "Rotate page"));
-                                    toolbar_tooltip(
-                                        rotate_response,
-                                        "Rotate the current page by 90° (saved in this PDF)",
-                                    );
-                                });
-                                if self.page_rotation_in_flight {
-                                    ui.spinner().on_hover_text("Saving page rotation…");
-                                }
-                            });
-                            if self.active_tool == Tool::Marker && self.sbs_mode.is_none() {
-                                ui.add_space(2.0);
-                                ui.horizontal(|ui| {
-                                    self.draw_marker_default_palette(ui);
-                                });
-                            }
-                        });
-                    });
-
-                    ui.add_space(6.0);
-
-                    toolbar_group(ui, |ui| {
-                        if toolbar_icon_button(
-                            ui,
-                            ToolbarIcon::ZoomOut,
-                            false,
-                            has_document,
-                            "Zoom out",
-                        )
-                        .clicked()
-                        {
-                            self.set_zoom(self.target_zoom / 1.15);
-                        }
-                        ui.label(format!("{:.0}%", self.zoom * 100.0));
-                        if toolbar_icon_button(
-                            ui,
-                            ToolbarIcon::ZoomIn,
-                            false,
-                            has_document,
-                            "Zoom in",
-                        )
-                        .clicked()
-                        {
-                            self.set_zoom(self.target_zoom * 1.15);
-                        }
-                    });
-
-                    ui.add_space(6.0);
-
-                    toolbar_group(ui, |ui| {
-                        if toolbar_icon_button(
-                            ui,
-                            ToolbarIcon::Previous,
-                            false,
-                            has_document && self.page_index > 0,
-                            "Previous page",
-                        )
-                        .clicked()
-                        {
-                            self.go_to_page(self.page_index.saturating_sub(1));
-                        }
-
-                        let page_input_id = ui.id().with((
-                            "toolbar-page-number",
-                            self.document_epoch,
-                        ));
-                        let input_had_focus =
-                            ui.memory(|memory| memory.has_focus(page_input_id));
-                        let current_page_number = if has_document {
-                            self.page_index + 1
-                        } else {
-                            0
-                        };
-                        let mut page_number_text = ui.ctx().data_mut(|data| {
-                            data.get_temp::<String>(page_input_id)
-                                .unwrap_or_else(|| current_page_number.to_string())
-                        });
-                        if !input_had_focus {
-                            page_number_text = current_page_number.to_string();
-                        }
-                        let page_input_response = ui
-                            .add_enabled(
-                                has_document,
-                                egui::TextEdit::singleline(&mut page_number_text)
-                                    .id(page_input_id)
-                                    .desired_width(42.0)
-                                    .horizontal_align(Align::Center),
-                            )
-                            .on_disabled_hover_text("Type a page number and press Enter");
-                        ui.ctx().accesskit_node_builder(page_input_response.id, |node| {
-                            node.set_label("Page number");
-                        });
-                        if page_input_response.changed() {
-                            page_number_text.retain(|character| character.is_ascii_digit());
-                        }
-                        let enter_pressed = ui.input(|input| {
-                            input.key_pressed(egui::Key::Enter)
-                                || input.key_pressed(egui::Key::Tab)
-                        });
-                        let submit_page_number = has_document
-                            && (page_input_response.lost_focus()
-                                || (page_input_response.has_focus() && enter_pressed));
-                        if submit_page_number {
-                            match page_index_from_input(&page_number_text, page_count) {
-                                Ok(page_index) => {
-                                    self.go_to_page(page_index);
-                                    page_number_text = (page_index + 1).to_string();
-                                }
-                                Err(message) => {
-                                    self.status = message;
-                                    page_number_text = current_page_number.to_string();
-                                }
-                            }
-                            ui.memory_mut(|memory| memory.surrender_focus(page_input_id));
-                        }
-                        ui.ctx().data_mut(|data| {
-                            data.insert_temp(page_input_id, page_number_text);
-                        });
-                        ui.label(format!("/ {page_count}"))
-                            .on_hover_text("Total pages in this PDF");
-                        if toolbar_icon_button(
-                            ui,
-                            ToolbarIcon::Next,
-                            false,
-                            has_document && self.page_index + 1 < page_count,
-                            "Next page",
-                        )
-                        .clicked()
-                        {
-                            self.go_to_page(self.page_index + 1);
-                        }
-                    });
-
-                    ui.add_space(6.0);
-
-                    toolbar_group(ui, |ui| {
-                        let search_enabled = has_document && self.sbs_mode.is_none();
-                        let search_response = ui.add_enabled(
-                            search_enabled,
-                            egui::TextEdit::singleline(&mut self.search_state.query)
-                                .hint_text("Find")
-                                .desired_width(190.0),
-                        )
-                        .on_disabled_hover_text("Open the active pane solo to search within it");
-                        if self.search_state.focus_request {
-                            if search_enabled {
-                                search_response.request_focus();
-                            } else if has_document {
-                                self.status =
-                                    "Open either SbS pane solo to search within it.".to_owned();
-                            }
-                            self.search_state.focus_request = false;
-                        }
-                        if search_response.changed() {
-                            self.invalidate_search_results();
-                        }
-                        let pressed_enter = search_response.lost_focus()
-                            && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                        if toolbar_icon_button(
-                            ui,
-                            ToolbarIcon::Search,
-                            false,
-                            search_enabled,
-                            if search_enabled {
-                                "Search this PDF"
-                            } else {
-                                "Open the active pane solo to search within it"
-                            },
-                        )
-                        .clicked()
-                            || pressed_enter
-                        {
-                            self.start_search(ctx);
-                            self.sidebar_tab = SidebarTab::Search;
-                        }
-                    });
-                });
-            });
-    }
-
     #[cfg(target_os = "macos")]
     fn draw_default_reader_prompt(&mut self, ctx: &Context) {
         if !self.show_default_reader_prompt {
@@ -5572,7 +4918,7 @@ impl PdfEditorApp {
         }
 
         egui::Window::new("Make LawPDF your default?")
-            .anchor(Align2::RIGHT_TOP, [-16.0, 76.0])
+            .anchor(Align2::RIGHT_TOP, [-16.0, 150.0])
             .collapsible(false)
             .resizable(false)
             .title_bar(false)
@@ -5807,126 +5153,6 @@ impl PdfEditorApp {
                 ui.add_space(10.0);
             }
         });
-    }
-
-    fn draw_review_outline_rail(&mut self, ctx: &Context) {
-        if self.sbs_mode.is_some() || self.review_pdf_split {
-            return;
-        }
-        if self.view_mode != DocumentViewMode::LiquidMode2 {
-            return;
-        }
-        let ready = match &self.liquid_mode2_state {
-            LiquidState::Ready(document) => {
-                let document = Arc::clone(document);
-                self.refresh_review_derived(&document);
-                Some((
-                    self.review_derived.title.clone(),
-                    Arc::clone(&self.review_derived.outline),
-                ))
-            }
-            _ => None,
-        };
-        let dark = matches!(self.liquid_theme, LiquidTheme::Dark);
-        let fill = if dark {
-            Color32::from_rgb(37, 39, 43)
-        } else {
-            Color32::from_rgb(246, 244, 239)
-        };
-        let stroke = if dark {
-            Color32::from_rgb(66, 69, 75)
-        } else {
-            Color32::from_rgb(214, 209, 198)
-        };
-        let ink = self.liquid_ink_color();
-        let muted = self.liquid_muted_color();
-        let active = self.review_active_heading;
-        let mut clicked = None;
-        egui::SidePanel::right("review_outline_rail")
-            .resizable(true)
-            .default_width(REVIEW_OUTLINE_RAIL_DEFAULT_WIDTH)
-            .width_range(188.0..=360.0)
-            .frame(
-                egui::Frame::NONE
-                    .fill(fill)
-                    .inner_margin(Margin::symmetric(14, 12))
-                    .stroke(Stroke::new(1.0_f32, stroke)),
-            )
-            .show(ctx, |ui| {
-                ui.label(RichText::new("CONTENTS").size(11.0).strong().color(muted));
-                ui.add_space(6.0);
-                let Some((title, outline)) = &ready else {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(RichText::new("Finding sections…").color(muted));
-                    });
-                    return;
-                };
-                if !title.trim().is_empty() {
-                    ui.label(RichText::new(title).size(13.5).strong().color(ink));
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-                }
-                if outline.is_empty() {
-                    ui.label(RichText::new("No section headings detected.").color(muted));
-                    return;
-                }
-                egui::ScrollArea::vertical()
-                    .id_salt("review_outline_rail_list")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for item in outline.iter() {
-                            let is_active = active == Some(item.block_index);
-                            ui.horizontal(|ui| {
-                                ui.add_space(12.0 * item.level.saturating_sub(1) as f32);
-                                let color = if is_active {
-                                    ink
-                                } else if item.level == 1 {
-                                    ink.linear_multiply(0.82)
-                                } else {
-                                    muted
-                                };
-                                let response = ui
-                                    .add(
-                                        egui::Label::new(
-                                            RichText::new(&item.text)
-                                                .size(if item.level == 1 { 12.5 } else { 11.5 })
-                                                .strong()
-                                                .color(color),
-                                        )
-                                        .wrap()
-                                        .sense(Sense::click()),
-                                    )
-                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text("Jump to this section");
-                                if is_active {
-                                    let marker = Rect::from_min_max(
-                                        Pos2::new(ui.max_rect().left(), response.rect.top() + 3.0),
-                                        Pos2::new(
-                                            ui.max_rect().left() + 2.5,
-                                            response.rect.bottom() - 3.0,
-                                        ),
-                                    );
-                                    ui.painter().rect_filled(
-                                        marker,
-                                        1.0,
-                                        Color32::from_rgb(164, 119, 63),
-                                    );
-                                }
-                                if response.clicked() {
-                                    clicked = Some(item.block_index);
-                                }
-                            });
-                            ui.add_space(5.0);
-                        }
-                    });
-            });
-        if let Some(block_index) = clicked {
-            self.liquid_scroll_to_block = Some(block_index);
-            self.review_active_heading = Some(block_index);
-            ctx.request_repaint();
-        }
     }
 
     fn update_review_active_heading(&mut self, clip: Rect) {
@@ -6372,57 +5598,6 @@ impl PdfEditorApp {
                         },
                     );
                 }
-            });
-    }
-
-    fn draw_status_bar(&mut self, ctx: &Context) {
-        egui::TopBottomPanel::bottom("status_bar")
-            .frame(
-                egui::Frame::NONE
-                    .fill(BAR_FILL)
-                    .inner_margin(Margin::symmetric(10, 6))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(222, 218, 208))),
-            )
-            .show(ctx, |ui| {
-                let page_count = self
-                    .document
-                    .as_ref()
-                    .map(|document| document.page_count)
-                    .unwrap_or_default();
-                let page_text = if page_count > 0 && self.view_mode == DocumentViewMode::Pdf {
-                    format!("Page {} of {}", self.page_index + 1, page_count)
-                } else if page_count > 0 && self.view_mode == DocumentViewMode::LiquidMode2 {
-                    self.liquid_mode2_state.label().to_owned()
-                } else if page_count > 0 {
-                    self.liquid_state.label().to_owned()
-                } else {
-                    "No document".to_owned()
-                };
-
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(page_text).color(INK));
-                    ui.separator();
-                    let mode_text = match self.view_mode {
-                        DocumentViewMode::Pdf => format!("{:.0}% zoom", self.zoom * 100.0),
-                        DocumentViewMode::Liquid => "Liquid view".to_owned(),
-                        DocumentViewMode::LiquidMode2 => "Review Mode".to_owned(),
-                    };
-                    ui.label(RichText::new(mode_text).color(INK));
-                    ui.separator();
-                    ui.label(RichText::new(self.active_tool.label()).color(INK));
-                    ui.separator();
-                    let saving = self.document.as_ref().is_some_and(|document|
-                        self.pending_annotation_saves.contains_key(&document.path)
-                            || self.active_annotation_saves.contains_key(&document.path));
-                    let save_label = if saving { "Saving…" } else if self.annotations_dirty { "Not saved" } else { "Saved" };
-                    ui.label(RichText::new(save_label).color(if self.annotations_dirty && !saving { Color32::DARK_RED } else { MUTED_INK }))
-                        .on_hover_text("Annotations save automatically. Keep the document open if saving fails; use Save As for a protected PDF.");
-                    ui.separator();
-                    ui.label(RichText::new(self.ocr_summary()).color(MUTED_INK));
-                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new(&self.status).color(MUTED_INK));
-                    });
-                });
             });
     }
 
@@ -6894,7 +6069,6 @@ impl PdfEditorApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let available = ui.available_width();
-                let margin_width = 0.0;
                 let width = available
                     .min(self.liquid_max_width)
                     .max(360.0)
@@ -6967,100 +6141,15 @@ impl PdfEditorApp {
                                 }
                                 let notes = liquid_note_blocks(&document.blocks);
                                 let hidden_contents = review_hidden_display_mask(&document.blocks);
-                                let mut block_index = 0usize;
-                                while block_index < document.blocks.len() {
-                                    let block = &document.blocks[block_index];
-                                    if review_skips_block_as_furniture(
-                                        block,
-                                        hidden_contents.get(block_index).copied().unwrap_or(false),
-                                    ) {
-                                        // #29: reveal hidden furniture (dimmed) when toggled on.
-                                        if self.liquid_show_hidden_furniture {
-                                            self.draw_liquid_hidden_furniture_block(ui, block);
-                                        }
-                                        block_index += 1;
-                                        continue;
-                                    }
-                                    if is_review_note_display_block(block)
-                                        && self.liquid_hide_footnotes
-                                    {
-                                        block_index += 1;
-                                        continue;
-                                    }
-                                    if is_review_margin_note_block(block) {
-                                        let (indices, next_index) =
-                                            review_collect_margin_note_indices(
-                                                &document.blocks,
-                                                block_index,
-                                                &hidden_contents,
-                                            );
-                                        let margin_notes = indices
-                                            .iter()
-                                            .map(|&note_index| {
-                                                (note_index, &document.blocks[note_index])
-                                            })
-                                            .collect::<Vec<_>>();
-                                        block_index = next_index;
-                                        self.draw_liquid_reader_row(
-                                            ui,
-                                            &document,
-                                            None,
-                                            None,
-                                            &margin_notes,
-                                            width,
-                                            margin_width,
-                                        );
-                                        continue;
-                                    }
-                                    if block.role == LiquidBlockRole::Metadata {
-                                        let start = block_index;
-                                        while block_index < document.blocks.len()
-                                            && document.blocks[block_index].role
-                                                == LiquidBlockRole::Metadata
-                                        {
-                                            block_index += 1;
-                                        }
-                                        let visible_metadata = document.blocks[start..block_index]
-                                            .iter()
-                                            .enumerate()
-                                            .filter(|(offset, block)| {
-                                                !hidden_contents
-                                                    .get(start + offset)
-                                                    .copied()
-                                                    .unwrap_or(false)
-                                                    && !should_hide_contents_block_for_display(
-                                                        block,
-                                                    )
-                                            })
-                                            .map(|(_, block)| block.clone())
-                                            .collect::<Vec<_>>();
-                                        if !visible_metadata.is_empty() {
-                                            self.draw_liquid_metadata_group(ui, &visible_metadata);
-                                        }
-                                        continue;
-                                    }
-                                    let (indices, next_index) = review_collect_margin_note_indices(
-                                        &document.blocks,
-                                        block_index + 1,
-                                        &hidden_contents,
-                                    );
-                                    let margin_notes = indices
-                                        .iter()
-                                        .map(|&note_index| {
-                                            (note_index, &document.blocks[note_index])
-                                        })
-                                        .collect::<Vec<_>>();
-                                    self.draw_liquid_reader_row(
-                                        ui,
-                                        &document,
-                                        Some(block_index),
-                                        Some(block),
-                                        &margin_notes,
-                                        width,
-                                        margin_width,
-                                    );
-                                    block_index = next_index;
-                                }
+                                self.chrome.margin_notes_live = false;
+                                self.draw_review_blocks(
+                                    ui,
+                                    &document,
+                                    &hidden_contents,
+                                    0.0,
+                                    width,
+                                    None,
+                                );
                                 if !self.liquid_mode2_complete {
                                     self.draw_liquid_deciphering(ui, ctx);
                                 }
@@ -7150,26 +6239,37 @@ impl PdfEditorApp {
 
     fn draw_liquid_mode2_document(&mut self, ui: &mut egui::Ui, ctx: &Context) {
         let state = self.liquid_mode2_state.clone();
+        let (canvas, sheet_fill, sheet_edge) = self.review_sheet_colors();
+        ui.painter().rect_filled(ui.max_rect(), 0.0, canvas);
         egui::ScrollArea::vertical()
             .id_salt("liquid_mode2_document")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let available = ui.available_width();
-                let column = review_column_layout(
-                    available,
-                    self.liquid_max_width,
-                    !self.liquid_hide_footnotes,
-                );
+                // Keep a gutter of canvas around the sheet.
+                let available = (ui.available_width() - 2.0 * REVIEW_SHEET_GUTTER).max(360.0);
+                // Margin notes are worth a narrower column: give up body width,
+                // down to a floor, before giving up the margins.
+                let body_width = if self.liquid_hide_footnotes {
+                    self.liquid_max_width
+                } else {
+                    self.liquid_max_width.min(
+                        (available - 2.0 * (REVIEW_MARGIN_MIN_WIDTH + REVIEW_MARGIN_GAP))
+                            .max(REVIEW_NARROW_BODY_MIN_WIDTH),
+                    )
+                };
+                let column =
+                    review_column_layout(available, body_width, !self.liquid_hide_footnotes);
                 let width = column.body_width;
                 let margin_width = column.margin_width;
                 ui.horizontal(|ui| {
-                    ui.add_space(column.side);
+                    ui.add_space(column.side + REVIEW_SHEET_GUTTER);
                     ui.vertical(|ui| {
                         ui.set_width(column.row_width);
-                        if column.body_indent > 0.0 {
-                            ui.add_space(0.0);
-                        }
-                        ui.add_space(28.0);
+                        let row_left = ui.max_rect().left();
+                        // The sheet is painted behind the content once its height is known.
+                        let sheet = ui.painter().add(egui::Shape::Noop);
+                        let sheet_top = ui.cursor().top() + 14.0;
+                        ui.add_space(40.0);
                         match state {
                             LiquidState::Idle => {
                                 ui.label(RichText::new("Review Mode").size(26.0).strong());
@@ -7218,9 +6318,7 @@ impl PdfEditorApp {
                                     ui.add_space(column.body_indent);
                                     ui.vertical(|ui| {
                                         ui.set_width(width);
-                                        self.draw_liquid_controls(ui, &document);
                                         self.draw_review_full_prepare_prompt(ui, ctx);
-                                        self.draw_liquid_tts_controls(ui, &document);
                                     });
                                 });
                                 self.refresh_review_derived(&document);
@@ -7233,103 +6331,37 @@ impl PdfEditorApp {
                                 let notes = liquid_note_blocks(&document.blocks);
                                 let hidden_contents =
                                     Arc::clone(&self.review_derived.hidden_contents);
-                                let mut block_index = 0usize;
-                                while block_index < document.blocks.len() {
-                                    let block = &document.blocks[block_index];
-                                    if review_skips_block_as_furniture(
-                                        block,
-                                        hidden_contents.get(block_index).copied().unwrap_or(false),
-                                    ) {
-                                        // #29: reveal hidden furniture (dimmed) when toggled on.
-                                        if self.liquid_show_hidden_furniture {
-                                            self.draw_liquid_hidden_furniture_block(ui, block);
-                                        }
-                                        block_index += 1;
-                                        continue;
-                                    }
-                                    if is_review_note_display_block(block)
-                                        && self.liquid_hide_footnotes
-                                    {
-                                        block_index += 1;
-                                        continue;
-                                    }
-                                    if is_review_margin_note_block(block) {
-                                        let (indices, next_index) =
-                                            review_collect_margin_note_indices(
-                                                &document.blocks,
-                                                block_index,
-                                                &hidden_contents,
-                                            );
-                                        let margin_notes = indices
-                                            .iter()
-                                            .map(|&note_index| {
-                                                (note_index, &document.blocks[note_index])
-                                            })
-                                            .collect::<Vec<_>>();
-                                        block_index = next_index;
-                                        self.draw_liquid_reader_row(
-                                            ui,
-                                            &document,
-                                            None,
-                                            None,
-                                            &margin_notes,
-                                            width,
-                                            margin_width,
-                                        );
-                                        continue;
-                                    }
-                                    if block.role == LiquidBlockRole::Metadata {
-                                        let start = block_index;
-                                        while block_index < document.blocks.len()
-                                            && document.blocks[block_index].role
-                                                == LiquidBlockRole::Metadata
-                                        {
-                                            block_index += 1;
-                                        }
-                                        let visible_metadata = document.blocks[start..block_index]
-                                            .iter()
-                                            .enumerate()
-                                            .filter(|(offset, block)| {
-                                                !hidden_contents
-                                                    .get(start + offset)
-                                                    .copied()
-                                                    .unwrap_or(false)
-                                                    && !should_hide_contents_block_for_display(
-                                                        block,
-                                                    )
-                                            })
-                                            .map(|(_, block)| block.clone())
-                                            .collect::<Vec<_>>();
-                                        if !visible_metadata.is_empty() {
-                                            self.draw_liquid_metadata_group(ui, &visible_metadata);
-                                        }
-                                        continue;
-                                    }
-                                    let (indices, next_index) = review_collect_margin_note_indices(
-                                        &document.blocks,
-                                        block_index + 1,
-                                        &hidden_contents,
-                                    );
-                                    let margin_notes = indices
-                                        .iter()
-                                        .map(|&note_index| {
-                                            (note_index, &document.blocks[note_index])
-                                        })
-                                        .collect::<Vec<_>>();
-                                    self.draw_liquid_reader_row(
+                                let margins_live = margin_width > 0.0;
+                                self.chrome.margin_notes_live = margins_live;
+                                let mut margin = ReviewMarginCollector::default();
+                                self.draw_review_blocks(
+                                    ui,
+                                    &document,
+                                    &hidden_contents,
+                                    column.body_indent,
+                                    width,
+                                    margins_live.then_some(&mut margin),
+                                );
+                                self.update_review_active_heading(ui.clip_rect());
+                                if margins_live {
+                                    let right_notes =
+                                        row_left + column.body_indent + width + REVIEW_MARGIN_GAP;
+                                    self.draw_review_margin_notes(
                                         ui,
-                                        &document,
-                                        Some(block_index),
-                                        Some(block),
-                                        &margin_notes,
-                                        width,
+                                        margin,
+                                        right_notes,
+                                        row_left,
                                         margin_width,
                                     );
-                                    block_index = next_index;
                                 }
-                                self.update_review_active_heading(ui.clip_rect());
                                 if !self.liquid_mode2_complete {
-                                    self.draw_liquid_deciphering(ui, ctx);
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(column.body_indent);
+                                        ui.vertical(|ui| {
+                                            ui.set_width(width);
+                                            self.draw_liquid_deciphering(ui, ctx);
+                                        });
+                                    });
                                 }
                                 if !self.liquid_hide_footnotes {
                                     ui.horizontal(|ui| {
@@ -7340,12 +6372,125 @@ impl PdfEditorApp {
                                         });
                                     });
                                 }
-                                ui.add_space(40.0);
                             }
                         }
+                        ui.add_space(96.0);
+                        let sheet_rect = Rect::from_min_max(
+                            Pos2::new(row_left - 28.0, sheet_top),
+                            Pos2::new(row_left + column.row_width + 28.0, ui.cursor().top()),
+                        );
+                        ui.painter().set(
+                            sheet,
+                            egui::Shape::Vec(vec![
+                                egui::Shape::rect_filled(
+                                    sheet_rect.translate(Vec2::new(0.0, 6.0)).expand(6.0),
+                                    4.0,
+                                    Color32::from_rgba_unmultiplied(42, 38, 32, 10),
+                                ),
+                                egui::Shape::rect_filled(sheet_rect, 2.0, sheet_fill),
+                                egui::Shape::rect_stroke(
+                                    sheet_rect,
+                                    2.0,
+                                    Stroke::new(1.0_f32, sheet_edge),
+                                    egui::StrokeKind::Inside,
+                                ),
+                            ]),
+                        );
                     });
                 });
             });
+    }
+
+    /// Canvas, sheet, and sheet edge for the current reading theme.
+    fn review_sheet_colors(&self) -> (Color32, Color32, Color32) {
+        match self.liquid_theme {
+            LiquidTheme::Paper => (CANVAS_FILL, PAPER_FILL, Color32::from_rgb(224, 215, 198)),
+            LiquidTheme::Sepia => (
+                Color32::from_rgb(226, 214, 190),
+                Color32::from_rgb(248, 239, 220),
+                Color32::from_rgb(214, 196, 160),
+            ),
+            LiquidTheme::Dark => (
+                Color32::from_rgb(16, 21, 31),
+                Color32::from_rgb(24, 32, 48),
+                Color32::from_rgb(38, 50, 74),
+            ),
+        }
+    }
+
+    /// Draw the article's blocks in reading order. With a collector, notes go to
+    /// the margin instead of the column and callouts are recorded for placement.
+    fn draw_review_blocks(
+        &mut self,
+        ui: &mut egui::Ui,
+        document: &LiquidDocument,
+        hidden_contents: &[bool],
+        indent: f32,
+        width: f32,
+        mut margin: Option<&mut ReviewMarginCollector>,
+    ) {
+        let mut block_index = 0usize;
+        while block_index < document.blocks.len() {
+            let block = &document.blocks[block_index];
+            if review_skips_block_as_furniture(
+                block,
+                hidden_contents.get(block_index).copied().unwrap_or(false),
+            ) {
+                // #29: reveal hidden furniture (dimmed) when toggled on.
+                if self.liquid_show_hidden_furniture {
+                    in_review_column(ui, indent, width, |ui| {
+                        self.draw_liquid_hidden_furniture_block(ui, block);
+                    });
+                }
+                block_index += 1;
+                continue;
+            }
+            if is_review_note_display_block(block) {
+                // Notes never interrupt the column. With a margin they sit beside
+                // their callouts; without one they open from the callout and
+                // appear in the notes list at the end.
+                if !self.liquid_hide_footnotes
+                    && let Some(margin) = margin.as_deref_mut()
+                {
+                    margin.add_note_block(block_index, &block.text, ui.cursor().top());
+                }
+                block_index += 1;
+                continue;
+            }
+            if block.role == LiquidBlockRole::Metadata {
+                let start = block_index;
+                while block_index < document.blocks.len()
+                    && document.blocks[block_index].role == LiquidBlockRole::Metadata
+                {
+                    block_index += 1;
+                }
+                let visible_metadata = document.blocks[start..block_index]
+                    .iter()
+                    .enumerate()
+                    .filter(|(offset, block)| {
+                        !hidden_contents
+                            .get(start + offset)
+                            .copied()
+                            .unwrap_or(false)
+                            && !should_hide_contents_block_for_display(block)
+                    })
+                    .map(|(_, block)| block.clone())
+                    .collect::<Vec<_>>();
+                if !visible_metadata.is_empty() {
+                    in_review_column(ui, indent, width, |ui| {
+                        self.draw_liquid_metadata_group(ui, &visible_metadata);
+                    });
+                }
+                continue;
+            }
+            let hits = in_review_column(ui, indent, width, |ui| {
+                self.draw_liquid_feedback_block(ui, document, block_index, block)
+            });
+            if let Some(margin) = margin.as_deref_mut() {
+                margin.add_callouts(&hits, &self.liquid_footnote_index);
+            }
+            block_index += 1;
+        }
     }
 
     /// Eased 0..1 progress of the reveal that plays when the reflow replaces the
@@ -7563,7 +6708,7 @@ impl PdfEditorApp {
         document: &LiquidDocument,
         block_index: usize,
         block: &LiquidBlock,
-    ) {
+    ) -> Vec<(Rect, u16)> {
         let feedback_id = liquid_feedback_id(&document.source_signature, block_index, block);
         if matches!(
             block.role,
@@ -7658,20 +6803,34 @@ impl PdfEditorApp {
                     self.scroll_target_page = Some(page);
                 }
             } else if let Some(number) = hovered_marker {
-                let popup_id = liquid_footnote_popup_id(&feedback_id, number);
-                egui::Popup::toggle_id(ui.ctx(), popup_id);
+                if self.chrome.margin_notes_live {
+                    // The note is already beside the line; the callout opens it in full.
+                    let key = number.to_string();
+                    self.chrome.expanded_note =
+                        if self.chrome.expanded_note.as_deref() == Some(key.as_str()) {
+                            None
+                        } else {
+                            Some(key)
+                        };
+                } else {
+                    let popup_id = liquid_footnote_popup_id(&feedback_id, number);
+                    egui::Popup::toggle_id(ui.ctx(), popup_id);
+                }
             }
         }
-        // Render any open footnote popovers, anchored at their markers.
-        for (rect, number) in &marker_hits {
-            let popup_id = liquid_footnote_popup_id(&feedback_id, *number);
-            if !egui::Popup::is_id_open(ui.ctx(), popup_id) {
-                continue;
-            }
-            if let Some(body) = self.liquid_footnote_index.get(number) {
-                self.draw_liquid_footnote_popover(ui, popup_id, *rect, *number, body);
+        if !self.chrome.margin_notes_live {
+            // Narrow windows have no margin: notes open as popovers at their markers.
+            for (rect, number) in &marker_hits {
+                let popup_id = liquid_footnote_popup_id(&feedback_id, *number);
+                if !egui::Popup::is_id_open(ui.ctx(), popup_id) {
+                    continue;
+                }
+                if let Some(body) = self.liquid_footnote_index.get(number) {
+                    self.draw_liquid_footnote_popover(ui, popup_id, *rect, *number, body);
+                }
             }
         }
+        marker_hits
     }
 
     /// #29: source bboxes (paired with their page index) for a reflowed block, joined from the
@@ -7791,7 +6950,6 @@ impl PdfEditorApp {
             key: Some(Arc::downgrade(document)),
             hidden_contents: Arc::new(review_hidden_display_mask(&document.blocks)),
             outline: Arc::new(liquid_outline_items(&document.blocks)),
-            title: document.title.clone(),
         };
     }
 
@@ -7846,142 +7004,6 @@ impl PdfEditorApp {
                 egui::StrokeKind::Inside,
             );
         }
-    }
-
-    fn draw_liquid_reader_row(
-        &mut self,
-        ui: &mut egui::Ui,
-        document: &LiquidDocument,
-        block_index: Option<usize>,
-        block: Option<&LiquidBlock>,
-        margin_notes: &[(usize, &LiquidBlock)],
-        body_width: f32,
-        margin_width: f32,
-    ) {
-        if margin_width <= 0.0 {
-            if let (Some(block_index), Some(block)) = (block_index, block) {
-                self.draw_liquid_feedback_block(ui, document, block_index, block);
-            }
-            return;
-        }
-
-        let mut left_notes = Vec::new();
-        let mut right_notes = Vec::new();
-        for (note_index, note) in margin_notes {
-            if liquid_margin_note_goes_left(*note_index, note) {
-                left_notes.push((*note_index, *note));
-            } else {
-                right_notes.push((*note_index, *note));
-            }
-        }
-
-        ui.horizontal_top(|ui| {
-            ui.allocate_ui_with_layout(
-                Vec2::new(margin_width, 0.0),
-                egui::Layout::top_down(Align::RIGHT),
-                |ui| {
-                    self.draw_liquid_margin_note_stack(ui, &left_notes, margin_width, true);
-                },
-            );
-            ui.add_space(LIQUID_MARGIN_NOTE_GAP);
-            ui.allocate_ui_with_layout(
-                Vec2::new(body_width, 0.0),
-                egui::Layout::top_down(Align::LEFT),
-                |ui| {
-                    ui.set_width(body_width);
-                    if let (Some(block_index), Some(block)) = (block_index, block) {
-                        self.draw_liquid_feedback_block(ui, document, block_index, block);
-                    } else {
-                        ui.add_space(2.0);
-                    }
-                },
-            );
-            ui.add_space(LIQUID_MARGIN_NOTE_GAP);
-            ui.allocate_ui_with_layout(
-                Vec2::new(margin_width, 0.0),
-                egui::Layout::top_down(Align::LEFT),
-                |ui| {
-                    self.draw_liquid_margin_note_stack(ui, &right_notes, margin_width, false);
-                },
-            );
-        });
-    }
-
-    fn draw_liquid_margin_note_stack(
-        &self,
-        ui: &mut egui::Ui,
-        notes: &[(usize, &LiquidBlock)],
-        width: f32,
-        left_side: bool,
-    ) {
-        let mut position = 0usize;
-        for (_, note) in notes {
-            for (marker, body) in split_fused_review_notes(&note.text) {
-                if position > 0 {
-                    ui.add_space(7.0);
-                }
-                self.draw_liquid_margin_note_card_parts(ui, &marker, &body, width, left_side);
-                position += 1;
-            }
-        }
-    }
-
-    fn draw_liquid_margin_note_card_parts(
-        &self,
-        ui: &mut egui::Ui,
-        marker: &str,
-        body: &str,
-        width: f32,
-        left_side: bool,
-    ) {
-        let label = if marker.is_empty() { "cont." } else { marker };
-        let body = compact_liquid_margin_note_text(callout_body_text("Footnote", body));
-        let (fill, stroke, label_color, body_color) = match self.liquid_theme {
-            LiquidTheme::Paper => (
-                Color32::from_rgb(252, 249, 242),
-                Color32::from_rgb(213, 202, 181),
-                Color32::from_rgb(118, 86, 48),
-                Color32::from_rgb(82, 73, 61),
-            ),
-            LiquidTheme::Sepia => (
-                Color32::from_rgb(245, 235, 214),
-                Color32::from_rgb(201, 179, 139),
-                Color32::from_rgb(112, 76, 39),
-                Color32::from_rgb(78, 59, 38),
-            ),
-            LiquidTheme::Dark => (
-                Color32::from_rgb(45, 43, 39),
-                Color32::from_rgb(96, 88, 73),
-                Color32::from_rgb(220, 190, 137),
-                Color32::from_rgb(202, 197, 187),
-            ),
-        };
-        let align = if left_side { Align::RIGHT } else { Align::LEFT };
-        ui.allocate_ui_with_layout(Vec2::new(width, 0.0), egui::Layout::top_down(align), |ui| {
-            egui::Frame::NONE
-                .fill(fill)
-                .stroke(Stroke::new(1.0_f32, stroke))
-                .corner_radius(4)
-                .inner_margin(Margin::symmetric(8, 7))
-                .show(ui, |ui| {
-                    ui.set_width((width - 18.0).max(72.0));
-                    ui.label(
-                        RichText::new(label)
-                            .size(10.5 * self.liquid_text_scale)
-                            .strong()
-                            .color(label_color),
-                    );
-                    ui.add_space(2.0);
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(body)
-                                .size(11.5 * self.liquid_text_scale)
-                                .color(body_color),
-                        )
-                        .wrap(),
-                    );
-                });
-        });
     }
 
     /// Read the reflowed text with an operating-system speech process. The
@@ -8158,9 +7180,8 @@ impl PdfEditorApp {
         }
     }
 
-    /// Reader actions: clean text download is the default; narration is optional.
-    fn draw_liquid_tts_controls(&mut self, ui: &mut egui::Ui, document: &LiquidDocument) {
-        // Clear the handle if playback finished on its own.
+    /// Clear the speech handle when playback ends on its own, whatever view is open.
+    fn poll_liquid_tts_finished(&mut self) {
         let finished = self
             .tts_controller
             .child
@@ -8183,6 +7204,10 @@ impl PdfEditorApp {
                 self.status = "Finished reading aloud.".to_owned();
             }
         }
+    }
+
+    /// Reader actions for the legacy Liquid view: text download and narration.
+    fn draw_liquid_tts_controls(&mut self, ui: &mut egui::Ui, document: &LiquidDocument) {
         ui.horizontal_wrapped(|ui| {
             if ui
                 .button(RichText::new("Download text").size(11.0).strong())
@@ -8343,7 +7368,7 @@ impl PdfEditorApp {
             let mut open_dialog = false;
             egui::Area::new(egui::Id::new("review_feedback_prompt"))
                 .order(egui::Order::Foreground)
-                .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -24.0))
+                .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -104.0))
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
                         ui.horizontal(|ui| {
@@ -8637,7 +7662,7 @@ impl PdfEditorApp {
     /// Theme-aware accent for tappable footnote markers in the Liquid view.
     fn liquid_footnote_marker_color(&self) -> Color32 {
         match self.liquid_theme {
-            LiquidTheme::Paper => Color32::from_rgb(38, 92, 158),
+            LiquidTheme::Paper => chrome::OXBLOOD,
             LiquidTheme::Sepia => Color32::from_rgb(120, 74, 38),
             LiquidTheme::Dark => Color32::from_rgb(126, 176, 222),
         }
@@ -9142,7 +8167,9 @@ impl PdfEditorApp {
         ui.add_space(22.0);
         ui.separator();
         ui.add_space(6.0);
-        egui::CollapsingHeader::new(format!("Notes ({})", notes.len()))
+        egui::CollapsingHeader::new(
+            RichText::new(format!("Notes ({})", notes.len())).color(self.liquid_ink_color()),
+        )
             .default_open(false)
             .show(ui, |ui| {
                 ui.add_space(4.0);
@@ -9294,7 +8321,7 @@ impl PdfEditorApp {
             }
             if ui.button(RichText::new("Reset").size(11.0)).clicked() {
                 self.liquid_text_scale = 1.0;
-                self.liquid_max_width = 920.0;
+                self.liquid_max_width = REVIEW_DEFAULT_MAX_WIDTH;
                 self.liquid_theme = LiquidTheme::Paper;
             }
             let details = ui.menu_button(
@@ -9542,6 +8569,7 @@ impl PdfEditorApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(CANVAS_FILL))
             .show(ctx, |ui| {
+                self.chrome.document_rect = Some(ui.max_rect());
                 if self.document.is_none() {
                     self.draw_empty_state(ui, ctx);
                     return;
@@ -12000,38 +11028,6 @@ impl PdfEditorApp {
         ctx.request_repaint();
     }
 
-    fn draw_marker_default_palette(&mut self, ui: &mut egui::Ui) {
-        for (index, preset) in MARKER_PRESETS.iter().copied().enumerate() {
-            let color = color_from_rgb(preset.color_rgb, 210);
-            let selected = self.marker_preset_index == index;
-            let stroke = if selected {
-                Stroke::new(1.6_f32, Color32::from_rgb(88, 66, 38))
-            } else {
-                Stroke::new(1.0_f32, Color32::from_rgb(210, 202, 188))
-            };
-            let button = match preset.style {
-                MarkerStyle::Highlight => egui::Button::new("")
-                    .fill(color)
-                    .stroke(stroke)
-                    .min_size(Vec2::splat(18.0)),
-                MarkerStyle::Underline => egui::Button::new(
-                    RichText::new("U")
-                        .strong()
-                        .color(color_from_rgb(preset.color_rgb, 255)),
-                )
-                .fill(Color32::from_rgb(255, 252, 246))
-                .stroke(stroke)
-                .min_size(Vec2::new(24.0, 18.0)),
-            };
-            let response = ui.add(button).on_hover_text(preset.label);
-            accessibility::name_color_choice(&response, preset.label, selected);
-            if response.clicked() {
-                self.marker_preset_index = index;
-                self.status = format!("Marker set to {}", preset.label);
-            }
-        }
-    }
-
     fn mark_selection(&mut self, preset: MarkerPreset) {
         let Some(selection) = self.selection_state.text else {
             return;
@@ -12404,13 +11400,13 @@ impl eframe::App for PdfEditorApp {
 
         self.advance_zoom_animation(ctx);
 
-        self.draw_toolbar(ctx);
-        if self.sbs_mode.is_none() {
+        self.poll_liquid_tts_finished();
+        self.draw_masthead(ctx);
+        if self.sidebar_visible() {
             self.draw_side_panel(ctx);
         }
-        self.draw_review_outline_rail(ctx);
-        self.draw_status_bar(ctx);
         self.draw_document(ctx);
+        self.draw_markup_bar(ctx);
         self.draw_review_feedback_ui(ctx);
         self.draw_settings_window(ctx);
         self.draw_unsaved_close_prompt(ctx);
@@ -12710,17 +11706,6 @@ fn format_download_progress(
     }
 }
 
-fn toolbar_group(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::NONE
-        .fill(Color32::from_rgb(244, 241, 235))
-        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(224, 219, 209)))
-        .corner_radius(6)
-        .inner_margin(Margin::symmetric(6, 4))
-        .show(ui, |ui| {
-            ui.horizontal(add_contents);
-        });
-}
-
 fn toolbar_tooltip(response: egui::Response, tooltip: &str) -> egui::Response {
     response
         .on_hover_text(tooltip)
@@ -12734,10 +11719,6 @@ enum ToolbarIcon {
     Export,
     Markdown,
     More,
-    DefaultApp,
-    Ocr,
-    Pdf,
-    SideBySide,
     Swap,
     Select,
     Marker,
@@ -12748,7 +11729,13 @@ enum ToolbarIcon {
     ZoomIn,
     Previous,
     Next,
-    Search,
+    Sidebar,
+    Reading,
+    Overflow,
+    Speaker,
+    Stop,
+    Undo,
+    Redo,
 }
 
 impl ToolbarIcon {
@@ -12875,43 +11862,6 @@ fn paint_toolbar_icon(
             painter.line_segment([point(-5.0, -2.0), point(0.0, 3.0)], stroke);
             painter.line_segment([point(0.0, 3.0), point(5.0, -2.0)], stroke);
         }
-        ToolbarIcon::DefaultApp => {
-            painter.circle_stroke(center, 7.0, stroke);
-            painter.line_segment([point(-3.5, 0.0), point(-0.8, 3.0)], stroke);
-            painter.line_segment([point(-0.8, 3.0), point(4.5, -3.5)], stroke);
-        }
-        ToolbarIcon::Ocr => {
-            painter.text(
-                center,
-                Align2::CENTER_CENTER,
-                "OCR",
-                FontId::proportional(9.5),
-                color,
-            );
-        }
-        ToolbarIcon::Pdf => {
-            painter.text(
-                center,
-                Align2::CENTER_CENTER,
-                "PDF",
-                FontId::proportional(9.5),
-                color,
-            );
-        }
-        ToolbarIcon::SideBySide => {
-            painter.rect_stroke(
-                Rect::from_min_max(point(-7.0, -6.0), point(-1.0, 6.0)),
-                1.0,
-                stroke,
-                egui::StrokeKind::Inside,
-            );
-            painter.rect_stroke(
-                Rect::from_min_max(point(1.0, -6.0), point(7.0, 6.0)),
-                1.0,
-                stroke,
-                egui::StrokeKind::Inside,
-            );
-        }
         ToolbarIcon::Swap => {
             painter.line_segment([point(-6.0, -3.0), point(5.0, -3.0)], stroke);
             painter.line_segment([point(2.0, -6.0), point(5.0, -3.0)], stroke);
@@ -13009,9 +11959,71 @@ fn paint_toolbar_icon(
             painter.line_segment([point(-3.0, -6.0), point(3.0, 0.0)], stroke);
             painter.line_segment([point(3.0, 0.0), point(-3.0, 6.0)], stroke);
         }
-        ToolbarIcon::Search => {
-            painter.circle_stroke(point(-1.5, -1.5), 5.0, stroke);
-            painter.line_segment([point(2.0, 2.0), point(7.0, 7.0)], stroke);
+        ToolbarIcon::Sidebar => {
+            let frame = Rect::from_min_max(point(-7.5, -6.0), point(7.5, 6.0));
+            painter.rect_stroke(frame, 1.5, stroke, egui::StrokeKind::Inside);
+            painter.line_segment([point(-2.5, -6.0), point(-2.5, 6.0)], stroke);
+        }
+        ToolbarIcon::Reading => {
+            painter.text(
+                point(-3.5, 0.5),
+                Align2::CENTER_CENTER,
+                "A",
+                FontId::proportional(16.0),
+                color,
+            );
+            painter.text(
+                point(4.5, 2.0),
+                Align2::CENTER_CENTER,
+                "a",
+                FontId::proportional(12.5),
+                color,
+            );
+        }
+        ToolbarIcon::Overflow => {
+            for x in [-5.5, 0.0, 5.5] {
+                painter.circle_filled(point(x, 0.0), 1.6, color);
+            }
+        }
+        ToolbarIcon::Speaker => {
+            let body = vec![
+                point(-7.0, -2.5),
+                point(-4.0, -2.5),
+                point(0.0, -6.0),
+                point(0.0, 6.0),
+                point(-4.0, 2.5),
+                point(-7.0, 2.5),
+                point(-7.0, -2.5),
+            ];
+            painter.add(egui::Shape::line(body, stroke));
+            let wave = |radius: f32| {
+                (0..=10)
+                    .map(|step| {
+                        let angle = -0.8 + step as f32 * 1.6 / 10.0;
+                        point(radius * angle.cos(), radius * angle.sin())
+                    })
+                    .collect::<Vec<_>>()
+            };
+            painter.add(egui::Shape::line(wave(3.8), stroke));
+            painter.add(egui::Shape::line(wave(6.8), stroke));
+        }
+        ToolbarIcon::Stop => {
+            let square = Rect::from_center_size(center, Vec2::splat(10.0));
+            painter.rect_filled(square, 1.5, color);
+        }
+        ToolbarIcon::Undo | ToolbarIcon::Redo => {
+            let flip = if icon == ToolbarIcon::Undo { 1.0 } else { -1.0 };
+            let p = |x: f32, y: f32| point(flip * x, y);
+            let mut path = vec![p(-6.0, -3.0), p(2.0, -3.0)];
+            for step in 1..=12 {
+                let angle =
+                    -std::f32::consts::FRAC_PI_2 + step as f32 * std::f32::consts::PI / 12.0;
+                path.push(p(2.0 + 4.0 * angle.cos(), 1.0 + 4.0 * angle.sin()));
+            }
+            path.push(p(-2.0, 5.0));
+            painter.add(egui::Shape::line(path, stroke));
+            painter.line_segment([p(-6.0, -3.0), p(-3.0, -6.0)], stroke);
+            painter.line_segment([p(-6.0, -3.0), p(-3.0, 0.0)], stroke);
         }
     }
 }
@@ -15095,34 +14107,29 @@ fn thumbnail_scale_from_key(render_scale_key: u32) -> f32 {
     render_scale_key as f32 / 1000.0
 }
 
+/// Run `add_contents` in the body column: indented past the left margin, at column width.
+fn in_review_column<R>(
+    ui: &mut egui::Ui,
+    indent: f32,
+    width: f32,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.horizontal(|ui| {
+        ui.add_space(indent);
+        ui.vertical(|ui| {
+            ui.set_width(width);
+            add_contents(ui)
+        })
+        .inner
+    })
+    .inner
+}
+
 fn liquid_note_blocks(blocks: &[LiquidBlock]) -> Vec<&LiquidBlock> {
     blocks
         .iter()
         .filter(|block| is_review_note_display_block(block))
         .collect()
-}
-
-fn liquid_margin_note_goes_left(block_index: usize, note: &LiquidBlock) -> bool {
-    split_liquid_note_marker(&note.text)
-        .0
-        .and_then(|marker| marker.parse::<usize>().ok())
-        .map(|marker| marker % 2 == 0)
-        .unwrap_or(block_index % 2 == 0)
-}
-
-fn compact_liquid_margin_note_text(text: &str) -> String {
-    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut output = compact
-        .chars()
-        .take(LIQUID_MARGIN_NOTE_MAX_CHARS)
-        .collect::<String>();
-    if compact.chars().count() > LIQUID_MARGIN_NOTE_MAX_CHARS {
-        output = output
-            .trim_end_matches(['.', ',', ';', ':', '-'])
-            .to_owned();
-        output.push_str("...");
-    }
-    output
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15255,31 +14262,6 @@ fn liquid_footnote_popup_id(feedback_id: &str, number: u16) -> egui::Id {
 
 fn liquid_block_click_enabled(command_active: bool, hovered_marker: Option<u16>) -> bool {
     command_active || hovered_marker.is_some()
-}
-
-fn split_liquid_note_marker(text: &str) -> (Option<&str>, &str) {
-    let trimmed = text.trim_start();
-    let mut marker_end = 0usize;
-    let mut digits = 0usize;
-
-    for (index, ch) in trimmed.char_indices() {
-        if ch.is_ascii_digit() && digits < 3 {
-            digits += 1;
-            marker_end = index + ch.len_utf8();
-            continue;
-        }
-        break;
-    }
-
-    if digits == 0 {
-        return (None, trimmed);
-    }
-
-    let rest = &trimmed[marker_end..];
-    let body = rest
-        .trim_start_matches(|ch: char| matches!(ch, '.' | ')' | ']' | ' ' | '\t'))
-        .trim_start();
-    (Some(&trimmed[..marker_end]), body)
 }
 
 fn callout_body_text<'a>(label: &str, text: &'a str) -> &'a str {
@@ -16944,18 +15926,6 @@ mod app_tests {
         assert!(notes[0].text.starts_with("1."));
         assert_eq!(notes[1].role, LiquidBlockRole::Marginalia);
         assert!(notes[2].text.starts_with("2 "));
-    }
-
-    #[test]
-    fn split_liquid_note_marker_parses_numbered_prefix() {
-        assert_eq!(
-            split_liquid_note_marker("12. See Restatement (Second) of Contracts."),
-            (Some("12"), "See Restatement (Second) of Contracts.")
-        );
-        assert_eq!(
-            split_liquid_note_marker("No marker here."),
-            (None, "No marker here.")
-        );
     }
 
     #[test]
