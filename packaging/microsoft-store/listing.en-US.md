@@ -1,7 +1,8 @@
 # Microsoft Store listing draft
 
-Publication status: not submitted. Account verification, the reserved product identity,
-Store screenshots, certification and a fresh Store installation are still required.
+Publication status: not submitted. The verified Individual publisher is John Arbel;
+LawPDF is reserved with Store ID 9MZXSP0C423F. Store screenshots, certification
+and a fresh Store installation are still required.
 
 ## Product name
 LawPDF
@@ -49,7 +50,6 @@ LawPDF is a native Rust/Win32 desktop PDF application, so it requires runFullTru
 No LawPDF account or payment is required. Start LawPDF, choose Open PDF, and select a nonconfidential PDF. Read and search the PDF, add an annotation, wait for saved status, close the tab, and reopen the PDF to verify persistence. Review Mode uses the bundled models. Optional network-backed AI features require a user-supplied provider account; they are not needed to test reading, annotation, saving, or local Review Mode. Use only disposable documents during certification tests.
 
 ## Submission details still needed
-- Reserved name and exact Package/Identity/Name, Publisher, and publisher display name from Partner Center.
 - Actual Windows screenshots of this build using a public or synthetic sample document.
 - Completed age-rating questionnaire based on the shipped capabilities.
 - Successful package installation evidence and any certification feedback.

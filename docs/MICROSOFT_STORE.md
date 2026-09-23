@@ -5,11 +5,16 @@ not submit the existing unsigned EXE installer as a Store download.
 
 ## Current status
 
-The developer account is being enrolled. No Store identity or product ID has
-been assigned to this source tree, no agreement acceptance has been confirmed,
-and no Store submission or publication is claimed. `identity.example.json` is
-an example only. The workflow creates an explicitly labeled validation package
-until a real `packaging/microsoft-store/identity.json` is provided.
+The Individual developer account is created and verified, the Microsoft Developer
+Agreement has been accepted, and the name LawPDF is reserved under public publisher
+John Arbel. Microsoft assigned Store ID `9MZXSP0C423F` and package identity
+`JohnArbel.LawPDF_byt1cn7x1mmx2`. The exact manifest identity is recorded in
+`packaging/microsoft-store/identity.json`.
+
+The submission is being prepared. No Microsoft certification, Store publication,
+or fresh Store installation is claimed. The workflow builds the real unsigned
+submission package using this identity; validation-only packages must not be
+uploaded as the product.
 
 ## Build and packaging
 
