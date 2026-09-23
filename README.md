@@ -34,8 +34,9 @@ Run the installer, or choose the portable ZIP if you prefer not to install.
 The packages are not publisher-signed, so Windows may show an unknown-publisher
 or reputation warning. Download only from this repository's release page.
 The installer registers LawPDF as a PDF-capable app and offers the Windows
-default-app chooser. You can also choose **Set as default** in LawPDF;
-Windows requires you to confirm the PDF association yourself.
+default-app chooser. You can also choose **Make LawPDF the default PDF
+reader** from the **⋯** menu; Windows requires you to confirm the PDF
+association yourself.
 
 ### Mac installation
 
@@ -49,9 +50,16 @@ See [Apple's instructions](https://support.apple.com/en-us/102445) and our
 ## Built for legal reading, research, and teaching
 
 - **Read footnote-heavy scholarship:** Review Mode reconstructs reading flow
-  and footnotes; keep the source PDF close for verification.
+  and sets each footnote in the margin beside the line that cites it. Long or
+  crowded notes are shortened to the room they have; click a note, or its
+  number in the text, to read it in full. Keep the source PDF close for
+  verification.
+- **Know what you are reading:** the masthead names the article, its authors,
+  and its citation, read from the PDF itself, with contents, find, and the
+  Original / Review / Side by side switch beneath.
 - **Prepare for class and workshops:** highlight, underline, comment, add text
-  boxes, and save annotated PDFs.
+  boxes, and save annotated PDFs. The markup tools, zoom, page, and save status
+  share one bar you can drag anywhere over the page.
 - **Find the passage you need:** native text selection, search, copy,
   continuous multi-page viewing, and zoom.
 - **Work with scanned materials:** OCR support for documents without native text.

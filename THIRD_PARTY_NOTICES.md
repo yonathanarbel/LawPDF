@@ -39,6 +39,20 @@ the SIL Open Font License 1.1. The OFL text is committed under:
 third_party/eb-garamond/OFL.txt
 ```
 
+## Frank Ruhl Libre
+
+The masthead title is set in Frank Ruhl Libre Black, Copyright 2015 The Frank
+Ruhl Libre Project Authors, licensed under the SIL Open Font License 1.1. LawPDF
+embeds a static Black instance subset to Latin characters
+(`vendor/fonts/FrankRuhlLibre-Black.ttf`), made from the variable font published
+in [google/fonts](https://github.com/google/fonts/tree/main/ofl/frankruhllibre).
+The family declares no Reserved Font Name, so the instanced subset keeps its
+name. The OFL text is committed under:
+
+```text
+third_party/frank-ruhl-libre/OFL.txt
+```
+
 ## Inno Setup
 
 The Windows installer is built with Inno Setup and includes the Inno Setup setup

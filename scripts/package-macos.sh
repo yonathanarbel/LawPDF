@@ -45,7 +45,7 @@ cp "$ROOT/assets/lawpdf.png" "$RESOURCES/lawpdf.png"
 cp "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_NOTICES.md" "$RESOURCES/"
 python3 "$ROOT/tools/package_rust_notices.py" --target aarch64-apple-darwin --destination "$RESOURCES"
 mkdir -p "$RESOURCES/third_party"
-for component in pdfium-binaries-mac-arm64 eb-garamond catboost; do
+for component in pdfium-binaries-mac-arm64 eb-garamond frank-ruhl-libre catboost; do
   cp -R "$ROOT/third_party/$component" "$RESOURCES/third_party/$component"
 done
 

@@ -29,6 +29,7 @@ def main():
         "tools/md_verify.py", "tools/test_md_verify.py", "tools/verify_release_manifest.py",
         "tools/make_update_manifest.py", "tools/package_rust_notices.py", "tools/export_public_source.py",
         "vendor/libpdfium.dylib", "vendor/pdfium.dll", "vendor/fonts/EBGaramond.ttf",
+        "vendor/fonts/FrankRuhlLibre-Black.ttf", "docs/READING_LAYOUT.md",
         "assets/lawpdf.ico", "assets/lawpdf.png",
     ]))
     for pattern in ["src/**/*.rs", "android/app/src/**/*.java", "android/app/src/**/*.xml",
