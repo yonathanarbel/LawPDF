@@ -31,6 +31,9 @@ foreach ($dll in @('opengl32.dll', 'libgallium_wgl.dll')) {
 }
 $env:GALLIUM_DRIVER = 'llvmpipe'
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
+# A roomy desktop avoids clipping the Store listing's app window.
+& powershell.exe -NoProfile -NonInteractive -Command "Set-DisplayResolution -Width 1920 -Height 1080 -Force"
+if ($LASTEXITCODE -ne 0) { throw 'Unable to configure screenshot desktop size.' }
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type @'
@@ -46,6 +49,9 @@ public static class LawPdfCapture {
 }
 '@
 [LawPdfCapture]::SetProcessDPIAware() | Out-Null
+$settingsDirectory = Join-Path $env:APPDATA 'LawPDF'
+New-Item -ItemType Directory -Path $settingsDirectory -Force | Out-Null
+'{"last_pdf_zoom":0.9}' | Set-Content (Join-Path $settingsDirectory 'settings.json') -Encoding utf8NoBOM
 $process = $null
 try {
     $process = Start-Process -FilePath $exe -ArgumentList ('"' + $SamplePdf + '"') -WorkingDirectory $payload -PassThru -RedirectStandardError (Join-Path $OutputDirectory 'launch-errors.txt')
@@ -57,7 +63,7 @@ try {
     } until ($process.MainWindowHandle -ne [IntPtr]::Zero -or [DateTime]::UtcNow -ge $deadline)
     if ($process.MainWindowHandle -eq [IntPtr]::Zero) { throw 'No visible LawPDF window was created.' }
     $screen = [Windows.Forms.Screen]::PrimaryScreen.Bounds
-    $width = [Math]::Min(1440, $screen.Width)
+    $width = [Math]::Min(1600, $screen.Width)
     $height = [Math]::Min(1000, $screen.Height)
     if ($width -lt 1024 -or $height -lt 720) { throw 'Runner desktop is too small for a useful Store screenshot.' }
     [LawPdfCapture]::ShowWindow($process.MainWindowHandle, 9) | Out-Null
