@@ -54,7 +54,7 @@ jobs:
             $identity=Join-Path $env:RUNNER_TEMP 'lawpdf-validation-identity.json'
             @{
               identity_name='LawPDF.Validation'; publisher='CN=LawPDF CI Validation';
-              publisher_display_name='LawPDF CI Validation'; package_version='1.2.34.0'
+              publisher_display_name='LawPDF CI Validation'; package_version='1.2.35.0'
             } | ConvertTo-Json | Set-Content $identity -Encoding utf8
             $args.ValidationOnly=$true
           }

@@ -11,10 +11,13 @@ John Arbel. Microsoft assigned Store ID `9MZXSP0C423F` and package identity
 `JohnArbel.LawPDF_byt1cn7x1mmx2`. The exact manifest identity is recorded in
 `packaging/microsoft-store/identity.json`.
 
-The submission is being prepared. No Microsoft certification, Store publication,
-or fresh Store installation is claimed. The workflow builds the real unsigned
-submission package using this identity; validation-only packages must not be
-uploaded as the product.
+The first submission (package `1.2.34.0`, app 0.2.34) was sent on September 23,
+2026 and is in Microsoft certification. Package `1.2.35.0` (app 0.2.35, the
+masthead reading layout) follows as an update once 0.2.34 is live; Partner
+Center accepts one submission at a time. No Store publication or fresh Store
+installation is claimed yet. The workflow builds the real unsigned submission
+package using this identity; validation-only packages must not be uploaded as
+the product.
 
 ## Build and packaging
 
@@ -31,7 +34,7 @@ uploaded as the product.
   the result, and checks the executable and manifest identity.
 - The package depends on Microsoft's VC++ Desktop runtime framework; Store
   deployment supplies that dependency. Minimum OS is Windows 10 build 19041.
-- Store package version `1.2.34.0` maps to application version `0.2.34`. The package
+- Store package version `1.2.35.0` maps to application version `0.2.35`. The package
   major is nonzero and the fourth component is zero, as Microsoft requires. This
   packaging identity does not change the application's public-beta status.
 
