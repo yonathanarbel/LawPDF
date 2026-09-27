@@ -8,6 +8,7 @@ Set-StrictMode -Version Latest
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
     throw 'This capture is restricted to disposable GitHub-hosted Windows runners.'
 }
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 $evidence = Get-Content (Join-Path $PackageDirectory 'package-evidence.json') -Raw | ConvertFrom-Json
 if ($evidence.app_version -ne '0.2.36') { throw 'Screenshot requires app 0.2.36.' }
 $package = Join-Path $PackageDirectory (Split-Path $evidence.package_path -Leaf)
@@ -52,7 +53,7 @@ public static class LawPdfCapture {
 [LawPdfCapture]::SetProcessDPIAware() | Out-Null
 $settingsDirectory = Join-Path $env:APPDATA 'LawPDF'
 New-Item -ItemType Directory -Path $settingsDirectory -Force | Out-Null
-'{"last_pdf_zoom":0.9}' | Set-Content (Join-Path $settingsDirectory 'settings.json') -Encoding utf8NoBOM
+[IO.File]::WriteAllText((Join-Path $settingsDirectory 'settings.json'), '{"last_pdf_zoom":0.9}')
 $process = $null
 try {
     $process = Start-Process -FilePath $exe -ArgumentList ('"' + $SamplePdf + '"') -WorkingDirectory $payload -PassThru -RedirectStandardError (Join-Path $OutputDirectory 'launch-errors.txt')
@@ -85,8 +86,8 @@ try {
         $bitmap.Save((Join-Path $OutputDirectory 'LawPDF-Windows-reading.png'), [Drawing.Imaging.ImageFormat]::Png)
     } finally { $graphics.Dispose(); $bitmap.Dispose() }
     # Open the named, accessible coffee control; never invoke the payment link.
-    Add-Type -Path "$env:WINDIR/Microsoft.NET/Framework64/v4.0.30319/WPF/UIAutomationTypes.dll"
-    Add-Type -Path "$env:WINDIR/Microsoft.NET/Framework64/v4.0.30319/WPF/UIAutomationClient.dll"
+    Add-Type -AssemblyName UIAutomationTypes
+    Add-Type -AssemblyName UIAutomationClient
     $windowElement = [System.Windows.Automation.AutomationElement]::FromHandle($process.MainWindowHandle)
     $coffeeCondition = New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::NameProperty, 'Buy me a coffee — support LawPDF')

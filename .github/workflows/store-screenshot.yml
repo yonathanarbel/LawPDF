@@ -31,7 +31,7 @@ jobs:
           github-token: ${{ github.token }}
           path: C:/tmp/lawpdf-screenshot-package
       - name: Capture actual Windows app using a synthetic reading sample
-        shell: pwsh
+        shell: powershell
         run: |
           $sample = Join-Path $env:RUNNER_TEMP 'LawPDF-Reading-Sample.pdf'
           [IO.File]::WriteAllBytes($sample,[Convert]::FromBase64String((Get-Content packaging/microsoft-store/reading-sample.pdf.base64 -Raw)))
