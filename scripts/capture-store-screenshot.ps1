@@ -43,6 +43,7 @@ using System;
 using System.Runtime.InteropServices;
 public static class LawPdfCapture {
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string className, string windowName);
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
@@ -64,17 +65,24 @@ try {
         if ($process.HasExited) { Get-Content (Join-Path $OutputDirectory 'launch-errors.txt'); throw 'LawPDF exited before a screenshot could be taken.' }
     } until ($process.MainWindowHandle -ne [IntPtr]::Zero -or [DateTime]::UtcNow -ge $deadline)
     if ($process.MainWindowHandle -eq [IntPtr]::Zero) { throw 'No visible LawPDF window was created.' }
+    # The process may initially report its inherited console rather than its GUI.
+    $appWindow = [IntPtr]::Zero
+    for ($attempt = 0; $attempt -lt 60 -and $appWindow -eq [IntPtr]::Zero; $attempt++) {
+        $appWindow = [LawPdfCapture]::FindWindow($null, 'LawPDF v0.2.36 - Y. Arbel design (2026)')
+        if ($appWindow -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 500 }
+    }
+    if ($appWindow -eq [IntPtr]::Zero) { throw 'The exact LawPDF 0.2.36 GUI window was not found.' }
     $screen = [Windows.Forms.Screen]::PrimaryScreen.Bounds
     $width = [Math]::Min(1600, $screen.Width)
     $height = [Math]::Min(1000, $screen.Height)
     if ($width -lt 1024 -or $height -lt 720) { throw 'Runner desktop is too small for a useful Store screenshot.' }
-    [LawPdfCapture]::ShowWindow($process.MainWindowHandle, 9) | Out-Null
-    [LawPdfCapture]::MoveWindow($process.MainWindowHandle, 0, 0, $width, $height, $true) | Out-Null
-    [LawPdfCapture]::SetForegroundWindow($process.MainWindowHandle) | Out-Null
+    [LawPdfCapture]::ShowWindow($appWindow, 9) | Out-Null
+    [LawPdfCapture]::MoveWindow($appWindow, 0, 0, $width, $height, $true) | Out-Null
+    [LawPdfCapture]::SetForegroundWindow($appWindow) | Out-Null
     # Only an original synthetic PDF is opened; no credentials or network features are configured.
     Start-Sleep -Seconds 15
     $rect = New-Object LawPdfCapture+RECT
-    if (-not [LawPdfCapture]::GetWindowRect($process.MainWindowHandle, [ref]$rect)) { throw 'Cannot read the app window bounds.' }
+    if (-not [LawPdfCapture]::GetWindowRect($appWindow, [ref]$rect)) { throw 'Cannot read the app window bounds.' }
     $x = [Math]::Max($screen.Left, $rect.Left)
     $y = [Math]::Max($screen.Top, $rect.Top)
     $w = [Math]::Min($screen.Right, $rect.Right) - $x
@@ -88,7 +96,7 @@ try {
     # Open the named, accessible coffee control; never invoke the payment link.
     Add-Type -AssemblyName UIAutomationTypes
     Add-Type -AssemblyName UIAutomationClient
-    $windowElement = [System.Windows.Automation.AutomationElement]::FromHandle($process.MainWindowHandle)
+    $windowElement = [System.Windows.Automation.AutomationElement]::FromHandle($appWindow)
     $coffeeCondition = New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::NameProperty, 'Buy me a coffee — support LawPDF')
     $coffeeButton = $null
