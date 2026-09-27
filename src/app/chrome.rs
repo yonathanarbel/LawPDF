@@ -298,6 +298,8 @@ impl PdfEditorApp {
                 });
                 open_new = plus.clicked();
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    support_ui::draw_coffee_button(ui);
+                    ui.add_space(6.0);
                     ui.label(
                         RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
                             .size(13.0)

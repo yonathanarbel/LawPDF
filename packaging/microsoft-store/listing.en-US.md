@@ -1,8 +1,9 @@
 # Microsoft Store listing draft
 
-Publication status: not submitted. The verified Individual publisher is John Arbel;
-LawPDF is reserved with Store ID 9MZXSP0C423F. Store screenshots, certification
-and a fresh Store installation are still required.
+Publication status: app 0.2.34 is live under publisher John Arbel, Store ID
+9MZXSP0C423F (verified September 27, 2026). This listing draft accompanies app
+0.2.36; the update has not been submitted. Updated Windows screenshots,
+certification, and a fresh Store installation are still required.
 
 ## Product name
 LawPDF
@@ -49,7 +50,17 @@ LawPDF is a native Rust/Win32 desktop PDF application, so it requires runFullTru
 ## Reviewer instructions
 No LawPDF account or payment is required. Start LawPDF, choose Open PDF, and select a nonconfidential PDF. Read and search the PDF, add an annotation, wait for saved status, close the tab, and reopen the PDF to verify persistence. Review Mode uses the bundled models. Optional network-backed AI features require a user-supplied provider account; they are not needed to test reading, annotation, saving, or local Review Mode. Use only disposable documents during certification tests.
 
+The small coffee-cup icon in the top bar opens an optional support panel. Its
+"Buy me a coffee" button opens https://buymeacoffee.com/lawpdf in the default
+browser. Buy Me a Coffee handles voluntary support through its hosted payment
+processor. No digital goods, features, memberships, or other rewards are provided
+in exchange. Reading and editing require no payment. LawPDF does not collect
+payment details or send document data through this link. Do not make a payment
+while testing the app.
+
 ## Submission details still needed
+- Verify the maintainer's payout connection and that the coffee page accepts
+  support before submission; disclose Buy Me a Coffee in Partner Center.
 - Actual Windows screenshots of this build using a public or synthetic sample document.
 - Completed age-rating questionnaire based on the shipped capabilities.
 - Successful package installation evidence and any certification feedback.
