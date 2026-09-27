@@ -3,7 +3,8 @@
 Publication status: app 0.2.34 is live under publisher John Arbel, Store ID
 9MZXSP0C423F (verified September 27, 2026). This listing accompanies app
 0.2.36 in Submission 2, submitted September 27, 2026. Partner Center confirmed
-Update in certification (Pre-processing). The new Windows reading and coffee
+Update in certification; pre-processing subsequently completed and certification
+was in progress. The new Windows reading and coffee
 screenshots, support-price disclosure, and external-commerce declaration were
 saved before submission. Certification and a fresh Store installation on the
 owner's Windows PC remain unverified.

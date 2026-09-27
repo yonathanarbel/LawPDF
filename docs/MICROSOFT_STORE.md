@@ -19,8 +19,9 @@ optional coffee-support panel; its payment destination is verified and its Store
 installation and runtime checks on a disposable Windows runner. On September 27,
 2026, Submission 2 (`1152921505701986313`) was submitted with that package,
 the revised listing, and screenshots of the reading interface and coffee panel.
-Partner Center confirmed **Update in certification**, with **Pre-processing**
-in progress and automatic publication selected after approval. The public
+Partner Center confirmed **Update in certification**. Pre-processing completed
+and the **Certification** stage was in progress at the last check, with
+automatic publication selected after approval. The public
 Store version remains 0.2.34 until Microsoft approves and publishes the update.
 A fresh installation through Microsoft
 Store on the user's Windows PC has not been verified. The workflow builds the
