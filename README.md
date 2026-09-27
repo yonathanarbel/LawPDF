@@ -96,6 +96,15 @@ Do not post confidential client files or private research.
 
 ## Creator, license, and no warranty
 
+### A little coffee, a lot of gratitude
+
+LawPDF is free. If you enjoy using it and want to support my coffee addiction,
+you can [buy me a coffee](https://buymeacoffee.com/lawpdf). A little coffee keeps
+the footnotes flowing. Support is entirely optional and does not unlock features.
+The small coffee cup in the app's top bar opens the same support page in your browser.
+
+### License
+
 **Created and maintained by Professor Yonathan Arbel.**
 
 LawPDF is free and open source under the [MIT License](LICENSE).

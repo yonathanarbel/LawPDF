@@ -50,10 +50,17 @@ LawPDF is a native Rust/Win32 desktop PDF application, so it requires runFullTru
 ## Reviewer instructions
 No LawPDF account or payment is required. Start LawPDF, choose Open PDF, and select a nonconfidential PDF. Read and search the PDF, add an annotation, wait for saved status, close the tab, and reopen the PDF to verify persistence. Review Mode uses the bundled models. Optional network-backed AI features require a user-supplied provider account; they are not needed to test reading, annotation, saving, or local Review Mode. Use only disposable documents during certification tests.
 
+The small coffee-cup icon in the top bar opens an optional support panel. Its
+"Buy me a coffee" button opens https://buymeacoffee.com/lawpdf in the default
+browser. Buy Me a Coffee handles voluntary support through its hosted payment
+processor. No digital goods, features, memberships, or other rewards are provided
+in exchange. Reading and editing require no payment. LawPDF does not collect
+payment details or send document data through this link. Do not make a payment
+while testing the app.
+
 ## Submission details still needed
-- Verify the coffee-support destination and disclose its payment provider in
-  Partner Center and reviewer notes. It is optional support only: no digital
-  goods, app features, or other rewards are sold or unlocked.
+- Verify the maintainer's payout connection and that the coffee page accepts
+  support before submission; disclose Buy Me a Coffee in Partner Center.
 - Actual Windows screenshots of this build using a public or synthetic sample document.
 - Completed age-rating questionnaire based on the shipped capabilities.
 - Successful package installation evidence and any certification feedback.
