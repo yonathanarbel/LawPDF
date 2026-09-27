@@ -16,8 +16,13 @@ The first submission (package `1.2.34.0`, app 0.2.34) is published. On September
 [LawPDF listing](https://apps.microsoft.com/detail/9MZXSP0C423F) was available.
 Package `1.2.36.0` (app 0.2.36) combines the masthead reading layout with the
 optional coffee-support panel; its payment destination is verified and its Store package has passed
-installation and runtime checks on a disposable Windows runner. Submission and
-Microsoft certification remain separate steps. A fresh installation through Microsoft
+installation and runtime checks on a disposable Windows runner. On September 27,
+2026, Submission 2 (`1152921505701986313`) was submitted with that package,
+the revised listing, and screenshots of the reading interface and coffee panel.
+Partner Center confirmed **Update in certification**, with **Pre-processing**
+in progress and automatic publication selected after approval. The public
+Store version remains 0.2.34 until Microsoft approves and publishes the update.
+A fresh installation through Microsoft
 Store on the user's Windows PC has not been verified. The workflow builds the
 real unsigned submission package using this identity; validation-only packages
 must not be uploaded as the product.

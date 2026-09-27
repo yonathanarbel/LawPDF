@@ -1,9 +1,12 @@
-# Microsoft Store listing draft
+# Microsoft Store listing
 
 Publication status: app 0.2.34 is live under publisher John Arbel, Store ID
-9MZXSP0C423F (verified September 27, 2026). This listing draft accompanies app
-0.2.36; the update has not been submitted. Updated Windows screenshots,
-certification, and a fresh Store installation are still required.
+9MZXSP0C423F (verified September 27, 2026). This listing accompanies app
+0.2.36 in Submission 2, submitted September 27, 2026. Partner Center confirmed
+Update in certification (Pre-processing). The new Windows reading and coffee
+screenshots, support-price disclosure, and external-commerce declaration were
+saved before submission. Certification and a fresh Store installation on the
+owner's Windows PC remain unverified.
 
 ## Product name
 LawPDF
@@ -19,6 +22,8 @@ Read the original PDF, search for a passage, highlight important text, leave com
 LawPDF saves annotations automatically and includes recovery copies, undo and redo, and visible save status. If a save fails, the document remains open so you can decide what to do next.
 
 Ordinary PDF reading and annotation work locally. Optional cloud AI, OCR, and narration features require your own provider account and may incur provider charges. They send the selected content needed for the requested feature to the chosen service; review the privacy policy before using confidential material.
+
+Optional coffee support: the small cup icon opens Buy Me a Coffee in your browser. Support starts at US$5 per coffee; choose a quantity and review the total before paying. Monthly support is optional. Support unlocks no features or rewards. Microsoft is not the fundraiser or payment provider.
 
 This is a public beta. Verify reconstructed text against the original PDF and retain backups of important documents. LawPDF is provided under the MIT License, without warranty of any kind.
 
@@ -60,7 +65,8 @@ while testing the app.
 
 ## Submission verification
 - The maintainer's payout connection and public coffee form were verified on
-  September 27, 2026. No test payment was made. Disclose Buy Me a Coffee in Partner Center.
+  September 27, 2026. No test payment was made. Buy Me a Coffee was disclosed in Partner Center,
+  and the external-commerce property was selected.
 - Actual Windows screenshots of this build using a public or synthetic sample document.
 - Completed age-rating questionnaire based on the shipped capabilities.
 - Successful package installation evidence and any certification feedback.
