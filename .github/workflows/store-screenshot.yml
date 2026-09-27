@@ -9,15 +9,25 @@ permissions:
 jobs:
   capture:
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Wait for the exact coffee candidate's verified Store package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: yonathanarbel/LawPDF
+        shell: pwsh
+        run: |
+          $source = gh api repos/yonathanarbel/LawPDF/actions/runs/36337015266 | ConvertFrom-Json
+          if ($source.head_sha -ne 'e263f55f8cda3ece07a2866678d5531fa7841ca1') { throw 'Unexpected source commit.' }
+          gh run watch 36337015266 --exit-status --interval 30
+          if ($LASTEXITCODE -ne 0) { throw 'Store package verification failed.' }
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: LawPDF-Microsoft-Store-package
-          run-id: 35870380673
+          run-id: 36337015266
           github-token: ${{ github.token }}
           path: C:/tmp/lawpdf-screenshot-package
       - name: Capture actual Windows app using a synthetic reading sample

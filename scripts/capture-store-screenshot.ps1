@@ -9,6 +9,7 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hoste
     throw 'This capture is restricted to disposable GitHub-hosted Windows runners.'
 }
 $evidence = Get-Content (Join-Path $PackageDirectory 'package-evidence.json') -Raw | ConvertFrom-Json
+if ($evidence.app_version -ne '0.2.36') { throw 'Screenshot requires app 0.2.36.' }
 $package = Join-Path $PackageDirectory (Split-Path $evidence.package_path -Leaf)
 if ((Get-FileHash $package -Algorithm SHA256).Hash.ToLowerInvariant() -ne $evidence.package_sha256) {
     throw 'Submission package checksum mismatch.'
@@ -83,6 +84,31 @@ try {
         $graphics.CopyFromScreen($x, $y, 0, 0, $bitmap.Size)
         $bitmap.Save((Join-Path $OutputDirectory 'LawPDF-Windows-reading.png'), [Drawing.Imaging.ImageFormat]::Png)
     } finally { $graphics.Dispose(); $bitmap.Dispose() }
+    # Open the named, accessible coffee control; never invoke the payment link.
+    Add-Type -Path "$env:WINDIR/Microsoft.NET/Framework64/v4.0.30319/WPF/UIAutomationTypes.dll"
+    Add-Type -Path "$env:WINDIR/Microsoft.NET/Framework64/v4.0.30319/WPF/UIAutomationClient.dll"
+    $windowElement = [System.Windows.Automation.AutomationElement]::FromHandle($process.MainWindowHandle)
+    $coffeeCondition = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::NameProperty, 'Buy me a coffee — support LawPDF')
+    $coffeeButton = $null
+    for ($attempt = 0; $attempt -lt 20 -and -not $coffeeButton; $attempt++) {
+        $coffeeButton = $windowElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $coffeeCondition)
+        if (-not $coffeeButton) { Start-Sleep -Milliseconds 500 }
+    }
+    if (-not $coffeeButton) { throw 'The accessible coffee button is missing.' }
+    $invoke = $coffeeButton.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+    $invoke.Invoke()
+    Start-Sleep -Seconds 2
+    $panelCondition = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::NameProperty, 'A little coffee, a lot of gratitude.')
+    $panel = $windowElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $panelCondition)
+    $bitmap = New-Object Drawing.Bitmap($w, $h)
+    $graphics = [Drawing.Graphics]::FromImage($bitmap)
+    try {
+        $graphics.CopyFromScreen($x, $y, 0, 0, $bitmap.Size)
+        $bitmap.Save((Join-Path $OutputDirectory 'LawPDF-Windows-coffee.png'), [Drawing.Imaging.ImageFormat]::Png)
+    } finally { $graphics.Dispose(); $bitmap.Dispose() }
+    if (-not $panel) { throw 'The coffee panel did not expose its heading after invocation.' }
     [ordered]@{
         app_version=$evidence.app_version; package_sha256=$evidence.package_sha256;
         executable_sha256=$evidence.executable_sha256; sample_sha256=(Get-FileHash $SamplePdf -Algorithm SHA256).Hash.ToLowerInvariant();
