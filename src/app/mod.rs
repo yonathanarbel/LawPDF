@@ -10,6 +10,7 @@ mod review_margin_ui;
 mod search_state;
 mod selection_state;
 mod settings_ui;
+mod support_ui;
 mod tts_controller;
 mod update_ui;
 
@@ -11714,6 +11715,7 @@ fn toolbar_tooltip(response: egui::Response, tooltip: &str) -> egui::Response {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolbarIcon {
+    Coffee,
     Open,
     Save,
     Export,
@@ -11816,6 +11818,29 @@ fn paint_toolbar_icon(
     let stroke = Stroke::new(1.65_f32, color);
 
     match icon {
+        ToolbarIcon::Coffee => {
+            painter.rect_stroke(
+                Rect::from_min_max(point(3.0, -2.5), point(8.0, 3.0)),
+                2.5,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.rect_stroke(
+                Rect::from_min_max(point(-6.0, -3.0), point(4.0, 6.0)),
+                egui::CornerRadius {
+                    nw: 1,
+                    ne: 1,
+                    sw: 4,
+                    se: 4,
+                },
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.line_segment([point(-7.0, 8.0), point(7.0, 8.0)], stroke);
+            for x in [-3.0, 1.0] {
+                painter.line_segment([point(x, -6.0), point(x + 1.0, -9.0)], stroke);
+            }
+        }
         ToolbarIcon::Open => {
             let folder = Rect::from_min_max(point(-7.0, -3.0), point(7.0, 6.0));
             painter.rect_stroke(folder, 1.5, stroke, egui::StrokeKind::Inside);
