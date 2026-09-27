@@ -58,9 +58,9 @@ in exchange. Reading and editing require no payment. LawPDF does not collect
 payment details or send document data through this link. Do not make a payment
 while testing the app.
 
-## Submission details still needed
-- Verify the maintainer's payout connection and that the coffee page accepts
-  support before submission; disclose Buy Me a Coffee in Partner Center.
+## Submission verification
+- The maintainer's payout connection and public coffee form were verified on
+  September 27, 2026. No test payment was made. Disclose Buy Me a Coffee in Partner Center.
 - Actual Windows screenshots of this build using a public or synthetic sample document.
 - Completed age-rating questionnaire based on the shipped capabilities.
 - Successful package installation evidence and any certification feedback.
