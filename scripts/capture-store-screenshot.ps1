@@ -65,13 +65,11 @@ try {
         if ($process.HasExited) { Get-Content (Join-Path $OutputDirectory 'launch-errors.txt'); throw 'LawPDF exited before a screenshot could be taken.' }
     } until ($process.MainWindowHandle -ne [IntPtr]::Zero -or [DateTime]::UtcNow -ge $deadline)
     if ($process.MainWindowHandle -eq [IntPtr]::Zero) { throw 'No visible LawPDF window was created.' }
-    # The process may initially report its inherited console rather than its GUI.
-    $appWindow = [IntPtr]::Zero
-    for ($attempt = 0; $attempt -lt 60 -and $appWindow -eq [IntPtr]::Zero; $attempt++) {
-        $appWindow = [LawPdfCapture]::FindWindow($null, 'LawPDF v0.2.36 - Y. Arbel design (2026)')
-        if ($appWindow -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 500 }
-    }
-    if ($appWindow -eq [IntPtr]::Zero) { throw 'The exact LawPDF 0.2.36 GUI window was not found.' }
+    # Wait for the actual app before refreshing its window handle.
+    Start-Sleep -Seconds 15
+    $process.Refresh()
+    $appWindow = $process.MainWindowHandle
+    if ($appWindow -eq [IntPtr]::Zero) { throw 'The LawPDF GUI window was not found.' }
     $screen = [Windows.Forms.Screen]::PrimaryScreen.Bounds
     $width = [Math]::Min(1600, $screen.Width)
     $height = [Math]::Min(1000, $screen.Height)
@@ -98,13 +96,17 @@ try {
     Add-Type -AssemblyName UIAutomationClient
     $windowElement = [System.Windows.Automation.AutomationElement]::FromHandle($appWindow)
     $coffeeCondition = New-Object System.Windows.Automation.PropertyCondition(
-        [System.Windows.Automation.AutomationElement]::NameProperty, 'Buy me a coffee — support LawPDF')
+        [System.Windows.Automation.AutomationElement]::NameProperty, ('Buy me a coffee ' + [char]0x2014 + ' support LawPDF'))
     $coffeeButton = $null
     for ($attempt = 0; $attempt -lt 20 -and -not $coffeeButton; $attempt++) {
         $coffeeButton = $windowElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $coffeeCondition)
         if (-not $coffeeButton) { Start-Sleep -Milliseconds 500 }
     }
-    if (-not $coffeeButton) { throw 'The accessible coffee button is missing.' }
+    if (-not $coffeeButton) {
+        $windowElement.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition) |
+            ForEach-Object { $_.Current.Name } | Set-Content (Join-Path $OutputDirectory 'accessibility-names.txt')
+        throw 'The accessible coffee button is missing.'
+    }
     $invoke = $coffeeButton.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
     $invoke.Invoke()
     Start-Sleep -Seconds 2
