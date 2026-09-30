@@ -300,6 +300,7 @@
       "objc2-core-services-0.3.2",
       "objc2-foundation-0.3.2",
       "objc2-io-surface-0.3.2",
+      "objc2-pdf-kit-0.3.2",
       "objc2-security-0.3.2"
     ],
     "repository": "https://github.com/madsmtm/objc2",

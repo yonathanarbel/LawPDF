@@ -104,6 +104,18 @@ pub struct DocumentStore {
 }
 
 impl DocumentStore {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn for_print_test(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn print_source(&self, revision: &FileRevision) -> Result<PathBuf, String> {
+        let path = self.snapshot_path(revision)?;
+        revision.require_current(&path)?;
+        Ok(path)
+    }
+
     pub fn new() -> Result<Self, String> {
         let root = crate::settings::app_data_dir()
             .ok_or_else(|| "Could not find the recovery folder.".to_owned())?

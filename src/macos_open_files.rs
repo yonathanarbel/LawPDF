@@ -34,6 +34,8 @@ struct OpenDocumentsHandlerIvars {
     sender: Sender<Vec<PathBuf>>,
     quit_requested: Cell<bool>,
     quit_items: RefCell<Vec<Retained<NSMenuItem>>>,
+    print_requested: Cell<bool>,
+    print_item: RefCell<Option<Retained<NSMenuItem>>>,
 }
 
 define_class!(
@@ -48,6 +50,12 @@ define_class!(
     unsafe impl NSObjectProtocol for OpenDocumentsHandler {}
 
     impl OpenDocumentsHandler {
+        #[unsafe(method(requestPrint:))]
+        fn request_print(&self, _sender: Option<&NSObject>) {
+            self.ivars().print_requested.set(true);
+            crate::single_instance::request_repaint();
+        }
+
         #[unsafe(method(requestQuit:))]
         fn request_quit(&self, _sender: Option<&NSObject>) {
             self.ivars().quit_requested.set(true);
@@ -107,11 +115,22 @@ impl OpenDocumentsRegistration {
         let app = NSApplication::sharedApplication(MainThreadMarker::from(&*self._handler));
         if let Some(menu) = app.mainMenu() {
             route_quit_menu(&menu, &self._handler);
+            install_print_menu(&menu, &self._handler);
         }
     }
 
     pub fn take_quit_requested(&self) -> bool {
         self._handler.ivars().quit_requested.replace(false)
+    }
+
+    pub fn take_print_requested(&self) -> bool {
+        self._handler.ivars().print_requested.replace(false)
+    }
+
+    pub fn set_print_enabled(&self, enabled: bool) {
+        if let Some(item) = self._handler.ivars().print_item.borrow().as_ref() {
+            item.setEnabled(enabled);
+        }
     }
 }
 
@@ -130,6 +149,14 @@ impl Drop for OpenDocumentsRegistration {
                 item.setAction(Some(sel!(terminate:)));
             }
         }
+        if let Some(item) = self._handler.ivars().print_item.borrow_mut().take() {
+            // SAFETY: Remove the weak callback before releasing its target.
+            unsafe {
+                item.setTarget(None);
+                item.setAction(None);
+            }
+            item.setEnabled(false);
+        }
         // SAFETY: The observer is retained until after it is unregistered.
         unsafe { NSNotificationCenter::defaultCenter().removeObserver(&*self._handler) };
     }
@@ -142,6 +169,8 @@ pub fn install(sender: Sender<Vec<PathBuf>>) -> OpenDocumentsRegistration {
             sender,
             quit_requested: Cell::new(false),
             quit_items: RefCell::new(Vec::new()),
+            print_requested: Cell::new(false),
+            print_item: RefCell::new(None),
         });
         // SAFETY: NSObject's `init` signature is correct for this subclass.
         unsafe { msg_send![super(allocated), init] }
@@ -197,6 +226,34 @@ fn route_quit_menu(menu: &NSMenu, handler: &OpenDocumentsHandler) {
             route_quit_menu(&submenu, handler);
         }
     }
+}
+
+fn install_print_menu(menu: &NSMenu, handler: &OpenDocumentsHandler) {
+    if handler.ivars().print_item.borrow().is_some() {
+        return;
+    }
+    let mtm = MainThreadMarker::from(handler);
+    let file_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("File"));
+    file_menu.setAutoenablesItems(false);
+    // SAFETY: requestPrint: accepts one sender and its target is retained by
+    // OpenDocumentsRegistration. Drop removes the weak target before release.
+    let print_item = unsafe {
+        let item = NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("Print…"),
+            Some(sel!(requestPrint:)),
+            ns_string!("p"),
+        );
+        item.setTarget(Some(handler));
+        item
+    };
+    print_item.setEnabled(false);
+    file_menu.addItem(&print_item);
+    let file_item = NSMenuItem::new(mtm);
+    file_item.setTitle(ns_string!("File"));
+    file_item.setSubmenu(Some(&file_menu));
+    menu.insertItem_atIndex(&file_item, 1.min(menu.numberOfItems()));
+    *handler.ivars().print_item.borrow_mut() = Some(print_item);
 }
 
 #[cfg(test)]

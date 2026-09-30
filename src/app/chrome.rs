@@ -958,6 +958,14 @@ impl PdfEditorApp {
             has_document,
             "Export this PDF as another document or image format",
             |ui| {
+                #[cfg(target_os = "macos")]
+                if ui.add_enabled(!self.print_ui.busy, egui::Button::new("Print…   ⌘P"))
+                    .on_hover_text("Print the original PDF with its current annotations")
+                    .clicked()
+                {
+                    self.request_print(ctx);
+                    ui.close();
+                }
                 if ui.button("Save PDF copy").clicked() {
                     self.save_as_dialog(ctx);
                     ui.close();

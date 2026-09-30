@@ -5,6 +5,8 @@ mod chat_ui;
 mod chrome;
 mod close_ui;
 mod document_opening;
+#[cfg(target_os = "macos")]
+mod print_ui;
 mod recovery_ui;
 mod review_margin_ui;
 mod search_state;
@@ -422,6 +424,8 @@ pub struct PdfEditorApp {
     pending_document_opens: HashMap<PathBuf, document_opening::OpenOptions>,
     open_into_sbs: bool,
     recovery_ui: recovery_ui::RecoveryUi,
+    #[cfg(target_os = "macos")]
+    print_ui: print_ui::PrintUi,
     page_rotation_in_flight: bool,
     text_box_text: String,
     signer_name: String,
@@ -1220,6 +1224,8 @@ impl PdfEditorApp {
             pending_document_opens: HashMap::new(),
             open_into_sbs: false,
             recovery_ui: recovery_ui::RecoveryUi::new(ctx, isolated),
+            #[cfg(target_os = "macos")]
+            print_ui: print_ui::PrintUi::default(),
             page_rotation_in_flight: false,
             text_box_text: String::new(),
             signer_name: String::new(),
@@ -11243,6 +11249,8 @@ impl eframe::App for PdfEditorApp {
         self.poll_queued_open_paths(ctx);
         self.poll_render_results(ctx);
         self.poll_recovery(ctx);
+        #[cfg(target_os = "macos")]
+        self.poll_print(ctx);
         self.poll_settings_credentials(ctx);
         self.poll_document_links(ctx);
         self.start_due_annotation_saves(ctx);
@@ -11278,6 +11286,18 @@ impl eframe::App for PdfEditorApp {
 
         if consume_command_shortcut(ctx, egui::Key::O) {
             self.open_dialog(ctx);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let native_print = self._macos_open_files.as_ref()
+                .is_some_and(|registration| registration.take_print_requested());
+            let shortcut_print = consume_command_shortcut(ctx, egui::Key::P);
+            if native_print || shortcut_print {
+                self.request_print(ctx);
+            }
+            if let Some(registration) = &self._macos_open_files {
+                registration.set_print_enabled(self.document.is_some() && !self.print_ui.busy);
+            }
         }
         if consume_command_shortcut(ctx, egui::Key::S)
             && let Err(error) = self.save_current_annotations()
@@ -15724,6 +15744,7 @@ mod app_tests {
         for key in [
             egui::Key::W,
             egui::Key::O,
+            egui::Key::P,
             egui::Key::S,
             egui::Key::F,
             egui::Key::Tab,
