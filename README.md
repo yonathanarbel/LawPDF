@@ -13,18 +13,18 @@ Highlight a passage for class, leave a comment on a colleague's draft, or work
 through a case with search, annotation, and recovery tools in one application.
 
 The “world's best” line expresses the creator's vision, not an independently
-tested ranking. **Version 0.2.36 is a public beta.**
+tested ranking. **Version 0.2.37 is a public beta.**
 
 ## Download
 
-[**Download LawPDF for Windows or Mac**](https://github.com/yonathanarbel/LawPDF/releases/tag/v0.2.36)
+[**Download LawPDF for Windows or Mac**](https://github.com/yonathanarbel/LawPDF/releases/tag/v0.2.37)
 
 | Platform | Download | Requirements |
 | --- | --- | --- |
 | Windows Store | [Microsoft Store](https://apps.microsoft.com/detail/9MZXSP0C423F) | Microsoft-signed package and Store-managed updates; check the version offered while updates await certification |
-| Windows installer | [LawPDFSetup-x64.exe](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.36/LawPDFSetup-x64.exe) | 64-bit Windows; installation may request administrator approval |
-| Windows portable | [LawPDF-windows-portable-x64.zip](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.36/LawPDF-windows-portable-x64.zip) | Extract the entire ZIP, then run `lawpdf.exe` |
-| Mac | [LawPDF-macos.zip](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.36/LawPDF-macos.zip) | Apple silicon (M-series), macOS 13 or later; Intel Macs are not supported by this build |
+| Windows installer | [LawPDFSetup-x64.exe](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.37/LawPDFSetup-x64.exe) | 64-bit Windows; installation may request administrator approval |
+| Windows portable | [LawPDF-windows-portable-x64.zip](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.37/LawPDF-windows-portable-x64.zip) | Extract the entire ZIP, then run `lawpdf.exe` |
+| Mac | [LawPDF-macos.zip](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.37/LawPDF-macos.zip) | Apple silicon (M-series), macOS 13 or later; Intel Macs are not supported by this build |
 
 Close older LawPDF versions before installing or opening the new version.
 Keep a backup of important PDFs while trying the beta.
@@ -32,8 +32,8 @@ Keep a backup of important PDFs while trying the beta.
 ### Windows installation
 
 Prefer the Microsoft Store edition for Microsoft-signed installation and
-automatic Store updates. The 0.2.36 Store update was submitted on September 27,
-2026 and is awaiting certification; the existing Store release is 0.2.34.
+automatic Store updates. The Store edition follows a separate release process;
+check the version offered there. A GitHub release does not establish Store availability.
 
 For direct downloads, run the installer or choose the portable ZIP.
 These direct-download packages are not publisher-signed, so Windows may show an unknown-publisher
@@ -65,6 +65,9 @@ See [Apple's instructions](https://support.apple.com/en-us/102445) and our
 - **Prepare for class and workshops:** highlight, underline, comment, add text
   boxes, and save annotated PDFs. The markup tools, zoom, page, and save status
   share one bar you can drag anywhere over the page.
+- **Print on Mac:** press **Command-P** or choose **File → Print…** for the
+  standard print dialog, page ranges, and Save as PDF. Printing includes current
+  annotations without changing the original file.
 - **Find the passage you need:** native text selection, search, copy,
   continuous multi-page viewing, and zoom.
 - **Work with scanned materials:** OCR support for documents without native text.
@@ -80,11 +83,11 @@ See [Apple's instructions](https://support.apple.com/en-us/102445) and our
 
 The Windows and Mac builds passed their automated regression and packaging
 checks. The exact Windows installer was verified on a clean hosted Windows
-machine. The 0.2.36 Mac package passed local bundled-runtime checks.
-Version 0.2.36 includes the new reading interface and optional coffee-support
-panel. It retains the 0.2.33 fixes for opening PDFs from Finder when LawPDF is closed,
+machine. The 0.2.37 Mac package passed local bundled-runtime and native print-dialog
+checks. Version 0.2.37 adds Mac printing and retains the reading interface and
+optional coffee-support panel. It retains the 0.2.33 fixes for opening PDFs from Finder when LawPDF is closed,
 closing the empty window with Command-W, and routing Mac Quit through the
-save-or-cancel flow. See the [release verification](docs/releases/v0.2.36.md).
+save-or-cancel flow. See the [release verification](docs/releases/v0.2.37.md).
 
 Broader screen-reader workflows, real-world reliability, large-document
 performance, and signed-update replacement/recovery still need more testing.
