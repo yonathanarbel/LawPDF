@@ -1,8 +1,9 @@
 use super::*;
-use crate::printing::{PrintCopy, prepare_copy, show_dialog};
+use crate::printing::{PrintCopy, PrintJob, prepare_copy};
 
 pub(super) struct PrintUi {
     pub busy: bool,
+    active_job: Option<PrintJob>,
     tx: Sender<Result<PrintCopy, String>>,
     rx: Receiver<Result<PrintCopy, String>>,
 }
@@ -12,6 +13,7 @@ impl Default for PrintUi {
         let (tx, rx) = unbounded();
         Self {
             busy: false,
+            active_job: None,
             tx,
             rx,
         }
@@ -21,6 +23,10 @@ impl Default for PrintUi {
 impl PdfEditorApp {
     pub(super) fn request_print(&mut self, ctx: &Context) {
         if self.print_ui.busy {
+            return;
+        }
+        if self.pending_close.is_some() {
+            self.status = "Finish closing the document before printing.".to_owned();
             return;
         }
         let Some(document) = &self.document else {
@@ -65,14 +71,28 @@ impl PdfEditorApp {
 
     pub(super) fn poll_print(&mut self, ctx: &Context) {
         while let Ok(result) = self.print_ui.rx.try_recv() {
-            match result.and_then(|copy| show_dialog(&copy)) {
-                Ok(true) => self.status = "Print job sent.".to_owned(),
-                // AppKit reports false for both cancellation and print failure.
-                // Do not turn a normal Cancel into an application error.
-                Ok(false) => self.status = "Printing was cancelled or did not finish.".to_owned(),
-                Err(error) => self.push_error_notice(error),
+            match result.and_then(PrintJob::start) {
+                Ok(job) => self.print_ui.active_job = Some(job),
+                Err(error) => {
+                    self.print_ui.busy = false;
+                    self.push_error_notice(error);
+                }
             }
+        }
+        if let Some(success) = self
+            .print_ui
+            .active_job
+            .as_ref()
+            .and_then(PrintJob::take_result)
+        {
+            self.print_ui.active_job = None;
             self.print_ui.busy = false;
+            self.status = if success {
+                "Print request completed."
+            } else {
+                "Print dialog closed."
+            }
+            .to_owned();
             ctx.request_repaint();
         }
     }

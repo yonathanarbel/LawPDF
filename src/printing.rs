@@ -1,9 +1,14 @@
 //! Print an immutable copy through PDFKit, keeping unsaved edits and the source safe.
+use std::cell::Cell;
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
-use objc2::{AnyThread, MainThreadMarker};
-use objc2_app_kit::NSPrintInfo;
-use objc2_foundation::{NSString, NSURL};
+use objc2::rc::Retained;
+use objc2::{
+    AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
+};
+use objc2_app_kit::{NSApplication, NSPrintInfo, NSPrintOperation};
+use objc2_foundation::{NSObject, NSObjectProtocol, NSString, NSURL};
 use objc2_pdf_kit::{PDFDocument, PDFPrintScalingMode};
 
 use crate::document_store::{DocumentStore, FileRevision};
@@ -55,35 +60,94 @@ pub(crate) fn prepare_copy(
     })
 }
 
-pub(crate) fn show_dialog(copy: &PrintCopy) -> Result<bool, String> {
-    let mtm = MainThreadMarker::new()
-        .ok_or_else(|| "The print dialog must open on the main thread.".to_owned())?;
-    let path = copy
-        .path
-        .to_str()
-        .ok_or_else(|| "The print path is not valid Unicode.".to_owned())?;
-    let url = NSURL::fileURLWithPath(&NSString::from_str(path));
-    // SAFETY: The PDF and its temporary directory remain alive throughout the
-    // synchronous AppKit print operation, which runs on the main UI thread.
-    unsafe {
-        let document = PDFDocument::initWithURL(PDFDocument::alloc(), &url)
-            .ok_or_else(|| "macOS could not open this PDF for printing.".to_owned())?;
-        if document.isLocked() || !document.allowsPrinting() {
-            return Err("This PDF does not allow printing.".to_owned());
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements. AppKit calls this
+    // delegate on the main thread because separate-thread printing is disabled.
+    #[unsafe(super = NSObject)]
+    #[name = "LawPDFPrintCompletion"]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = Cell<Option<bool>>]
+    struct PrintCompletion;
+
+    unsafe impl NSObjectProtocol for PrintCompletion {}
+
+    impl PrintCompletion {
+        #[unsafe(method(printOperationDidRun:success:contextInfo:))]
+        fn print_operation_did_run(
+            &self,
+            _operation: &NSPrintOperation,
+            success: bool,
+            _context: *mut c_void,
+        ) {
+            self.ivars().set(Some(success));
+            crate::single_instance::request_repaint();
         }
-        let info = NSPrintInfo::sharedPrintInfo();
-        let operation = document
-            .printOperationForPrintInfo_scalingMode_autoRotate(
-                Some(&info),
-                PDFPrintScalingMode::PageScaleDownToFit,
-                true,
-                mtm,
-            )
-            .ok_or_else(|| "macOS could not create a print preview for this PDF.".to_owned())?;
-        operation.setJobTitle(Some(&NSString::from_str(&copy.title)));
-        operation.setShowsPrintPanel(true);
-        operation.setShowsProgressPanel(true);
-        Ok(operation.runOperation())
+    }
+);
+
+pub(crate) struct PrintJob {
+    _operation: Retained<NSPrintOperation>,
+    _document: Retained<PDFDocument>,
+    completion: Retained<PrintCompletion>,
+    _copy: PrintCopy,
+}
+
+impl PrintJob {
+    pub(crate) fn start(copy: PrintCopy) -> Result<Self, String> {
+        let mtm = MainThreadMarker::new()
+            .ok_or_else(|| "The print dialog must open on the main thread.".to_owned())?;
+        let app = NSApplication::sharedApplication(mtm);
+        let window = app
+            .mainWindow()
+            .or_else(|| app.keyWindow())
+            .ok_or_else(|| "Bring the LawPDF window forward before printing.".to_owned())?;
+        let path = copy
+            .path
+            .to_str()
+            .ok_or_else(|| "The print path is not valid Unicode.".to_owned())?;
+        let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+        // SAFETY: Native objects, callback target, and temporary PDF are retained
+        // until didRun fires. A sheet returns immediately instead of nesting a
+        // modal run loop inside winit's borrowed event handler (which can abort
+        // when the PDF menu opens its Save panel).
+        unsafe {
+            let document = PDFDocument::initWithURL(PDFDocument::alloc(), &url)
+                .ok_or_else(|| "macOS could not open this PDF for printing.".to_owned())?;
+            if document.isLocked() || !document.allowsPrinting() {
+                return Err("This PDF does not allow printing.".to_owned());
+            }
+            let info = NSPrintInfo::sharedPrintInfo();
+            let operation = document
+                .printOperationForPrintInfo_scalingMode_autoRotate(
+                    Some(&info),
+                    PDFPrintScalingMode::PageScaleDownToFit,
+                    true,
+                    mtm,
+                )
+                .ok_or_else(|| "macOS could not create a print preview for this PDF.".to_owned())?;
+            operation.setJobTitle(Some(&NSString::from_str(&copy.title)));
+            operation.setShowsPrintPanel(true);
+            operation.setShowsProgressPanel(true);
+            operation.setCanSpawnSeparateThread(false);
+            let allocated = PrintCompletion::alloc(mtm).set_ivars(Cell::new(None));
+            let completion: Retained<PrintCompletion> = msg_send![super(allocated), init];
+            operation.runOperationModalForWindow_delegate_didRunSelector_contextInfo(
+                &window,
+                Some(&completion),
+                Some(sel!(printOperationDidRun:success:contextInfo:)),
+                std::ptr::null_mut(),
+            );
+            Ok(Self {
+                _operation: operation,
+                _document: document,
+                completion,
+                _copy: copy,
+            })
+        }
+    }
+
+    pub(crate) fn take_result(&self) -> Option<bool> {
+        self.completion.ivars().take()
     }
 }
 
