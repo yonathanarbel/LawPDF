@@ -22,6 +22,8 @@ mod native_process;
 mod ocr;
 mod page_geometry;
 mod pdf_backend;
+#[cfg(target_os = "macos")]
+mod printing;
 mod performance_cache;
 mod render_worker;
 mod review_margin;

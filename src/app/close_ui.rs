@@ -8,6 +8,12 @@ pub(super) enum CloseTarget {
 
 impl PdfEditorApp {
     pub(super) fn request_window_close(&mut self, ctx: &Context) {
+        #[cfg(target_os = "macos")]
+        if self.print_ui.busy {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.status = "Finish or cancel the print dialog before quitting.".to_owned();
+            return;
+        }
         self.save_active_tab_state();
         if self.has_unsaved_annotations() || self.close_target_is_saving(CloseTarget::Window) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
