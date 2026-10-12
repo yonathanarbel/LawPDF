@@ -75,6 +75,12 @@ See [Apple's instructions](https://support.apple.com/en-us/102445) and our
   undo/redo, recovery copies, and external-file conflict detection. Closing
   waits for pending writes; failed writes keep the document open.
   Protected PDFs require Save As for an annotated copy.
+- **Choose where to save:** use **Save As…** in the toolbar or the Mac **File**
+  menu (⌘⇧S on Mac, Ctrl+Shift+S on Windows). Choose a folder and filename;
+  further edits save to that file. **File → Show in Finder** locates the current
+  PDF on Mac, and hovering over the save status shows its full path.
+  **Export → Save PDF copy** makes a separate copy while keeping the current
+  document open at its original location.
 - **Choose your tools:** optional AI-provider features, with provider keys stored
   in the operating system's credential store. Review the
   [privacy guide](docs/PRIVACY.md) before using network-backed features.

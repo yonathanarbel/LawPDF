@@ -215,7 +215,8 @@ impl PdfEditorApp {
     }
 
     pub(super) fn close_target_is_saving(&self, target: CloseTarget) -> bool {
-        self.page_rotation_in_flight
+        self.save_as.is_some()
+            || self.page_rotation_in_flight
             || self.recovery_ui.is_writing()
             || self
                 .pending_annotation_saves
@@ -239,7 +240,7 @@ impl PdfEditorApp {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::model::PageInfo;
 

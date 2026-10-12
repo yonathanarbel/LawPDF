@@ -9,6 +9,7 @@ mod document_opening;
 mod print_ui;
 mod recovery_ui;
 mod review_margin_ui;
+mod save_as;
 mod search_state;
 mod selection_state;
 mod settings_ui;
@@ -424,6 +425,7 @@ pub struct PdfEditorApp {
     pending_document_opens: HashMap<PathBuf, document_opening::OpenOptions>,
     open_into_sbs: bool,
     recovery_ui: recovery_ui::RecoveryUi,
+    save_as: Option<save_as::SaveAsTask>,
     #[cfg(target_os = "macos")]
     print_ui: print_ui::PrintUi,
     page_rotation_in_flight: bool,
@@ -1224,6 +1226,7 @@ impl PdfEditorApp {
             pending_document_opens: HashMap::new(),
             open_into_sbs: false,
             recovery_ui: recovery_ui::RecoveryUi::new(ctx, isolated),
+            save_as: None,
             #[cfg(target_os = "macos")]
             print_ui: print_ui::PrintUi::default(),
             page_rotation_in_flight: false,
@@ -11245,6 +11248,12 @@ impl eframe::App for PdfEditorApp {
             self.close_active_tab_or_window(ctx);
         }
 
+        if self.save_as.is_some() {
+            self.poll_render_results(ctx);
+            if self.poll_save_as(ctx) {
+                return;
+            }
+        }
         self.poll_incoming_paths(ctx);
         self.poll_queued_open_paths(ctx);
         self.poll_render_results(ctx);
@@ -11299,7 +11308,32 @@ impl eframe::App for PdfEditorApp {
                 registration.set_print_enabled(self.document.is_some() && !self.print_ui.busy);
             }
         }
-        if consume_command_shortcut(ctx, egui::Key::S)
+        #[cfg(target_os = "macos")]
+        let (native_save, native_save_as, native_reveal) = self._macos_open_files.as_ref()
+            .map(|registration| {
+                registration.set_save_enabled(
+                    self.document.is_some(),
+                    !self.recovery_is_busy() && !self.page_rotation_in_flight,
+                );
+                (
+                    registration.take_save_requested(),
+                    registration.take_save_as_requested(),
+                    registration.take_reveal_requested(),
+                )
+            }).unwrap_or_default();
+        #[cfg(not(target_os = "macos"))]
+        let (native_save, native_save_as) = (false, false);
+        #[cfg(target_os = "macos")]
+        if native_reveal {
+            self.reveal_current_pdf();
+        }
+        // Consume the modified shortcut first: egui also matches extra Shift
+        // modifiers against the plain Command-S shortcut.
+        let save_as_shortcut = consume_save_as_shortcut(ctx);
+        let save_shortcut = consume_command_shortcut(ctx, egui::Key::S);
+        if native_save_as || save_as_shortcut {
+            self.save_as_dialog(ctx);
+        } else if (native_save || save_shortcut)
             && let Err(error) = self.save_current_annotations()
         {
             self.push_error_notice(error);
@@ -12107,6 +12141,26 @@ fn input_has_command_shortcut_event(input: &egui::InputState, key: egui::Key) ->
 
 fn command_shortcut(key: egui::Key) -> egui::KeyboardShortcut {
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, key)
+}
+
+fn consume_save_as_shortcut(ctx: &Context) -> bool {
+    let shortcut = egui::KeyboardShortcut::new(
+        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        egui::Key::S,
+    );
+    ctx.input_mut(|input| {
+        if input.consume_shortcut(&shortcut) {
+            return true;
+        }
+        let mut consumed = false;
+        input.events.retain(|event| {
+            let matches = matches!(event, egui::Event::Key { key: egui::Key::S, modifiers, pressed: true, .. }
+                if modifiers.shift && !modifiers.alt && (modifiers.command || modifiers.mac_cmd || modifiers.ctrl));
+            consumed |= matches;
+            !matches
+        });
+        consumed
+    })
 }
 
 fn markdown_copy_shortcut() -> egui::KeyboardShortcut {

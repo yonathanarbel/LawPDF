@@ -124,7 +124,7 @@ impl PdfEditorApp {
         });
     }
 
-    pub(super) fn save_as_dialog(&mut self, ctx: &Context) {
+    pub(super) fn save_copy_dialog(&mut self, ctx: &Context) {
         if self.recovery_ui.busy || self.page_rotation_in_flight {
             return;
         }

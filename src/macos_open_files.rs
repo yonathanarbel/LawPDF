@@ -6,7 +6,8 @@ use objc2::rc::Retained;
 use objc2::runtime::Sel;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationWillFinishLaunchingNotification, NSMenu, NSMenuItem,
+    NSApplication, NSApplicationWillFinishLaunchingNotification, NSEventModifierFlags, NSMenu,
+    NSMenuItem,
 };
 use objc2_foundation::{
     NSAppleEventDescriptor, NSAppleEventManager, NSNotification, NSNotificationCenter, NSObject,
@@ -34,6 +35,10 @@ struct OpenDocumentsHandlerIvars {
     sender: Sender<Vec<PathBuf>>,
     quit_requested: Cell<bool>,
     quit_items: RefCell<Vec<Retained<NSMenuItem>>>,
+    save_requested: Cell<bool>,
+    save_as_requested: Cell<bool>,
+    reveal_requested: Cell<bool>,
+    save_items: RefCell<Vec<Retained<NSMenuItem>>>,
     print_requested: Cell<bool>,
     print_item: RefCell<Option<Retained<NSMenuItem>>>,
 }
@@ -50,6 +55,24 @@ define_class!(
     unsafe impl NSObjectProtocol for OpenDocumentsHandler {}
 
     impl OpenDocumentsHandler {
+        #[unsafe(method(requestSave:))]
+        fn request_save(&self, _sender: Option<&NSObject>) {
+            self.ivars().save_requested.set(true);
+            crate::single_instance::request_repaint();
+        }
+
+        #[unsafe(method(requestSaveAs:))]
+        fn request_save_as(&self, _sender: Option<&NSObject>) {
+            self.ivars().save_as_requested.set(true);
+            crate::single_instance::request_repaint();
+        }
+
+        #[unsafe(method(requestReveal:))]
+        fn request_reveal(&self, _sender: Option<&NSObject>) {
+            self.ivars().reveal_requested.set(true);
+            crate::single_instance::request_repaint();
+        }
+
         #[unsafe(method(requestPrint:))]
         fn request_print(&self, _sender: Option<&NSObject>) {
             self.ivars().print_requested.set(true);
@@ -115,12 +138,32 @@ impl OpenDocumentsRegistration {
         let app = NSApplication::sharedApplication(MainThreadMarker::from(&*self._handler));
         if let Some(menu) = app.mainMenu() {
             route_quit_menu(&menu, &self._handler);
-            install_print_menu(&menu, &self._handler);
+            install_file_menu(&menu, &self._handler);
         }
     }
 
     pub fn take_quit_requested(&self) -> bool {
         self._handler.ivars().quit_requested.replace(false)
+    }
+
+    pub fn take_save_requested(&self) -> bool {
+        self._handler.ivars().save_requested.replace(false)
+    }
+
+    pub fn take_save_as_requested(&self) -> bool {
+        self._handler.ivars().save_as_requested.replace(false)
+    }
+
+    pub fn take_reveal_requested(&self) -> bool {
+        self._handler.ivars().reveal_requested.replace(false)
+    }
+
+    pub fn set_save_enabled(&self, has_document: bool, can_save_as: bool) {
+        for item in self._handler.ivars().save_items.borrow().iter() {
+            item.setEnabled(
+                has_document && (item.action() != Some(sel!(requestSaveAs:)) || can_save_as),
+            );
+        }
     }
 
     pub fn take_print_requested(&self) -> bool {
@@ -149,6 +192,14 @@ impl Drop for OpenDocumentsRegistration {
                 item.setAction(Some(sel!(terminate:)));
             }
         }
+        for item in self._handler.ivars().save_items.borrow_mut().drain(..) {
+            // SAFETY: Remove each weak target before releasing the handler.
+            unsafe {
+                item.setTarget(None);
+                item.setAction(None);
+            }
+            item.setEnabled(false);
+        }
         if let Some(item) = self._handler.ivars().print_item.borrow_mut().take() {
             // SAFETY: Remove the weak callback before releasing its target.
             unsafe {
@@ -169,6 +220,10 @@ pub fn install(sender: Sender<Vec<PathBuf>>) -> OpenDocumentsRegistration {
             sender,
             quit_requested: Cell::new(false),
             quit_items: RefCell::new(Vec::new()),
+            save_requested: Cell::new(false),
+            save_as_requested: Cell::new(false),
+            reveal_requested: Cell::new(false),
+            save_items: RefCell::new(Vec::new()),
             print_requested: Cell::new(false),
             print_item: RefCell::new(None),
         });
@@ -228,13 +283,54 @@ fn route_quit_menu(menu: &NSMenu, handler: &OpenDocumentsHandler) {
     }
 }
 
-fn install_print_menu(menu: &NSMenu, handler: &OpenDocumentsHandler) {
+fn install_file_menu(menu: &NSMenu, handler: &OpenDocumentsHandler) {
     if handler.ivars().print_item.borrow().is_some() {
         return;
     }
     let mtm = MainThreadMarker::from(handler);
     let file_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("File"));
     file_menu.setAutoenablesItems(false);
+    for (title, selector, key, shift) in [
+        (
+            ns_string!("Save"),
+            sel!(requestSave:),
+            ns_string!("s"),
+            false,
+        ),
+        (
+            ns_string!("Save As…"),
+            sel!(requestSaveAs:),
+            ns_string!("s"),
+            true,
+        ),
+        (
+            ns_string!("Show in Finder"),
+            sel!(requestReveal:),
+            ns_string!(""),
+            false,
+        ),
+    ] {
+        // SAFETY: All selectors accept one sender; Drop clears their weak target.
+        let item = unsafe {
+            let item = NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                title,
+                Some(selector),
+                key,
+            );
+            item.setTarget(Some(handler));
+            item
+        };
+        let mut modifiers = NSEventModifierFlags::Command;
+        if shift {
+            modifiers |= NSEventModifierFlags::Shift;
+        }
+        item.setKeyEquivalentModifierMask(modifiers);
+        item.setEnabled(false);
+        file_menu.addItem(&item);
+        handler.ivars().save_items.borrow_mut().push(item);
+    }
+    file_menu.addItem(&NSMenuItem::separatorItem(mtm));
     // SAFETY: requestPrint: accepts one sender and its target is retained by
     // OpenDocumentsRegistration. Drop removes the weak target before release.
     let print_item = unsafe {
