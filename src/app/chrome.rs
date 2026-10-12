@@ -48,6 +48,7 @@ pub(super) struct ChromeState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IdentityKey {
     epoch: u64,
+    path: PathBuf,
     text_pages: usize,
     review: usize,
 }
@@ -137,6 +138,7 @@ impl PdfEditorApp {
             .count();
         let key = IdentityKey {
             epoch: self.document_epoch,
+            path: document.path.clone(),
             text_pages,
             review: review
                 .as_ref()

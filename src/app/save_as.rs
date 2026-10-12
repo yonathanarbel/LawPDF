@@ -28,8 +28,8 @@ impl PdfEditorApp {
         }
         let source = document.path.clone();
         let filename = source.file_name().unwrap_or_default().to_string_lossy();
-        // Let the native panel remember the user's last destination rather than
-        // opening inside an email application's temporary attachment directory.
+        // Keep the attachment's filename and let the native panel choose its
+        // initial folder; the user can select any destination.
         let Some(destination) = self.pick_save_path("Save PDF As", &filename, "PDF", &["pdf"])
         else {
             return;
@@ -144,6 +144,11 @@ impl PdfEditorApp {
         let tab = &mut self.tabs[index];
         let newer_edits = (tab.annotations != task.annotations).then(|| tab.annotations.clone());
         tab.document.path = destination.clone();
+        tab.document.title = destination
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         tab.annotations_dirty = newer_edits.is_some();
         tab.status = format!("Saved to {}", destination.display());
         if let Some(session) = self.annotation_sessions.get_mut(&task.epoch) {
@@ -151,8 +156,17 @@ impl PdfEditorApp {
             session.recovery_error = None;
         }
         if self.active_tab == Some(index) {
-            self.apply_tab_state(self.tabs[index].clone(), ctx);
+            // Keep the viewport and selection in place when only the path changes.
+            self.document = Some(self.tabs[index].document.clone());
+            self.annotations_dirty = self.tabs[index].annotations_dirty;
+            self.status = self.tabs[index].status.clone();
+            self.pending_page_renders.clear();
+            self.pending_thumbnail_renders.clear();
+            self.pending_native_text.clear();
+            self.pending_text_chars.clear();
+            self.remember_pdf_zoom(self.target_zoom);
         }
+        ctx.request_repaint();
         // Input delivered in the frame that opened the panel may have changed
         // an annotation after the snapshot. Carry it to the chosen destination.
         if let Some(annotations) = newer_edits
@@ -235,6 +249,7 @@ mod tests {
         assert_eq!(std::fs::read(&source).unwrap(), original);
         assert_eq!(app.document.as_ref().unwrap().path, destination);
         assert_eq!(app.tabs[0].document.path, destination);
+        assert_eq!(app.tabs[0].title(), "My saved attachment.pdf");
         assert!(!app.annotations_dirty);
         assert!(!app.pending_annotation_saves.contains_key(&source));
         let session = &app.annotation_sessions[&app.document_epoch];
