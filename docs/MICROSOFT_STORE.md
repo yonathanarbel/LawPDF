@@ -11,22 +11,30 @@ John Arbel. Microsoft assigned Store ID `9MZXSP0C423F` and package identity
 `JohnArbel.LawPDF_byt1cn7x1mmx2`. The exact manifest identity is recorded in
 `packaging/microsoft-store/identity.json`.
 
-The first submission (package `1.2.34.0`, app 0.2.34) is published. On September
-27, 2026, Partner Center showed **In Microsoft Store** and the public
-[LawPDF listing](https://apps.microsoft.com/detail/9MZXSP0C423F) was available.
-Package `1.2.36.0` (app 0.2.36) combines the masthead reading layout with the
-optional coffee-support panel; its payment destination is verified and its Store package has passed
-installation and runtime checks on a disposable Windows runner. On September 27,
-2026, Submission 2 (`1152921505701986313`) was submitted with that package,
-the revised listing, and screenshots of the reading interface and coffee panel.
-Partner Center confirmed **Update in certification**. Pre-processing completed
-and the **Certification** stage was in progress at the last check, with
-automatic publication selected after approval. The public
-Store version remains 0.2.34 until Microsoft approves and publishes the update.
-A fresh installation through Microsoft
-Store on the user's Windows PC has not been verified. The workflow builds the
-real unsigned submission package using this identity; validation-only packages
-must not be uploaded as the product.
+The first submission (package `1.2.34.0`, app 0.2.34) was verified as published
+on September 27, 2026. Submission 2 (`1152921505701986313`, package `1.2.36.0`,
+app 0.2.36) was submitted that day with the revised reading interface, optional
+coffee-support panel, and matching screenshots. Partner Center last showed
+**Update in certification** for that submission, with automatic publication
+after approval. These are dated observations, not a claim about today's Store
+version.
+
+Package `1.2.38.0` contains app 0.2.38 and adds Save As in the Windows toolbar
+and on Ctrl+Shift+S. The current packaging identity targets this version.
+On October 12, 2026, the [Store verification workflow](https://github.com/yonathanarbel/LawPDF/actions/runs/38260970593)
+passed for source `37db5c01d4e129473e0d429f0796b51bdf9d37e5`. The exact unsigned
+submission package SHA-256 is
+`6ce0c0d07c974041d44f10ba8937e49faa4e2deecd98daeca4582ff1cd76ac4d`.
+Its test-signed copy passed installation, identity, product/file version,
+Start Menu registration, PDF association, and required-runtime checks on the
+hosted runner. The original unsigned package was downloaded and its package
+and executable hashes were independently checked.
+
+Submission is prepared but awaiting Partner Center sign-in. Version 0.2.38 has
+not been submitted or certified as part of this release. Store availability
+is separate from the [direct-download release](https://github.com/yonathanarbel/LawPDF/releases/tag/v0.2.38).
+A fresh installation through Microsoft Store on the owner's Windows PC has not
+been verified. Validation-only packages must not be uploaded as the product.
 
 ## Build and packaging
 
@@ -43,7 +51,7 @@ must not be uploaded as the product.
   the result, and checks the executable and manifest identity.
 - The package depends on Microsoft's VC++ Desktop runtime framework; Store
   deployment supplies that dependency. Minimum OS is Windows 10 build 19041.
-- Store package version `1.2.36.0` maps to application version `0.2.36`. The package
+- Store package version `1.2.38.0` maps to application version `0.2.38`. The package
   major is nonzero and the fourth component is zero, as Microsoft requires. This
   packaging identity does not change the application's public-beta status.
 
