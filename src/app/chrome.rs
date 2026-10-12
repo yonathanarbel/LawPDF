@@ -48,6 +48,7 @@ pub(super) struct ChromeState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IdentityKey {
     epoch: u64,
+    path: PathBuf,
     text_pages: usize,
     review: usize,
 }
@@ -137,6 +138,7 @@ impl PdfEditorApp {
             .count();
         let key = IdentityKey {
             epoch: self.document_epoch,
+            path: document.path.clone(),
             text_pages,
             review: review
                 .as_ref()
@@ -967,7 +969,7 @@ impl PdfEditorApp {
                     ui.close();
                 }
                 if ui.button("Save PDF copy").clicked() {
-                    self.save_as_dialog(ctx);
+                    self.save_copy_dialog(ctx);
                     ui.close();
                 }
                 if ui.button("Text").clicked() {
@@ -993,6 +995,16 @@ impl PdfEditorApp {
                 }
             },
         );
+        if ui
+            .add_enabled(
+                has_document && !self.recovery_is_busy() && !self.page_rotation_in_flight,
+                egui::Button::new("Save As…"),
+            )
+            .on_hover_text("Choose a filename and folder, then continue editing there\nCtrl/Cmd+Shift+S")
+            .clicked()
+        {
+            self.save_as_dialog(ctx);
+        }
         if toolbar_icon_button(
             ui,
             ToolbarIcon::Save,
@@ -1651,9 +1663,10 @@ impl PdfEditorApp {
             color,
         );
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label));
-        response.on_hover_text(
-            "Annotations save automatically. Keep the document open if saving fails; use Save As for a protected PDF.",
-        );
+        let location = self.document.as_ref()
+            .map(|document| document.path.display().to_string())
+            .unwrap_or_default();
+        response.on_hover_text(format!("Saving to: {location}\nAnnotations save automatically. Use Save As to choose another folder."));
     }
 
     /// Short-lived caption above the bar: the status line, when there is news.
