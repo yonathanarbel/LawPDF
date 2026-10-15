@@ -27,6 +27,19 @@ For Microsoft Store installations, Windows can remove package-private applicatio
 
 The support-diagnostics export contains only an explicit list of version, platform, job counts, and success/failure flags. It excludes document paths and text, keys, raw server responses, environment variables, and crash payloads. Nothing is sent automatically when creating this file.
 
+Starting with desktop 0.2.40, the local `logs` folder also keeps lifecycle and
+error records in `diagnostics.jsonl`, plus a session marker used to detect an
+interrupted prior session. Records include timestamps, application version,
+process IDs, shutdown stages, bounded error descriptions, and panic locations;
+the application does not intentionally record document text or provider keys.
+On macOS, it also records summaries of LawPDF crash reports (report filename,
+OS/app versions, exception, and termination reason), not their complete contents.
+These files are not uploaded automatically or included in the minimal support
+export described above. On launch, a diagnostic log larger than 2 MiB is rotated,
+retaining one previous log. After quitting, the `logs` folder and `panic.log` can
+be removed without deleting document annotations or recovery copies. Inspect
+diagnostic files for private information before sharing them.
+
 Android keeps immutable PDF sources and annotation journals in private app storage. Completed edits are saved automatically there; the source supplied by the document provider is preserved. Reopening identical PDF bytes restores the marks. A changed PDF is treated as a different revision. If provider access is lost, an available verified local source can be opened as a recovery copy. The Android app excludes its storage from its own cloud/device backup rules. Clearing Android app storage or uninstalling removes those local copies and marks. Export a copy before doing so. Android **Save copy** creates flattened image pages; selectable text, editable annotation objects, and digital-signature validity are not preserved in that export.
 
 ## Removal and questions
