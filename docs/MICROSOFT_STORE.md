@@ -60,8 +60,12 @@ owner's Windows hardware.
 
 Partner Center validated the unsigned `1.2.40.0` package in submission 3
 (`1152921505702141171`). With the owner's approval, the package replacement was
-saved to the draft. This is **not** a submission for certification or publication;
-the live package remains `1.2.36.0` until a later confirmed release.
+saved to the draft. Later that day, the owner approved certification submission
+and automatic publication after approval. Updated 0.2.40 release notes were
+saved and submission 3 was submitted. Partner Center confirmed **Update in
+certification**, with preprocessing in progress and publication set to start
+as soon as certification passes. This is not yet evidence of publication;
+the last verified live package remains `1.2.36.0`.
 
 ## Build and packaging
 

@@ -11235,7 +11235,7 @@ impl eframe::App for PdfEditorApp {
         crate::native_process::shutdown();
         crate::diagnostics::event("shutdown_pdf_worker_stopped");
         self.flush_settings_now();
-        crate::diagnostics::event("shutdown_complete");
+        crate::diagnostics::cleanup_completed();
     }
 
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {

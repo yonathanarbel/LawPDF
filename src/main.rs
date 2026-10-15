@@ -163,6 +163,7 @@ fn main() -> eframe::Result<()> {
     }
 
     let options = eframe::NativeOptions {
+        run_and_return: native_run_and_return(),
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_TITLE)
             .with_icon(std::sync::Arc::new(load_app_icon()))
@@ -196,6 +197,16 @@ fn main() -> eframe::Result<()> {
     }
     diagnostics::finish_session(if result.is_ok() { "clean" } else { "run_native_error" });
     result
+}
+
+/// On macOS, stop after eframe has saved and destroyed the app instead of
+/// returning through AppKit's display-cycle cleanup. On affected systems that
+/// path aborts while invalidating `_NSTouchBarFinderObservation`. eframe's
+/// supported run-and-exit mode still runs `on_exit` and destroys the app/windows
+/// before calling `process::exit`; our normal-exit hook then finishes the log.
+/// Keep the existing return behavior on other platforms.
+pub(crate) const fn native_run_and_return() -> bool {
+    !cfg!(target_os = "macos")
 }
 
 #[cfg(feature = "devtools")]

@@ -259,6 +259,9 @@ fn corrupt_settings_backup_path(path: &Path) -> PathBuf {
 pub fn app_data_dir() -> Option<PathBuf> {
     #[cfg(feature = "devtools")]
     if crate::shutdown_smoke::running() {
+        if let Some(path) = std::env::var_os("LAWPDF_SHUTDOWN_SMOKE_DATA_DIR") {
+            return Some(PathBuf::from(path));
+        }
         return Some(std::env::temp_dir().join(format!("lawpdf-shutdown-data-{}", std::process::id())));
     }
     // Unit tests must never read, overwrite, or prune a user's application data.

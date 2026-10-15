@@ -36,6 +36,7 @@ struct Session {
     log_path: PathBuf,
     marker_path: PathBuf,
     finished: AtomicBool,
+    cleanup_completed: AtomicBool,
 }
 
 /// Start diagnostics for the interactive application process.
@@ -43,7 +44,52 @@ pub fn start_session() {
     let Some(root) = crate::settings::app_data_dir() else {
         return;
     };
-    let _ = SESSION.set(initialize_at(&root, now_unix_ms(), std::process::id()));
+    if SESSION.set(initialize_at(&root, now_unix_ms(), std::process::id())).is_ok() {
+        #[cfg(target_os = "macos")]
+        install_normal_exit_hook();
+    }
+}
+
+/// App cleanup is necessary but not sufficient for a clean process exit.
+/// Keep the marker until main returns or the normal C exit hook actually runs.
+pub fn cleanup_completed() {
+    if let Some(session) = SESSION.get() {
+        append_event(session, "shutdown_complete", Value::Null);
+        session.cleanup_completed.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_normal_exit_hook() {
+    unsafe extern "C" {
+        fn atexit(callback: extern "C" fn()) -> std::ffi::c_int;
+    }
+    extern "C" fn normal_exit() {
+        // Never unwind through the C runtime. This is not a signal handler:
+        // allocation and synchronized file writes are safe during normal exit.
+        let _ = std::panic::catch_unwind(|| {
+            if let Some(session) = SESSION.get() {
+                finish_native_exit(session);
+            }
+        });
+    }
+    // SAFETY: The callback has static lifetime and the C ABI. Registration is
+    // limited to the interactive session, not isolated PDF/speech workers.
+    if unsafe { atexit(normal_exit) } != 0 {
+        event("normal_exit_hook_registration_failed");
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn finish_native_exit(session: &Session) {
+    if session.finished.load(Ordering::Acquire) {
+        return;
+    }
+    if session.cleanup_completed.load(Ordering::Acquire) {
+        finish_session_at(session, "clean_native_exit");
+    } else {
+        append_event(session, "native_exit_before_cleanup", Value::Null);
+    }
 }
 
 /// Record a lifecycle milestone without document contents or credentials.
@@ -82,6 +128,10 @@ pub fn finish_session(outcome: &str) {
     let Some(session) = SESSION.get() else {
         return;
     };
+    finish_session_at(session, outcome);
+}
+
+fn finish_session_at(session: &Session, outcome: &str) {
     if session.finished.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -125,6 +175,7 @@ fn initialize_at(root: &Path, now_ms: u64, pid: u32) -> Session {
         log_path,
         marker_path,
         finished: AtomicBool::new(false),
+        cleanup_completed: AtomicBool::new(false),
     };
 
     if let Some(previous) = previous {
@@ -333,10 +384,28 @@ mod tests {
 
         append_event(&second, "shutdown_complete", Value::Null);
         assert!(second.marker_path.exists());
-        if !second.finished.swap(true, Ordering::AcqRel) {
-            fs::remove_file(&second.marker_path).unwrap();
-        }
+        finish_session_at(&second, "clean");
         assert!(!second.marker_path.exists());
+    }
+
+    #[test]
+    fn native_exit_requires_completed_cleanup_and_finishes_only_once() {
+        let root = tempfile::tempdir().unwrap();
+        let session = initialize_at(root.path(), 100, 41);
+        finish_native_exit(&session);
+        assert!(session.marker_path.exists());
+        assert!(!session.finished.load(Ordering::Acquire));
+        session.cleanup_completed.store(true, Ordering::Release);
+        // A crash/kill after app cleanup must still leave an interrupted marker.
+        assert!(session.marker_path.exists());
+        finish_native_exit(&session);
+        finish_session_at(&session, "duplicate");
+        assert!(!session.marker_path.exists());
+        let log = fs::read_to_string(&session.log_path).unwrap();
+        assert!(log.contains("native_exit_before_cleanup"));
+        assert!(log.contains("clean_native_exit"));
+        assert_eq!(log.matches("session_finished").count(), 1);
+        assert!(!log.contains("duplicate"));
     }
 
     #[test]
