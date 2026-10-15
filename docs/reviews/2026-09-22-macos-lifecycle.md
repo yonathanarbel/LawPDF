@@ -82,3 +82,21 @@ that exact package were completed without GUI access. Windows installation was
 verified on the clean hosted Windows runner, not the owner's Windows computer.
 This release remains a public beta; the broader qualification gates in the
 [release notes](../releases/v0.2.33.md) remain open.
+
+## October 15 follow-up: shutdown crash remains open
+
+The 0.2.40 local lifecycle log captured two ordinary Command-Q sessions on macOS
+26.6.2 that reached `shutdown_complete` but never reached `run_native_returned`
+or `session_finished`. The subsequent launches recorded interrupted sessions
+and imported summaries of the corresponding macOS `EXC_CRASH` / `SIGABRT`
+reports. The exception backtrace passed through KVO observer removal and
+`_NSTouchBarFinderObservation invalidate` in AppKit while returning through the
+native event loop. This reproduces a native teardown failure after the PDF
+worker shutdown completed, rather than a Rust panic or worker shutdown error.
+
+The existing `NSFunctionBarAPIEnabled` default did not prevent these crashes.
+Durable logging is verified; this is not a verified crash fix. The public-source
+0.2.40 candidate (`3423d0ad877f0d5f145a08fd8f609f19976a9606`) was subsequently
+installed for testing, with matching bundle versions, strict signature check,
+and required native/context runtime exit code 0. No clean-shutdown qualification
+or broad Mac release approval is inferred from that installation.

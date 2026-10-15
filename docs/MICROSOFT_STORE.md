@@ -17,7 +17,8 @@ app 0.2.36) was submitted that day with the revised reading interface, optional
 coffee-support panel, and matching screenshots. Partner Center last showed
 **Update in certification** for that submission, with automatic publication
 after approval. These are dated observations, not a claim about today's Store
-version.
+version. On October 15, 2026, the signed-in Partner Center dashboard confirmed
+submission 2 was live with package `1.2.36.0`.
 
 Package `1.2.38.0` contains app 0.2.38 and adds Save As in the Windows toolbar
 and on Ctrl+Shift+S.
@@ -43,6 +44,24 @@ lifecycle diagnostics. Interrupted sessions are reported at the next launch;
 force quit cannot execute an exit handler. Windows package verification and
 Partner Center submission must be confirmed for this exact source before this
 version is described as available in Microsoft Store.
+
+On October 15, the [Store verification workflow](https://github.com/yonathanarbel/LawPDF/actions/runs/38772527411)
+passed for source `3423d0ad877f0d5f145a08fd8f609f19976a9606`.
+The downloaded unsigned package SHA-256 is
+`8c196adcfcbea36ad32d01d887b16d66981ac71c75d33dc68711ce66603f343e`;
+its executable SHA-256 is
+`fcffb497a7b9eeec276e86056ee01a0893016d9cf060fb1771029a04c1914ed8`.
+Both hashes were independently checked after download. The test-signed copy
+passed exact installation, product/file version, Start Menu, PDF association,
+Store-channel behavior and required-runtime checks on the disposable Windows
+runner. The direct-installer [release build](https://github.com/yonathanarbel/LawPDF/actions/runs/38772531944)
+also passed its exact-install checks; neither result is an installation on the
+owner's Windows hardware.
+
+Partner Center validated the unsigned `1.2.40.0` package in submission 3
+(`1152921505702141171`). With the owner's approval, the package replacement was
+saved to the draft. This is **not** a submission for certification or publication;
+the live package remains `1.2.36.0` until a later confirmed release.
 
 ## Build and packaging
 
