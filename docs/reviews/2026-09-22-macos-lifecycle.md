@@ -100,3 +100,70 @@ Durable logging is verified; this is not a verified crash fix. The public-source
 installed for testing, with matching bundle versions, strict signature check,
 and required native/context runtime exit code 0. No clean-shutdown qualification
 or broad Mac release approval is inferred from that installation.
+
+## October 15 follow-up: 0.2.41 shutdown correction
+
+The curated 0.2.40 installation reproduced the same AppKit abort again during
+an ordinary Command-Q from an empty reader. The macOS report identified the
+same Touch Bar/KVO teardown path, after LawPDF's worker and settings cleanup.
+
+Version 0.2.41 uses eframe's supported `run_and_return: false` mode on macOS.
+The framework still saves and destroys the application and runs `on_exit`, then
+exits without returning through the failing AppKit display-cycle cleanup. Other
+platforms retain their existing event-loop mode. Save/close cancellation and
+pending annotation saves are unchanged.
+
+A normal-exit hook records `session_finished` with `clean_native_exit`, but only
+after application cleanup completed. Cleanup alone does not remove the active
+session marker. A native abort, forced quit or process kill therefore remains
+detectable on the next launch; the fix does not relabel these as clean exits.
+
+Local verification of source `289960e0ce46b679e86b796fedcf2e3c2cad1110`:
+
+- All 1,118 development-feature tests passed, including the new exit-marker test
+  and existing failed-save/cancel-close tests.
+- Six isolated native-window close cycles passed: three empty readers and three
+  readers given a private test PDF. All six recorded `clean_native_exit`, with no
+  interrupted-session event. The PDF's SHA-256 was unchanged.
+- An intentionally killed isolated test process retained its marker. Its next
+  launch recorded the killed process as interrupted, then closed cleanly and
+  removed the marker.
+- The development-only shutdown test can isolate its data directory and compare
+  both event-loop modes. These environment overrides are not in production.
+
+The production bundle from that source was installed at
+`/Applications/LawPDF.app`, with the previous installation preserved for rollback.
+Both bundle versions are 0.2.41. Strict deep signature verification passed, and
+the installed executable matches the packaged executable. Required native,
+context, arbiter, note-head and link-ranker runtime verification exited 0 with
+`requirements_met: true`, using the installed bundle's assets.
+
+Two ordinary Command-Q tests of the installed app passed: one from an empty
+reader and one after opening a disposable copy of the 21-page reading PDF.
+Both recorded completed worker cleanup and `clean_native_exit`, left no running
+app/worker or active-session marker, and produced no new macOS crash report.
+The disposable PDF's hash remained unchanged. The first launch also imported
+the preceding 0.2.40 crash report, verifying that the diagnostics still expose
+native failures rather than hiding them.
+
+- Local Mac ZIP SHA-256: `e011799c708bfb0c673d9889e677c6f9fe5b2066c57422319f913dd7d65ac9d0`.
+- Installed Mac executable SHA-256: `18cab97374466029048b1cfab9efab8748d092a96d95a73f652075f013931edb`.
+- [Desktop verification](https://github.com/yonathanarbel/LawPDF/actions/runs/38777731224)
+  passed production/development tests on Mac (1,114/1,118) and Windows
+  (1,111/1,115), plus dependency audit.
+- [Release build](https://github.com/yonathanarbel/LawPDF/actions/runs/38777726750)
+  passed both platforms. The exact Windows installer was installed on the hosted
+  Windows runner: product/file version 0.2.41, runtime exit 0,
+  `requirements_met: true`, and the Start Menu target verified. Its SHA-256 was
+  checked again after download:
+  `6e749640f9fa3d12b56356d29968a26958a5723d2e42c30e4caa70e08c982d27`.
+  This was not an installation on the owner's Windows computer. The direct
+  installer is not Authenticode-signed.
+
+The Mac package, Windows installer and local verification evidence are retained
+under `Downloads/LawPDF-0.2.41`. This branch build was not published as a tagged
+GitHub release. The separate Microsoft Store 0.2.40 submission remains the
+already-submitted Windows update; 0.2.41 does not replace it in certification.
+
+This is a targeted correction for the reproduced teardown failure, not a claim
+that every possible native crash or interruption has been eliminated.
