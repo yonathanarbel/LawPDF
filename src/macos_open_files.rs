@@ -81,6 +81,7 @@ define_class!(
 
         #[unsafe(method(requestQuit:))]
         fn request_quit(&self, _sender: Option<&NSObject>) {
+            crate::diagnostics::event("quit_requested_from_menu");
             self.ivars().quit_requested.set(true);
             crate::single_instance::request_repaint();
         }
@@ -91,6 +92,7 @@ define_class!(
             _event: &NSAppleEventDescriptor,
             _reply: &NSAppleEventDescriptor,
         ) {
+            crate::diagnostics::event("quit_requested_from_macos_event");
             self.ivars().quit_requested.set(true);
             crate::single_instance::request_repaint();
         }

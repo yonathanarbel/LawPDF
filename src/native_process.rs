@@ -155,6 +155,9 @@ impl ProcessClient {
                         Ok(response)
                     })();
                     let failed = result.is_err();
+                    if let Err(error) = &result {
+                        crate::diagnostics::error("pdf_worker_transport_error", &error.to_string());
+                    }
                     let _ = job.reply.send(result);
                     if failed {
                         break;
@@ -184,8 +187,10 @@ impl Drop for ProcessClient {
 }
 
 pub fn shutdown() {
+    crate::diagnostics::event("pdf_worker_shutdown_requested");
     SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Release);
     terminate_current_worker();
+    crate::diagnostics::event("pdf_worker_shutdown_complete");
 }
 
 fn terminate_current_worker() {
@@ -209,13 +214,15 @@ fn call(request: Request) -> Result<Response> {
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     if client.is_none() {
-        *client = Some(ProcessClient::start().map_err(|_| {
+        *client = Some(ProcessClient::start().map_err(|error| {
+            crate::diagnostics::error("pdf_worker_start_error", &error.to_string());
             anyhow!("Could not start the isolated PDF worker. Reinstall LawPDF if this continues.")
         })?);
     }
     match client.as_ref().expect("started worker").call(request) {
         Ok(result) => result.map_err(anyhow::Error::msg),
-        Err(_) => {
+        Err(error) => {
+            crate::diagnostics::error("pdf_worker_call_error", &error.to_string());
             client.take();
             Err(anyhow!(
                 "The PDF worker stopped or exceeded its two-minute limit. LawPDF kept your recovery edits. Try opening the PDF again; the worker will restart automatically."

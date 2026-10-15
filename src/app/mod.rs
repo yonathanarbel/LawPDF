@@ -3780,11 +3780,13 @@ impl PdfEditorApp {
         let (native_flags, char_flags) = self.review_extract_ready_flags();
         let opening_ready = opening_pages_ready_for_review(&native_flags, &char_flags, page_count);
         let all_ready = review_all_pages_ready(&native_flags, &char_flags, page_count);
+        let preview_ready = matches!(self.liquid_mode2_state, LiquidState::Ready(_));
         match review_gate_automatic_full(
             review_prepare_next_action(
                 page_count,
                 opening_ready,
                 all_ready,
+                preview_ready,
                 self.liquid_mode2_preview_spawned,
                 self.liquid_mode2_full_spawned,
             ),
@@ -11227,9 +11229,13 @@ impl eframe::App for PdfEditorApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        crate::diagnostics::event("shutdown_begin");
         self.stop_liquid_tts();
+        crate::diagnostics::event("shutdown_tts_stopped");
         crate::native_process::shutdown();
+        crate::diagnostics::event("shutdown_pdf_worker_stopped");
         self.flush_settings_now();
+        crate::diagnostics::event("shutdown_complete");
     }
 
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
@@ -14452,12 +14458,12 @@ mod app_tests {
         assert!(opening_pages_ready_for_review(&native, &chars, 5));
         assert!(!review_all_pages_ready(&native, &chars, 5));
         assert_eq!(
-            review_prepare_next_action(5, true, false, false, false),
+            review_prepare_next_action(5, true, false, false, false, false),
             ReviewPrepareAction::SpawnPreview { page_count: 4 }
         );
         assert!(!should_apply_review_event(true, false));
         assert_eq!(
-            review_prepare_next_action(2, true, true, false, false),
+            review_prepare_next_action(2, true, true, false, false, false),
             ReviewPrepareAction::SpawnFull { page_count: 2 }
         );
     }

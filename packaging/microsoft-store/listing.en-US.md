@@ -1,6 +1,6 @@
 # Microsoft Store listing
 
-This listing accompanies app 0.2.38, Store package 1.2.38.0, under publisher
+This listing accompanies app 0.2.40, Store package 1.2.40.0, under publisher
 John Arbel and Store ID 9MZXSP0C423F. Publication and certification are separate
 from the GitHub release. See `docs/MICROSOFT_STORE.md` for dated submission
 observations and verification boundaries. Existing reading and coffee-panel
@@ -35,6 +35,13 @@ This is a public beta. Verify reconstructed text against the original PDF and re
 
 ## Suggested category
 Productivity
+
+## What's new in 0.2.40
+Review Mode now completes the opening-page preview before preparing the rest of
+the document, preventing a loading animation that could remain indefinitely.
+Local diagnostic logs now retain shutdown stages and errors, detect interrupted
+sessions on the next launch, and help diagnose PDF worker failures. Logs do not
+include document text or provider credentials.
 
 ## Privacy URL
 https://github.com/yonathanarbel/LawPDF/blob/main/docs/PRIVACY.md

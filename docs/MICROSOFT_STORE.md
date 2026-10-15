@@ -20,7 +20,7 @@ after approval. These are dated observations, not a claim about today's Store
 version.
 
 Package `1.2.38.0` contains app 0.2.38 and adds Save As in the Windows toolbar
-and on Ctrl+Shift+S. The current packaging identity targets this version.
+and on Ctrl+Shift+S.
 On October 12, 2026, the [Store verification workflow](https://github.com/yonathanarbel/LawPDF/actions/runs/38260970593)
 passed for source `37db5c01d4e129473e0d429f0796b51bdf9d37e5`. The exact unsigned
 submission package SHA-256 is
@@ -30,11 +30,19 @@ Start Menu registration, PDF association, and required-runtime checks on the
 hosted runner. The original unsigned package was downloaded and its package
 and executable hashes were independently checked.
 
-Submission is prepared but awaiting Partner Center sign-in. Version 0.2.38 has
+That submission was prepared but awaiting Partner Center sign-in. Version 0.2.38 has
 not been submitted or certified as part of this release. Store availability
 is separate from the [direct-download release](https://github.com/yonathanarbel/LawPDF/releases/tag/v0.2.38).
 A fresh installation through Microsoft Store on the owner's Windows PC has not
 been verified. Validation-only packages must not be uploaded as the product.
+
+On October 15, 2026, the packaging identity was advanced to `1.2.40.0` for app
+0.2.40. This update preserves the Store-specific update and speech behavior and
+adds serialized Review preview/full-document preparation plus durable local
+lifecycle diagnostics. Interrupted sessions are reported at the next launch;
+force quit cannot execute an exit handler. Windows package verification and
+Partner Center submission must be confirmed for this exact source before this
+version is described as available in Microsoft Store.
 
 ## Build and packaging
 
@@ -51,7 +59,7 @@ been verified. Validation-only packages must not be uploaded as the product.
   the result, and checks the executable and manifest identity.
 - The package depends on Microsoft's VC++ Desktop runtime framework; Store
   deployment supplies that dependency. Minimum OS is Windows 10 build 19041.
-- Store package version `1.2.38.0` maps to application version `0.2.38`. The package
+- Store package version `1.2.40.0` maps to application version `0.2.40`. The package
   major is nonzero and the fourth component is zero, as Microsoft requires. This
   packaging identity does not change the application's public-beta status.
 

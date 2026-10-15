@@ -10,6 +10,7 @@ pub fn running() -> bool {
 
 pub fn run() -> eframe::Result<()> {
     RUNNING.store(true, Ordering::Relaxed);
+    crate::diagnostics::start_session();
     let paths: Vec<_> = std::env::args_os().skip_while(|arg| arg != "--smoke-shutdown")
         .skip(1).map(std::path::PathBuf::from).collect();
     let delay = if paths.is_empty() { Duration::from_millis(350) } else { Duration::from_secs(3) };
@@ -56,5 +57,6 @@ pub fn run() -> eframe::Result<()> {
         }),
     )?;
     println!("LawPDF native shutdown completed cleanly");
+    crate::diagnostics::finish_session("shutdown_smoke_complete");
     Ok(())
 }

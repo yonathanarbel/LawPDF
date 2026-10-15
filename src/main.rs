@@ -7,6 +7,7 @@ mod atomic_file;
 mod benchmark;
 mod chat;
 mod credentials;
+mod diagnostics;
 mod document_store;
 mod hashing;
 mod layout_roles;
@@ -52,6 +53,7 @@ const APP_TITLE: &str = concat!(
 );
 
 fn main() -> eframe::Result<()> {
+    install_panic_log_hook();
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     // The child has no UI, update service, credentials, or document-write
     // commands. Anonymous pipes carry its bounded request/response protocol.
@@ -82,7 +84,6 @@ fn main() -> eframe::Result<()> {
     }
     #[cfg(target_os = "macos")]
     macos_open_files::install_appkit_crash_workarounds();
-    install_panic_log_hook();
 
     #[cfg(feature = "devtools")]
     if args.iter().any(|arg| arg == "--smoke-shutdown") {
@@ -170,7 +171,8 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    diagnostics::start_session();
+    let result = eframe::run_native(
         APP_TITLE,
         options,
         Box::new(move |cc| {
@@ -187,7 +189,13 @@ fn main() -> eframe::Result<()> {
                 Some(macos_open_files),
             )))
         }),
-    )
+    );
+    match &result {
+        Ok(()) => diagnostics::event("run_native_returned"),
+        Err(error) => diagnostics::error("run_native_error", &error.to_string()),
+    }
+    diagnostics::finish_session(if result.is_ok() { "clean" } else { "run_native_error" });
+    result
 }
 
 #[cfg(feature = "devtools")]
@@ -587,6 +595,7 @@ fn install_panic_log_hook() {
             thread.name().unwrap_or("unnamed"),
             location
         );
+        diagnostics::panic(thread.name().unwrap_or("unnamed"), &location);
         if let Some(dir) = settings::app_data_dir() {
             let _ = std::fs::create_dir_all(&dir);
             let path = dir.join("panic.log");
