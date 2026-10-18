@@ -301,7 +301,8 @@
       "objc2-foundation-0.3.2",
       "objc2-io-surface-0.3.2",
       "objc2-pdf-kit-0.3.2",
-      "objc2-security-0.3.2"
+      "objc2-security-0.3.2",
+      "objc2-vision-0.3.2"
     ],
     "repository": "https://github.com/madsmtm/objc2",
     "commit": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
