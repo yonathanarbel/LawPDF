@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -11,6 +12,7 @@ use crate::model::OcrPageState;
 use crate::pdf_backend::{PdfEngine, save_with_ocr_text};
 use crate::render_worker::RenderRequest;
 use crate::settings::app_data_dir;
+use crate::system_ocr::{self, SystemOcrError};
 
 const OCR_CACHE_SCHEMA_VERSION: u32 = 1;
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
@@ -40,6 +42,98 @@ struct OcrCache {
     pages: Vec<Option<String>>,
 }
 
+/// The on-device engine that reads page images. The operating system's own
+/// recognizer comes first because it needs no installation; Tesseract remains
+/// a fallback for platforms or machines without one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalOcrEngine {
+    System,
+    Tesseract,
+}
+
+impl LocalOcrEngine {
+    pub fn label(self) -> &'static str {
+        match self {
+            LocalOcrEngine::System => system_ocr::engine_name(),
+            LocalOcrEngine::Tesseract => "Tesseract",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnginePreference {
+    Auto,
+    System,
+    Tesseract,
+}
+
+/// `LAWPDF_OCR_ENGINE=system|tesseract` pins one engine for diagnosis.
+fn engine_preference() -> EnginePreference {
+    match std::env::var("LAWPDF_OCR_ENGINE")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "system" | "windows" | "vision" => EnginePreference::System,
+        "tesseract" => EnginePreference::Tesseract,
+        _ => EnginePreference::Auto,
+    }
+}
+
+/// Chooses the local engine for a job, or explains why none can run.
+pub fn local_ocr_engine() -> Result<LocalOcrEngine, String> {
+    let preference = engine_preference();
+    let system_error = if preference == EnginePreference::Tesseract {
+        None
+    } else {
+        match system_ocr::availability() {
+            Ok(_) => return Ok(LocalOcrEngine::System),
+            Err(error) => Some(error),
+        }
+    };
+    if preference == EnginePreference::System {
+        return Err(system_error
+            .map(|error| error.message().to_owned())
+            .unwrap_or_default());
+    }
+    match tesseract_version() {
+        Ok(_) => Ok(LocalOcrEngine::Tesseract),
+        Err(tesseract_error) => Err(no_local_engine_message(
+            system_error.as_ref(),
+            &tesseract_error,
+        )),
+    }
+}
+
+fn no_local_engine_message(system_error: Option<&SystemOcrError>, tesseract_error: &str) -> String {
+    match system_error {
+        Some(error) if cfg!(any(target_os = "windows", target_os = "macos")) => {
+            error.message().to_owned()
+        }
+        _ => format!(
+            "No OCR engine is available on this computer. Install Tesseract OCR and make sure \
+             it is on PATH, or use Cloud OCR with an OpenRouter key. ({tesseract_error})"
+        ),
+    }
+}
+
+/// Recognizes one rendered page image with the given local engine. If the
+/// built-in recognizer fails on a particular image, Tesseract is tried when it
+/// is installed.
+pub fn recognize_page_image(engine: LocalOcrEngine, image_path: &Path) -> Result<String, String> {
+    match engine {
+        LocalOcrEngine::Tesseract => run_tesseract_image(image_path),
+        LocalOcrEngine::System => match system_ocr::recognize_image(image_path) {
+            Ok(text) => Ok(text),
+            Err(error) if engine_preference() != EnginePreference::System => {
+                run_tesseract_image(image_path).map_err(|_| error.message().to_owned())
+            }
+            Err(error) => Err(error.message().to_owned()),
+        },
+    }
+}
+
 pub fn spawn_ocr_job(
     document_epoch: u64,
     pdf_path: PathBuf,
@@ -48,16 +142,28 @@ pub fn spawn_ocr_job(
     render_tx: crate::render_worker::RenderSender,
 ) {
     thread::spawn(move || {
+        let engine = match local_ocr_engine() {
+            Ok(engine) => engine,
+            Err(error) => {
+                fail_ocr_job(&tx, document_epoch, &pdf_path, page_count, error);
+                return;
+            }
+        };
+
         for page_index in 0..page_count {
             let _ = tx.send(OcrEvent {
                 document_epoch,
                 path: pdf_path.clone(),
                 page_index,
                 state: OcrPageState::Running,
-                status: None,
+                status: Some(format!(
+                    "{}: reading page {} of {page_count}...",
+                    engine.label(),
+                    page_index + 1
+                )),
             });
 
-            let state = match ocr_page(&render_tx, &pdf_path, page_index) {
+            let state = match ocr_page(engine, &render_tx, &pdf_path, page_index) {
                 Ok(text) => OcrPageState::Done(text),
                 Err(error) => OcrPageState::Failed(error),
             };
@@ -67,8 +173,163 @@ pub fn spawn_ocr_job(
                 path: pdf_path.clone(),
                 page_index,
                 state,
-                status: None,
+                status: (page_index + 1 == page_count)
+                    .then(|| format!("{}: OCR finished for {page_count} page(s).", engine.label())),
             });
+        }
+    });
+}
+
+/// Reports a job that cannot start once, rather than once per page, and
+/// returns every page to idle so the buttons become available again.
+fn fail_ocr_job(
+    tx: &Sender<OcrEvent>,
+    document_epoch: u64,
+    pdf_path: &PathBuf,
+    page_count: usize,
+    error: String,
+) {
+    for page_index in 0..page_count {
+        let state = if page_index == 0 {
+            OcrPageState::Failed(error.clone())
+        } else {
+            OcrPageState::Idle
+        };
+        let _ = tx.send(OcrEvent {
+            document_epoch,
+            path: pdf_path.clone(),
+            page_index,
+            state,
+            status: None,
+        });
+    }
+    send_ocr_status(
+        tx,
+        document_epoch,
+        pdf_path,
+        format!("OCR could not start: {error}"),
+    );
+}
+
+/// Recognizes the pages that have no OCR text yet on this computer and saves
+/// a copy of the PDF with an invisible, searchable text layer. Nothing leaves
+/// the device.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_local_ocr_save_job(
+    document_epoch: u64,
+    pdf_path: PathBuf,
+    page_count: usize,
+    page_sizes: Vec<(f32, f32)>,
+    destination: PathBuf,
+    initial_ocr_text: Vec<Option<String>>,
+    tx: Sender<OcrEvent>,
+    render_tx: crate::render_worker::RenderSender,
+) {
+    thread::spawn(move || {
+        let mut ocr_text = initial_ocr_text
+            .into_iter()
+            .take(page_count)
+            .map(|text| text.unwrap_or_default())
+            .collect::<Vec<_>>();
+        ocr_text.resize(page_count, String::new());
+        let pages_to_ocr = ocr_text
+            .iter()
+            .enumerate()
+            .filter(|(_, text)| text.trim().is_empty())
+            .map(|(page_index, _)| page_index)
+            .collect::<Vec<_>>();
+
+        if !pages_to_ocr.is_empty() {
+            let engine = match local_ocr_engine() {
+                Ok(engine) => engine,
+                Err(error) => {
+                    for page_index in &pages_to_ocr {
+                        let state = if Some(page_index) == pages_to_ocr.first() {
+                            OcrPageState::Failed(error.clone())
+                        } else {
+                            OcrPageState::Idle
+                        };
+                        let _ = tx.send(OcrEvent {
+                            document_epoch,
+                            path: pdf_path.clone(),
+                            page_index: *page_index,
+                            state,
+                            status: None,
+                        });
+                    }
+                    send_ocr_status(
+                        &tx,
+                        document_epoch,
+                        &pdf_path,
+                        format!("OCR could not start: {error}"),
+                    );
+                    return;
+                }
+            };
+
+            let mut failed = 0usize;
+            for (done, page_index) in pages_to_ocr.iter().copied().enumerate() {
+                let _ = tx.send(OcrEvent {
+                    document_epoch,
+                    path: pdf_path.clone(),
+                    page_index,
+                    state: OcrPageState::Running,
+                    status: Some(format!(
+                        "{}: reading page {} of {page_count} ({}/{} left to read)...",
+                        engine.label(),
+                        page_index + 1,
+                        done + 1,
+                        pages_to_ocr.len()
+                    )),
+                });
+                let state = match ocr_page(engine, &render_tx, &pdf_path, page_index) {
+                    Ok(text) => {
+                        ocr_text[page_index] = text.clone();
+                        OcrPageState::Done(text)
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        OcrPageState::Failed(error)
+                    }
+                };
+                let _ = tx.send(OcrEvent {
+                    document_epoch,
+                    path: pdf_path.clone(),
+                    page_index,
+                    state,
+                    status: None,
+                });
+            }
+            if failed > 0 {
+                send_ocr_status(
+                    &tx,
+                    document_epoch,
+                    &pdf_path,
+                    format!("OCR stopped; {failed} page(s) failed. No copy was saved."),
+                );
+                return;
+            }
+        }
+
+        send_ocr_status(
+            &tx,
+            document_epoch,
+            &pdf_path,
+            format!("Embedding OCR text in {}", destination.display()),
+        );
+        match save_with_ocr_text(&pdf_path, &destination, &page_sizes, &ocr_text) {
+            Ok(_report) => send_ocr_status(
+                &tx,
+                document_epoch,
+                &pdf_path,
+                format!("Saved searchable PDF {}", destination.display()),
+            ),
+            Err(error) => send_ocr_status(
+                &tx,
+                document_epoch,
+                &pdf_path,
+                format!("Could not save OCR PDF: {error}"),
+            ),
         }
     });
 }
@@ -141,11 +402,12 @@ pub fn ocr_page_with_engine_scale(
         return Err(error);
     }
 
-    let result = run_tesseract_image(&image_path);
+    let result = local_ocr_engine().and_then(|engine| recognize_page_image(engine, &image_path));
     let _ = std::fs::remove_file(&image_path);
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_openrouter_ocr_save_job(
     document_epoch: u64,
     pdf_path: PathBuf,
@@ -304,16 +566,55 @@ pub fn spawn_openrouter_ocr_save_job(
 }
 
 fn ocr_page(
+    engine: LocalOcrEngine,
     render_tx: &crate::render_worker::RenderSender,
     pdf_path: &PathBuf,
     page_index: usize,
 ) -> Result<String, String> {
     let image_path = temp_image_path(page_index);
-    export_ocr_image(render_tx, pdf_path.clone(), page_index, image_path.clone())?;
+    if let Err(error) =
+        export_ocr_image(render_tx, pdf_path.clone(), page_index, image_path.clone())
+    {
+        let _ = std::fs::remove_file(&image_path);
+        return Err(error);
+    }
 
-    let result = run_tesseract_image(&image_path);
+    let result = recognize_page_image(engine, &image_path);
     let _ = std::fs::remove_file(&image_path);
     result
+}
+
+/// Confirms that Tesseract can be launched, returning its version line.
+fn tesseract_version() -> Result<String, String> {
+    let mut command = Command::new("tesseract");
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("tesseract was not found: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("tesseract --version exited with {}", output.status));
+    }
+    let text = if output.stdout.is_empty() {
+        output.stderr
+    } else {
+        output.stdout
+    };
+    Ok(String::from_utf8_lossy(&text)
+        .lines()
+        .next()
+        .unwrap_or("tesseract")
+        .trim()
+        .to_owned())
 }
 
 fn run_tesseract_image(image_path: &Path) -> Result<String, String> {
@@ -406,7 +707,8 @@ fn temp_image_path(page_index: usize) -> PathBuf {
         .unwrap_or_default();
 
     std::env::temp_dir().join(format!(
-        "rust_pdf_editor_ocr_{stamp}_p{}.png",
+        "lawpdf_ocr_{}_{stamp}_p{}.png",
+        std::process::id(),
         page_index + 1
     ))
 }
@@ -799,9 +1101,206 @@ fn stable_hash(value: &str) -> String {
     format!("{hash:016x}")
 }
 
+/// A small printed sample compiled into the app, so an installed copy can
+/// prove that recognition works without any document.
+const SELF_TEST_IMAGE: &[u8] = include_bytes!("../assets/ocr-self-test.png");
+const SELF_TEST_WORDS: [&str; 4] = ["consideration", "bargained", "promise", "enforceable"];
+
+/// `--ocr-self-test [--pdf <file> [--page <n>]] [--output <file>]`
+///
+/// Reports which local engine is available, recognizes the built-in sample,
+/// and optionally one page of a PDF. Returns whether every check passed.
+pub fn run_ocr_self_test(args: impl IntoIterator<Item = OsString>) -> Result<bool, String> {
+    let mut pdf_path: Option<PathBuf> = None;
+    let mut page_number = 1usize;
+    let mut output_path: Option<PathBuf> = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == OsStr::new("--ocr-self-test") {
+            continue;
+        }
+        let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
+        if arg == OsStr::new("--pdf") {
+            pdf_path = Some(PathBuf::from(value("--pdf")?));
+        } else if arg == OsStr::new("--page") {
+            page_number = value("--page")?
+                .to_string_lossy()
+                .parse::<usize>()
+                .ok()
+                .filter(|page| *page >= 1)
+                .ok_or_else(|| "--page needs a page number starting at 1".to_owned())?;
+        } else if arg == OsStr::new("--output") {
+            output_path = Some(PathBuf::from(value("--output")?));
+        } else {
+            return Err(format!(
+                "unknown OCR self-test argument {}",
+                arg.to_string_lossy()
+            ));
+        }
+    }
+
+    let system = match system_ocr::availability() {
+        Ok(language) => json!({ "available": true, "language": language }),
+        Err(error) => json!({ "available": false, "detail": error.message() }),
+    };
+    let tesseract = match tesseract_version() {
+        Ok(version) => json!({ "available": true, "version": version }),
+        Err(error) => json!({ "available": false, "detail": error }),
+    };
+    let engine = local_ocr_engine();
+
+    let sample = match &engine {
+        Ok(engine) => {
+            let image_path = temp_image_path(0)
+                .with_file_name(format!("lawpdf_ocr_self_test_{}.png", std::process::id()));
+            let result = std::fs::write(&image_path, SELF_TEST_IMAGE)
+                .map_err(|error| format!("Could not write the OCR sample image: {error}"))
+                .and_then(|_| recognize_page_image(*engine, &image_path));
+            let _ = std::fs::remove_file(&image_path);
+            match result {
+                Ok(text) => {
+                    let lower = text.to_lowercase();
+                    let matched = SELF_TEST_WORDS
+                        .iter()
+                        .filter(|word| lower.contains(*word))
+                        .count();
+                    json!({
+                        "passed": matched >= 3,
+                        "matched_words": matched,
+                        "expected_words": SELF_TEST_WORDS.len(),
+                        "text": text,
+                    })
+                }
+                Err(error) => json!({ "passed": false, "error": error }),
+            }
+        }
+        Err(error) => json!({ "passed": false, "error": error }),
+    };
+
+    let pdf = match (&engine, &pdf_path) {
+        (_, None) => serde_json::Value::Null,
+        (Err(error), Some(path)) => json!({
+            "path": path.display().to_string(),
+            "passed": false,
+            "error": error,
+        }),
+        (Ok(engine), Some(path)) => {
+            let page_index = page_number - 1;
+            let image_path = temp_image_path(page_index);
+            let result = PdfEngine::new()
+                .map_err(|error| format!("Could not start the PDF engine: {error:#}"))
+                .and_then(|pdf_engine| {
+                    pdf_engine
+                        .export_page_png(path, page_index, &image_path, OCR_RENDER_SCALE)
+                        .map_err(|error| format!("Could not render page {page_number}: {error:#}"))
+                })
+                .and_then(|_| recognize_page_image(*engine, &image_path));
+            let _ = std::fs::remove_file(&image_path);
+            match result {
+                Ok(text) => json!({
+                    "path": path.display().to_string(),
+                    "page": page_number,
+                    "passed": !text.trim().is_empty(),
+                    "characters": text.chars().filter(|ch| !ch.is_whitespace()).count(),
+                    "words": text.split_whitespace().count(),
+                    "preview": preview(&text, 600),
+                }),
+                Err(error) => json!({
+                    "path": path.display().to_string(),
+                    "page": page_number,
+                    "passed": false,
+                    "error": error,
+                }),
+            }
+        }
+    };
+
+    let requirements_met = engine.is_ok()
+        && sample["passed"].as_bool() == Some(true)
+        && (pdf.is_null() || pdf["passed"].as_bool() == Some(true));
+    let report = json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "engine": engine.as_ref().map(|engine| engine.label()).ok(),
+        "engine_error": engine.as_ref().err(),
+        "system_engine": { "name": system_ocr::engine_name(), "status": system },
+        "tesseract": tesseract,
+        "sample": sample,
+        "pdf": pdf,
+        "requirements_met": requirements_met,
+    });
+    let text = serde_json::to_string_pretty(&report)
+        .map_err(|error| format!("Could not encode the OCR report: {error}"))?;
+    match output_path {
+        Some(path) => std::fs::write(&path, text)
+            .map_err(|error| format!("Could not write {}: {error}", path.display()))?,
+        None => println!("{text}"),
+    }
+    Ok(requirements_met)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_engine_reads_the_built_in_sample() {
+        let engine = match local_ocr_engine() {
+            Ok(engine) => engine,
+            Err(error) => {
+                // A machine without any OCR language (or, off Windows and macOS,
+                // without Tesseract) cannot run this check.
+                assert!(
+                    !cfg!(target_os = "macos"),
+                    "macOS Vision should always be available: {error}"
+                );
+                eprintln!("skipping OCR sample check: {error}");
+                return;
+            }
+        };
+        let image_path =
+            std::env::temp_dir().join(format!("lawpdf_ocr_unit_sample_{}.png", std::process::id()));
+        std::fs::write(&image_path, SELF_TEST_IMAGE).unwrap();
+        let text = recognize_page_image(engine, &image_path);
+        let _ = std::fs::remove_file(&image_path);
+        let text = text.unwrap_or_else(|error| panic!("{} failed: {error}", engine.label()));
+        let lower = text.to_lowercase();
+        let matched = SELF_TEST_WORDS
+            .iter()
+            .filter(|word| lower.contains(*word))
+            .count();
+        assert!(
+            matched >= 3,
+            "{} read only {matched} sample words: {text:?}",
+            engine.label()
+        );
+    }
+
+    #[test]
+    fn self_test_report_is_written_and_rejects_unknown_arguments() {
+        let output = std::env::temp_dir().join(format!(
+            "lawpdf_ocr_self_test_report_{}.json",
+            std::process::id()
+        ));
+        let passed = run_ocr_self_test(
+            ["--ocr-self-test", "--output", output.to_str().unwrap()]
+                .into_iter()
+                .map(OsString::from),
+        )
+        .unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&output);
+        assert_eq!(report["requirements_met"].as_bool(), Some(passed));
+        assert_eq!(report["version"], env!("CARGO_PKG_VERSION"));
+        assert!(
+            run_ocr_self_test(
+                ["--ocr-self-test", "--bogus"]
+                    .into_iter()
+                    .map(OsString::from)
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn openrouter_ocr_request_uses_dynamic_free_vision_router() {

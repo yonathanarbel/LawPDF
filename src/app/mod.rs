@@ -60,7 +60,8 @@ use crate::model::{
     PageTextChar, PdfRect, RenderedPage, SearchHit, SearchSource, Tool,
 };
 use crate::ocr::{
-    OcrEvent, load_ocr_cache, save_ocr_cache, spawn_ocr_job, spawn_openrouter_ocr_save_job,
+    OcrEvent, load_ocr_cache, save_ocr_cache, spawn_local_ocr_save_job, spawn_ocr_job,
+    spawn_openrouter_ocr_save_job,
 };
 use crate::pdf_backend::{
     LAWPDF_COMMENT_ID_PREFIX, PdfEngine, export_text, sidecar_path_for_export,
@@ -95,6 +96,18 @@ const PAPER_STROKE: Color32 = Color32::from_rgb(205, 201, 192);
 const INK: Color32 = Color32::from_rgb(42, 38, 32);
 const MUTED_INK: Color32 = Color32::from_rgb(106, 99, 88);
 const RENDER_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const LOCAL_OCR_HOVER: &str =
+    "Recognize text on this computer for search, copying, and Review Mode. Nothing is uploaded.";
+const LOCAL_OCR_SAVE_HOVER: &str =
+    "Recognize text on this computer and save a searchable PDF copy. Nothing is uploaded.";
+const CLOUD_OCR_SAVE_HOVER: &str = "Send page images to OpenRouter for recognition and save a \
+    searchable PDF copy. Requires your OpenRouter key; do not use for confidential material.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OcrSaveBackend {
+    Local,
+    OpenRouter,
+}
 const ZOOM_RENDER_DEBOUNCE: Duration = Duration::from_millis(180);
 const ZOOM_ANIMATION_EPSILON: f32 = 0.001;
 const ZOOM_ANIMATION_SPEED: f32 = 18.0;
@@ -2602,14 +2615,30 @@ impl PdfEditorApp {
     }
 
     fn start_openrouter_ocr_save(&mut self) {
+        self.start_ocr_save(OcrSaveBackend::OpenRouter);
+    }
+
+    fn start_local_ocr_save(&mut self) {
+        self.start_ocr_save(OcrSaveBackend::Local);
+    }
+
+    fn start_ocr_save(&mut self, backend: OcrSaveBackend) {
         let Some(document) = self.document.as_ref() else {
             return;
         };
 
-        let Some(api_key) = effective_openrouter_api_key(&self.settings) else {
-            self.status = "OpenRouter OCR needs an API key.".to_owned();
-            self.settings_ui.open = true;
-            return;
+        let api_key = match backend {
+            OcrSaveBackend::Local => None,
+            OcrSaveBackend::OpenRouter => {
+                let Some(api_key) = effective_openrouter_api_key(&self.settings) else {
+                    self.status = "Cloud OCR needs an OpenRouter API key. Add one in Settings, \
+                                   or use OCR on this computer instead."
+                        .to_owned();
+                    self.settings_ui.open = true;
+                    return;
+                };
+                Some(api_key)
+            }
         };
 
         let pdf_path = document.path.clone();
@@ -2626,7 +2655,8 @@ impl PdfEditorApp {
             .and_then(|value| value.to_str())
             .unwrap_or("document-ocr.pdf");
 
-        let Some(destination) = self.pick_save_path("Save OCR PDF", file_name, "PDF", &["pdf"])
+        let Some(destination) =
+            self.pick_save_path("Save searchable PDF", file_name, "PDF", &["pdf"])
         else {
             return;
         };
@@ -2652,24 +2682,42 @@ impl PdfEditorApp {
             started_at: Instant::now(),
             initial_completed: cached_pages,
         });
-        spawn_openrouter_ocr_save_job(
-            self.document_epoch,
-            pdf_path,
-            page_count,
-            page_sizes,
-            destination.clone(),
-            initial_ocr_text,
-            api_key,
-            self.ocr_tx.clone(),
-            self.render_tx.clone(),
-        );
+        let engine_label = match api_key {
+            Some(api_key) => {
+                spawn_openrouter_ocr_save_job(
+                    self.document_epoch,
+                    pdf_path,
+                    page_count,
+                    page_sizes,
+                    destination.clone(),
+                    initial_ocr_text,
+                    api_key,
+                    self.ocr_tx.clone(),
+                    self.render_tx.clone(),
+                );
+                "Cloud OCR (OpenRouter)"
+            }
+            None => {
+                spawn_local_ocr_save_job(
+                    self.document_epoch,
+                    pdf_path,
+                    page_count,
+                    page_sizes,
+                    destination.clone(),
+                    initial_ocr_text,
+                    self.ocr_tx.clone(),
+                    self.render_tx.clone(),
+                );
+                "OCR"
+            }
+        };
         self.status = if cached_pages > 0 {
             format!(
-                "OpenRouter OCR started with {cached_pages} cached page(s); saving {}",
+                "{engine_label} started with {cached_pages} cached page(s); saving {}",
                 destination.display()
             )
         } else {
-            format!("OpenRouter OCR started; saving {}", destination.display())
+            format!("{engine_label} started; saving {}", destination.display())
         };
     }
 
@@ -5335,15 +5383,27 @@ impl PdfEditorApp {
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(8.0);
+        let ocr_active = self.ocr_is_active();
         if ui
-            .add_enabled(has_document, egui::Button::new("Run OCR"))
+            .add_enabled(has_document && !ocr_active, egui::Button::new("Run OCR"))
+            .on_hover_text(LOCAL_OCR_HOVER)
             .clicked()
         {
             self.start_ocr();
         }
         if ui
-            .add_enabled(has_document, egui::Button::new("OCR PDF"))
-            .on_hover_text("Use OpenRouter OCR and save a searchable PDF copy")
+            .add_enabled(has_document && !ocr_active, egui::Button::new("OCR PDF"))
+            .on_hover_text(LOCAL_OCR_SAVE_HOVER)
+            .clicked()
+        {
+            self.start_local_ocr_save();
+        }
+        if ui
+            .add_enabled(
+                has_document && !ocr_active,
+                egui::Button::new("Cloud OCR PDF"),
+            )
+            .on_hover_text(CLOUD_OCR_SAVE_HOVER)
             .clicked()
         {
             self.start_openrouter_ocr_save();
@@ -7543,6 +7603,7 @@ impl PdfEditorApp {
             let ocr_active = self.ocr_is_active();
             if ui
                 .add_enabled(!ocr_active, egui::Button::new("Run OCR"))
+                .on_hover_text(LOCAL_OCR_HOVER)
                 .clicked()
             {
                 self.start_ocr();
@@ -7550,7 +7611,15 @@ impl PdfEditorApp {
             }
             if ui
                 .add_enabled(!ocr_active, egui::Button::new("OCR PDF"))
-                .on_hover_text("Use OpenRouter OCR and save a searchable PDF copy")
+                .on_hover_text(LOCAL_OCR_SAVE_HOVER)
+                .clicked()
+            {
+                self.start_local_ocr_save();
+                ctx.request_repaint_after(RENDER_POLL_INTERVAL);
+            }
+            if ui
+                .add_enabled(!ocr_active, egui::Button::new("Cloud OCR PDF"))
+                .on_hover_text(CLOUD_OCR_SAVE_HOVER)
                 .clicked()
             {
                 self.start_openrouter_ocr_save();

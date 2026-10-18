@@ -35,6 +35,7 @@ mod settings;
 mod shutdown_smoke;
 mod single_instance;
 mod storage_maintenance;
+mod system_ocr;
 mod text_conversion;
 mod text_search;
 mod tts;
@@ -90,6 +91,16 @@ fn main() -> eframe::Result<()> {
         return shutdown_smoke::run();
     }
 
+    if args.iter().any(|arg| arg == "--ocr-self-test") {
+        match ocr::run_ocr_self_test(args.clone()) {
+            Ok(true) => return Ok(()),
+            Ok(false) => std::process::exit(2),
+            Err(error) => {
+                eprintln!("OCR self-test failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if args.iter().any(|arg| arg == "--lm2-runtime-status") {
         if let Err(error) = liquid2::run_lm2_runtime_status(args.clone().into_iter()) {
             eprintln!("LiquidMode2 runtime verification failed: {error}");

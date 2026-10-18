@@ -40,10 +40,11 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 objc2 = "0.6.4"
 objc2-pdf-kit = { version = "0.3.2", default-features = false, features = ["std", "PDFDocument", "objc2-app-kit"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "std"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSAppleEventDescriptor", "NSAppleEventManager", "NSNotification", "NSObject", "NSString", "NSUserDefaults", "NSURL", "objc2-core-services", "std"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSAppleEventDescriptor", "NSAppleEventManager", "NSData", "NSDictionary", "NSError", "NSNotification", "NSObject", "NSString", "NSUserDefaults", "NSURL", "objc2-core-services", "std"] }
+objc2-vision = { version = "0.3.2", default-features = false, features = ["VNObservation", "VNRecognizeTextRequest", "VNRequest", "VNRequestHandler", "objc2-core-foundation", "std"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.61.3", features = ["Win32_Media_Speech", "Win32_System_Com", "Win32_Storage_Packaging_Appx"] }
+windows = { version = "0.61.3", features = ["Foundation", "Foundation_Collections", "Globalization", "Graphics_Imaging", "Media_Ocr", "Storage", "Storage_Streams", "Win32_Media_Speech", "Win32_System_Com", "Win32_Storage_Packaging_Appx"] }
 
 [build-dependencies]
 winresource = { version = "0.1.31", default-features = false }
