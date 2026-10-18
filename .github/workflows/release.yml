@@ -69,6 +69,32 @@ jobs:
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1 -Configuration release
 
+      - name: Check on-device OCR on a scanned page
+        shell: pwsh
+        run: |
+          $report = Join-Path $env:RUNNER_TEMP 'ocr-self-test-windows.json'
+          $pdf = (Resolve-Path 'tests/fixtures/ocr/scanned-law-review-sample.pdf').Path
+          $process = Start-Process -FilePath 'dist/LawPDF-portable/lawpdf.exe' `
+            -ArgumentList @('--ocr-self-test', '--pdf', "`"$pdf`"", '--page', '1', '--output', "`"$report`"") `
+            -NoNewWindow -PassThru -Wait
+          Get-Content -LiteralPath $report
+          $result = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
+          if ($null -eq $result.engine) {
+            # Hosted runners may lack a Windows OCR language; report rather than fail.
+            Write-Warning "No OCR engine on this runner: $($result.engine_error)"
+          } elseif ($process.ExitCode -ne 0 -or -not $result.requirements_met) {
+            throw "On-device OCR failed with $($result.engine)."
+          }
+
+      - name: Upload OCR self-test report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: LawPDF-Windows-ocr-self-test
+          path: ${{ runner.temp }}/ocr-self-test-windows.json
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --no-progress -y
@@ -165,6 +191,22 @@ jobs:
 
       - name: Build and verify app bundle
         run: bash scripts/package-macos.sh
+
+      - name: Check on-device OCR on a scanned page
+        run: |
+          report="$RUNNER_TEMP/ocr-self-test-macos.json"
+          app_binary="$(find dist -path '*.app/Contents/MacOS/*' -type f -perm -u+x | head -n 1)"
+          "$app_binary" --ocr-self-test --pdf tests/fixtures/ocr/scanned-law-review-sample.pdf --page 1 --output "$report"
+          cat "$report"
+
+      - name: Upload OCR self-test report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: LawPDF-macOS-ocr-self-test
+          path: ${{ runner.temp }}/ocr-self-test-macos.json
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Create macOS SHA-256 manifest fragment
         run: (cd dist && shasum -a 256 LawPDF-macos.zip > SHA256SUMS-macos.txt)
