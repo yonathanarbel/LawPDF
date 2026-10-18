@@ -217,7 +217,10 @@ fn read_zip_file<R: Read + Seek>(archive: &mut ZipArchive<R>, name: &str) -> Res
         let Ok(mut file) = archive.by_index(index) else {
             continue;
         };
-        if normalize_zip_entry_name(file.name()) == normalized_target {
+        let Ok(entry_name) = file.name() else {
+            continue;
+        };
+        if normalize_zip_entry_name(&entry_name) == normalized_target {
             return read_zip_file_to_string(&mut file, name);
         }
     }

@@ -70,6 +70,8 @@ jobs:
         run: powershell -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1 -Configuration release
 
       - name: Check on-device OCR on a scanned page
+        env:
+          LAWPDF_OCR_ENGINE: system
         shell: pwsh
         run: |
           $report = Join-Path $env:RUNNER_TEMP 'ocr-self-test-windows.json'
@@ -193,6 +195,8 @@ jobs:
         run: bash scripts/package-macos.sh
 
       - name: Check on-device OCR on a scanned page
+        env:
+          LAWPDF_OCR_ENGINE: system
         run: |
           report="$RUNNER_TEMP/ocr-self-test-macos.json"
           app_binary="$(find dist -path '*.app/Contents/MacOS/*' -type f -perm -u+x | head -n 1)"

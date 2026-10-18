@@ -152,13 +152,16 @@ fn median(values: impl Iterator<Item = f64>) -> f64 {
 #[cfg(target_os = "windows")]
 mod platform {
     use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
 
     use image::imageops::FilterType;
     use windows::Globalization::Language;
     use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap};
     use windows::Media::Ocr::OcrEngine;
     use windows::Storage::Streams::DataWriter;
-    use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+    use windows::Win32::System::Com::{
+        COINIT_MULTITHREADED, CoIncrementMTAUsage, CoInitializeEx, CoUninitialize,
+    };
     use windows::core::HSTRING;
 
     use super::{RecognizedLine, SystemOcrError, assemble_page_text};
@@ -190,9 +193,30 @@ mod platform {
     fn on_multithreaded_thread<T: Send + 'static>(
         work: impl FnOnce() -> Result<T, SystemOcrError> + Send + 'static,
     ) -> Result<T, SystemOcrError> {
+        // windows-rs caches agile WinRT factories for the process lifetime.
+        // If the last short-lived OCR thread tears down the MTA, those cached
+        // factories can point to freed objects on the next page/request.
+        // Retain one process-lifetime MTA reference to match their lifetime;
+        // each worker still balances its own CoInitializeEx below.
+        static MTA_COOKIE: OnceLock<Result<usize, SystemOcrError>> = OnceLock::new();
         std::thread::Builder::new()
             .name("lawpdf-windows-ocr".to_owned())
             .spawn(move || {
+                MTA_COOKIE
+                    .get_or_init(|| {
+                        // SAFETY: Keep COM's MTA alive until process exit, matching
+                        // the cached factories. Initialize on this worker so an
+                        // uninitialized caller/UI thread keeps its apartment choice.
+                        unsafe { CoIncrementMTAUsage() }
+                            .map(|cookie| cookie.0 as usize)
+                            .map_err(|error| {
+                                SystemOcrError::Unavailable(format!(
+                                    "Could not initialize Windows OCR: {error}"
+                                ))
+                            })
+                    })
+                    .as_ref()
+                    .map_err(Clone::clone)?;
                 let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
                 let result = work();
                 if initialized {

@@ -1276,6 +1276,52 @@ mod tests {
     }
 
     #[test]
+    fn scanned_pages_become_searchable_without_changing_the_source() {
+        if let Err(error) = local_ocr_engine() {
+            assert!(!cfg!(target_os = "macos"), "macOS OCR unavailable: {error}");
+            eprintln!("skipping OCR round trip: {error}");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("scan.pdf");
+        let destination = directory.path().join("searchable.pdf");
+        let original = include_bytes!("../tests/fixtures/ocr/scanned-law-review-sample.pdf");
+        std::fs::write(&source, original).unwrap();
+        let engine = PdfEngine::new().unwrap();
+        let mut recognized = Vec::new();
+        for page in 0..2 {
+            assert!(
+                engine
+                    .load_page_text(&source, page)
+                    .unwrap()
+                    .trim()
+                    .is_empty()
+            );
+            let text = ocr_page_with_engine(&engine, &source, page).unwrap();
+            assert!(text.len() > 100, "page {} was not read: {text:?}", page + 1);
+            recognized.push(text);
+        }
+        let all = recognized.join("\n").to_lowercase();
+        assert!(all.contains("consideration") && all.contains("promise"));
+        // Verify PDF font-code encoding independently of OCR punctuation accuracy.
+        let symbols = "Legal symbols: § 79 — “bargained” ’49.";
+        recognized[0].push_str(&format!("\n{symbols}"));
+        save_with_ocr_text(&source, &destination, &[(612.0, 792.0); 2], &recognized).unwrap();
+        for page in 0..2 {
+            let extracted = engine.load_page_text(&destination, page).unwrap();
+            assert!(extracted.len() > 100);
+            assert!(!extracted.contains('\0') && !extracted.contains("þÿ"));
+            if page == 0 {
+                assert!(
+                    extracted.contains(symbols),
+                    "corrupt text layer: {extracted}"
+                );
+            }
+        }
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+    }
+
+    #[test]
     fn self_test_report_is_written_and_rejects_unknown_arguments() {
         let output = std::env::temp_dir().join(format!(
             "lawpdf_ocr_self_test_report_{}.json",
