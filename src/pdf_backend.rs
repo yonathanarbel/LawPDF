@@ -2166,7 +2166,7 @@ fn ocr_text_content(text: &str, page_size: (f32, f32)) -> Result<Vec<u8>> {
     for line in ocr_pdf_lines(text) {
         operations.push(Operation::new(
             "Tj",
-            vec![literal(sanitize_pdf_text(&line))],
+            vec![win_ansi_literal(&sanitize_pdf_text(&line))],
         ));
         operations.push(Operation::new("T*", vec![]));
     }
@@ -2191,6 +2191,51 @@ fn ocr_pdf_lines(text: &str) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// Encodes OCR text for the WinAnsi Helvetica font used by the invisible text
+/// layer. Content-stream strings are font codes, not PDF text strings, so a
+/// UTF-16 byte-order mark would be read as the characters "þÿ" followed by
+/// interleaved zero bytes, breaking search on any line with "§" or curly
+/// quotes. Characters outside Windows-1252 become "?".
+fn win_ansi_literal(text: &str) -> Object {
+    let bytes = text.chars().map(win_ansi_byte).collect::<Vec<_>>();
+    Object::String(bytes, StringFormat::Literal)
+}
+
+fn win_ansi_byte(ch: char) -> u8 {
+    match ch {
+        '\u{20}'..='\u{7e}' => ch as u8,
+        '\u{a0}'..='\u{ff}' => ch as u32 as u8,
+        '\u{20ac}' => 0x80,
+        '\u{201a}' => 0x82,
+        '\u{0192}' => 0x83,
+        '\u{201e}' => 0x84,
+        '\u{2026}' => 0x85,
+        '\u{2020}' => 0x86,
+        '\u{2021}' => 0x87,
+        '\u{02c6}' => 0x88,
+        '\u{2030}' => 0x89,
+        '\u{0160}' => 0x8a,
+        '\u{2039}' => 0x8b,
+        '\u{0152}' => 0x8c,
+        '\u{017d}' => 0x8e,
+        '\u{2018}' => 0x91,
+        '\u{2019}' => 0x92,
+        '\u{201c}' => 0x93,
+        '\u{201d}' => 0x94,
+        '\u{2022}' => 0x95,
+        '\u{2013}' => 0x96,
+        '\u{2014}' => 0x97,
+        '\u{02dc}' => 0x98,
+        '\u{2122}' => 0x99,
+        '\u{0161}' => 0x9a,
+        '\u{203a}' => 0x9b,
+        '\u{0153}' => 0x9c,
+        '\u{017e}' => 0x9e,
+        '\u{0178}' => 0x9f,
+        _ => b'?',
+    }
 }
 
 fn sanitize_pdf_text(text: &str) -> String {
@@ -2843,6 +2888,22 @@ pub fn sidecar_path_for_export(source: &Path, suffix: &str, extension: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ocr_text_layer_uses_win_ansi_codes_for_legal_symbols() {
+        let content = ocr_text_content(
+            "See Restatement \u{a7} 79 \u{2014} \u{201c}bargained\u{201d} \u{2019}49 \u{3b1}",
+            (612.0, 792.0),
+        )
+        .unwrap();
+        assert!(!content.windows(2).any(|pair| pair == [0xfe, 0xff]));
+        assert!(!content.contains(&0x00));
+        for byte in [0xa7u8, 0x97, 0x93, 0x94, 0x92] {
+            assert!(content.contains(&byte), "missing WinAnsi byte {byte:#x}");
+        }
+        assert_eq!(win_ansi_byte('\u{3b1}'), b'?');
+        assert_eq!(win_ansi_byte('A'), b'A');
+    }
 
     #[test]
     fn marks_round_trip_on_cropped_rotated_pages_and_after_rotation() {

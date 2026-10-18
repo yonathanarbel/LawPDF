@@ -258,10 +258,22 @@ pub fn deep_source_lines_for_pages_with_extraction_report_and_text_overrides(
     let source_lines = all_lines
         .iter()
         .map(|line| {
-            let page_object = pages
+            let synthetic_text_geometry = use_selected_text
                 .get(line.page_index)
-                .map(|page| page_object_features_for_line(page, line))
-                .unwrap_or_default();
+                .copied()
+                .unwrap_or(false);
+            // OCR pages carry synthetic line boxes laid over a scanned page
+            // image. That image is the text itself, so image and drawing
+            // overlaps say nothing about tables or figures and would hide the
+            // whole page as "Table/Figure".
+            let page_object = if synthetic_text_geometry {
+                PageObjectLineFeatures::default()
+            } else {
+                pages
+                    .get(line.page_index)
+                    .map(|page| page_object_features_for_line(page, line))
+                    .unwrap_or_default()
+            };
             DeepLiquidSourceLine {
                 id: deep_source_line_id(line.page_index, line.line_index),
                 page_index: line.page_index,
@@ -269,10 +281,7 @@ pub fn deep_source_lines_for_pages_with_extraction_report_and_text_overrides(
                 page_height: line.page_height,
                 line_index: line.line_index,
                 text: line.text.clone(),
-                synthetic_text_geometry: use_selected_text
-                    .get(line.page_index)
-                    .copied()
-                    .unwrap_or(false),
+                synthetic_text_geometry,
                 left: line.left,
                 bottom: line.bottom,
                 right: line.right,
@@ -8627,6 +8636,34 @@ mod tests {
         assert!(text.contains("recovered OCR body"));
         assert!(!text.contains("broken native header"));
         assert!(lines.iter().all(|line| line.id.starts_with("p0:l")));
+    }
+
+    #[test]
+    fn scanned_page_image_does_not_mark_ocr_lines_as_figures() {
+        let mut page = PageInfo::new(612.0, 792.0);
+        // A scan is one image covering the whole page.
+        page.image_object_rects
+            .push(PdfRect::new(0.0, 0.0, 612.0, 792.0));
+        let selected = vec![
+            "Courts have long said that they will not weigh the adequacy of consideration.\n\
+             A promise supported by a peppercorn binds as surely as one supported by a fortune."
+                .to_owned(),
+        ];
+
+        let lines = deep_source_lines_for_pages_with_text_overrides(
+            &[page.clone()],
+            &[None],
+            &selected,
+            &[true],
+        );
+
+        assert!(!lines.is_empty());
+        for line in &lines {
+            assert!(line.synthetic_text_geometry);
+            assert!(!line.page_object_overlaps_image_bbox, "{}", line.text);
+            assert!(!line.page_object_hide_candidate_guarded, "{}", line.text);
+            assert_eq!(line.page_object_image_overlap_ratio, 0.0);
+        }
     }
 
     #[test]

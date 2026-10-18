@@ -62,10 +62,8 @@ impl RecognizedLine {
 /// paragraph break is inferred from vertical gaps, first-line indents, short
 /// closing lines, size changes, and jumps back up the page (a new column).
 pub(crate) fn assemble_page_text(lines: &[RecognizedLine]) -> String {
-    let lines = lines
-        .iter()
-        .filter(|line| !line.text.trim().is_empty())
-        .collect::<Vec<_>>();
+    let lines = merge_same_row_pieces(lines);
+    let lines = lines.iter().collect::<Vec<_>>();
     if lines.is_empty() {
         return String::new();
     }
@@ -106,6 +104,34 @@ pub(crate) fn assemble_page_text(lines: &[RecognizedLine]) -> String {
         output.push_str(line.text.trim());
     }
     output
+}
+
+/// Recognizers split one printed line at wide gaps, as in a running head
+/// ("1949]   NOMINAL CONSIDERATION   217"). Consecutive pieces that share a
+/// row are rejoined with a space so the line reads as printed.
+fn merge_same_row_pieces(lines: &[RecognizedLine]) -> Vec<RecognizedLine> {
+    let mut merged: Vec<RecognizedLine> = Vec::new();
+    for line in lines.iter().filter(|line| !line.text.trim().is_empty()) {
+        if let Some(previous) = merged.last_mut() {
+            let overlap = previous.bottom.min(line.bottom) - previous.top.max(line.top);
+            let shorter = previous.height().min(line.height());
+            if shorter > 0.0
+                && overlap > shorter * 0.5
+                && line.left >= previous.right - shorter * 0.5
+            {
+                previous.text = format!("{} {}", previous.text.trim_end(), line.text.trim());
+                previous.right = previous.right.max(line.right);
+                previous.top = previous.top.min(line.top);
+                previous.bottom = previous.bottom.max(line.bottom);
+                continue;
+            }
+        }
+        merged.push(RecognizedLine {
+            text: line.text.trim().to_owned(),
+            ..line.clone()
+        });
+    }
+    merged
 }
 
 fn ends_sentence(text: &str) -> bool {
@@ -501,6 +527,20 @@ mod tests {
         assert_eq!(
             text,
             "Body text that runs to the margin and keeps\n\n1 See Restatement (Second) of Contracts § 71.\n\nSecond column text"
+        );
+    }
+
+    #[test]
+    fn running_head_pieces_on_one_row_are_rejoined() {
+        let text = assemble_page_text(&[
+            line("1949]", 100.0, 60.0, 160.0),
+            line("NOMINAL CONSIDERATION AND THE BARGAIN", 380.0, 61.0, 1000.0),
+            line("217", 1080.0, 60.0, 1120.0),
+            line("I. THE PUZZLE OF THE PEPPERCORN", 400.0, 140.0, 980.0),
+        ]);
+        assert_eq!(
+            text,
+            "1949] NOMINAL CONSIDERATION AND THE BARGAIN 217\n\nI. THE PUZZLE OF THE PEPPERCORN"
         );
     }
 
