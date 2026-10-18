@@ -10,9 +10,20 @@ pub fn running() -> bool {
 
 pub fn run() -> eframe::Result<()> {
     RUNNING.store(true, Ordering::Relaxed);
+    crate::diagnostics::start_session();
     let paths: Vec<_> = std::env::args_os().skip_while(|arg| arg != "--smoke-shutdown")
         .skip(1).map(std::path::PathBuf::from).collect();
-    let delay = if paths.is_empty() { Duration::from_millis(350) } else { Duration::from_secs(3) };
+    let delay = std::env::var("LAWPDF_SHUTDOWN_SMOKE_DELAY_MS")
+        .ok().and_then(|value| value.parse::<u64>().ok())
+        .map(|ms| Duration::from_millis(ms.min(30_000)))
+        .unwrap_or_else(|| if paths.is_empty() { Duration::from_millis(350) } else { Duration::from_secs(3) });
+    // QA-only override permits an A/B comparison with the old macOS return path.
+    // Normal applications cannot enable this override or the isolated data dir.
+    let run_and_return = match std::env::var("LAWPDF_SHUTDOWN_SMOKE_RETURN").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => crate::native_run_and_return(),
+    };
     let (tx, rx) = crossbeam_channel::unbounded();
     #[cfg(target_os = "macos")]
     let registration = crate::macos_open_files::install(tx);
@@ -38,7 +49,10 @@ pub fn run() -> eframe::Result<()> {
     }
     eframe::run_native(
         "LawPDF shutdown verification",
-        eframe::NativeOptions::default(),
+        eframe::NativeOptions {
+            run_and_return,
+            ..Default::default()
+        },
         Box::new(move |cc| {
             #[cfg(target_os = "macos")]
             registration.register();
@@ -56,5 +70,6 @@ pub fn run() -> eframe::Result<()> {
         }),
     )?;
     println!("LawPDF native shutdown completed cleanly");
+    crate::diagnostics::finish_session("shutdown_smoke_complete");
     Ok(())
 }

@@ -1162,12 +1162,25 @@ impl PdfEditorApp {
         };
         toolbar_icon_menu_button(ui, ToolbarIcon::Overflow, true, "More", |ui| {
             ui.set_min_width(260.0);
+            let ocr_active = self.ocr_is_active();
             if ui
                 .add_enabled(
-                    has_document,
+                    has_document && !ocr_active,
                     egui::Button::new("OCR: save a searchable copy…"),
                 )
-                .on_hover_text("Use OpenRouter OCR and save a searchable PDF copy")
+                .on_hover_text(super::LOCAL_OCR_SAVE_HOVER)
+                .clicked()
+            {
+                self.sidebar_tab = SidebarTab::Search;
+                self.start_local_ocr_save();
+                ui.close();
+            }
+            if ui
+                .add_enabled(
+                    has_document && !ocr_active,
+                    egui::Button::new("Cloud OCR (OpenRouter): save a searchable copy…"),
+                )
+                .on_hover_text(super::CLOUD_OCR_SAVE_HOVER)
                 .clicked()
             {
                 self.sidebar_tab = SidebarTab::Search;

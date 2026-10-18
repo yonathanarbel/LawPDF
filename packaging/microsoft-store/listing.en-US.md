@@ -1,13 +1,10 @@
 # Microsoft Store listing
 
-Publication status: app 0.2.34 is live under publisher John Arbel, Store ID
-9MZXSP0C423F (verified September 27, 2026). This listing accompanies app
-0.2.36 in Submission 2, submitted September 27, 2026. Partner Center confirmed
-Update in certification; pre-processing subsequently completed and certification
-was in progress. The new Windows reading and coffee
-screenshots, support-price disclosure, and external-commerce declaration were
-saved before submission. Certification and a fresh Store installation on the
-owner's Windows PC remain unverified.
+This listing accompanies app 0.2.42, Store package 1.2.42.0, under publisher
+John Arbel and Store ID 9MZXSP0C423F. Publication and certification are separate
+from the GitHub release. See `docs/MICROSOFT_STORE.md` for dated submission
+observations and verification boundaries. Existing reading and coffee-panel
+screenshots and the external-commerce disclosure are retained.
 
 ## Product name
 LawPDF
@@ -20,9 +17,9 @@ Created by Professor Yonathan Arbel, LawPDF is a free, open-source PDF reader an
 
 Read the original PDF, search for a passage, highlight important text, leave comments, and add text boxes. Review Mode reconstructs reading flow and footnotes in law review articles while keeping the original PDF available for checking quotations, citations, and layout.
 
-LawPDF saves annotations automatically and includes recovery copies, undo and redo, and visible save status. If a save fails, the document remains open so you can decide what to do next.
+LawPDF saves annotations automatically and includes recovery copies, undo and redo, and visible save status. Choose Save As in the toolbar or press Ctrl+Shift+S to choose a folder and filename; later edits save to that file. Hover over the save status to see the full path. If a save fails, the document remains open so you can decide what to do next.
 
-Ordinary PDF reading and annotation work locally. Optional cloud AI, OCR, and narration features require your own provider account and may incur provider charges. They send the selected content needed for the requested feature to the chosen service; review the privacy policy before using confidential material.
+Reading, annotation, and OCR of scanned pages work locally; OCR uses the text recognizer built into Windows, so there is nothing extra to install. Optional cloud AI, cloud OCR, and narration features require your own provider account and may incur provider charges. They send the selected content needed for the requested feature to the chosen service; review the privacy policy before using confidential material.
 
 Optional coffee support: the small cup icon opens Buy Me a Coffee in your browser. Support starts at US$5 per coffee; choose a quantity and review the total before paying. Monthly support is optional. Support unlocks no features or rewards. Microsoft is not the fundraiser or payment provider.
 
@@ -33,10 +30,25 @@ This is a public beta. Verify reconstructed text against the original PDF and re
 - Highlight, underline, comment, and add text boxes to PDF documents.
 - Reconstruct legal reading flow and footnotes with local Review Mode models.
 - Save annotations automatically, with recovery copies and clear save failures.
+- Choose a folder and filename with Save As (Ctrl+Shift+S).
+- Recognize text in scanned PDFs with Windows' built-in OCR and save searchable copies.
 - Receive application updates through Microsoft Store.
 
 ## Suggested category
 Productivity
+
+## What's new in 0.2.42
+OCR now uses the text recognizer built into Windows, so Run OCR and "OCR: save a
+searchable copy" work without installing anything and without uploading pages.
+Recognized text feeds search, copying, and Review Mode for scanned PDFs. Cloud
+OCR through your own OpenRouter key remains a separate, optional command.
+
+## What's new in 0.2.40
+Review Mode now completes the opening-page preview before preparing the rest of
+the document, preventing a loading animation that could remain indefinitely.
+Local diagnostic logs now retain shutdown stages and errors, detect interrupted
+sessions on the next launch, and help diagnose PDF worker failures. Logs do not
+include document text or provider credentials.
 
 ## Privacy URL
 https://github.com/yonathanarbel/LawPDF/blob/main/docs/PRIVACY.md
@@ -55,6 +67,8 @@ LawPDF is a native Rust/Win32 desktop PDF application, so it requires runFullTru
 
 ## Reviewer instructions
 No LawPDF account or payment is required. Start LawPDF, choose Open PDF, and select a nonconfidential PDF. Read and search the PDF, add an annotation, wait for saved status, close the tab, and reopen the PDF to verify persistence. Review Mode uses the bundled models. Optional network-backed AI features require a user-supplied provider account; they are not needed to test reading, annotation, saving, or local Review Mode. Use only disposable documents during certification tests.
+
+To test Save As, annotate a disposable PDF, choose Save As in the toolbar (or press Ctrl+Shift+S), and choose a new folder and filename. Confirm that the tab displays the new name; add another annotation, wait for saved status, close the tab, and reopen the chosen file. Confirm that both annotations are present. Hover over the saved status to inspect its full path.
 
 The small coffee-cup icon in the top bar opens an optional support panel. Its
 "Buy me a coffee" button opens https://buymeacoffee.com/lawpdf in the default

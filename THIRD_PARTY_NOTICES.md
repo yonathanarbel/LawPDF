@@ -62,10 +62,13 @@ runtime. Its license is committed under:
 third_party/inno-setup/LICENSE.txt
 ```
 
-## Tesseract OCR
+## OCR engines
 
-LawPDF invokes `tesseract.exe` only when OCR is requested. Tesseract is not
-bundled in the LawPDF release packages; users install it separately.
+On-device OCR uses the recognizer included with the operating system:
+`Windows.Media.Ocr` on Windows and the Vision framework on macOS. Neither is
+bundled or redistributed by LawPDF. If the system recognizer is unavailable,
+LawPDF invokes a separately installed `tesseract` executable found on PATH.
+Tesseract is not bundled in the LawPDF release packages.
 
 ## CatBoost Model Evaluation Library
 

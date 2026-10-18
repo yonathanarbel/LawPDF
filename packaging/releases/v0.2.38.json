@@ -1,0 +1,10 @@
+{
+  "version": "0.2.38",
+  "commit": "747cbb8435c5b484fec2c7a1f1b245ab03b6577e",
+  "release_id": 410689429,
+  "manifest_sha256": "1a6e17011c48d78a2588d631749f1b74e958753c16a19f471870ada12743a2d8",
+  "required_runs": [
+    38260426868,
+    38260355157
+  ]
+}

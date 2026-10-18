@@ -6,7 +6,7 @@ LawPDF reads and annotates PDFs locally. An ordinary open, search, highlight, or
 
 - Direct-download desktop update checks contact GitHub and disclose the connection's IP address and LawPDF's version in its user-agent. Downloads contact GitHub's artifact delivery infrastructure. Document contents and API keys are not included. Microsoft Store builds disable these GitHub update checks and receive updates through Microsoft Store.
 - Asking a document chat question sends the question, conversation context, and selected document context to OpenRouter and its selected model provider.
-- Choosing cloud OCR sends page images to OpenRouter and its selected vision provider. Operating-system OCR runs locally.
+- Choosing cloud OCR sends page images to OpenRouter and its selected vision provider. On-device OCR (**Run OCR** and **OCR: save a searchable copy**) uses the operating system's own recognizer, Windows OCR or macOS Vision, and runs locally. A separately installed Tesseract is used only if the system recognizer is unavailable, and it also runs locally.
 - Choosing a cloud-assisted reading feature sends the text needed for that feature to its named provider. Local Review Mode reconstruction uses bundled models on the device.
 - Choosing paid narration sends the text to OpenAI or OpenRouter, according to the selected provider. System narration uses the operating system's speech service.
 - The separate **Send review** action uploads generated review text, layout metadata, the document title, and the optional comment to `lawpdf.battleoftheforms.com` for improving reading reconstruction. The dialog explains this before submission. Do not use it for confidential material. Reading corrections stored locally are not automatically uploaded by this action unless included in the submitted review.
@@ -26,6 +26,19 @@ Settings provides a retention period for cached content and old backup copies, a
 For Microsoft Store installations, Windows can remove package-private application data when the app is uninstalled or reset, including cached content and recovery copies. Save or export pending edits to ordinary document files before uninstalling or resetting. PDFs saved outside the package's application-data folders are separate from the installed app. Existing data from a direct-download installation and native-store credentials can remain. See [Microsoft's description of packaged desktop app storage](https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-behind-the-scenes).
 
 The support-diagnostics export contains only an explicit list of version, platform, job counts, and success/failure flags. It excludes document paths and text, keys, raw server responses, environment variables, and crash payloads. Nothing is sent automatically when creating this file.
+
+Starting with desktop 0.2.40, the local `logs` folder also keeps lifecycle and
+error records in `diagnostics.jsonl`, plus a session marker used to detect an
+interrupted prior session. Records include timestamps, application version,
+process IDs, shutdown stages, bounded error descriptions, and panic locations;
+the application does not intentionally record document text or provider keys.
+On macOS, it also records summaries of LawPDF crash reports (report filename,
+OS/app versions, exception, and termination reason), not their complete contents.
+These files are not uploaded automatically or included in the minimal support
+export described above. On launch, a diagnostic log larger than 2 MiB is rotated,
+retaining one previous log. After quitting, the `logs` folder and `panic.log` can
+be removed without deleting document annotations or recovery copies. Inspect
+diagnostic files for private information before sharing them.
 
 Android keeps immutable PDF sources and annotation journals in private app storage. Completed edits are saved automatically there; the source supplied by the document provider is preserved. Reopening identical PDF bytes restores the marks. A changed PDF is treated as a different revision. If provider access is lost, an available verified local source can be opened as a recovery copy. The Android app excludes its storage from its own cloud/device backup rules. Clearing Android app storage or uninstalling removes those local copies and marks. Export a copy before doing so. Android **Save copy** creates flattened image pages; selectable text, editable annotation objects, and digital-signature validity are not preserved in that export.
 

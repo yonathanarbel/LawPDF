@@ -7,6 +7,7 @@ mod atomic_file;
 mod benchmark;
 mod chat;
 mod credentials;
+mod diagnostics;
 mod document_store;
 mod hashing;
 mod layout_roles;
@@ -34,6 +35,7 @@ mod settings;
 mod shutdown_smoke;
 mod single_instance;
 mod storage_maintenance;
+mod system_ocr;
 mod text_conversion;
 mod text_search;
 mod tts;
@@ -52,6 +54,7 @@ const APP_TITLE: &str = concat!(
 );
 
 fn main() -> eframe::Result<()> {
+    install_panic_log_hook();
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     // The child has no UI, update service, credentials, or document-write
     // commands. Anonymous pipes carry its bounded request/response protocol.
@@ -82,13 +85,22 @@ fn main() -> eframe::Result<()> {
     }
     #[cfg(target_os = "macos")]
     macos_open_files::install_appkit_crash_workarounds();
-    install_panic_log_hook();
 
     #[cfg(feature = "devtools")]
     if args.iter().any(|arg| arg == "--smoke-shutdown") {
         return shutdown_smoke::run();
     }
 
+    if args.iter().any(|arg| arg == "--ocr-self-test") {
+        match ocr::run_ocr_self_test(args.clone()) {
+            Ok(true) => return Ok(()),
+            Ok(false) => std::process::exit(2),
+            Err(error) => {
+                eprintln!("OCR self-test failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if args.iter().any(|arg| arg == "--lm2-runtime-status") {
         if let Err(error) = liquid2::run_lm2_runtime_status(args.clone().into_iter()) {
             eprintln!("LiquidMode2 runtime verification failed: {error}");
@@ -162,6 +174,7 @@ fn main() -> eframe::Result<()> {
     }
 
     let options = eframe::NativeOptions {
+        run_and_return: native_run_and_return(),
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_TITLE)
             .with_icon(std::sync::Arc::new(load_app_icon()))
@@ -170,7 +183,8 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    diagnostics::start_session();
+    let result = eframe::run_native(
         APP_TITLE,
         options,
         Box::new(move |cc| {
@@ -187,7 +201,23 @@ fn main() -> eframe::Result<()> {
                 Some(macos_open_files),
             )))
         }),
-    )
+    );
+    match &result {
+        Ok(()) => diagnostics::event("run_native_returned"),
+        Err(error) => diagnostics::error("run_native_error", &error.to_string()),
+    }
+    diagnostics::finish_session(if result.is_ok() { "clean" } else { "run_native_error" });
+    result
+}
+
+/// On macOS, stop after eframe has saved and destroyed the app instead of
+/// returning through AppKit's display-cycle cleanup. On affected systems that
+/// path aborts while invalidating `_NSTouchBarFinderObservation`. eframe's
+/// supported run-and-exit mode still runs `on_exit` and destroys the app/windows
+/// before calling `process::exit`; our normal-exit hook then finishes the log.
+/// Keep the existing return behavior on other platforms.
+pub(crate) const fn native_run_and_return() -> bool {
+    !cfg!(target_os = "macos")
 }
 
 #[cfg(feature = "devtools")]
@@ -587,6 +617,7 @@ fn install_panic_log_hook() {
             thread.name().unwrap_or("unnamed"),
             location
         );
+        diagnostics::panic(thread.name().unwrap_or("unnamed"), &location);
         if let Some(dir) = settings::app_data_dir() {
             let _ = std::fs::create_dir_all(&dir);
             let path = dir.join("panic.log");

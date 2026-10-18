@@ -53,7 +53,7 @@ const LM2_D1_RUNTIME_FOOTER_ARTIFACT_OVERLAY_VERSION: &str =
     "d1-footer-artifact-v1-guarded-no-contact";
 const LM2_FOOTNOTE_MONOTONE_OVERLAY_VERSION: &str = "footnote-monotone-v1-marker-context";
 const LM2_FOOTNOTE_CARRYOVER_OVERLAY_VERSION: &str = "footnote-carryover-v1-open-prev-smallfont";
-const LM2_ASSEMBLY_CACHE_VERSION: &str = "lm2-assembly-v156-runtime-isolation-and-inference-errors";
+const LM2_ASSEMBLY_CACHE_VERSION: &str = "lm2-assembly-v157-ocr-pages-ignore-scan-image-objects";
 const LM2_MAX_NOTE_MARKER: u16 = 999;
 const LM2_TABLE_FIGURE_ROUTER_OVERLAY_VERSION: &str = "table-figure-router-v4-default-on";
 const LM2_PAGE_OBJECT_OVERLAY_VERSION: &str = "page-object-overlay-v1-guarded-ruled-path";

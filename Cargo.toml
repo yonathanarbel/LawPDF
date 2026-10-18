@@ -1,6 +1,6 @@
 [package]
 name = "lawpdf"
-version = "0.2.38"
+version = "0.2.42"
 edition = "2024"
 description = "Native PDF reader and annotation editor for legal workflows"
 license = "MIT"
@@ -34,16 +34,17 @@ serde_json = "1.0"
 sha2 = "0.10"
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 tempfile = "3"
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.0", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
 objc2-pdf-kit = { version = "0.3.2", default-features = false, features = ["std", "PDFDocument", "objc2-app-kit"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "std"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSAppleEventDescriptor", "NSAppleEventManager", "NSNotification", "NSObject", "NSString", "NSUserDefaults", "NSURL", "objc2-core-services", "std"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSAppleEventDescriptor", "NSAppleEventManager", "NSData", "NSDictionary", "NSError", "NSNotification", "NSObject", "NSString", "NSUserDefaults", "NSURL", "objc2-core-services", "std"] }
+objc2-vision = { version = "0.3.2", default-features = false, features = ["VNObservation", "VNRecognizeTextRequest", "VNRequest", "VNRequestHandler", "objc2-core-foundation", "std"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.61.3", features = ["Win32_Media_Speech", "Win32_System_Com", "Win32_Storage_Packaging_Appx"] }
+windows = { version = "0.61.3", features = ["Foundation", "Foundation_Collections", "Globalization", "Graphics_Imaging", "Media_Ocr", "Storage", "Storage_Streams", "Win32_Media_Speech", "Win32_System_Com", "Win32_Storage_Packaging_Appx"] }
 
 [build-dependencies]
 winresource = { version = "0.1.31", default-features = false }

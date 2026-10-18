@@ -38,6 +38,20 @@ def require(condition, message):
     if not condition:
         raise RuntimeError(message)
 
+def verify_checksum_file(work):
+    # Windows and macOS checksum fragments retain their native line endings.
+    # Parse both without changing the downloaded checksum file or packages.
+    seen = set()
+    for line in (work / "SHA256SUMS.txt").read_text(encoding="utf-8").splitlines():
+        match = re.fullmatch(r"([a-f0-9]{64}) [ *](.+)", line)
+        require(match is not None, "Invalid checksum record")
+        digest, name = match.groups()
+        require(name in NAMES and name not in seen, "Unexpected or duplicate checksum package")
+        require(sha(work / name) == digest, f"Checksum mismatch: {name}")
+        seen.add(name)
+        print(f"{name}: OK", flush=True)
+    require(seen == NAMES, "Missing package checksum")
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--publish", action="store_true")
@@ -112,7 +126,7 @@ def main():
         "version": version, "commit": commit, "required_runs": record["required_runs"],
         "verified_packages": manifest["assets"], "windows_installation": installation}, indent=2) + "\n")
     # Verify the existing checksum file too; never replace the built packages.
-    subprocess.run(["sha256sum", "--check", "SHA256SUMS.txt"], cwd=work, check=True)
+    verify_checksum_file(work)
     if not args.publish:
         print("Package, provenance and checksum verification passed.", flush=True)
         print("VERIFIED_MANIFEST_BASE64=" + base64.b64encode(manifest_path.read_bytes()).decode("ascii"), flush=True)

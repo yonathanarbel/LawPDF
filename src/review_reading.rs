@@ -449,6 +449,7 @@ pub fn review_prepare_next_action(
     total_pages: usize,
     opening_ready: bool,
     all_ready: bool,
+    preview_ready: bool,
     preview_spawned: bool,
     full_spawned: bool,
 ) -> ReviewPrepareAction {
@@ -467,7 +468,9 @@ pub fn review_prepare_next_action(
             return ReviewPrepareAction::WaitForPages;
         }
         if !full_spawned {
-            if all_ready {
+            // Complete the preview before starting the full job: both share
+            // one result state, so overlapping jobs can leave Review incomplete.
+            if preview_ready && all_ready {
                 return ReviewPrepareAction::SpawnFull {
                     page_count: total_pages,
                 };
@@ -1760,15 +1763,15 @@ mod tests {
     #[test]
     fn short_documents_spawn_one_full_job_never_a_preview() {
         assert_eq!(
-            review_prepare_next_action(3, true, true, false, false),
+            review_prepare_next_action(3, true, true, false, false, false),
             ReviewPrepareAction::SpawnFull { page_count: 3 }
         );
         assert_eq!(
-            review_prepare_next_action(3, true, true, false, true),
+            review_prepare_next_action(3, true, true, false, false, true),
             ReviewPrepareAction::Nothing
         );
         assert_eq!(
-            review_prepare_next_action(3, false, false, false, false),
+            review_prepare_next_action(3, false, false, false, false, false),
             ReviewPrepareAction::WaitForPages
         );
     }
@@ -1776,20 +1779,32 @@ mod tests {
     #[test]
     fn long_documents_preview_then_full_without_double_preview() {
         assert_eq!(
-            review_prepare_next_action(20, true, false, false, false),
+            review_prepare_next_action(20, true, false, false, false, false),
             ReviewPrepareAction::SpawnPreview { page_count: 4 }
         );
         assert_eq!(
-            review_prepare_next_action(20, true, false, true, false),
+            review_prepare_next_action(20, true, false, false, true, false),
             ReviewPrepareAction::WaitForPages
         );
         assert_eq!(
-            review_prepare_next_action(20, true, true, true, false),
+            review_prepare_next_action(20, true, true, true, true, false),
             ReviewPrepareAction::SpawnFull { page_count: 20 }
         );
         assert_eq!(
-            review_prepare_next_action(20, true, true, true, true),
+            review_prepare_next_action(20, true, true, true, true, true),
             ReviewPrepareAction::Nothing
+        );
+    }
+
+    #[test]
+    fn full_review_waits_for_the_opening_preview_result() {
+        assert_eq!(
+            review_prepare_next_action(20, true, true, false, true, false),
+            ReviewPrepareAction::WaitForPages
+        );
+        assert_eq!(
+            review_prepare_next_action(20, true, true, true, true, false),
+            ReviewPrepareAction::SpawnFull { page_count: 20 }
         );
     }
 
@@ -1849,12 +1864,13 @@ mod tests {
         let reset = review_prepare_flags_after_restart();
         assert_eq!(reset, ReviewPrepareFlags::default());
         assert_eq!(
-            review_prepare_next_action(3, true, true, reset.preview_spawned, reset.full_spawned),
+            review_prepare_next_action(3, true, true, false, reset.preview_spawned, reset.full_spawned),
             ReviewPrepareAction::SpawnFull { page_count: 3 }
         );
         assert_eq!(
             review_prepare_next_action(
                 20,
+                true,
                 true,
                 true,
                 after_full.preview_spawned,
