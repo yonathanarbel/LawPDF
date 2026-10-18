@@ -67,6 +67,16 @@ certification**, with preprocessing in progress and publication set to start
 as soon as certification passes. This is not yet evidence of publication;
 the last verified live package remains `1.2.36.0`.
 
+On October 18, 2026, Microsoft's public Store catalog reported product
+`9MZXSP0C423F` (package family `JohnArbel.LawPDF_byt1cn7x1mmx2`) as last updated
+`2026-10-15T17:41:15Z`, with the 0.2.40 release notes. Submission 3 therefore
+appears to have passed certification and published `1.2.40.0`. A fresh
+installation of that version on the owner's Windows PC has not been verified.
+
+The packaging identity is now `1.2.42.0` for app 0.2.42, which replaces the
+Tesseract-only OCR path with the recognizer built into Windows. That package has
+not been built for, submitted to, or certified by Partner Center.
+
 ## Build and packaging
 
 - Build with `--features microsoft-store`. This disables GitHub update checks,
@@ -82,7 +92,7 @@ the last verified live package remains `1.2.36.0`.
   the result, and checks the executable and manifest identity.
 - The package depends on Microsoft's VC++ Desktop runtime framework; Store
   deployment supplies that dependency. Minimum OS is Windows 10 build 19041.
-- Store package version `1.2.40.0` maps to application version `0.2.40`. The package
+- Store package version `1.2.42.0` maps to application version `0.2.42`. The package
   major is nonzero and the fourth component is zero, as Microsoft requires. This
   packaging identity does not change the application's public-beta status.
 

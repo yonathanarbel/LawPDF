@@ -70,7 +70,13 @@ See [Apple's instructions](https://support.apple.com/en-us/102445) and our
   annotations without changing the original file.
 - **Find the passage you need:** native text selection, search, copy,
   continuous multi-page viewing, and zoom.
-- **Work with scanned materials:** OCR support for documents without native text.
+- **Work with scanned materials:** **Run OCR** reads scanned pages with the text
+  recognizer built into Windows or macOS, so there is nothing extra to install
+  and nothing leaves your computer. Recognized text feeds search, copying, and
+  Review Mode, and **OCR: save a searchable copy** writes a searchable PDF.
+  On Windows, OCR uses the recognition languages installed with Windows; if none
+  is installed, LawPDF says how to add one. **Cloud OCR** through your own
+  OpenRouter key remains optional.
 - **Keep your work:** automatic annotation saving, visible save status,
   undo/redo, recovery copies, and external-file conflict detection. Closing
   waits for pending writes; failed writes keep the document open.

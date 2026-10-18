@@ -127,13 +127,11 @@ fn median(values: impl Iterator<Item = f64>) -> f64 {
 mod platform {
     use std::path::{Path, PathBuf};
 
+    use image::imageops::FilterType;
     use windows::Globalization::Language;
-    use windows::Graphics::Imaging::{
-        BitmapAlphaMode, BitmapDecoder, BitmapInterpolationMode, BitmapPixelFormat,
-        BitmapTransform, ColorManagementMode, ExifOrientationMode,
-    };
+    use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap};
     use windows::Media::Ocr::OcrEngine;
-    use windows::Storage::{FileAccessMode, StorageFile};
+    use windows::Storage::Streams::DataWriter;
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
     use windows::core::HSTRING;
 
@@ -218,52 +216,43 @@ mod platform {
             SystemOcrError::Failed(format!("Windows OCR could not {stage}: {error}"))
         };
         let engine = create_engine()?;
-        let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(path.as_os_str()))
-            .and_then(|operation| operation.get())
-            .map_err(|error| failed("open the page image", error))?;
-        let stream = file
-            .OpenAsync(FileAccessMode::Read)
-            .and_then(|operation| operation.get())
-            .map_err(|error| failed("read the page image", error))?;
-        let decoder = BitmapDecoder::CreateAsync(&stream)
-            .and_then(|operation| operation.get())
-            .map_err(|error| failed("decode the page image", error))?;
-        let width = decoder
-            .PixelWidth()
-            .map_err(|error| failed("measure the page image", error))?;
-        let height = decoder
-            .PixelHeight()
-            .map_err(|error| failed("measure the page image", error))?;
-        let max_dimension = OcrEngine::MaxImageDimension().unwrap_or(10_000).max(1);
 
-        let bitmap = if width > max_dimension || height > max_dimension {
-            let scale = f64::from(max_dimension) / f64::from(width.max(height));
-            let transform =
-                BitmapTransform::new().map_err(|error| failed("resize the page image", error))?;
-            transform
-                .SetScaledWidth(((f64::from(width) * scale) as u32).max(1))
-                .and_then(|_| {
-                    transform.SetScaledHeight(((f64::from(height) * scale) as u32).max(1))
-                })
-                .and_then(|_| transform.SetInterpolationMode(BitmapInterpolationMode::Fant))
-                .map_err(|error| failed("resize the page image", error))?;
-            decoder
-                .GetSoftwareBitmapTransformedAsync(
-                    BitmapPixelFormat::Bgra8,
-                    BitmapAlphaMode::Premultiplied,
-                    &transform,
-                    ExifOrientationMode::IgnoreExifOrientation,
-                    ColorManagementMode::DoNotColorManage,
-                )
-                .and_then(|operation| operation.get())
+        // Decode in memory rather than handing Windows a file path, so the
+        // packaged (Store) app never depends on file-broker access to a temp file.
+        let image = image::open(path).map_err(|error| {
+            SystemOcrError::Failed(format!("Could not read the OCR page image: {error}"))
+        })?;
+        let max_dimension = OcrEngine::MaxImageDimension().unwrap_or(10_000).max(1);
+        let image = if image.width() > max_dimension || image.height() > max_dimension {
+            let scale = f64::from(max_dimension) / f64::from(image.width().max(image.height()));
+            image.resize(
+                ((f64::from(image.width()) * scale) as u32).max(1),
+                ((f64::from(image.height()) * scale) as u32).max(1),
+                FilterType::Triangle,
+            )
         } else {
-            decoder
-                .GetSoftwareBitmapConvertedAsync(
-                    BitmapPixelFormat::Bgra8,
-                    BitmapAlphaMode::Premultiplied,
-                )
-                .and_then(|operation| operation.get())
+            image
+        };
+        let rgba = image.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        let mut bgra = rgba.into_raw();
+        for pixel in bgra.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
         }
+        let writer = DataWriter::new().map_err(|error| failed("prepare the page image", error))?;
+        writer
+            .WriteBytes(&bgra)
+            .map_err(|error| failed("prepare the page image", error))?;
+        let buffer = writer
+            .DetachBuffer()
+            .map_err(|error| failed("prepare the page image", error))?;
+        let bitmap = SoftwareBitmap::CreateCopyWithAlphaFromBuffer(
+            &buffer,
+            BitmapPixelFormat::Bgra8,
+            width as i32,
+            height as i32,
+            BitmapAlphaMode::Premultiplied,
+        )
         .map_err(|error| failed("prepare the page image", error))?;
 
         let result = engine

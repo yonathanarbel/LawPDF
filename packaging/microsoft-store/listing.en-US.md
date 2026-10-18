@@ -1,6 +1,6 @@
 # Microsoft Store listing
 
-This listing accompanies app 0.2.40, Store package 1.2.40.0, under publisher
+This listing accompanies app 0.2.42, Store package 1.2.42.0, under publisher
 John Arbel and Store ID 9MZXSP0C423F. Publication and certification are separate
 from the GitHub release. See `docs/MICROSOFT_STORE.md` for dated submission
 observations and verification boundaries. Existing reading and coffee-panel
@@ -19,7 +19,7 @@ Read the original PDF, search for a passage, highlight important text, leave com
 
 LawPDF saves annotations automatically and includes recovery copies, undo and redo, and visible save status. Choose Save As in the toolbar or press Ctrl+Shift+S to choose a folder and filename; later edits save to that file. Hover over the save status to see the full path. If a save fails, the document remains open so you can decide what to do next.
 
-Ordinary PDF reading and annotation work locally. Optional cloud AI, OCR, and narration features require your own provider account and may incur provider charges. They send the selected content needed for the requested feature to the chosen service; review the privacy policy before using confidential material.
+Reading, annotation, and OCR of scanned pages work locally; OCR uses the text recognizer built into Windows, so there is nothing extra to install. Optional cloud AI, cloud OCR, and narration features require your own provider account and may incur provider charges. They send the selected content needed for the requested feature to the chosen service; review the privacy policy before using confidential material.
 
 Optional coffee support: the small cup icon opens Buy Me a Coffee in your browser. Support starts at US$5 per coffee; choose a quantity and review the total before paying. Monthly support is optional. Support unlocks no features or rewards. Microsoft is not the fundraiser or payment provider.
 
@@ -31,10 +31,17 @@ This is a public beta. Verify reconstructed text against the original PDF and re
 - Reconstruct legal reading flow and footnotes with local Review Mode models.
 - Save annotations automatically, with recovery copies and clear save failures.
 - Choose a folder and filename with Save As (Ctrl+Shift+S).
+- Recognize text in scanned PDFs with Windows' built-in OCR and save searchable copies.
 - Receive application updates through Microsoft Store.
 
 ## Suggested category
 Productivity
+
+## What's new in 0.2.42
+OCR now uses the text recognizer built into Windows, so Run OCR and "OCR: save a
+searchable copy" work without installing anything and without uploading pages.
+Recognized text feeds search, copying, and Review Mode for scanned PDFs. Cloud
+OCR through your own OpenRouter key remains a separate, optional command.
 
 ## What's new in 0.2.40
 Review Mode now completes the opening-page preview before preparing the rest of
