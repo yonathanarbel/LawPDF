@@ -9,6 +9,7 @@ mod document_opening;
 mod print_ui;
 mod recovery_ui;
 mod review_margin_ui;
+mod review_reveal;
 mod save_as;
 mod search_state;
 mod selection_state;
@@ -344,6 +345,23 @@ pub struct PdfEditorApp {
     /// When the reflow first became readable while the reader was still on the
     /// original PDF. Drives the reveal, and is cleared once it has played.
     liquid_mode2_reveal_at: Option<f64>,
+    /// The one-time reveal of how Review Mode rearranged the reader's page.
+    review_reveal: Option<review_reveal::ReviewReveal>,
+    /// The document the reveal has already played for, so it plays once.
+    review_reveal_played_epoch: Option<u64>,
+    /// The page the reader was on when they last left Review Mode for the
+    /// original view. Review Mode follows the reader only when they moved.
+    review_left_at_page: Option<usize>,
+    /// Pages the original view drew last frame, so the reveal can measure
+    /// the page the reader was looking at.
+    pdf_page_placements: Vec<(usize, PagePlacement)>,
+    /// The block drawing right now, so paragraph labels can be attributed.
+    review_reveal_block: std::cell::Cell<Option<usize>>,
+    /// Labels measured while drawing this frame, taken by the reveal after.
+    review_reveal_labels: std::cell::RefCell<Vec<review_reveal::CapturedLabel>>,
+    /// Scroll Review Mode without egui's scroll animation (the reveal is the
+    /// animation).
+    liquid_scroll_instant: bool,
     pending_markdown_copy: bool,
     pending_markdown_request: Option<PendingMarkdownRequest>,
     liquid_notice_dismissed: bool,
@@ -1154,6 +1172,13 @@ impl PdfEditorApp {
             review_pdf_split: false,
             liquid_mode2_runtime_choice: Lm2RuntimeChoice::CatBoost,
             liquid_mode2_reveal_at: None,
+            review_reveal: None,
+            review_reveal_played_epoch: None,
+            review_left_at_page: None,
+            pdf_page_placements: Vec::new(),
+            review_reveal_block: std::cell::Cell::new(None),
+            review_reveal_labels: std::cell::RefCell::new(Vec::new()),
+            liquid_scroll_instant: false,
             pending_markdown_copy: false,
             pending_markdown_request: None,
             liquid_notice_dismissed: false,
@@ -1738,6 +1763,8 @@ impl PdfEditorApp {
         self.review_pdf_split = false;
         self.liquid_mode2_runtime_choice = Lm2RuntimeChoice::CatBoost;
         self.liquid_mode2_reveal_at = None;
+        self.review_reveal = None;
+        self.review_left_at_page = None;
         self.pending_markdown_copy = false;
         self.pending_markdown_request = None;
         self.liquid_notice_dismissed = false;
@@ -3535,6 +3562,12 @@ impl PdfEditorApp {
             return;
         }
         self.clear_text_selection();
+        if mode == DocumentViewMode::Pdf && self.view_mode == DocumentViewMode::LiquidMode2 {
+            // Arm the switch back: Review Mode follows the reader to a new page.
+            self.liquid_mode2_reveal_at = None;
+            self.review_left_at_page = Some(self.page_index);
+            self.review_reveal = None;
+        }
         self.view_mode = mode;
         self.liquid_scroll_to_block = None;
         if matches!(
@@ -6311,6 +6344,10 @@ impl PdfEditorApp {
 
     fn draw_liquid_mode2_document(&mut self, ui: &mut egui::Ui, ctx: &Context) {
         let state = self.liquid_mode2_state.clone();
+        let ready_document = match &state {
+            LiquidState::Ready(document) => Some(Arc::clone(document)),
+            _ => None,
+        };
         let (canvas, sheet_fill, sheet_edge) = self.review_sheet_colors();
         ui.painter().rect_filled(ui.max_rect(), 0.0, canvas);
         egui::ScrollArea::vertical()
@@ -6471,6 +6508,9 @@ impl PdfEditorApp {
                     });
                 });
             });
+        if let Some(document) = ready_document {
+            self.draw_review_reveal(ui, ctx, &document);
+        }
     }
 
     /// Canvas, sheet, and sheet edge for the current reading theme.
@@ -6563,6 +6603,217 @@ impl PdfEditorApp {
             }
             block_index += 1;
         }
+    }
+
+    /// The first time a document opens in Review Mode from the original page,
+    /// measure that page so the reveal can show where its words went, and
+    /// open Review Mode at that page. Later switches keep Review Mode's own
+    /// scroll position and play nothing.
+    fn begin_review_reveal(&mut self, ctx: &Context, panel: Rect) {
+        let epoch = self.document_epoch;
+        let page_index = self.page_index;
+        if self.liquid_scroll_to_block.is_some() || self.review_left_at_page == Some(page_index) {
+            return;
+        }
+        let LiquidState::Ready(document) = &self.liquid_mode2_state else {
+            return;
+        };
+        let document = Arc::clone(document);
+        // The page's blocks may not be prepared yet; then Review Mode opens
+        // where it was and the reveal waits for a later switch.
+        let Some(block_index) = review_reveal::first_block_on_page(&document, page_index) else {
+            return;
+        };
+        self.liquid_scroll_to_block = Some(block_index);
+        self.liquid_scroll_instant = true;
+        ctx.request_repaint();
+        if self.review_reveal_played_epoch == Some(epoch)
+            || self.settings.reduce_motion
+            || self.review_pdf_split
+            || self.sbs_mode.is_some()
+        {
+            return;
+        }
+        let Some((_, placement)) = self
+            .pdf_page_placements
+            .iter()
+            .find(|(index, _)| *index == page_index)
+            .copied()
+        else {
+            return;
+        };
+        let Some(path) = self.document.as_ref().map(|document| document.path.clone()) else {
+            return;
+        };
+        let texture = self
+            .ensure_page_texture(ctx, &path, page_index)
+            .map(|view| view.texture_id);
+        let Some(chars) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.text_chars.get(page_index))
+            .and_then(Option::as_ref)
+        else {
+            return;
+        };
+        self.review_reveal =
+            review_reveal::ReviewReveal::plan(page_index, &placement, texture, chars, panel);
+        if self.review_reveal.is_some() {
+            self.review_reveal_played_epoch = Some(epoch);
+            ctx.request_repaint();
+        }
+    }
+
+    /// Add a Review paragraph label. While the reveal is measuring (its
+    /// first frames, under the printed page) the label is laid out and
+    /// painted by hand so the galley egui actually produced can be recorded
+    /// word by word; otherwise this is `ui.add(label)`.
+    fn add_review_label(&self, ui: &mut egui::Ui, label: egui::Label, size: f32) -> egui::Response {
+        let capturing = self
+            .review_reveal
+            .as_ref()
+            .is_some_and(|reveal| reveal.is_capturing());
+        let Some(block_index) = self.review_reveal_block.get().filter(|_| capturing) else {
+            return ui.add(label);
+        };
+        let (pos, galley, response) = label.layout_in_ui(ui);
+        if ui.is_rect_visible(response.rect) {
+            ui.painter().add(egui::epaint::TextShape::new(
+                pos,
+                Arc::clone(&galley),
+                ui.style().visuals.text_color(),
+            ));
+        }
+        self.review_reveal_labels
+            .borrow_mut()
+            .push(review_reveal::CapturedLabel {
+                block_index,
+                rect: response.rect,
+                style: review_reveal::LandingStyle {
+                    size,
+                    line_height: None,
+                },
+                words: review_reveal::galley_words(&galley, pos, None),
+            });
+        response
+    }
+
+    /// Paint the reveal over Review Mode, or finish it. Called after the
+    /// Review scroll area has drawn, in the same layer, so the flight sits
+    /// above the settled text and below the floating tool bar.
+    fn draw_review_reveal(&mut self, ui: &mut egui::Ui, ctx: &Context, document: &LiquidDocument) {
+        let captured = std::mem::take(&mut *self.review_reveal_labels.borrow_mut());
+        let (canvas, sheet_fill, _) = self.review_sheet_colors();
+        let ink = self.liquid_ink_color();
+        let Some(reveal) = self.review_reveal.as_mut() else {
+            return;
+        };
+        let now = ctx.input(|input| input.time);
+        let panel = ui.max_rect();
+        if reveal.is_capturing() {
+            reveal.labels.extend(captured);
+            let (source_lines, note_lines) =
+                review_reveal::source_maps(document, reveal.page_index);
+            reveal.settle(now, panel, &source_lines, &note_lines);
+        }
+        // Any new input ends it: a press, a scroll, a key. A key still held
+        // from the shortcut that opened Review Mode does not count.
+        let interrupted = ctx.input(|input| {
+            input.pointer.any_pressed()
+                || input.raw_scroll_delta != Vec2::ZERO
+                || input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key { pressed: true, .. } | egui::Event::Text(_)
+                    )
+                })
+        });
+        if interrupted || reveal.finished(now) || !reveal.is_active() {
+            self.review_reveal = None;
+            ctx.request_repaint();
+            return;
+        }
+        let Some(p) = reveal.progress(now) else {
+            self.review_reveal = None;
+            return;
+        };
+        let painter = ui.painter().with_clip_rect(panel);
+        let page_alpha = review_reveal::page_alpha(p);
+        // Destinations exist only once the flight has started; lay the
+        // landed words out then, once.
+        if !reveal.is_capturing() && reveal.galleys.is_empty() {
+            reveal.galleys = ui.fonts_mut(|fonts| {
+                reveal
+                    .words
+                    .iter()
+                    .map(|word| {
+                        word.to.map(|landing| {
+                            fonts.layout_job(review_reveal::landing_job(&word.text, landing.style))
+                        })
+                    })
+                    .collect()
+            });
+        }
+        let flights = reveal
+            .words
+            .iter()
+            .zip(&reveal.galleys)
+            .filter_map(|(word, galley)| {
+                let galley = galley.as_ref()?;
+                let landing = word.to?;
+                let end = review_reveal::landing_origin(&landing, galley);
+                let flight = review_reveal::flight(word, end, p)?;
+                Some((word, landing, galley, flight))
+            })
+            .collect::<Vec<_>>();
+        // Bottom to top: paper over each word's place in the reflow until it
+        // arrives (the rest of the reflow stays visible, so the words are
+        // seen taking their places in it); the canvas and the printed page
+        // over everything while the words lift; the words in flight above.
+        for (_, landing, _, f) in &flights {
+            if !f.settled {
+                painter.rect_filled(landing.rect.expand2(Vec2::new(1.0, 0.0)), 0.0, sheet_fill);
+            }
+        }
+        if page_alpha > 0.0 {
+            painter.rect_filled(panel, 0.0, review_reveal::with_alpha(canvas, page_alpha));
+            painter.rect_filled(
+                reveal.page_rect,
+                3.0,
+                review_reveal::with_alpha(Color32::WHITE, page_alpha),
+            );
+            if let Some(texture) = reveal.texture {
+                painter.image(
+                    texture,
+                    reveal.page_rect,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    review_reveal::with_alpha(Color32::WHITE, page_alpha),
+                );
+            }
+        }
+        // A lifting word fades out of the print and in as type, in place,
+        // then leaves blank paper behind.
+        if page_alpha > 0.0 {
+            for (word, _, _, f) in &flights {
+                if f.departed > 0.0 {
+                    painter.rect_filled(
+                        word.from.expand(1.5),
+                        0.0,
+                        review_reveal::with_alpha(Color32::WHITE, page_alpha * f.alpha),
+                    );
+                }
+            }
+        }
+        for (_, _, galley, f) in &flights {
+            if f.alpha <= 0.01 || f.settled {
+                continue;
+            }
+            let mut shape = egui::epaint::TextShape::new(Pos2::ZERO, Arc::clone(galley), ink)
+                .with_opacity_factor(f.alpha);
+            shape.transform(egui::emath::TSTransform::new(f.pos.to_vec2(), f.scale));
+            painter.add(egui::Shape::Text(shape));
+        }
+        ctx.request_repaint();
     }
 
     /// Eased 0..1 progress of the reveal that plays when the reflow replaces the
@@ -6788,7 +7039,9 @@ impl PdfEditorApp {
         ) {
             self.draw_review_table_figure(ui, document, block_index, block);
         }
+        self.review_reveal_block.set(Some(block_index));
         let inner = egui::Frame::NONE.show(ui, |ui| self.draw_liquid_block(ui, block));
+        self.review_reveal_block.set(None);
         if matches!(
             block.role,
             LiquidBlockRole::Title | LiquidBlockRole::Heading | LiquidBlockRole::Subheading
@@ -6825,8 +7078,14 @@ impl PdfEditorApp {
         }
         // Exact block identity makes repeated headings navigate deterministically.
         if self.liquid_scroll_to_block == Some(block_index) {
-            response.scroll_to_me(Some(Align::TOP));
+            if self.liquid_scroll_instant {
+                response
+                    .scroll_to_me_animation(Some(Align::TOP), egui::style::ScrollAnimation::none());
+            } else {
+                response.scroll_to_me(Some(Align::TOP));
+            }
             self.liquid_scroll_to_block = None;
+            self.liquid_scroll_instant = false;
         }
         // Keep ordinary Review Mode text inert. The block-wide overlay only becomes clickable for
         // an explicit provenance gesture or while the pointer is over a footnote marker. Because
@@ -7674,7 +7933,11 @@ impl PdfEditorApp {
             return Vec::new();
         }
         if !has_callout {
-            ui.add(egui::Label::new(body_text(text)).wrap().selectable(true));
+            self.add_review_label(
+                ui,
+                egui::Label::new(body_text(text)).wrap().selectable(true),
+                size,
+            );
             return Vec::new();
         }
 
@@ -7711,7 +7974,11 @@ impl PdfEditorApp {
             ui.spacing_mut().item_spacing.x = 0.0;
             for (is_callout, run) in &segments {
                 if !is_callout {
-                    ui.add(egui::Label::new(body_text(run)).wrap().selectable(true));
+                    self.add_review_label(
+                        ui,
+                        egui::Label::new(body_text(run)).wrap().selectable(true),
+                        size,
+                    );
                     continue;
                 }
                 let number = run
@@ -8693,6 +8960,7 @@ impl PdfEditorApp {
                             && matches!(self.liquid_mode2_state, LiquidState::Ready(_))
                         {
                             self.liquid_mode2_reveal_at = Some(ctx.input(|input| input.time));
+                            self.begin_review_reveal(ctx, ui.max_rect());
                         }
                         self.draw_liquid_mode2_document(ui, ctx);
                         return;
@@ -8887,6 +9155,7 @@ impl PdfEditorApp {
                             }
                         }
 
+                        self.pdf_page_placements.clear();
                         for page_index in visible_pages {
                             let page_layout = page_layouts[page_index];
                             let display_size = page_layout.display_size;
@@ -8899,6 +9168,7 @@ impl PdfEditorApp {
                                 page_width: page_layout.page_width,
                                 page_height: page_layout.page_height,
                             };
+                            self.pdf_page_placements.push((page_index, placement));
                             let response = ui.interact(
                                 rect,
                                 ui.id().with(("document-page", self.document_epoch, page_index)),
