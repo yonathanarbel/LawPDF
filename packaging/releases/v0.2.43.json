@@ -1,0 +1,10 @@
+{
+  "version": "0.2.43",
+  "commit": "5d166170eb65b2b37cbb1ab906828a1243b429b5",
+  "release_id": 417000504,
+  "manifest_sha256": "ffcf516d283ee93b3ba5dd9e4c42a592129418dbc8bee69df58f851caf1fd5b1",
+  "required_runs": [
+    39211601289,
+    39212232873
+  ]
+}
