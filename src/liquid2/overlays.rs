@@ -2242,7 +2242,12 @@ pub(super) fn attached_ascii_callout_range(
                 && !matches!(ch, '§' | '-' | '*' | CALLOUT_START | CALLOUT_END)
         });
         let bounded = after.is_none_or(|ch| !ch.is_ascii_digit());
-        if attached && bounded {
+        // A digit run glued to a following letter is part of a token, not a
+        // callout: the reporter series in "F.3d", "S.W.3d" and "F.4th", the
+        // ordinal in "2d Cir.", or "1L". Real callouts are followed by space,
+        // punctuation or the end of the line.
+        let glued_to_word = after.is_some_and(|ch| ch.is_alphabetic());
+        if attached && bounded && !glued_to_word {
             return Some((start, end));
         }
         cursor = end;

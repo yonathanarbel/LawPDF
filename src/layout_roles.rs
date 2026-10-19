@@ -1689,9 +1689,14 @@ fn plausible_inline_callout_context(text: &str, start: usize, end: usize) -> boo
         " chapter ",
         " § ",
     ];
-    if citation_prefixes
-        .iter()
-        .any(|prefix| before_lower.ends_with(prefix))
+    // Reporter series: the digit in "F.2d", "F.3d", "F.4th", "S.W.3d", "A.2d",
+    // "N.E.2d" or "P.3d" is part of the reporter name, not a callout. Applies
+    // at line start ("F.3d 191" after a wrap) as well as mid-line.
+    let reporter_series = is_reporter_series_digit(&before_lower, &after_lower);
+    if reporter_series
+        || citation_prefixes
+            .iter()
+            .any(|prefix| before_lower.ends_with(prefix))
         || (after_lower.starts_with('d') && before_lower.ends_with('f'))
         || [" u.s.", " s. ct.", " f.2d", " f.3d", " l. rev."]
             .iter()
@@ -1707,6 +1712,40 @@ fn plausible_inline_callout_context(text: &str, start: usize, end: usize) -> boo
                 '.' | ',' | ';' | ':' | '?' | '!' | ')' | ']' | '}' | '"' | '\''
             )
     })
+}
+
+/// True when a digit run sits inside a reporter abbreviation such as "F.3d",
+/// "F. 3d", "S.W.3d", "A.2d" or "F.4th": the text before it ends with a capital
+/// letter and a period (optionally a space), and the text after it begins with
+/// "d" or "th" followed by a non-letter.
+fn is_reporter_series_digit(before_lower: &str, after_lower: &str) -> bool {
+    let series_suffix = {
+        let rest = after_lower;
+        let tail = if let Some(r) = rest.strip_prefix("th") {
+            Some(r)
+        } else {
+            rest.strip_prefix('d')
+        };
+        tail.is_some_and(|r| r.chars().next().is_none_or(|ch| !ch.is_alphabetic()))
+    };
+    if !series_suffix {
+        return false;
+    }
+    let trimmed = before_lower.trim_end_matches(' ');
+    let Some(stem) = trimmed.strip_suffix('.') else {
+        return false;
+    };
+    // The abbreviation letter(s): "f", "a", "p", "s.w", "n.e", "so", "cal.rptr"...
+    let letters = stem
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_alphabetic() || *ch == '.')
+        .count();
+    letters >= 1
+        && stem
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_ascii_alphabetic())
 }
 
 fn normalize_line_text(text: &str) -> String {
@@ -8610,6 +8649,46 @@ fn percentile_sorted(values: &[f32], percentile: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reporter_series_digits_are_not_inline_callouts() {
+        // The digit in each reporter abbreviation must not be wrapped as a callout.
+        let cases = [
+            (
+                "F.3d 191 (No. 07-30119), 2007 WL 4266576; Brief for Plaintiff-Appellee",
+                "F.3d",
+            ),
+            (
+                "Litig., 495 F.3d 191 (No. 07-30119), 2007 WL 4266583; Brief",
+                "F.3d",
+            ),
+            (
+                "Ebbing v. State Farm Fire & Cas. Co., 1 S.W.3d 459, 462 (Ark. Ct. App.",
+                "S.W.3d",
+            ),
+            (
+                "Co., 701 S.E.2d 33, 36 (S.C. 2010) (finding that rainwater",
+                "S.E.2d",
+            ),
+            (
+                "See Smith v. Jones, 12 F.4th 100, 104 (2d Cir. 2021).",
+                "F.4th",
+            ),
+            ("Commerce Clause, 41 F. 3d 12 (1994).", "F. 3d"),
+        ];
+        for (text, reporter) in cases {
+            let at = text.find(reporter).expect("reporter present");
+            let digit = at + reporter.find(|c: char| c.is_ascii_digit()).unwrap();
+            assert!(
+                !plausible_inline_callout_context(text, digit, digit + 1),
+                "treated reporter digit as a callout in {text:?}"
+            );
+        }
+        // A real callout after a sentence still passes.
+        let text = "the court held otherwise.12 Next";
+        let at = text.find("12").unwrap();
+        assert!(plausible_inline_callout_context(text, at, at + 2));
+    }
 
     #[test]
     fn ocr_text_override_replaces_sparse_native_deep_lines() {
