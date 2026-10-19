@@ -654,8 +654,10 @@ pub(super) fn locate_lines(page_keys: &[String], lines: &[&str]) -> Vec<usize> {
             continue;
         }
         let probe = tokens.len().min(2);
-        let start = (cursor..page_keys.len().saturating_sub(probe - 1))
-            .chain(0..cursor.min(page_keys.len()))
+        let start_count = page_keys.len().saturating_sub(probe - 1);
+        let search_start = cursor.min(start_count);
+        let start = (search_start..start_count)
+            .chain(0..search_start)
             .find(|&at| (0..probe).all(|i| page_keys[at + i] == tokens[i]));
         let Some(start) = start else {
             continue;
@@ -807,6 +809,18 @@ mod tests {
         // The reflow dropped the callout "12" that the page carries.
         let slots = locate_lines(&page, &["the court held", "that flood means water"]);
         assert_eq!(slots, vec![2, 3, 4, 5, 6, 8, 9]);
+    }
+
+    #[test]
+    fn locate_lines_wraparound_keeps_the_probe_inside_the_page() {
+        let page = ["one", "two"].map(key);
+        // The first line reaches the end; the next line starts with the last
+        // word but has no complete two-word match on this page.
+        assert_eq!(
+            locate_lines(&page, &["one two", "two missing"]),
+            vec![0, 1]
+        );
+        assert!(locate_lines(&[key("two")], &["two missing"]).is_empty());
     }
 
     #[test]
