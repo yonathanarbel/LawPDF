@@ -13,18 +13,18 @@ Highlight a passage for class, leave a comment on a colleague's draft, or work
 through a case with search, annotation, and recovery tools in one application.
 
 The “world's best” line expresses the creator's vision, not an independently
-tested ranking. **Version 0.2.37 is a public beta.**
+tested ranking. **Version 0.2.43 is a public beta.**
 
 ## Download
 
-[**Download LawPDF for Windows or Mac**](https://github.com/yonathanarbel/LawPDF/releases/tag/v0.2.37)
+[**Download LawPDF for Windows or Mac**](https://github.com/yonathanarbel/LawPDF/releases/tag/v0.2.43)
 
 | Platform | Download | Requirements |
 | --- | --- | --- |
 | Windows Store | [Microsoft Store](https://apps.microsoft.com/detail/9MZXSP0C423F) | Microsoft-signed package and Store-managed updates; check the version offered while updates await certification |
-| Windows installer | [LawPDFSetup-x64.exe](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.37/LawPDFSetup-x64.exe) | 64-bit Windows; installation may request administrator approval |
-| Windows portable | [LawPDF-windows-portable-x64.zip](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.37/LawPDF-windows-portable-x64.zip) | Extract the entire ZIP, then run `lawpdf.exe` |
-| Mac | [LawPDF-macos.zip](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.37/LawPDF-macos.zip) | Apple silicon (M-series), macOS 13 or later; Intel Macs are not supported by this build |
+| Windows installer | [LawPDFSetup-x64.exe](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.43/LawPDFSetup-x64.exe) | 64-bit Windows; installation may request administrator approval |
+| Windows portable | [LawPDF-windows-portable-x64.zip](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.43/LawPDF-windows-portable-x64.zip) | Extract the entire ZIP, then run `lawpdf.exe` |
+| Mac | [LawPDF-macos.zip](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.43/LawPDF-macos.zip) | Apple silicon (M-series), macOS 13 or later; Intel Macs are not supported by this build |
 
 Close older LawPDF versions before installing or opening the new version.
 Keep a backup of important PDFs while trying the beta.
@@ -59,6 +59,10 @@ See [Apple's instructions](https://support.apple.com/en-us/102445) and our
   crowded notes are shortened to the room they have; click a note, or its
   number in the text, to read it in full. Keep the source PDF close for
   verification.
+- **Follow the page into Review Mode:** a brief reveal shows its words moving
+  into the reading column and footnote cards on the first switch. Review Mode
+  opens at your current page. Reduced motion skips the animation, and any
+  click, scroll, or key press ends it.
 - **Know what you are reading:** the masthead names the article, its authors,
   and its citation, read from the PDF itself, with contents, find, and the
   Original / Review / Side by side switch beneath.
@@ -95,11 +99,11 @@ See [Apple's instructions](https://support.apple.com/en-us/102445) and our
 
 The Windows and Mac builds passed their automated regression and packaging
 checks. The exact Windows installer was verified on a clean hosted Windows
-machine. The 0.2.37 Mac package passed local bundled-runtime and native print-dialog
-checks. Version 0.2.37 adds Mac printing and retains the reading interface and
-optional coffee-support panel. It retains the 0.2.33 fixes for opening PDFs from Finder when LawPDF is closed,
-closing the empty window with Command-W, and routing Mac Quit through the
-save-or-cancel flow. See the [release verification](docs/releases/v0.2.37.md).
+machine. Version 0.2.43 adds the Review Mode reveal and keeps reporter citation
+digits out of footnote callouts. It includes on-device OCR and searchable
+copies, Save As, Mac printing, annotation recovery, and the earlier Finder
+opening and save-aware closing fixes. See the
+[release verification](docs/releases/v0.2.43.md) for evidence and its scope.
 
 Broader screen-reader workflows, real-world reliability, large-document
 performance, and signed-update replacement/recovery still need more testing.
@@ -138,5 +142,5 @@ particular legal matter is made. See the full license for its terms.
 Bundled third-party components and models are credited in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 Technical evidence and remaining qualification work are documented in
-[the current release evidence](docs/releases/v0.2.33.md)
+[the current release evidence](docs/releases/v0.2.43.md)
 and [release procedure](docs/RELEASING.md).

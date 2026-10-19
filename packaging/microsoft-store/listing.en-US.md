@@ -1,6 +1,6 @@
 # Microsoft Store listing
 
-This listing accompanies app 0.2.42, Store package 1.2.42.0, under publisher
+This listing accompanies app 0.2.43, Store package 1.2.43.0, under publisher
 John Arbel and Store ID 9MZXSP0C423F. Publication and certification are separate
 from the GitHub release. See `docs/MICROSOFT_STORE.md` for dated submission
 observations and verification boundaries. Existing reading and coffee-panel
@@ -36,6 +36,13 @@ This is a public beta. Verify reconstructed text against the original PDF and re
 
 ## Suggested category
 Productivity
+
+## What's new in 0.2.43
+The first switch to Review Mode briefly shows the current page's words moving
+into the reading column and footnote cards. Reduced motion skips the reveal,
+and any click, scroll, or key ends it. Review Mode opens at the current PDF page.
+Reporter citation digits such as the 3 in F.3d remain intact in Review Mode and
+Markdown exports.
 
 ## What's new in 0.2.42
 OCR now uses the text recognizer built into Windows, so Run OCR and "OCR: save a

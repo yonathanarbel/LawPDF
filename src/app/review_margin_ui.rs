@@ -318,7 +318,27 @@ impl PdfEditorApp {
             } else {
                 rect.left() + NOTE_TEXT_INSET
             };
-            painter.galley(Pos2::new(text_left, rect.top() + 2.0), galley, colors.body);
+            let text_origin = Pos2::new(text_left, rect.top() + 2.0);
+            if let Some(reveal) = self.review_reveal.as_mut()
+                && reveal.is_capturing()
+                && let Ok(number) = entry.key.parse::<u16>()
+            {
+                let body_font = FontId::proportional(13.5 * scale);
+                let body_height = ui.fonts_mut(|fonts| fonts.row_height(&body_font));
+                reveal.notes.push(super::review_reveal::CapturedNote {
+                    number,
+                    style: super::review_reveal::LandingStyle {
+                        size: 13.5 * scale,
+                        line_height: Some(18.0 * scale),
+                    },
+                    words: super::review_reveal::galley_words(
+                        &galley,
+                        text_origin,
+                        Some(body_height),
+                    ),
+                });
+            }
+            painter.galley(text_origin, galley, colors.body);
             if placement.shortened {
                 let more = ui.fonts_mut(|fonts| {
                     fonts.layout_job(small_caps_job("more", 10.5 * scale, colors.number, 80.0))

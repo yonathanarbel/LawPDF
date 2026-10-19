@@ -17796,3 +17796,37 @@ fn final_body_coalescer_restores_centered_false_heading_inside_body_segment() {
     assert_eq!(blocks.len(), 1);
     assert!(blocks[0].text.contains("what Professors Timothy Meyer"));
 }
+
+#[test]
+fn attached_ascii_callout_range_skips_digits_glued_to_letters() {
+    use super::overlays::attached_ascii_callout_range;
+    // Reporter series and ordinals: the digit is part of the token.
+    for (text, marker) in [
+        (
+            "Litig., 495 F.3d 191 (No. 07-30119), 2007 WL 4266583; Brief",
+            3,
+        ),
+        (
+            "F.3d 191 (No. 07-30119), 2007 WL 4266576; Brief for Plaintiff",
+            3,
+        ),
+        (
+            "Ebbing v. State Farm, 1 S.W.3d 459, 462 (Ark. Ct. App. 1999)",
+            3,
+        ),
+        ("Smith v. Jones, 12 F.4th 100, 104 (2d Cir. 2021).", 4),
+        ("Smith v. Jones, 12 F.4th 100, 104 (2d Cir. 2021).", 2),
+        ("taught to 1Ls. See, e.g.,", 1),
+    ] {
+        assert_eq!(
+            attached_ascii_callout_range(text, marker, 0),
+            None,
+            "{text:?} marker {marker}"
+        );
+    }
+    // A genuine attached callout is still found.
+    let text = "the court held otherwise.12 Next sentence";
+    assert_eq!(attached_ascii_callout_range(text, 12, 0), Some((25, 27)));
+    let text = "as the rule provides,7 and";
+    assert_eq!(attached_ascii_callout_range(text, 7, 0), Some((21, 22)));
+}
