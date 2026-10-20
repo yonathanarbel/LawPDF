@@ -180,6 +180,10 @@ impl PdfEditorApp {
                 self.chrome.expanded_note = None;
                 self.queue_settings_save();
             }
+            if self.settings.review_margin_mode == ReviewMarginMode::Footnotes {
+                ui.separator();
+                self.draw_footnote_source_batch_controls(ui);
+            }
         });
         ui.add_space(5.0);
     }

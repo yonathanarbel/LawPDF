@@ -73,6 +73,22 @@ jobs:
           desktop-file-validate "$smoke/data/applications/lawpdf.desktop"
           XDG_DATA_HOME="$smoke/data" "$smoke/LawPDF-linux-x86_64/uninstall.sh"
           test ! -f "$smoke/data/applications/lawpdf.desktop"
+      - name: Probe deployed citation search (diagnostic)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          "$RUNNER_TEMP/lawpdf-extracted/LawPDF-linux-x86_64/lawpdf" \
+            --citation-source-probe 'Oliver Wendell Holmes, The Path of the Law, 10 Harvard Law Review 457 (1897)' \
+            > "$RUNNER_TEMP/citation-search-probe.json"
+          cat "$RUNNER_TEMP/citation-search-probe.json"
+      - name: Upload citation search diagnostic
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: LawPDF-citation-search-probe
+          path: ${{ runner.temp }}/citation-search-probe.json
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Upload Linux package and smoke evidence
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

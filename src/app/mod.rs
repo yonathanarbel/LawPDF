@@ -6,6 +6,7 @@ mod chrome;
 mod close_ui;
 mod comments_ui;
 mod document_opening;
+mod footnote_sources_ui;
 #[cfg(target_os = "linux")]
 mod platform_ui;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -416,6 +417,7 @@ pub struct PdfEditorApp {
     /// #27 footnote popovers: body superscript marker number -> footnote text,
     /// rebuilt each frame from the rendered document's Footnote/Marginalia blocks.
     liquid_footnote_index: HashMap<u16, String>,
+    footnote_sources_ui: footnote_sources_ui::FootnoteSourcesUi,
     /// Pending exact Review Mode block selected from the right-hand contents rail.
     liquid_scroll_to_block: Option<usize>,
     /// Heading currently nearest the top of the Review viewport.
@@ -1234,6 +1236,7 @@ impl PdfEditorApp {
             annotations_dirty: false,
             liquid_feedback: Vec::new(),
             liquid_footnote_index: HashMap::new(),
+            footnote_sources_ui: footnote_sources_ui::FootnoteSourcesUi::default(),
             liquid_scroll_to_block: None,
             review_active_heading: None,
             review_heading_screen_rects: Vec::new(),
@@ -7251,8 +7254,8 @@ impl PdfEditorApp {
                 if !egui::Popup::is_id_open(ui.ctx(), popup_id) {
                     continue;
                 }
-                if let Some(body) = self.liquid_footnote_index.get(number) {
-                    self.draw_liquid_footnote_popover(ui, popup_id, *rect, *number, body);
+                if let Some(body) = self.liquid_footnote_index.get(number).cloned() {
+                    self.draw_liquid_footnote_popover(ui, popup_id, *rect, *number, &body);
                 }
             }
         }
@@ -7827,7 +7830,7 @@ impl PdfEditorApp {
     /// Renders an open footnote popover anchored at a body marker's rect. Open state
     /// lives in egui memory (keyed by `popup_id`); it closes on a click outside.
     fn draw_liquid_footnote_popover(
-        &self,
+        &mut self,
         ui: &egui::Ui,
         popup_id: egui::Id,
         anchor: Rect,
@@ -7878,6 +7881,8 @@ impl PdfEditorApp {
                     egui::Label::new(RichText::new(body).size(13.0 * scale).color(body_color))
                         .wrap(),
                 );
+                ui.separator();
+                self.draw_footnote_sources(ui, &number.to_string(), body);
             });
     }
 
@@ -8315,7 +8320,7 @@ impl PdfEditorApp {
         ui.add_space(7.0);
     }
 
-    fn draw_liquid_notes(&self, ui: &mut egui::Ui, notes: &[&LiquidBlock]) {
+    fn draw_liquid_notes(&mut self, ui: &mut egui::Ui, notes: &[&LiquidBlock]) {
         if notes.is_empty() {
             return;
         }
@@ -8343,7 +8348,7 @@ impl PdfEditorApp {
                             egui::Layout::top_down(Align::RIGHT),
                             |ui| {
                                 ui.label(
-                                    RichText::new(marker)
+                                    RichText::new(&marker)
                                         .size(11.0)
                                         .strong()
                                         .color(self.liquid_muted_color()),
@@ -8353,7 +8358,7 @@ impl PdfEditorApp {
                         ui.add_space(8.0);
                         ui.add(
                             egui::Label::new(
-                                RichText::new(body)
+                                RichText::new(&body)
                                     .size(14.0)
                                     .color(self.liquid_muted_color()),
                             )
@@ -8361,6 +8366,7 @@ impl PdfEditorApp {
                             .selectable(true),
                         );
                     });
+                    self.draw_footnote_sources(ui, &format!("list-{index}-{marker}"), &body);
                     ui.add_space(7.0);
                 }
             }
@@ -11394,6 +11400,7 @@ impl eframe::App for PdfEditorApp {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         self.poll_print(ctx);
         self.poll_comment_cache(ctx);
+        self.poll_footnote_sources(ctx);
         #[cfg(target_os = "linux")]
         self.poll_platform_actions();
         self.poll_settings_credentials(ctx);

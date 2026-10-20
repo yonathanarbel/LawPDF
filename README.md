@@ -22,6 +22,12 @@ click your name on a comment to edit it globally. Author colors distinguish
 readers. Narration uses **System**, **ElevenLabs**, or **OpenRouter** throughout
 the app; select the source and configure provider keys in Settings.
 
+Footnotes also offer **Find source**. Existing URLs and DOIs open directly;
+otherwise BBGPT returns candidate article links in the note. Choose **Find
+article links** in Review to queue up to 32 unresolved footnotes at a time.
+Lookups run in the background, deduplicate identical queries, and cache results.
+Only the selected footnote text is sent; opening a document starts no searches.
+
 The “world's best” line expresses the creator's vision, not an independently
 tested ranking. **Version 0.2.43 is a public beta.**
 

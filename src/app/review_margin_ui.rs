@@ -316,6 +316,9 @@ impl PdfEditorApp {
                     .rows
                     .len()
                     .max(1)
+                    // Footnotes reserve one row for the explicit source lookup.
+                    // Comments keep their existing size and never search citations.
+                    + usize::from(entry.comment.is_none())
             })
             .collect::<Vec<_>>();
         let row_height = 18.0 * scale;
@@ -366,6 +369,7 @@ impl PdfEditorApp {
         let clip = ui.clip_rect();
         let mut hovered = None;
         let mut toggled = None;
+        let mut source_opened = None;
         let previous_hover = self.chrome.hovered_note.clone();
         let expanded = self.chrome.expanded_note.clone();
         let mut note_rects = Vec::with_capacity(entries.len());
@@ -419,7 +423,11 @@ impl PdfEditorApp {
                     Stroke::new(1.0_f32, colors.rule)
                 },
             );
-            let job = self.review_note_job(entry, &colors, text_width, placement.rows);
+            let content_rows = placement
+                .rows
+                .saturating_sub(usize::from(entry.comment.is_none()))
+                .max(1);
+            let job = self.review_note_job(entry, &colors, text_width, content_rows);
             let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
             let text_left = if left_side {
                 rect.left()
@@ -492,6 +500,38 @@ impl PdfEditorApp {
                     egui::StrokeKind::Outside,
                 );
             }
+            let mut source_clicked = false;
+            if entry.comment.is_none() {
+                let footer_top = rect.bottom()
+                    - row_height
+                    - if placement.shortened {
+                        metrics.more_height
+                    } else {
+                        0.0
+                    };
+                let source_rect = Rect::from_min_size(
+                    Pos2::new(text_left, footer_top),
+                    Vec2::new(text_width, row_height),
+                );
+                let label = self.footnote_sources_button_label(&entry.key, &entry.body);
+                let source = ui
+                    .push_id(("review-note-source", &entry.key), |ui| {
+                        ui.put(
+                            source_rect,
+                            egui::Button::new(
+                                RichText::new(label).size(11.0 * scale).color(colors.number),
+                            )
+                            .frame(false),
+                        )
+                    })
+                    .inner
+                    .on_hover_text("Reuse an existing link or search BBGPT using this footnote text. The PDF stays on this computer.");
+                if source.clicked() {
+                    self.request_footnote_sources(&entry.key, &entry.body, ui.ctx());
+                    source_opened = Some(entry.key.clone());
+                    source_clicked = true;
+                }
+            }
             response.widget_info(|| {
                 egui::WidgetInfo::labeled(
                     egui::WidgetType::Button,
@@ -513,7 +553,7 @@ impl PdfEditorApp {
             } else {
                 response
             };
-            if response.clicked() && !author_clicked {
+            if response.clicked() && !author_clicked && !source_clicked {
                 toggled = Some(entry.key.clone());
             }
         }
@@ -528,8 +568,10 @@ impl PdfEditorApp {
             self.chrome.hovered_note = hovered;
             ui.ctx().request_repaint();
         }
-        let toggled_now = toggled.is_some();
-        if let Some(key) = toggled {
+        let toggled_now = toggled.is_some() || source_opened.is_some();
+        if let Some(key) = source_opened {
+            self.chrome.expanded_note = Some(key);
+        } else if let Some(key) = toggled {
             self.chrome.expanded_note = if self.chrome.expanded_note.as_deref() == Some(&key) {
                 None
             } else {
@@ -690,6 +732,9 @@ impl PdfEditorApp {
                                         .wrap()
                                         .selectable(true),
                                     );
+                                    ui.add_space(8.0);
+                                    ui.separator();
+                                    self.draw_footnote_sources(ui, &entry.key, &entry.body);
                                 }
                             });
                     });

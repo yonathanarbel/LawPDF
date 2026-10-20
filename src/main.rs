@@ -6,10 +6,12 @@ mod atomic_file;
 #[cfg(feature = "devtools")]
 mod benchmark;
 mod chat;
+mod citation_links;
 mod comments;
 mod credentials;
 mod diagnostics;
 mod document_store;
+mod footnote_sources;
 mod hashing;
 mod layout_roles;
 #[cfg(target_os = "linux")]
@@ -62,6 +64,16 @@ const APP_TITLE: &str = concat!(
 fn main() -> eframe::Result<()> {
     install_panic_log_hook();
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args.len() == 2 && args[0] == "--citation-source-probe" {
+        match footnote_sources::probe(&args[1].to_string_lossy()) {
+            Ok(result) => println!("{}", serde_json::json!({"success": true, "search": result})),
+            Err(error) => {
+                println!("{}", serde_json::json!({"success": false, "error": error}));
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     #[cfg(target_os = "linux")]
     if args.len() == 1
         && (args[0] == "--install-desktop-entry" || args[0] == "--uninstall-desktop-entry")
