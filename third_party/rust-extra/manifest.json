@@ -25,8 +25,10 @@
   },
   {
     "packages": [
+      "accesskit_atspi_common-0.14.2",
       "accesskit_consumer-0.31.0",
       "accesskit_macos-0.22.2",
+      "accesskit_unix-0.17.2",
       "accesskit_windows-0.29.2",
       "accesskit_winit-0.29.2"
     ],
@@ -425,6 +427,25 @@
         "path": "third_party/rust-extra/brendanzab-gl-rs-f150967b1c44/LICENSE",
         "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
         "source": "https://raw.githubusercontent.com/brendanzab/gl-rs/f150967b1c44ae888e6676f93f639ebc82771bdc/LICENSE"
+      }
+    ]
+  },
+  {
+    "packages": [
+      "atspi-proxies-0.9.0"
+    ],
+    "repository": "https://github.com/odilia-app/atspi",
+    "commit": "ef2b4d1b41a9d53a9bb5b484661d712e0d1964e7",
+    "files": [
+      {
+        "path": "third_party/rust-extra/odilia-app-atspi-ef2b4d1b41a9/LICENSE-APACHE2.txt",
+        "sha256": "50e6751797c50dedd75ef1b8a0d9e42f5f8472e9fbce91f34718e9f97b0c780a",
+        "source": "https://raw.githubusercontent.com/odilia-app/atspi/ef2b4d1b41a9d53a9bb5b484661d712e0d1964e7/atspi-proxies/LICENSE-APACHE2.txt"
+      },
+      {
+        "path": "third_party/rust-extra/odilia-app-atspi-ef2b4d1b41a9/LICENSE-MIT.txt",
+        "sha256": "a94bf521d21b7db984c8b141b6f9341bbedbe24e617c1a55d952f8ef613ef1cd",
+        "source": "https://raw.githubusercontent.com/odilia-app/atspi/ef2b4d1b41a9d53a9bb5b484661d712e0d1964e7/atspi-proxies/LICENSE-MIT.txt"
       }
     ]
   }
