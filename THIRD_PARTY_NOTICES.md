@@ -22,13 +22,15 @@ SPDX license text; the provenance identifies this explicitly.
 
 ## PDFium Binaries
 
-Mac and Windows builds bundle the matching `chromium/8057` release from
+Mac, Windows, and Linux x86_64 builds bundle the matching `chromium/8057` release from
 [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries/releases/tag/chromium/8057),
-published September 14, 2026. Both downloaded archives were checked against the
+published September 14, 2026. Downloaded archives are checked against the
 publisher's SHA-256 digests. The exact library hashes are recorded in
 `release-manifest.json` and checked before packaging. The upstream license files
 and dependency notices are distributed under `third_party/pdfium-binaries/`
-(Windows) and `third_party/pdfium-binaries-mac-arm64/` (Mac).
+(Windows), `third_party/pdfium-binaries-mac-arm64/` (Mac), and
+`third_party/pdfium-binaries-linux-x64/` (Linux). Linux acquisition is pinned by
+`scripts/fetch-pdfium-linux.sh`, including both archive and shared-library hashes.
 
 ## EB Garamond
 
@@ -76,10 +78,19 @@ Review Mode bundles the CatBoost model evaluation library and a trained CBM
 model. CatBoost is Copyright 2017–2026 YANDEX LLC and is distributed under the
 Apache License 2.0. Release libraries are pinned to CatBoost 1.2.10 artifacts
 published by the official `catboost/catboost` GitHub project. The Windows DLL
-is checksum-verified by `scripts/fetch-catboost-windows.ps1` before packaging.
+and Linux shared library are checksum-verified by
+`scripts/fetch-catboost-windows.ps1` and `scripts/fetch-catboost-linux.sh` before
+packaging.
 
 The Apache License 2.0 text is committed at:
 
 ```text
 third_party/catboost/LICENSE
 ```
+
+## Linux contribution
+
+Linux desktop integration, CUPS printing, and the original Linux packaging
+foundation are adapted from Sarah Lawsky's LawPDF Linux port, shared under
+LawPDF's MIT license with permission to reuse. Her contribution is credited in
+`CONTRIBUTORS.md`.

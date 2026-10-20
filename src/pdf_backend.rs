@@ -14,8 +14,8 @@ use lopdf::{
 use pdfium_render::prelude::*;
 
 use crate::model::{
-    AnnotationKind, EditorAnnotation, LoadedDocument, MarkerStyle, PageInfo, PageLink,
-    PageTextChar, PdfRect, RenderedPage,
+    AnnotationKind, DocumentComment, DocumentCommentSource, EditorAnnotation, LoadedDocument,
+    MarkerStyle, PageInfo, PageLink, PageTextChar, PdfRect, RenderedPage,
 };
 use crate::performance_cache::{CachedDocumentMetadata, PerformanceCache};
 
@@ -1527,6 +1527,32 @@ pub fn rewrite_hazard(document: &Document) -> Option<RewriteHazard> {
     signed.then_some(RewriteHazard::Signed)
 }
 
+/// Check the original PDF before annotation export can remove an owner-password
+/// wrapper. This matches the macOS PDFKit print path's allowsPrinting check.
+#[cfg(any(target_os = "linux", test))]
+fn allows_printing(document: &Document) -> bool {
+    // lopdf removes /Encrypt after automatically decrypting an empty user
+    // password. The original permissions survive in its encryption state.
+    if let Some(state) = document.encryption_state.as_ref() {
+        return state.permissions().contains(lopdf::Permissions::PRINTABLE);
+    }
+    const PRINT_PERMISSION: i64 = 1 << 2;
+    if !(document.is_encrypted() || document.was_encrypted()) {
+        return true;
+    }
+    document
+        .get_dict_in_dict(&document.trailer, b"Encrypt")
+        .ok()
+        .and_then(|dictionary| dictionary.get(b"P").ok())
+        .and_then(|object| object.as_i64().ok())
+        .is_none_or(|permissions| permissions & PRINT_PERMISSION != 0)
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn allows_printing_at(source: &Path) -> Result<bool> {
+    Ok(allows_printing(&Document::load(source)?))
+}
+
 /// Drop the owner-password wrapper from a document lopdf has already decrypted,
 /// so that saving it produces a readable, unencrypted file.
 fn strip_owner_password(document: &mut Document) -> Result<()> {
@@ -1686,6 +1712,7 @@ pub fn save_with_annotations_checked(
     let mut document = Document::load_mem(&source_bytes)
         .with_context(|| format!("failed to load source PDF {}", source.display()))?;
     let mut report = prepare_rewrite(&mut document, source, destination)?;
+    let mut previous_comments = existing_comment_objects(&document);
     remove_lawpdf_owned_annotations(&mut document)?;
     let pages = document.get_pages();
 
@@ -1694,10 +1721,18 @@ pub fn save_with_annotations_checked(
         let page_id = *pages
             .get(&page_number)
             .ok_or_else(|| anyhow!("PDF has no page {}", page_number))?;
-        let annotation_id = document.new_object_id();
+        let previous = match &annotation.kind {
+            AnnotationKind::Comment { id, .. } => previous_comments.remove(id),
+            _ => None,
+        };
+        let annotation_id = previous
+            .as_ref()
+            .map(|(id, _)| *id)
+            .unwrap_or_else(|| document.new_object_id());
         let mut annotation = annotation.clone();
         pdf_page_geometry(&document, page_id)?.annotation(&mut annotation, true);
-        let object = annotation_to_pdf_object(&annotation);
+        let mut object = annotation_to_pdf_object(&annotation);
+        preserve_comment_reply(&mut object, previous.as_ref());
         document.objects.insert(annotation_id, object);
         append_annotation(&mut document, page_id, annotation_id)?;
     }
@@ -1955,6 +1990,178 @@ pub fn load_lawpdf_annotations(source: &Path) -> Result<Vec<EditorAnnotation>> {
     Ok(annotations)
 }
 
+/// Read embedded remarks on demand, from exactly the source revision requested
+/// by the tab. Opening a PDF does not invoke this parse. Hashing and parsing use
+/// the same immutable bytes so cloud replacement cannot mix comment geometry
+/// from one revision with the article text of another.
+pub fn load_document_comments_checked(
+    source: &Path,
+    expected: &crate::document_store::FileRevision,
+) -> Result<Vec<DocumentComment>> {
+    use crate::document_store::{FileRevision, MAX_DOCUMENT_BYTES, read_limited};
+    let bytes = read_limited(source, MAX_DOCUMENT_BYTES).map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        FileRevision::from_bytes(&bytes) == *expected,
+        "The PDF changed outside LawPDF. Reopen it to load comments from the new revision."
+    );
+    let document = Document::load_mem(&bytes)
+        .with_context(|| format!("failed to read PDF comments from {}", source.display()))?;
+    document_comments(&document)
+}
+
+fn document_comments(document: &Document) -> Result<Vec<DocumentComment>> {
+    let mut comments = Vec::new();
+    for (page_number, page_id) in document.get_pages() {
+        let page_index = page_number.saturating_sub(1) as usize;
+        let page = document.get_object(page_id)?.as_dict()?;
+        let Ok(annots) = page.get(b"Annots") else {
+            continue;
+        };
+        let annots = match annots {
+            Object::Reference(id) => document.get_object(*id)?,
+            value => value,
+        };
+        let items = match annots {
+            Object::Array(items) => items.as_slice(),
+            value => std::slice::from_ref(value),
+        };
+        let mut geometry = None;
+        for (ordinal, annotation) in items.iter().enumerate() {
+            let Some(mut comment) =
+                foreign_comment_from_annotation(document, annotation, page_index, ordinal)
+            else {
+                continue;
+            };
+            let geometry = match geometry {
+                Some(geometry) => geometry,
+                None => {
+                    let loaded = pdf_page_geometry(document, page_id)?;
+                    geometry = Some(loaded);
+                    loaded
+                }
+            };
+            comment.anchor = geometry.to_display(comment.anchor);
+            comment.rect = geometry.rect(comment.rect, false);
+            comments.push(comment);
+        }
+    }
+    comments.sort_by(|a, b| {
+        a.page_index
+            .cmp(&b.page_index)
+            .then_with(|| b.anchor.1.total_cmp(&a.anchor.1))
+            .then_with(|| a.anchor.0.total_cmp(&b.anchor.0))
+            .then_with(|| a.key.cmp(&b.key))
+    });
+    Ok(comments)
+}
+
+fn foreign_comment_from_annotation(
+    document: &Document,
+    annotation: &Object,
+    page_index: usize,
+    ordinal: usize,
+) -> Option<DocumentComment> {
+    let dict = annotation_dict(document, annotation)?;
+    if is_lawpdf_owned_dict(dict) {
+        return None;
+    }
+    let subtype = dict.get(b"Subtype").ok().and_then(pdf_object_text)?;
+    if ![
+        "Text",
+        "FreeText",
+        "Highlight",
+        "Underline",
+        "Squiggly",
+        "StrikeOut",
+        "Caret",
+        "Ink",
+        "Stamp",
+    ]
+    .contains(&subtype.as_str())
+    {
+        return None;
+    }
+    let text = dict
+        .get(b"Contents")
+        .ok()
+        .and_then(pdf_object_text)
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())?;
+    let mut rect = dict.get(b"Rect").ok().and_then(pdf_rect_from_object)?;
+    let mut anchor = (rect.left, rect.top);
+    // Markup quadrilaterals refer to the actual highlighted text. A popup's
+    // icon rectangle can be far away, especially in a two-column article.
+    if let Some(quad) = dict
+        .get(b"QuadPoints")
+        .ok()
+        .and_then(|value| value.as_array().ok())
+    {
+        if let Some(points) = quad
+            .get(..8)
+            .and_then(|values| values.iter().map(pdf_number).collect::<Option<Vec<_>>>())
+        {
+            let xs = [points[0], points[2], points[4], points[6]];
+            let ys = [points[1], points[3], points[5], points[7]];
+            rect = PdfRect::new(
+                xs.into_iter().fold(f32::INFINITY, f32::min),
+                ys.into_iter().fold(f32::INFINITY, f32::min),
+                xs.into_iter().fold(f32::NEG_INFINITY, f32::max),
+                ys.into_iter().fold(f32::NEG_INFINITY, f32::max),
+            );
+            anchor = (
+                (rect.left + rect.right) * 0.5,
+                (rect.bottom + rect.top) * 0.5,
+            );
+        }
+    }
+    let author = dict
+        .get(b"T")
+        .ok()
+        .and_then(pdf_object_text)
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty());
+    let author_id = dict
+        .get(b"LawAuthorId")
+        .ok()
+        .and_then(pdf_object_text)
+        .filter(|id| !id.is_empty());
+    let color_rgb = dict
+        .get(b"C")
+        .ok()
+        .and_then(pdf_color_from_object)
+        .unwrap_or([0.42, 0.47, 0.58]);
+    let reply_to = dict
+        .get(b"IRT")
+        .ok()
+        .and_then(|parent| comment_reference_key(document, parent));
+    let key = comment_reference_key(document, annotation)
+        .unwrap_or_else(|| format!("doc-inline-{page_index}-{ordinal}"));
+    Some(DocumentComment {
+        page_index,
+        anchor,
+        rect,
+        text,
+        author,
+        author_id,
+        color_rgb,
+        source: DocumentCommentSource::Embedded,
+        is_reply: dict.get(b"IRT").is_ok(),
+        reply_to,
+        key,
+    })
+}
+
+fn comment_reference_key(document: &Document, value: &Object) -> Option<String> {
+    let id = value.as_reference().ok()?;
+    if let Some(dict) = annotation_dict(document, value).filter(|dict| is_lawpdf_comment_dict(dict))
+    {
+        if let Some(name) = dict.get(b"NM").ok().and_then(pdf_object_text) {
+            return Some(format!("mine-{name}"));
+        }
+    }
+    Some(format!("doc-{}-{}", id.0, id.1))
+}
+
 #[cfg(test)]
 fn load_lawpdf_comments(source: &Path) -> Result<Vec<EditorAnnotation>> {
     Ok(load_lawpdf_annotations(source)?
@@ -1967,6 +2174,7 @@ pub fn sync_lawpdf_comments(source: &Path, comments: &[EditorAnnotation]) -> Res
     let mut document = Document::load(source)
         .with_context(|| format!("failed to load source PDF {}", source.display()))?;
     prepare_rewrite(&mut document, source, source)?;
+    let mut previous_comments = existing_comment_objects(&document);
     remove_lawpdf_comment_annotations(&mut document)?;
     let pages = document.get_pages();
     let mut saved = 0usize;
@@ -1980,10 +2188,18 @@ pub fn sync_lawpdf_comments(source: &Path, comments: &[EditorAnnotation]) -> Res
         let Some(page_id) = pages.get(&page_number).copied() else {
             continue;
         };
-        let annotation_id = document.new_object_id();
+        let previous = match &annotation.kind {
+            AnnotationKind::Comment { id, .. } => previous_comments.remove(id),
+            _ => None,
+        };
+        let annotation_id = previous
+            .as_ref()
+            .map(|(id, _)| *id)
+            .unwrap_or_else(|| document.new_object_id());
         let mut annotation = annotation.clone();
         pdf_page_geometry(&document, page_id)?.annotation(&mut annotation, true);
-        let object = annotation_to_pdf_object(&annotation);
+        let mut object = annotation_to_pdf_object(&annotation);
+        preserve_comment_reply(&mut object, previous.as_ref());
         document.objects.insert(annotation_id, object);
         append_annotation(&mut document, page_id, annotation_id)?;
         saved += 1;
@@ -1994,6 +2210,31 @@ pub fn sync_lawpdf_comments(source: &Path, comments: &[EditorAnnotation]) -> Res
     save_document_in_place(&mut document, source)?;
 
     Ok(saved)
+}
+
+/// Keep object IDs of surviving comments so Acrobat/Preview reply and popup
+/// references continue to point at their parent after a LawPDF save.
+fn existing_comment_objects(document: &Document) -> HashMap<String, (ObjectId, Option<Object>)> {
+    document
+        .objects
+        .iter()
+        .filter_map(|(&object_id, object)| {
+            let dict = object.as_dict().ok()?;
+            if !is_lawpdf_comment_dict(dict) {
+                return None;
+            }
+            let id = dict.get(b"NM").ok().and_then(pdf_object_text)?;
+            Some((id, (object_id, dict.get(b"IRT").ok().cloned())))
+        })
+        .collect()
+}
+
+fn preserve_comment_reply(object: &mut Object, previous: Option<&(ObjectId, Option<Object>)>) {
+    if let Some((_, Some(reply_to))) = previous {
+        if let Ok(dict) = object.as_dict_mut() {
+            dict.set("IRT", reply_to.clone());
+        }
+    }
 }
 
 pub fn save_with_ocr_text(
@@ -2321,6 +2562,8 @@ fn annotation_to_pdf_object(annotation: &EditorAnnotation) -> Object {
         AnnotationKind::Comment {
             id,
             text,
+            author,
+            author_id,
             color_rgb,
             updated_at,
             created_at,
@@ -2330,7 +2573,8 @@ fn annotation_to_pdf_object(annotation: &EditorAnnotation) -> Object {
             "Subtype" => Object::Name(b"Text".to_vec()),
             "Rect" => rect_array(annotation.rect),
             "Contents" => literal(text),
-            "T" => literal("LawPDF"),
+            "T" => literal(author),
+            "LawAuthorId" => literal(author_id),
             "NM" => literal(id),
             "M" => literal(updated_at),
             "CreationDate" => literal(created_at),
@@ -2401,6 +2645,16 @@ fn lawpdf_comment_from_annotation(
         .ok()
         .and_then(pdf_object_text)
         .unwrap_or_else(|| updated_at.clone());
+    let author = dict
+        .get(b"T")
+        .ok()
+        .and_then(pdf_object_text)
+        .unwrap_or_default();
+    let author_id = dict
+        .get(b"LawAuthorId")
+        .ok()
+        .and_then(pdf_object_text)
+        .unwrap_or_default();
     // Older files (and non-LawPDF readers) won't have the anchor; fall back to
     // the card's center so the leader still points somewhere sensible.
     let anchor = dict
@@ -2418,6 +2672,8 @@ fn lawpdf_comment_from_annotation(
         kind: AnnotationKind::Comment {
             id,
             text,
+            author,
+            author_id,
             color_rgb,
             created_at,
             updated_at,
@@ -3089,6 +3345,8 @@ mod tests {
                 page_index: 0,
                 rect: PdfRect::new(500.0, 650.0, 530.0, 680.0),
                 kind: AnnotationKind::Comment {
+                    author: "Test Reader".to_owned(),
+                    author_id: "test-reader-profile".to_owned(),
                     id: format!("{LAWPDF_COMMENT_ID_PREFIX}roundtrip"),
                     text: "Remember this point".to_owned(),
                     color_rgb: [1.0, 0.78, 0.28],
@@ -3184,6 +3442,8 @@ mod tests {
                 page_index: 0,
                 rect,
                 kind: AnnotationKind::Comment {
+                    author: "Test Reader".to_owned(),
+                    author_id: "test-reader-profile".to_owned(),
                     id: "LawPDF-comment-roundtrip-all".to_owned(),
                     text: "Check § 2".to_owned(),
                     color_rgb: [1.0, 0.8, 0.3],
@@ -3293,6 +3553,55 @@ mod tests {
         assert!(full_again.rgba.chunks_exact(4).any(|p| p[0] != p[2]));
         engine.close_document(&source);
         fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn printing_checks_permissions_before_owner_protection_is_removed() {
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/owner-password.pdf");
+        assert!(
+            allows_printing_at(&source).unwrap(),
+            "the fixture permits printing"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        for permitted in [false, true] {
+            let mut document = Document::load(&source).unwrap();
+            let mut permissions = lopdf::Permissions::all();
+            permissions.set(lopdf::Permissions::PRINTABLE, permitted);
+            let state = lopdf::EncryptionState::try_from(lopdf::EncryptionVersion::V2 {
+                document: &document,
+                owner_password: "lawpdf-permission-test",
+                user_password: "",
+                key_length: 128,
+                permissions,
+            })
+            .unwrap();
+            document.encrypt(&state).unwrap();
+            assert_eq!(
+                allows_printing(&document),
+                permitted,
+                "encrypted dictionary"
+            );
+            let path = directory.path().join(format!("printing-{permitted}.pdf"));
+            document.save(&path).unwrap();
+            let loaded = Document::load(&path).unwrap();
+            assert!(loaded.was_encrypted());
+            assert!(
+                loaded.trailer.get(b"Encrypt").is_err(),
+                "lopdf removes the wrapper after decryption"
+            );
+            assert_eq!(
+                allows_printing(&loaded),
+                permitted,
+                "retained encryption state"
+            );
+            assert_eq!(
+                allows_printing_at(&path).unwrap(),
+                permitted,
+                "printing checks the actual source"
+            );
+        }
+        assert!(allows_printing(&Document::with_version("1.7")));
     }
 
     #[test]
@@ -3435,6 +3744,8 @@ mod tests {
             page_index: 0,
             rect: PdfRect::new(72.0, 700.0, 100.0, 728.0),
             kind: AnnotationKind::Comment {
+                author: "Test Reader".to_owned(),
+                author_id: "test-reader-profile".to_owned(),
                 id: format!("{LAWPDF_COMMENT_ID_PREFIX}unit"),
                 text: "First note".to_owned(),
                 color_rgb: [1.0, 0.78, 0.28],
@@ -3506,6 +3817,157 @@ mod tests {
         assert_eq!(links[0][0].url, "https://www.example.com");
         assert_eq!(normalize_web_url("javascript:alert(1)"), None);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn foreign_comments_keep_authors_replies_and_geometry_through_save() {
+        let path = temp_pdf_path("foreign-comments");
+        write_blank_pdf(&path);
+        let mut pdf = Document::load(&path).unwrap();
+        let page_id = pdf.get_pages()[&1];
+        let page = pdf.get_object_mut(page_id).unwrap().as_dict_mut().unwrap();
+        page.set(
+            "CropBox",
+            Object::Array(vec![20.into(), 40.into(), 600.into(), 760.into()]),
+        );
+        page.set("Rotate", 90);
+        let root = pdf.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Highlight",
+            // An icon can sit in the margin; the quad is the source anchor.
+            "Rect" => rect_array(PdfRect::new(580.0, 700.0, 600.0, 720.0)),
+            "QuadPoints" => Object::Array(vec![100.into(),720.into(),180.into(),720.into(),100.into(),700.into(),180.into(),700.into()]),
+            "Contents" => literal("Cite the statute here."), "T" => literal("Zoë Reviewer"),
+            "C" => color_array([1.0, 0.0, 0.0]),
+        });
+        let reply = pdf.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Text",
+            "Rect" => rect_array(PdfRect::new(100.0, 690.0, 120.0, 710.0)),
+            "Contents" => literal("Added § 2."), "T" => literal("B. Author"),
+            "IRT" => Object::Reference(root), "C" => color_array([0.0, 0.5, 1.0]),
+        });
+        append_annotation(&mut pdf, page_id, root).unwrap();
+        append_annotation(&mut pdf, page_id, reply).unwrap();
+        pdf.save(&path).unwrap();
+        let load = || {
+            let revision = crate::document_store::FileRevision::read(&path).unwrap();
+            load_document_comments_checked(&path, &revision).unwrap()
+        };
+        let before = load();
+        assert_eq!(before.len(), 2);
+        let root_comment = before.iter().find(|comment| !comment.is_reply).unwrap();
+        assert_eq!(root_comment.author.as_deref(), Some("Zoë Reviewer"));
+        assert_eq!(root_comment.anchor, (670.0, 460.0));
+        assert_eq!(root_comment.rect, PdfRect::new(660.0, 420.0, 680.0, 500.0));
+        assert_eq!(root_comment.color_rgb, [1.0, 0.0, 0.0]);
+        assert_eq!(
+            before
+                .iter()
+                .find(|comment| comment.is_reply)
+                .unwrap()
+                .reply_to
+                .as_deref(),
+            Some(root_comment.key.as_str())
+        );
+        for _ in 0..2 {
+            save_with_annotations(&path, &path, &[highlight_annotation()]).unwrap();
+            assert_eq!(load(), before);
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn foreign_reply_to_our_comment_survives_comment_rewrites() {
+        let path = temp_pdf_path("foreign-reply-to-mine");
+        write_blank_pdf(&path);
+        let mut comment = EditorAnnotation {
+            page_index: 0,
+            rect: PdfRect::new(500.0, 650.0, 530.0, 680.0),
+            kind: AnnotationKind::Comment {
+                id: format!("{LAWPDF_COMMENT_ID_PREFIX}reply-root"),
+                text: "Question".to_owned(),
+                author: "Original name".to_owned(),
+                author_id: "stable-local-profile".to_owned(),
+                created_at: "created".to_owned(),
+                updated_at: "updated".to_owned(),
+                color_rgb: [0.2, 0.4, 0.7],
+                anchor: (220.0, 660.0),
+            },
+        };
+        save_with_annotations(&path, &path, &[comment.clone()]).unwrap();
+        let mut pdf = Document::load(&path).unwrap();
+        let page_id = pdf.get_pages()[&1];
+        let root_id = existing_comment_objects(&pdf)
+            .into_values()
+            .next()
+            .unwrap()
+            .0;
+        let reply = pdf.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Text", "T" => literal("Other reader"),
+            "Rect" => rect_array(comment.rect), "Contents" => literal("Answer"),
+            "IRT" => Object::Reference(root_id),
+        });
+        append_annotation(&mut pdf, page_id, reply).unwrap();
+        pdf.save(&path).unwrap();
+        if let AnnotationKind::Comment { author, .. } = &mut comment.kind {
+            *author = "New name".to_owned();
+        }
+        for _ in 0..2 {
+            save_with_annotations(&path, &path, &[comment.clone()]).unwrap();
+            assert_eq!(
+                load_lawpdf_annotations(&path).unwrap(),
+                vec![comment.clone()]
+            );
+            let revision = crate::document_store::FileRevision::read(&path).unwrap();
+            let mut all = load_document_comments_checked(&path, &revision).unwrap();
+            all.push(DocumentComment::from_editor_annotation(&comment).unwrap());
+            let threads = crate::review_reading::group_comment_threads(&all);
+            assert_eq!(threads.len(), 1);
+            assert_eq!(threads[0].root.author.as_deref(), Some("New name"));
+            assert_eq!(
+                threads[0].replies[0].author.as_deref(),
+                Some("Other reader")
+            );
+            assert_eq!(threads[0].replies[0].text, "Answer");
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn lazy_comment_load_rejects_a_different_source_revision() {
+        let path = temp_pdf_path("comments-revision");
+        write_blank_pdf(&path);
+        let revision = crate::document_store::FileRevision::read(&path).unwrap();
+        save_with_annotations(&path, &path, &[highlight_annotation()]).unwrap();
+        assert!(
+            load_document_comments_checked(&path, &revision)
+                .unwrap_err()
+                .to_string()
+                .contains("changed outside")
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_comment_identity_remains_unknown_and_saved_author_is_retained() {
+        let pdf = Document::with_version("1.5");
+        let legacy = Object::Dictionary(dictionary! {
+            "Type" => "Annot", "Subtype" => "Text", "NM" => literal("LawPDF-comment-legacy"),
+            "Rect" => rect_array(PdfRect::new(0.0, 0.0, 20.0, 20.0)),
+            "Contents" => literal("An old note"), "T" => literal("Someone else"),
+        });
+        let annotation = lawpdf_comment_from_annotation(&pdf, &legacy, 0).unwrap();
+        let comment = DocumentComment::from_editor_annotation(&annotation).unwrap();
+        assert_eq!(comment.author.as_deref(), Some("Someone else"));
+        assert_eq!(comment.author_id, None);
+        assert!(!comment.is_owned_by("local-profile"));
+        let mut journal = serde_json::to_value(&annotation).unwrap();
+        let fields = journal["kind"]["Comment"].as_object_mut().unwrap();
+        fields.remove("author");
+        fields.remove("author_id");
+        let restored: EditorAnnotation = serde_json::from_value(journal).unwrap();
+        let restored = DocumentComment::from_editor_annotation(&restored).unwrap();
+        assert_eq!(restored.author_id, None);
+        assert_eq!(restored.author, None);
     }
 
     fn write_blank_pdf(path: &Path) {

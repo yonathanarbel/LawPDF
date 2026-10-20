@@ -19,11 +19,27 @@ jobs:
             target_dir: /tmp/lawpdf-target
           - os: windows-latest
             target_dir: C:\tmp\lawpdf-target
+          - os: ubuntu-24.04
+            target_dir: /tmp/lawpdf-target
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TARGET_DIR: ${{ matrix.target_dir }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Linux build and test dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            libgl1-mesa-dev libwayland-dev libxkbcommon-dev libx11-dev \
+            libxcursor-dev libxi-dev libxrandr-dev libfontconfig1-dev \
+            libdbus-1-dev libssl-dev tesseract-ocr tesseract-ocr-eng \
+            desktop-file-utils cups-client
+      - name: Fetch pinned Linux native libraries
+        if: runner.os == 'Linux'
+        run: |
+          ./scripts/fetch-pdfium-linux.sh
+          ./scripts/fetch-catboost-linux.sh
       - name: Fetch Windows native runtime
         if: runner.os == 'Windows'
         shell: pwsh
@@ -36,6 +52,55 @@ jobs:
         run: python tools/verify_release_manifest.py --require-platform-library
       - name: Verify Markdown exports
         run: python -m unittest discover -s tools -p test_md_verify.py
+      - name: Build and smoke-test extracted Linux package
+        if: runner.os == 'Linux'
+        env:
+          LAWPDF_DIST_DIR: ${{ runner.temp }}/lawpdf-dist
+          LAWPDF_OCR_ENGINE: tesseract
+        run: |
+          ./scripts/package-linux.sh
+          smoke="$RUNNER_TEMP/lawpdf-extracted"
+          mkdir -p "$smoke"
+          tar -xzf "$LAWPDF_DIST_DIR/LawPDF-linux-x86_64.tar.gz" -C "$smoke"
+          fixture="$GITHUB_WORKSPACE/tests/fixtures/ocr/scanned-law-review-sample.pdf"
+          cd "$RUNNER_TEMP"
+          env -u LAWPDF_MODEL_DIR "$smoke/LawPDF-linux-x86_64/lawpdf" \
+            --lm2-runtime-status --require-native --require-context --require-arbiter \
+            --require-note-head --require-link-ranker > linux-runtime.json
+          "$smoke/LawPDF-linux-x86_64/lawpdf" --ocr-self-test \
+            --pdf "$fixture" --page 1 --output "$RUNNER_TEMP/linux-ocr.json"
+          XDG_DATA_HOME="$smoke/data" "$smoke/LawPDF-linux-x86_64/install.sh"
+          desktop-file-validate "$smoke/data/applications/lawpdf.desktop"
+          XDG_DATA_HOME="$smoke/data" "$smoke/LawPDF-linux-x86_64/uninstall.sh"
+          test ! -f "$smoke/data/applications/lawpdf.desktop"
+      - name: Probe deployed citation search (diagnostic)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          "$RUNNER_TEMP/lawpdf-extracted/LawPDF-linux-x86_64/lawpdf" \
+            --citation-source-probe 'Oliver Wendell Holmes, The Path of the Law, 10 Harvard Law Review 457 (1897)' \
+            > "$RUNNER_TEMP/citation-search-probe.json"
+          cat "$RUNNER_TEMP/citation-search-probe.json"
+      - name: Upload citation search diagnostic
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: LawPDF-citation-search-probe
+          path: ${{ runner.temp }}/citation-search-probe.json
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload Linux package and smoke evidence
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: LawPDF-linux-x86_64
+          path: |
+            ${{ runner.temp }}/lawpdf-dist/LawPDF-linux-x86_64.tar.gz
+            ${{ runner.temp }}/lawpdf-dist/SHA256SUMS-linux.txt
+            ${{ runner.temp }}/linux-runtime.json
+            ${{ runner.temp }}/linux-ocr.json
+          if-no-files-found: error
+          retention-days: 14
 
   audit:
     runs-on: ubuntu-latest

@@ -223,6 +223,9 @@ impl PdfEditorApp {
                 ui.add_space(12.0);
                 self.draw_identity_row(ui, &identity);
                 self.draw_action_row(ui, ctx);
+                if self.view_mode == DocumentViewMode::LiquidMode2 {
+                    self.draw_review_feedback_switch(ui);
+                }
                 // Brass hairline where the masthead meets the page.
                 let rect = ui.max_rect();
                 ui.painter().hline(
@@ -960,8 +963,16 @@ impl PdfEditorApp {
             has_document,
             "Export this PDF as another document or image format",
             |ui| {
-                #[cfg(target_os = "macos")]
-                if ui.add_enabled(!self.print_ui.busy, egui::Button::new("Print…   ⌘P"))
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                if ui
+                    .add_enabled(
+                        !self.print_ui.busy,
+                        egui::Button::new(if cfg!(target_os = "macos") {
+                            "Print…   ⌘P"
+                        } else {
+                            "Print…   Ctrl+P"
+                        }),
+                    )
                     .on_hover_text("Print the original PDF with its current annotations")
                     .clicked()
                 {
@@ -1000,7 +1011,9 @@ impl PdfEditorApp {
                 has_document && !self.recovery_is_busy() && !self.page_rotation_in_flight,
                 egui::Button::new("Save As…"),
             )
-            .on_hover_text("Choose a filename and folder, then continue editing there\nCtrl/Cmd+Shift+S")
+            .on_hover_text(
+                "Choose a filename and folder, then continue editing there\nCtrl/Cmd+Shift+S",
+            )
             .clicked()
         {
             self.save_as_dialog(ctx);
@@ -1068,14 +1081,6 @@ impl PdfEditorApp {
                     ui.selectable_value(&mut self.liquid_theme, LiquidTheme::Dark, "Dark");
                 });
                 ui.separator();
-                let mut show_notes = !self.liquid_hide_footnotes;
-                if ui
-                    .checkbox(&mut show_notes, "Footnotes in the margin")
-                    .on_hover_text("Show footnote markers, margin notes, and the notes list")
-                    .changed()
-                {
-                    self.liquid_hide_footnotes = !show_notes;
-                }
                 ui.checkbox(
                     &mut self.liquid_show_hidden_furniture,
                     "Show hidden furniture",
@@ -1092,61 +1097,7 @@ impl PdfEditorApp {
                     return;
                 };
                 ui.separator();
-                ui.label(RichText::new("Narration").strong());
-                ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_salt("paid_tts_provider")
-                        .selected_text(self.tts_controller.provider.label())
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.tts_controller.provider,
-                                PaidTtsProvider::OpenRouter,
-                                "OpenRouter",
-                            );
-                            ui.selectable_value(
-                                &mut self.tts_controller.provider,
-                                PaidTtsProvider::OpenAi,
-                                "OpenAI",
-                            );
-                        });
-                    let paid_label = self
-                        .tts_controller
-                        .progress
-                        .map(|(completed, total)| {
-                            if total == 0 {
-                                "Creating MP3…".to_owned()
-                            } else {
-                                format!("Creating MP3… {completed}/{total}")
-                            }
-                        })
-                        .unwrap_or_else(|| "Create AI MP3".to_owned());
-                    if ui
-                        .add_enabled(
-                            self.tts_controller.progress.is_none(),
-                            egui::Button::new(paid_label),
-                        )
-                        .on_hover_text(
-                            "Creates AI-generated narration. Sends the article text to the selected provider using your key; provider charges may apply.",
-                        )
-                        .clicked()
-                    {
-                        self.start_paid_liquid_tts(document);
-                    }
-                });
-                let mut include = self.tts_controller.include_notes;
-                if ui
-                    .checkbox(&mut include, "Read footnotes after the body")
-                    .changed()
-                {
-                    self.tts_controller.include_notes = include;
-                }
-                if ui
-                    .button("Narration keys…")
-                    .on_hover_text("Add or change OpenAI and OpenRouter API keys")
-                    .clicked()
-                {
-                    self.settings_ui.open = true;
-                    ui.close();
-                }
+                self.draw_speech_menu(ui, document);
             },
         );
     }
@@ -1256,6 +1207,15 @@ impl PdfEditorApp {
                 }
             }
             ui.separator();
+            if ui.button("Comment name…").clicked() {
+                self.open_comment_profile();
+                ui.close();
+            }
+            #[cfg(target_os = "linux")]
+            if ui.button("Make LawPDF the default PDF reader").clicked() {
+                self.request_linux_default_reader(ctx);
+                ui.close();
+            }
             if ui.button("Settings…").clicked() {
                 self.settings_ui.open = true;
                 ui.close();
@@ -1474,7 +1434,7 @@ impl PdfEditorApp {
                 LiquidState::Ready(document) => Some(Arc::clone(document)),
                 _ => None,
             };
-            let reading = self.tts_controller.child.is_some();
+            let reading = self.tts_controller.is_active();
             if toolbar_icon_button(
                 ui,
                 if reading {
@@ -1486,12 +1446,8 @@ impl PdfEditorApp {
                 review_document.is_some(),
                 if reading {
                     "Stop reading"
-                } else if cfg!(target_os = "windows") {
-                    "Read the reflowed text aloud with Windows speech"
-                } else if cfg!(target_os = "macos") {
-                    "Read the reflowed text aloud with macOS speech"
                 } else {
-                    "Read the reflowed text aloud"
+                    "Read aloud using the selected speech source"
                 },
             )
             .clicked()
@@ -1500,6 +1456,7 @@ impl PdfEditorApp {
                     self.stop_liquid_tts();
                 } else if let Some(document) = review_document.as_deref() {
                     self.start_liquid_tts(document);
+                    ui.ctx().request_repaint();
                 }
             }
         }
@@ -1676,7 +1633,9 @@ impl PdfEditorApp {
             color,
         );
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label));
-        let location = self.document.as_ref()
+        let location = self
+            .document
+            .as_ref()
             .map(|document| document.path.display().to_string())
             .unwrap_or_default();
         response.on_hover_text(format!("Saving to: {location}\nAnnotations save automatically. Use Save As to choose another folder."));

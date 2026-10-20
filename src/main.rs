@@ -6,11 +6,16 @@ mod atomic_file;
 #[cfg(feature = "devtools")]
 mod benchmark;
 mod chat;
+mod citation_links;
+mod comments;
 mod credentials;
 mod diagnostics;
 mod document_store;
+mod footnote_sources;
 mod hashing;
 mod layout_roles;
+#[cfg(target_os = "linux")]
+mod linux_desktop;
 mod liquid;
 mod liquid2;
 #[cfg(feature = "devtools")]
@@ -23,9 +28,12 @@ mod native_process;
 mod ocr;
 mod page_geometry;
 mod pdf_backend;
+mod performance_cache;
 #[cfg(target_os = "macos")]
 mod printing;
-mod performance_cache;
+#[cfg(target_os = "linux")]
+#[path = "printing_linux.rs"]
+mod printing;
 mod render_worker;
 mod review_margin;
 mod review_masthead;
@@ -56,6 +64,35 @@ const APP_TITLE: &str = concat!(
 fn main() -> eframe::Result<()> {
     install_panic_log_hook();
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args.len() == 2 && args[0] == "--citation-source-probe" {
+        match footnote_sources::probe(&args[1].to_string_lossy()) {
+            Ok(result) => println!("{}", serde_json::json!({"success": true, "search": result})),
+            Err(error) => {
+                println!("{}", serde_json::json!({"success": false, "error": error}));
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    if args.len() == 1
+        && (args[0] == "--install-desktop-entry" || args[0] == "--uninstall-desktop-entry")
+    {
+        let result = if args[0] == "--install-desktop-entry" {
+            linux_desktop::install_desktop_entry()
+                .map(|path| format!("Installed {}", path.display()))
+        } else {
+            linux_desktop::uninstall_desktop_entry().map(|_| "Desktop entry removed.".to_owned())
+        };
+        match result {
+            Ok(message) => println!("{message}"),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     // The child has no UI, update service, credentials, or document-write
     // commands. Anonymous pipes carry its bounded request/response protocol.
     if args.len() == 1 && args[0] == "--pdf-worker" {
@@ -74,13 +111,24 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
+    #[cfg(target_os = "windows")]
+    if args.len() == 1 && args[0] == "--audio-worker" {
+        if let Err(error) = tts::run_windows_audio_worker() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if args.len() == 1 && args[0] == "--distribution-status" {
-        println!("{}", serde_json::json!({
-            "version": env!("CARGO_PKG_VERSION"),
-            "channel": if updater::managed_by_store() { "microsoft-store" } else { "direct" },
-            "self_updates_enabled": !updater::managed_by_store(),
-            "package_identity": updater::windows_package_identity(),
-        }));
+        println!(
+            "{}",
+            serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "channel": if updater::managed_by_store() { "microsoft-store" } else { "direct" },
+                "self_updates_enabled": updater::automatic_updates_supported(),
+                "package_identity": updater::windows_package_identity(),
+            })
+        );
         return Ok(());
     }
     #[cfg(target_os = "macos")]
@@ -206,7 +254,11 @@ fn main() -> eframe::Result<()> {
         Ok(()) => diagnostics::event("run_native_returned"),
         Err(error) => diagnostics::error("run_native_error", &error.to_string()),
     }
-    diagnostics::finish_session(if result.is_ok() { "clean" } else { "run_native_error" });
+    diagnostics::finish_session(if result.is_ok() {
+        "clean"
+    } else {
+        "run_native_error"
+    });
     result
 }
 
@@ -238,13 +290,24 @@ const DEV_COMMANDS: &[DevCommand] = &[
     DevCommand {
         flags: &["--verify-update-manifest"],
         handler: |args| {
-            let index = args.iter().position(|arg| arg == "--verify-update-manifest").unwrap();
-            let manifest = args.get(index + 1).ok_or("Provide a manifest and signature path")?;
-            let signature = args.get(index + 2).ok_or("Provide a manifest and signature path")?;
+            let index = args
+                .iter()
+                .position(|arg| arg == "--verify-update-manifest")
+                .unwrap();
+            let manifest = args
+                .get(index + 1)
+                .ok_or("Provide a manifest and signature path")?;
+            let signature = args
+                .get(index + 2)
+                .ok_or("Provide a manifest and signature path")?;
             let manifest = std::fs::read_to_string(manifest).map_err(|error| error.to_string())?;
-            let signature = std::fs::read_to_string(signature).map_err(|error| error.to_string())?;
+            let signature =
+                std::fs::read_to_string(signature).map_err(|error| error.to_string())?;
             let release = update_trust::verify(&manifest, &signature)?;
-            println!("Authenticated LawPDF {} manifest for {}", release.version, release.commit);
+            println!(
+                "Authenticated LawPDF {} manifest for {}",
+                release.version, release.commit
+            );
             Ok(())
         },
     },
@@ -637,6 +700,8 @@ fn install_panic_log_hook() {
                 let _ = file.write_all(line.as_bytes());
             }
         }
-        eprintln!("LawPDF encountered an unexpected error at {location}. Check document recovery when reopening the app.");
+        eprintln!(
+            "LawPDF encountered an unexpected error at {location}. Check document recovery when reopening the app."
+        );
     }));
 }

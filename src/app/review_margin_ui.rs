@@ -1,4 +1,4 @@
-//! Footnotes in the Review Mode margin.
+//! Footnotes and threaded PDF comments in the Review Mode margin.
 //!
 //! The body column is drawn first and records where each callout landed. The
 //! notes are then placed beside those lines by `review_margin::place_margin_notes`,
@@ -8,10 +8,13 @@
 
 use super::chrome::{BRASS, OXBLOOD, RULE, small_caps_job};
 use super::*;
+use crate::comments::comment_author_key;
 use crate::review_margin::{
     MarginNoteMetrics, MarginNotePlacement, MarginNoteRequest, MarginSide, assign_margin_sides,
     margin_notes_bottom, place_margin_notes,
 };
+use crate::review_reading::CommentThread;
+use std::sync::Arc;
 
 const NOTE_TEXT_INSET: f32 = 12.0;
 const NOTE_MAX_ROWS: usize = 9;
@@ -28,6 +31,21 @@ pub(super) struct ReviewMarginEntry {
     pub(super) anchor_top: f32,
     /// The callout in the body text, when the note was reached through one.
     pub(super) callout: Option<Rect>,
+    comment: Option<ReviewCommentPresentation>,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewCommentAuthor {
+    name: String,
+    color: Color32,
+    own: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewCommentPresentation {
+    thread: Arc<CommentThread>,
+    /// Root first, then replies, matching the cached PDF thread order.
+    authors: Vec<ReviewCommentAuthor>,
 }
 
 #[derive(Debug, Default)]
@@ -54,6 +72,7 @@ impl ReviewMarginCollector {
                 body: body.clone(),
                 anchor_top: rect.top(),
                 callout: Some(*rect),
+                comment: None,
             });
         }
     }
@@ -98,12 +117,62 @@ impl ReviewMarginCollector {
                 body,
                 anchor_top,
                 callout: None,
+                comment: None,
             });
         }
     }
 
     pub(super) fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    pub(super) fn add_comment_thread(
+        &mut self,
+        thread: Arc<CommentThread>,
+        anchor_top: f32,
+        own_id: &str,
+        own_display_name: &str,
+        colors: &HashMap<String, [f32; 3]>,
+    ) {
+        let key = format!("comment:{}", thread.root.key);
+        if !self.placed.insert(key.clone()) {
+            return;
+        }
+        let authors = std::iter::once(&thread.root)
+            .chain(thread.replies.iter())
+            .map(|comment| {
+                let own = comment.is_owned_by(own_id);
+                let name = if own && !own_display_name.trim().is_empty() {
+                    own_display_name.to_owned()
+                } else {
+                    comment
+                        .author
+                        .clone()
+                        .unwrap_or_else(|| "Unknown author".to_owned())
+                };
+                let color = colors
+                    .get(&comment_author_key(comment))
+                    .copied()
+                    .unwrap_or(comment.color_rgb);
+                ReviewCommentAuthor {
+                    name,
+                    own,
+                    color: Color32::from_rgb(
+                        (color[0].clamp(0.0, 1.0) * 255.0) as u8,
+                        (color[1].clamp(0.0, 1.0) * 255.0) as u8,
+                        (color[2].clamp(0.0, 1.0) * 255.0) as u8,
+                    ),
+                }
+            })
+            .collect();
+        self.entries.push(ReviewMarginEntry {
+            key,
+            marker: String::new(),
+            body: String::new(),
+            anchor_top,
+            callout: None,
+            comment: Some(ReviewCommentPresentation { thread, authors }),
+        });
     }
 }
 
@@ -158,6 +227,19 @@ impl PdfEditorApp {
     ) -> LayoutJob {
         let scale = self.liquid_text_scale;
         let mut job = LayoutJob::default();
+        if let Some(comment) = &entry.comment {
+            let author = &comment.authors[0];
+            job.append(
+                &format!("{}\n", author.name),
+                0.0,
+                TextFormat {
+                    font_id: FontId::proportional(11.5 * scale),
+                    color: self.comment_author_label_color(author.color),
+                    line_height: Some(18.0 * scale),
+                    ..Default::default()
+                },
+            );
+        }
         if !entry.marker.is_empty() {
             job.append(
                 &entry.marker,
@@ -171,7 +253,11 @@ impl PdfEditorApp {
             );
         }
         job.append(
-            &entry.body,
+            entry
+                .comment
+                .as_ref()
+                .map(|comment| comment.thread.root.text.as_str())
+                .unwrap_or(&entry.body),
             if entry.marker.is_empty() { 0.0 } else { 4.0 },
             TextFormat {
                 font_id: FontId::proportional(13.5 * scale),
@@ -180,6 +266,21 @@ impl PdfEditorApp {
                 ..Default::default()
             },
         );
+        if let Some(comment) = &entry.comment
+            && !comment.thread.replies.is_empty()
+        {
+            let count = comment.thread.replies.len();
+            job.append(
+                &format!("\n{count} {}", if count == 1 { "reply" } else { "replies" }),
+                0.0,
+                TextFormat {
+                    font_id: FontId::proportional(11.0 * scale),
+                    color: self.comment_author_label_color(comment.authors[0].color),
+                    line_height: Some(18.0 * scale),
+                    ..Default::default()
+                },
+            );
+        }
         job.wrap = egui::text::TextWrapping {
             max_width: width,
             max_rows,
@@ -215,6 +316,9 @@ impl PdfEditorApp {
                     .rows
                     .len()
                     .max(1)
+                    // Footnotes reserve one row for the explicit source lookup.
+                    // Comments keep their existing size and never search citations.
+                    + usize::from(entry.comment.is_none())
             })
             .collect::<Vec<_>>();
         let row_height = 18.0 * scale;
@@ -265,11 +369,17 @@ impl PdfEditorApp {
         let clip = ui.clip_rect();
         let mut hovered = None;
         let mut toggled = None;
+        let mut source_opened = None;
         let previous_hover = self.chrome.hovered_note.clone();
         let expanded = self.chrome.expanded_note.clone();
         let mut note_rects = Vec::with_capacity(entries.len());
 
         for ((entry, placement), side) in entries.iter().zip(&placements).zip(&sides) {
+            let accent = entry
+                .comment
+                .as_ref()
+                .map(|comment| comment.authors[0].color)
+                .unwrap_or(colors.number);
             let left_side = *side == MarginSide::Left;
             let left = if left_side { left_left } else { right_left };
             let rect = Rect::from_min_size(
@@ -306,12 +416,18 @@ impl PdfEditorApp {
                 },
                 rect.top() + 3.0..=rect.bottom() - 3.0,
                 if lit {
-                    Stroke::new(2.0_f32, colors.number)
+                    Stroke::new(2.0_f32, accent)
+                } else if entry.comment.is_some() {
+                    Stroke::new(1.5_f32, accent)
                 } else {
                     Stroke::new(1.0_f32, colors.rule)
                 },
             );
-            let job = self.review_note_job(entry, &colors, text_width, placement.rows);
+            let content_rows = placement
+                .rows
+                .saturating_sub(usize::from(entry.comment.is_none()))
+                .max(1);
+            let job = self.review_note_job(entry, &colors, text_width, content_rows);
             let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
             let text_left = if left_side {
                 rect.left()
@@ -339,14 +455,41 @@ impl PdfEditorApp {
                 });
             }
             painter.galley(text_origin, galley, colors.body);
+            let mut author_clicked = false;
+            if let Some(comment) = &entry.comment
+                && comment.authors[0].own
+            {
+                let author = &comment.authors[0];
+                let author_width = ui
+                    .fonts_mut(|fonts| {
+                        fonts.layout_no_wrap(
+                            author.name.clone(),
+                            FontId::proportional(11.5 * scale),
+                            author.color,
+                        )
+                    })
+                    .size()
+                    .x
+                    .min(text_width);
+                let name_rect =
+                    Rect::from_min_size(text_origin, Vec2::new(author_width, 18.0 * scale));
+                let name = ui
+                    .interact(name_rect, id.with("author"), Sense::click())
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .on_hover_text("Edit your name for all comments");
+                if name.clicked() {
+                    self.open_comment_profile();
+                    author_clicked = true;
+                }
+            }
             if placement.shortened {
                 let more = ui.fonts_mut(|fonts| {
-                    fonts.layout_job(small_caps_job("more", 10.5 * scale, colors.number, 80.0))
+                    fonts.layout_job(small_caps_job("more", 10.5 * scale, accent, 80.0))
                 });
                 painter.galley(
                     Pos2::new(text_left, rect.bottom() - metrics.more_height + 3.0),
                     more,
-                    colors.number,
+                    accent,
                 );
             }
             if lit && let Some(callout) = entry.callout {
@@ -357,11 +500,50 @@ impl PdfEditorApp {
                     egui::StrokeKind::Outside,
                 );
             }
+            let mut source_clicked = false;
+            if entry.comment.is_none() {
+                let footer_top = rect.bottom()
+                    - row_height
+                    - if placement.shortened {
+                        metrics.more_height
+                    } else {
+                        0.0
+                    };
+                let source_rect = Rect::from_min_size(
+                    Pos2::new(text_left, footer_top),
+                    Vec2::new(text_width, row_height),
+                );
+                let label = self.footnote_sources_button_label(&entry.key, &entry.body);
+                let source = ui
+                    .push_id(("review-note-source", &entry.key), |ui| {
+                        ui.put(
+                            source_rect,
+                            egui::Button::new(
+                                RichText::new(label).size(11.0 * scale).color(colors.number),
+                            )
+                            .frame(false),
+                        )
+                    })
+                    .inner
+                    .on_hover_text("Reuse an existing link or search BBGPT, with Crossref as a fallback, using this footnote text. The PDF stays on this computer.");
+                if source.clicked() {
+                    self.request_footnote_sources(&entry.key, &entry.body, ui.ctx());
+                    source_opened = Some(entry.key.clone());
+                    source_clicked = true;
+                }
+            }
             response.widget_info(|| {
                 egui::WidgetInfo::labeled(
                     egui::WidgetType::Button,
                     true,
-                    format!("Footnote {}: {}", entry.marker, entry.body),
+                    if let Some(comment) = &entry.comment {
+                        format!(
+                            "Comment by {}: {}",
+                            comment.authors[0].name, comment.thread.root.text
+                        )
+                    } else {
+                        format!("Footnote {}: {}", entry.marker, entry.body)
+                    },
                 )
             });
             let response = if placement.shortened {
@@ -371,7 +553,7 @@ impl PdfEditorApp {
             } else {
                 response
             };
-            if response.clicked() {
+            if response.clicked() && !author_clicked && !source_clicked {
                 toggled = Some(entry.key.clone());
             }
         }
@@ -386,8 +568,10 @@ impl PdfEditorApp {
             self.chrome.hovered_note = hovered;
             ui.ctx().request_repaint();
         }
-        let toggled_now = toggled.is_some();
-        if let Some(key) = toggled {
+        let toggled_now = toggled.is_some() || source_opened.is_some();
+        if let Some(key) = source_opened {
+            self.chrome.expanded_note = Some(key);
+        } else if let Some(key) = toggled {
             self.chrome.expanded_note = if self.chrome.expanded_note.as_deref() == Some(&key) {
                 None
             } else {
@@ -463,7 +647,9 @@ impl PdfEditorApp {
                         ui.horizontal(|ui| {
                             let heading = ui.fonts_mut(|fonts| {
                                 fonts.layout_job(small_caps_job(
-                                    &if entry.marker.is_empty() {
+                                    &if entry.comment.is_some() {
+                                        "Comment".to_owned()
+                                    } else if entry.marker.is_empty() {
                                         "Note".to_owned()
                                     } else {
                                         format!("Note {}", entry.marker)
@@ -500,15 +686,56 @@ impl PdfEditorApp {
                             .id_salt(("review-note-open-scroll", &entry.key))
                             .max_height(max_height)
                             .show(ui, |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&entry.body)
-                                            .size(15.0 * scale)
-                                            .color(colors.body),
-                                    )
-                                    .wrap()
-                                    .selectable(true),
-                                );
+                                if let Some(comment) = &entry.comment {
+                                    for (index, (note, author)) in
+                                        std::iter::once(&comment.thread.root)
+                                            .chain(comment.thread.replies.iter())
+                                            .zip(&comment.authors)
+                                            .enumerate()
+                                    {
+                                        if index > 0 {
+                                            ui.add_space(12.0 * scale);
+                                            ui.separator();
+                                            ui.add_space(4.0);
+                                        }
+                                        let name = RichText::new(&author.name)
+                                            .size(12.0 * scale)
+                                            .color(self.comment_author_label_color(author.color))
+                                            .strong();
+                                        if author.own {
+                                            let response = ui
+                                                .add(egui::Button::new(name).frame(false))
+                                                .on_hover_text("Edit your name for all comments");
+                                            if response.clicked() {
+                                                self.open_comment_profile();
+                                            }
+                                        } else {
+                                            ui.label(name);
+                                        }
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&note.text)
+                                                    .size(15.0 * scale)
+                                                    .color(colors.body),
+                                            )
+                                            .wrap()
+                                            .selectable(true),
+                                        );
+                                    }
+                                } else {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&entry.body)
+                                                .size(15.0 * scale)
+                                                .color(colors.body),
+                                        )
+                                        .wrap()
+                                        .selectable(true),
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.separator();
+                                    self.draw_footnote_sources(ui, &entry.key, &entry.body);
+                                }
                             });
                     });
             });

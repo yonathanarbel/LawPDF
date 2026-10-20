@@ -42,6 +42,7 @@ impl PdfEditorApp {
 
     fn begin_save_as(&mut self, destination: PathBuf) -> Result<(), String> {
         let destination = std::fs::canonicalize(&destination).unwrap_or(destination);
+        self.normalize_document_comment_authors(self.document_epoch);
         let Some(document) = &self.document else {
             return Ok(());
         };
@@ -225,6 +226,51 @@ mod tests {
             });
             assert!(Instant::now() < deadline, "Save As did not finish");
             std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn save_as_writes_current_comment_author_name_without_renaming_foreign_authors() {
+        let (mut app, ctx, _) = edited_fixture();
+        app.settings.comment_author_id = "this-reader".to_owned();
+        app.settings.comment_author_name = "New profile name".to_owned();
+        let comment = |id: &str, author_id: &str| EditorAnnotation {
+            page_index: 0,
+            rect: PdfRect::new(500.0, 650.0, 530.0, 680.0),
+            kind: AnnotationKind::Comment {
+                id: format!("LawPDF-comment-{id}"),
+                text: "A note".to_owned(),
+                author: "Old profile name".to_owned(),
+                author_id: author_id.to_owned(),
+                color_rgb: [0.2, 0.4, 0.7],
+                created_at: "created".to_owned(),
+                updated_at: "updated".to_owned(),
+                anchor: (220.0, 660.0),
+            },
+        };
+        app.annotations.extend([
+            comment("own", "this-reader"),
+            comment("foreign", "someone-else"),
+        ]);
+        let destination = app
+            .document
+            .as_ref()
+            .unwrap()
+            .path
+            .with_file_name("renamed-author-export.pdf");
+        app.begin_save_as(destination.clone()).unwrap();
+        finish(&mut app, &ctx);
+        assert!(
+            !app.annotations_dirty,
+            "normalizing a saved author must not look like a newer edit"
+        );
+        let annotations = crate::pdf_backend::load_lawpdf_annotations(&destination).unwrap();
+        for (id, expected) in [
+            ("this-reader", "New profile name"),
+            ("someone-else", "Old profile name"),
+        ] {
+            assert!(annotations.iter().any(|annotation| matches!(&annotation.kind,
+                AnnotationKind::Comment { author, author_id, .. } if author_id == id && author == expected)));
         }
     }
 

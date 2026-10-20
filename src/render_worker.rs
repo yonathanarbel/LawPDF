@@ -7,7 +7,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use eframe::egui::Context;
 
 use crate::document_store::{DocumentStore, FileRevision};
-use crate::model::{EditorAnnotation, LoadedDocument, PageTextChar, RenderedPage};
+use crate::model::{DocumentComment, EditorAnnotation, LoadedDocument, PageTextChar, RenderedPage};
 use crate::pdf_backend::{PdfEngine, RenderQuality, SaveReport, rotate_pdf_page_checked};
 
 #[derive(Debug)]
@@ -31,7 +31,10 @@ impl RenderSender {
     /// Cancel speculative work when its tab closes. Writes are deliberately
     /// excluded: a queued save must still report its actual outcome.
     pub fn set_live_documents(&self, epochs: impl IntoIterator<Item = u64>) {
-        *self.live_documents.lock().unwrap_or_else(|error| error.into_inner()) = Some(epochs.into_iter().collect());
+        *self
+            .live_documents
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(epochs.into_iter().collect());
     }
 
     pub fn send(&self, request: RenderRequest) -> Result<(), TrySendError<RenderRequest>> {
@@ -109,6 +112,11 @@ pub enum RenderRequest {
         document_epoch: u64,
         path: PathBuf,
     },
+    DocumentComments {
+        document_epoch: u64,
+        path: PathBuf,
+        expected_revision: FileRevision,
+    },
     TextCharsAsync {
         document_epoch: u64,
         path: PathBuf,
@@ -183,6 +191,12 @@ pub enum RenderEvent {
         document_epoch: u64,
         path: PathBuf,
         result: Result<LoadedDocument, String>,
+    },
+    DocumentComments {
+        document_epoch: u64,
+        path: PathBuf,
+        revision: FileRevision,
+        result: Result<Vec<DocumentComment>, String>,
     },
     Page {
         key: PageRenderKey,
@@ -260,11 +274,18 @@ pub fn spawn_render_worker(
                 break;
             };
             let epoch = cancellable_epoch(&request);
-            let cancelled = || epoch.is_some_and(|epoch| {
-                worker_documents.lock().unwrap_or_else(|error| error.into_inner())
-                    .as_ref().is_some_and(|live| !live.contains(&epoch))
-            });
-            if cancelled() { continue; }
+            let cancelled = || {
+                epoch.is_some_and(|epoch| {
+                    worker_documents
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .as_ref()
+                        .is_some_and(|live| !live.contains(&epoch))
+                })
+            };
+            if cancelled() {
+                continue;
+            }
             if engine.is_none() {
                 match PdfEngine::new() {
                     Ok(ready) => engine = Some(ready),
@@ -338,6 +359,44 @@ pub fn spawn_render_worker(
                         .load_document(&path)
                         .map_err(|error| error.to_string()),
                 },
+                RenderRequest::DocumentComments {
+                    document_epoch,
+                    path,
+                    expected_revision,
+                } => {
+                    // Comment extraction is opt-in and does not occupy the
+                    // native rendering thread while a long PDF is parsed.
+                    let sender = event_tx.clone();
+                    let context = repaint_context.clone();
+                    let source = path.clone();
+                    let revision = expected_revision.clone();
+                    let spawned = thread::Builder::new()
+                        .name("lawpdf-comments".to_owned())
+                        .spawn(move || {
+                            let result = crate::pdf_backend::load_document_comments_checked(
+                                &source, &revision,
+                            )
+                            .map_err(|error| format!("{error:#}"));
+                            let _ = sender.send(RenderEvent::DocumentComments {
+                                document_epoch,
+                                path: source,
+                                revision,
+                                result,
+                            });
+                            if let Some(context) = context {
+                                context.request_repaint();
+                            }
+                        });
+                    match spawned {
+                        Ok(_) => continue,
+                        Err(error) => RenderEvent::DocumentComments {
+                            document_epoch,
+                            path,
+                            revision: expected_revision,
+                            result: Err(format!("Could not start PDF comment loading: {error}")),
+                        },
+                    }
+                }
                 RenderRequest::TextCharsAsync {
                     document_epoch,
                     path,
@@ -517,7 +576,9 @@ pub fn spawn_render_worker(
                 }
             };
 
-            if cancelled() { continue; }
+            if cancelled() {
+                continue;
+            }
             if event_tx.send(event).is_ok() {
                 if let Some(ctx) = &repaint_context {
                     ctx.request_repaint();
@@ -541,6 +602,7 @@ fn cancellable_epoch(request: &RenderRequest) -> Option<u64> {
         RenderRequest::Page { key, .. } => Some(key.document_epoch),
         RenderRequest::Thumbnail { key, .. } => Some(key.document_epoch),
         RenderRequest::EnrichDocument { document_epoch, .. }
+        | RenderRequest::DocumentComments { document_epoch, .. }
         | RenderRequest::TextCharsAsync { document_epoch, .. }
         | RenderRequest::TextPageAsync { document_epoch, .. } => Some(*document_epoch),
         _ => None,
@@ -607,6 +669,7 @@ fn request_priority(request: &RenderRequest) -> u8 {
         | RenderRequest::RotatePage { .. } => 0,
         RenderRequest::Page { .. } => 1,
         RenderRequest::EnrichDocument { .. } => 2,
+        RenderRequest::DocumentComments { .. } => 2,
         RenderRequest::TextCharsAsync { .. } => 3,
         RenderRequest::Thumbnail { .. } => 4,
         RenderRequest::TextPageAsync { .. } => 5,
@@ -683,6 +746,16 @@ fn error_event(request: RenderRequest, message: String) -> RenderEvent {
         } => RenderEvent::DocumentEnriched {
             document_epoch,
             path,
+            result: Err(message),
+        },
+        RenderRequest::DocumentComments {
+            document_epoch,
+            path,
+            expected_revision,
+        } => RenderEvent::DocumentComments {
+            document_epoch,
+            path,
+            revision: expected_revision,
             result: Err(message),
         },
         RenderRequest::TextCharsAsync {

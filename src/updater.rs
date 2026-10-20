@@ -35,17 +35,28 @@ pub fn windows_package_identity() -> Option<String> {
         // SAFETY: The first call requests the bounded UTF-16 buffer length;
         // the second receives a valid, initialized buffer of exactly that size.
         if unsafe { GetCurrentPackageFullName(&mut length, None) } != ERROR_INSUFFICIENT_BUFFER
-            || length == 0 || length > 32768 { return None; }
+            || length == 0
+            || length > 32768
+        {
+            return None;
+        }
         let mut buffer = vec![0u16; length as usize];
         if unsafe { GetCurrentPackageFullName(&mut length, Some(PWSTR(buffer.as_mut_ptr()))) }
-            != ERROR_SUCCESS { return None; }
-        let end = buffer.iter().position(|value| *value == 0).unwrap_or(buffer.len());
+            != ERROR_SUCCESS
+        {
+            return None;
+        }
+        let end = buffer
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(buffer.len());
         String::from_utf16(&buffer[..end]).ok()
     }
     #[cfg(not(windows))]
-    { None }
+    {
+        None
+    }
 }
-
 
 #[derive(Debug, Clone)]
 pub enum UpdateEvent {
@@ -115,8 +126,14 @@ pub fn spawn_update_check(tx: Sender<UpdateEvent>) {
     });
 }
 
+pub fn automatic_updates_supported() -> bool {
+    cfg!(any(windows, target_os = "macos")) && !managed_by_store()
+}
+
 pub fn load_pending_update() -> Option<PendingUpdate> {
-    if managed_by_store() { return None; }
+    if managed_by_store() {
+        return None;
+    }
     let path = pending_update_path()?;
     let bytes = crate::document_store::read_limited(&path, 512 * 1024).ok()?;
     let pending = match serde_json::from_slice::<PendingUpdate>(&bytes) {
@@ -141,7 +158,9 @@ pub fn load_pending_update() -> Option<PendingUpdate> {
 }
 
 pub fn take_installed_update() -> Option<String> {
-    if managed_by_store() { return None; }
+    if managed_by_store() {
+        return None;
+    }
     let path = installed_update_path()?;
     let version = std::fs::read_to_string(&path).ok()?;
     let _ = std::fs::remove_file(path);
@@ -153,7 +172,9 @@ pub fn take_installed_update() -> Option<String> {
 }
 
 pub fn take_update_error() -> Option<String> {
-    if managed_by_store() { return None; }
+    if managed_by_store() {
+        return None;
+    }
     let path = update_error_path()?;
     let message = std::fs::read_to_string(&path).ok()?;
     let _ = std::fs::remove_file(path);
@@ -245,6 +266,11 @@ fn check_and_stage_update(tx: &Sender<UpdateEvent>) -> Result<(), String> {
         return Ok(());
     }
 
+    if !automatic_updates_supported() {
+        write_last_check("manual_download", Some(&version));
+        let _ = tx.send(UpdateEvent::ManualDownload { version });
+        return Ok(());
+    }
     let package_kind = preferred_package_kind();
     let asset_name = match package_kind {
         UpdatePackageKind::PortableZip => PORTABLE_ASSET_NAME,
@@ -976,8 +1002,10 @@ mod tests {
             signed_manifest: String::new(),
             manifest_signature: String::new(),
         };
-        assert_eq!(start_update_helper(&pending, &[]).unwrap_err(),
-            "Updates for this installation are managed by Microsoft Store.");
+        assert_eq!(
+            start_update_helper(&pending, &[]).unwrap_err(),
+            "Updates for this installation are managed by Microsoft Store."
+        );
     }
     use std::time::{SystemTime, UNIX_EPOCH};
 

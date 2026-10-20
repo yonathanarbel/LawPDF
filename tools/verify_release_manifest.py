@@ -16,7 +16,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--manifest", type=Path, default=Path("release-manifest.json"))
-    parser.add_argument("--platform", choices=("host", "macos", "windows"), default="host")
+    parser.add_argument(
+        "--platform", choices=("host", "macos", "windows", "linux"), default="host"
+    )
     parser.add_argument("--require-platform-library", action="store_true")
     parser.add_argument(
         "--expected-version",
@@ -34,7 +36,12 @@ def sha256(path: Path) -> str:
 
 
 def host_platform() -> str:
-    return "windows" if platform.system().lower().startswith("win") else "macos"
+    system = platform.system().lower()
+    if system.startswith("win"):
+        return "windows"
+    if system.startswith("linux"):
+        return "linux"
+    return "macos"
 
 
 def main() -> int:
@@ -98,7 +105,11 @@ def main() -> int:
     elif args.require_platform_library:
         errors.append(f"missing required {selected_platform} library: {library_path}")
 
-    contract_key = {"windows": "windows-x86_64", "macos": "macos-arm64"}[selected_platform]
+    contract_key = {
+        "windows": "windows-x86_64",
+        "macos": "macos-arm64",
+        "linux": "linux-x86_64",
+    }[selected_platform]
     contract = manifest.get("package_contracts", {}).get(contract_key)
     if not contract:
         errors.append(f"missing package contract: {contract_key}")
