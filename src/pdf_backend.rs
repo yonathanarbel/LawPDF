@@ -1527,6 +1527,32 @@ pub fn rewrite_hazard(document: &Document) -> Option<RewriteHazard> {
     signed.then_some(RewriteHazard::Signed)
 }
 
+/// Check the original PDF before annotation export can remove an owner-password
+/// wrapper. This matches the macOS PDFKit print path's allowsPrinting check.
+#[cfg(any(target_os = "linux", test))]
+fn allows_printing(document: &Document) -> bool {
+    // lopdf removes /Encrypt after automatically decrypting an empty user
+    // password. The original permissions survive in its encryption state.
+    if let Some(state) = document.encryption_state.as_ref() {
+        return state.permissions().contains(lopdf::Permissions::PRINTABLE);
+    }
+    const PRINT_PERMISSION: i64 = 1 << 2;
+    if !(document.is_encrypted() || document.was_encrypted()) {
+        return true;
+    }
+    document
+        .get_dict_in_dict(&document.trailer, b"Encrypt")
+        .ok()
+        .and_then(|dictionary| dictionary.get(b"P").ok())
+        .and_then(|object| object.as_i64().ok())
+        .is_none_or(|permissions| permissions & PRINT_PERMISSION != 0)
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn allows_printing_at(source: &Path) -> Result<bool> {
+    Ok(allows_printing(&Document::load(source)?))
+}
+
 /// Drop the owner-password wrapper from a document lopdf has already decrypted,
 /// so that saving it produces a readable, unencrypted file.
 fn strip_owner_password(document: &mut Document) -> Result<()> {
@@ -3527,6 +3553,55 @@ mod tests {
         assert!(full_again.rgba.chunks_exact(4).any(|p| p[0] != p[2]));
         engine.close_document(&source);
         fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn printing_checks_permissions_before_owner_protection_is_removed() {
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/owner-password.pdf");
+        assert!(
+            allows_printing_at(&source).unwrap(),
+            "the fixture permits printing"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        for permitted in [false, true] {
+            let mut document = Document::load(&source).unwrap();
+            let mut permissions = lopdf::Permissions::all();
+            permissions.set(lopdf::Permissions::PRINTABLE, permitted);
+            let state = lopdf::EncryptionState::try_from(lopdf::EncryptionVersion::V2 {
+                document: &document,
+                owner_password: "lawpdf-permission-test",
+                user_password: "",
+                key_length: 128,
+                permissions,
+            })
+            .unwrap();
+            document.encrypt(&state).unwrap();
+            assert_eq!(
+                allows_printing(&document),
+                permitted,
+                "encrypted dictionary"
+            );
+            let path = directory.path().join(format!("printing-{permitted}.pdf"));
+            document.save(&path).unwrap();
+            let loaded = Document::load(&path).unwrap();
+            assert!(loaded.was_encrypted());
+            assert!(
+                loaded.trailer.get(b"Encrypt").is_err(),
+                "lopdf removes the wrapper after decryption"
+            );
+            assert_eq!(
+                allows_printing(&loaded),
+                permitted,
+                "retained encryption state"
+            );
+            assert_eq!(
+                allows_printing_at(&path).unwrap(),
+                permitted,
+                "printing checks the actual source"
+            );
+        }
+        assert!(allows_printing(&Document::with_version("1.7")));
     }
 
     #[test]

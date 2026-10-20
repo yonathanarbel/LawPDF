@@ -109,7 +109,7 @@ impl DocumentStore {
         Self { root }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn print_source(&self, revision: &FileRevision) -> Result<PathBuf, String> {
         let path = self.snapshot_path(revision)?;
         revision.require_current(&path)?;

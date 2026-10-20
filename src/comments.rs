@@ -3,7 +3,34 @@ use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::DocumentComment;
+use crate::model::{AnnotationKind, DocumentComment, EditorAnnotation};
+
+/// Materialize the current profile name at save/export boundaries. Display
+/// overlays alone must not leave the PDF's standard author field out of date.
+pub fn normalize_comment_authors(
+    annotations: &mut [EditorAnnotation],
+    author_id: &str,
+    display_name: &str,
+) -> usize {
+    if author_id.is_empty() || display_name.trim().is_empty() {
+        return 0;
+    }
+    let mut changed = 0;
+    for annotation in annotations {
+        if let AnnotationKind::Comment {
+            author,
+            author_id: stored_id,
+            ..
+        } = &mut annotation.kind
+            && *stored_id == author_id
+            && *author != display_name
+        {
+            *author = display_name.to_owned();
+            changed += 1;
+        }
+    }
+    changed
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewMarginMode {

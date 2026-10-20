@@ -8,6 +8,26 @@ use crate::review_reading::{CommentThread, anchor_comments_to_blocks, group_comm
 type PendingComment = (u64, usize, (f32, f32), f32, f32);
 type CommentGeneration = (u64, usize, u64);
 
+/// A comment must never be journaled with an identity that exists only in RAM.
+/// Commit the profile first; failed writes leave both settings and PDFs alone.
+fn persist_comment_profile(
+    settings: &mut AppSettings,
+    name: String,
+    persist: impl FnOnce(&AppSettings) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut candidate = settings.clone();
+    candidate.comment_author_name = name;
+    if candidate.comment_author_id.is_empty() {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random)
+            .map_err(|_| "Could not create a comment identity. Please try again.".to_owned())?;
+        candidate.comment_author_id = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    }
+    persist(&candidate)?;
+    *settings = candidate;
+    Ok(())
+}
+
 #[derive(Default)]
 pub(super) struct CommentsUi {
     documents: HashMap<u64, CommentCache>,
@@ -50,6 +70,7 @@ pub(super) struct ReviewComments {
     pub(super) threads: Vec<Arc<CommentThread>>,
     pub(super) anchors: HashMap<usize, Vec<usize>>,
     pub(super) colors: HashMap<String, [f32; 3]>,
+    pub(super) unanchored: Vec<usize>,
 }
 
 struct DerivedResult {
@@ -174,12 +195,8 @@ impl PdfEditorApp {
 
     pub(super) fn ensure_comment_author_id(&mut self) -> Result<(), String> {
         if self.settings.comment_author_id.is_empty() {
-            let mut random = [0_u8; 16];
-            getrandom::fill(&mut random)
-                .map_err(|_| "Could not create a comment identity. Please try again.".to_owned())?;
-            self.settings.comment_author_id =
-                random.iter().map(|byte| format!("{byte:02x}")).collect();
-            self.queue_settings_save();
+            let name = self.settings.comment_author_name.clone();
+            persist_comment_profile(&mut self.settings, name, save_settings)?;
         }
         Ok(())
     }
@@ -231,11 +248,12 @@ impl PdfEditorApp {
                     Some("Enter a name without control characters.".to_owned());
                 return;
             }
-            if let Err(error) = self.ensure_comment_author_id() {
+            if let Err(error) =
+                persist_comment_profile(&mut self.settings, name.clone(), save_settings)
+            {
                 self.comments_ui.error = Some(error);
                 return;
             }
-            self.settings.comment_author_name = name.clone();
             // Display names in unopened documents use this same stable identity.
             // Only the active document needs saving now; other authors are untouched.
             let mut changed = false;
@@ -254,7 +272,6 @@ impl PdfEditorApp {
             if changed {
                 self.schedule_annotation_autosave(ctx);
             }
-            self.queue_settings_save();
             self.comments_ui.profile_open = false;
             if let Some((epoch, page, anchor, width, height)) =
                 self.comments_ui.pending_comment.take()
@@ -512,6 +529,10 @@ impl PdfEditorApp {
                         anchors.entry(target).or_default().extend(indices);
                     }
                 }
+                let anchored = anchors.values().flatten().copied().collect::<HashSet<_>>();
+                let unanchored = (0..threads.len())
+                    .filter(|index| !anchored.contains(index))
+                    .collect();
                 let _ = tx.send(DerivedResult {
                     epoch,
                     revision,
@@ -520,6 +541,7 @@ impl PdfEditorApp {
                         threads,
                         anchors,
                         colors,
+                        unanchored,
                     },
                     geometry,
                 });
@@ -561,48 +583,121 @@ impl PdfEditorApp {
                     .id_salt("narrow-review-comments")
                     .max_height(260.0)
                     .show(ui, |ui| {
-                        for (index, thread) in comments.threads.iter().enumerate() {
-                            for comment in std::iter::once(&thread.root).chain(&thread.replies) {
-                                let name = self.comment_display_author(
-                                    comment.author.as_deref().unwrap_or(""),
-                                    comment.author_id.as_deref().unwrap_or(""),
-                                );
-                                let color = comments
-                                    .colors
-                                    .get(&crate::comments::comment_author_key(comment))
-                                    .copied()
-                                    .unwrap_or(comment.color_rgb);
-                                let color =
-                                    self.comment_author_label_color(color_from_rgb(color, 255));
-                                ui.horizontal(|ui| {
-                                    if comment.is_owned_by(&self.settings.comment_author_id) {
-                                        if ui.link(RichText::new(name).color(color)).clicked() {
-                                            self.open_comment_profile();
-                                        }
-                                    } else {
-                                        ui.label(RichText::new(name).color(color).strong());
-                                    }
-                                });
-                                ui.label(&comment.text);
-                            }
-                            if ui.small_button("Go to passage").clicked()
-                                && let Some((&block, _)) = comments
-                                    .anchors
-                                    .iter()
-                                    .find(|(_, indices)| indices.contains(&index))
-                            {
-                                self.liquid_scroll_to_block = Some(block);
-                            }
-                            ui.separator();
-                        }
+                        self.draw_comment_list(ui, comments, 0..comments.threads.len())
                     });
             });
+    }
+
+    pub(super) fn draw_unanchored_comments(
+        &mut self,
+        ui: &mut egui::Ui,
+        comments: &ReviewComments,
+    ) {
+        if comments.unanchored.is_empty() {
+            return;
+        }
+        egui::CollapsingHeader::new(format!(
+            "Comments outside this Review excerpt ({})",
+            comments.unanchored.len()
+        ))
+        .default_open(true)
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("unanchored-review-comments")
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    self.draw_comment_list(ui, comments, comments.unanchored.iter().copied())
+                });
+        });
+    }
+
+    fn draw_comment_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        comments: &ReviewComments,
+        indices: impl IntoIterator<Item = usize>,
+    ) {
+        for index in indices {
+            let Some(thread) = comments.threads.get(index) else {
+                continue;
+            };
+            for comment in std::iter::once(&thread.root).chain(&thread.replies) {
+                let name = self.comment_display_author(
+                    comment.author.as_deref().unwrap_or(""),
+                    comment.author_id.as_deref().unwrap_or(""),
+                );
+                let color = comments
+                    .colors
+                    .get(&crate::comments::comment_author_key(comment))
+                    .copied()
+                    .unwrap_or(comment.color_rgb);
+                let color = self.comment_author_label_color(color_from_rgb(color, 255));
+                ui.horizontal(|ui| {
+                    if comment.is_owned_by(&self.settings.comment_author_id) {
+                        if ui.link(RichText::new(name).color(color)).clicked() {
+                            self.open_comment_profile();
+                        }
+                    } else {
+                        ui.label(RichText::new(name).color(color).strong());
+                    }
+                });
+                ui.label(&comment.text);
+            }
+            let anchor = comments
+                .anchors
+                .iter()
+                .find(|(_, indices)| indices.contains(&index))
+                .map(|(&block, _)| block);
+            if let Some(block) = anchor {
+                if ui.small_button("Go to passage").clicked() {
+                    self.liquid_scroll_to_block = Some(block);
+                }
+            } else if ui
+                .small_button(format!("Open PDF page {}", thread.root.page_index + 1))
+                .clicked()
+            {
+                self.page_index = thread.root.page_index;
+                self.scroll_target_page = Some(thread.root.page_index);
+                self.set_view_mode(DocumentViewMode::Pdf, ui.ctx());
+            }
+            ui.separator();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_is_persisted_before_identity_becomes_available_to_comments() {
+        let mut settings = AppSettings::default();
+        assert!(
+            persist_comment_profile(&mut settings, "Reader".to_owned(), |_| Err(
+                "disk full".to_owned()
+            ))
+            .is_err()
+        );
+        assert!(settings.comment_author_id.is_empty());
+        assert!(settings.comment_author_name.is_empty());
+        let mut persisted_id = String::new();
+        persist_comment_profile(&mut settings, "Reader".to_owned(), |candidate| {
+            assert_eq!(candidate.comment_author_name, "Reader");
+            assert!(!candidate.comment_author_id.is_empty());
+            persisted_id = candidate.comment_author_id.clone();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(settings.comment_author_id, persisted_id);
+        assert!(
+            persist_comment_profile(&mut settings, "New name".to_owned(), |_| Err(
+                "disk full".to_owned()
+            ))
+            .is_err()
+        );
+        assert_eq!(settings.comment_author_name, "Reader");
+        assert_eq!(settings.comment_author_id, persisted_id);
+    }
 
     fn review_document() -> Arc<LiquidDocument> {
         Arc::new(

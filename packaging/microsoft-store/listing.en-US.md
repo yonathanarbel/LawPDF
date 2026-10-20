@@ -1,6 +1,6 @@
 # Microsoft Store listing
 
-This listing accompanies app 0.2.43, Store package 1.2.43.0, under publisher
+This listing accompanies app 0.2.44, Store package 1.2.44.0, under publisher
 John Arbel and Store ID 9MZXSP0C423F. Publication and certification are separate
 from the GitHub release. See `docs/MICROSOFT_STORE.md` for dated submission
 observations and verification boundaries. Existing reading and coffee-panel
@@ -36,6 +36,12 @@ This is a public beta. Verify reconstructed text against the original PDF and re
 
 ## Suggested category
 Productivity
+
+## What's new in 0.2.44
+Review Mode has separate Show footnotes and Show comments controls. Imported
+PDF feedback keeps its authors and reply threads. Set your comment name once,
+click your own name to edit it globally, and distinguish authors by color.
+Narration consistently offers System speech, ElevenLabs, and OpenRouter.
 
 ## What's new in 0.2.43
 The first switch to Review Mode briefly shows the current page's words moving

@@ -1097,7 +1097,6 @@ impl PdfEditorApp {
                     return;
                 };
                 ui.separator();
-                ui.label(RichText::new("Narration").strong());
                 self.draw_speech_menu(ui, document);
             },
         );
@@ -1457,7 +1456,7 @@ impl PdfEditorApp {
                     self.stop_liquid_tts();
                 } else if let Some(document) = review_document.as_deref() {
                     self.start_liquid_tts(document);
-                ui.ctx().request_repaint();
+                    ui.ctx().request_repaint();
                 }
             }
         }

@@ -2,12 +2,41 @@ use super::*;
 use crate::pdf_backend::SaveReport;
 
 impl PdfEditorApp {
+    /// Keep live state equal to the normalized save snapshot. Otherwise a name
+    /// change can look like an unsaved edit immediately after a successful save.
+    pub(super) fn normalize_document_comment_authors(&mut self, epoch: u64) {
+        let normalize = |annotations: &mut [EditorAnnotation]| {
+            crate::comments::normalize_comment_authors(
+                annotations,
+                &self.settings.comment_author_id,
+                &self.settings.comment_author_name,
+            )
+        };
+        if self.document_epoch == epoch && normalize(&mut self.annotations) > 0 {
+            self.annotations_dirty = true;
+        }
+        for tab in &mut self.tabs {
+            if tab.document_epoch == epoch && normalize(&mut tab.annotations) > 0 {
+                tab.annotations_dirty = true;
+            }
+        }
+        if let Some(session) = self.annotation_sessions.get_mut(&epoch) {
+            normalize(&mut session.current);
+        }
+    }
+
     pub(super) fn queue_annotation_save(
         &mut self,
         epoch: u64,
         path: PathBuf,
-        annotations: Vec<EditorAnnotation>,
+        mut annotations: Vec<EditorAnnotation>,
     ) -> Result<(), String> {
+        self.normalize_document_comment_authors(epoch);
+        crate::comments::normalize_comment_authors(
+            &mut annotations,
+            &self.settings.comment_author_id,
+            &self.settings.comment_author_name,
+        );
         let session = self
             .annotation_sessions
             .get(&epoch)
@@ -54,6 +83,7 @@ impl PdfEditorApp {
             self.push_error_notice("Recover or discard the earlier edits before editing this PDF.");
             return;
         }
+        self.normalize_document_comment_authors(self.document_epoch);
         self.annotations_dirty = true;
         let Some(path) = self.document.as_ref().map(|document| document.path.clone()) else {
             return;
@@ -101,9 +131,15 @@ impl PdfEditorApp {
             .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
         for path in paths {
-            let Some(save) = self.pending_annotation_saves.remove(&path) else {
+            let Some(mut save) = self.pending_annotation_saves.remove(&path) else {
                 continue;
             };
+            self.normalize_document_comment_authors(save.document_epoch);
+            crate::comments::normalize_comment_authors(
+                &mut save.annotations,
+                &self.settings.comment_author_id,
+                &self.settings.comment_author_name,
+            );
             let Some(session) = self.annotation_sessions.get(&save.document_epoch) else {
                 self.push_error_notice(
                     "Could not find this PDF's recovery state. Keep it open and save a copy.",
@@ -553,7 +589,12 @@ pub(super) mod tests {
         let (mut app, ctx, _rx) = fixture();
         app.add_text_box_annotation(0, PdfRect::new(10.0, 20.0, 200.0, 60.0));
         app.update_ui.tx.send(UpdateEvent::Checking).unwrap();
-        app.update_ui.tx.send(UpdateEvent::Failed("direct channel must be ignored".to_owned())).unwrap();
+        app.update_ui
+            .tx
+            .send(UpdateEvent::Failed(
+                "direct channel must be ignored".to_owned(),
+            ))
+            .unwrap();
         app.poll_update_events(&ctx);
         assert!(app.annotations_dirty);
         assert!(app.update_ui.notice.is_none());

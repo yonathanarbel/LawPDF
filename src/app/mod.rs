@@ -2268,6 +2268,7 @@ impl PdfEditorApp {
     }
 
     fn save_current_annotations(&mut self) -> Result<(), String> {
+        self.normalize_document_comment_authors(self.document_epoch);
         let Some(document) = &self.document else {
             return Ok(());
         };
@@ -5591,10 +5592,21 @@ impl PdfEditorApp {
             .enumerate()
             .filter_map(|(index, annotation)| {
                 if let AnnotationKind::Comment {
-                    text, color_rgb, ..
+                    text,
+                    color_rgb,
+                    author,
+                    author_id,
+                    ..
                 } = &annotation.kind
                 {
-                    Some((index, annotation.page_index, text.clone(), *color_rgb))
+                    Some((
+                        index,
+                        annotation.page_index,
+                        text.clone(),
+                        *color_rgb,
+                        self.comment_display_author(author, author_id),
+                        !author_id.is_empty() && *author_id == self.settings.comment_author_id,
+                    ))
                 } else {
                     None
                 }
@@ -5606,7 +5618,18 @@ impl PdfEditorApp {
             egui::ScrollArea::vertical()
                 .max_height(180.0)
                 .show(ui, |ui| {
-                    for (index, page_index, text, color_rgb) in comments {
+                    for (index, page_index, text, color_rgb, author, own) in comments {
+                        if own {
+                            if ui
+                                .link(RichText::new(&author).strong())
+                                .on_hover_text("Edit your name for all comments")
+                                .clicked()
+                            {
+                                self.open_comment_profile();
+                            }
+                        } else {
+                            ui.label(RichText::new(&author).strong());
+                        }
                         ui.horizontal(|ui| {
                             let (swatch_rect, _) =
                                 ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
@@ -6478,6 +6501,8 @@ impl PdfEditorApp {
                                     self.draw_comment_load_status(ui);
                                     if margin_width <= 0.0 {
                                         self.draw_narrow_comments(ui, &comments);
+                                    } else {
+                                        self.draw_unanchored_comments(ui, &comments);
                                     }
                                 }
                                 if liquid_document_needs_ocr(&document) {

@@ -100,6 +100,18 @@ pub fn anchor_comments_to_blocks(
     }
     let mut result = HashMap::<usize, Vec<usize>>::new();
     for (index, comment) in comments.iter().enumerate() {
+        // Long PDFs may have only an opening-page Review excerpt ready. A
+        // later-page comment belongs in the unanchored list until that page is
+        // prepared, not beside an unrelated paragraph at the end of the excerpt.
+        if by_page
+            .first_key_value()
+            .is_none_or(|(&first, _)| comment.page_index < first)
+            || by_page
+                .last_key_value()
+                .is_none_or(|(&last, _)| comment.page_index > last)
+        {
+            continue;
+        }
         let Some((&page, lines)) = by_page.iter().min_by_key(|(page, _)| {
             (
                 page.abs_diff(comment.page_index),
@@ -1480,6 +1492,31 @@ mod tests {
         let anchors = anchor_comments_to_blocks(&comments, &blocks, &geometry, &[792.0]);
         assert_eq!(anchors[&11], vec![0]);
         assert_eq!(anchors[&10], vec![1]);
+    }
+
+    #[test]
+    fn later_page_comments_do_not_attach_to_the_opening_review_excerpt() {
+        let opening = comment_source_line(0, 50.0, 700.0);
+        let mut later = comment_source_line(0, 50.0, 700.0);
+        later.page_index = 79;
+        let blocks = vec![LiquidBlockSourceLines {
+            block_index: 3,
+            lines: vec![LiquidSourceLineRef {
+                id: Some(opening.id.clone()),
+                page_index: 0,
+                line_index: 0,
+                text: opening.text.clone(),
+                role: LiquidBlockRole::Paragraph,
+                note_markers: Vec::new(),
+            }],
+        }];
+        let mut future = comment("page-80", None, (120.0, 707.0));
+        future.page_index = 79;
+        let comments = [comment("opening", None, (120.0, 707.0)), future];
+        let anchors =
+            anchor_comments_to_blocks(&comments, &blocks, &[opening, later], &vec![792.0; 80]);
+        assert_eq!(anchors[&3], vec![0]);
+        assert!(!anchors.values().flatten().any(|&index| index == 1));
     }
 
     #[test]

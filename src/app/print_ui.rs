@@ -70,7 +70,12 @@ impl PdfEditorApp {
         // autosave completing must not change the requested print job.
         let source = document.path.clone();
         let revision = session.revision.clone();
-        let annotations = self.annotations.clone();
+        let mut annotations = self.annotations.clone();
+        crate::comments::normalize_comment_authors(
+            &mut annotations,
+            &self.settings.comment_author_id,
+            &self.settings.comment_author_name,
+        );
         let tx = self.print_ui.tx.clone();
         let ctx = ctx.clone();
         self.print_ui.busy = true;
