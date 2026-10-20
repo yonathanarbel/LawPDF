@@ -525,7 +525,7 @@ impl PdfEditorApp {
                         )
                     })
                     .inner
-                    .on_hover_text("Reuse an existing link or search BBGPT using this footnote text. The PDF stays on this computer.");
+                    .on_hover_text("Reuse an existing link or search BBGPT, with Crossref as a fallback, using this footnote text. The PDF stays on this computer.");
                 if source.clicked() {
                     self.request_footnote_sources(&entry.key, &entry.body, ui.ctx());
                     source_opened = Some(entry.key.clone());

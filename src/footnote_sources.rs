@@ -7,13 +7,17 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_SEARCH_URL: &str = "https://bbgpt.battleoftheforms.com/api/search";
+const CROSSREF_SEARCH_URL: &str = "https://api.crossref.org/works";
+const CROSSREF_SELECT: &str = "DOI,title,author,issued,URL";
+const CROSSREF_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_QUERY_CHARS: usize = 2_000;
 const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 const MAX_CACHE_RECORD_BYTES: u64 = 256 * 1024;
@@ -22,7 +26,7 @@ const MAX_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CANDIDATES: usize = 20;
 const RESULT_TTL: u64 = 14 * 24 * 60 * 60;
 const EMPTY_TTL: u64 = 24 * 60 * 60;
-const CACHE_VERSION: u8 = 1;
+const CACHE_VERSION: u8 = 2;
 
 /// Candidates are discovery results, never a claim that an article matches the
 /// footnote. The reader selects the appropriate source.
@@ -40,6 +44,8 @@ pub struct SourceSearch {
     pub candidates: Vec<SourceCandidate>,
     pub partial_errors: Vec<String>,
     pub cached: bool,
+    #[serde(default)]
+    pub via_crossref: bool,
 }
 
 pub struct LookupRequest {
@@ -135,6 +141,13 @@ pub fn query_key(endpoint: &str, query: &str) -> String {
         "use_llm": false,
         "top_per_engine": 5,
         "timeout": 10,
+        "fallback": {
+            "endpoint": CROSSREF_SEARCH_URL,
+            "query": "query.bibliographic",
+            "rows": 5,
+            "select": CROSSREF_SELECT,
+            "minimum_interval_ms": 1_000,
+        },
     });
     format!("{:x}", Sha256::digest(payload.to_string().as_bytes()))
 }
@@ -181,6 +194,9 @@ struct LookupService {
     endpoint: Result<Url, String>,
     client: Result<Client, String>,
     cache_dir: Option<PathBuf>,
+    crossref_endpoint: Option<Url>,
+    bbgpt_unavailable: Cell<bool>,
+    last_crossref_start: Cell<Option<Instant>>,
 }
 
 impl LookupService {
@@ -199,7 +215,17 @@ impl LookupService {
                 .build()
                 .map_err(|_| "Could not initialize citation search.".to_owned()),
             cache_dir,
+            crossref_endpoint: validated_endpoint(CROSSREF_SEARCH_URL).ok(),
+            bbgpt_unavailable: Cell::new(false),
+            last_crossref_start: Cell::new(None),
         }
+    }
+
+    #[cfg(test)]
+    fn without_fallback(endpoint: &str, cache_dir: Option<PathBuf>) -> Self {
+        let mut service = Self::new(endpoint, cache_dir);
+        service.crossref_endpoint = None;
+        service
     }
 
     fn lookup(&self, query: &str, refresh: bool) -> Result<SourceSearch, String> {
@@ -218,16 +244,81 @@ impl LookupService {
         {
             return Ok(cached);
         }
+        let result = if self.bbgpt_unavailable.get() {
+            self.lookup_crossref(&query)?
+        } else {
+            let primary = self
+                .fetch_json(
+                    endpoint,
+                    &[
+                        ("q", query.as_str()),
+                        ("engines", "crossref"),
+                        ("use_llm", "false"),
+                        ("top_per_engine", "5"),
+                        ("timeout", "10"),
+                    ],
+                )
+                .and_then(|value| parse_response(&value));
+            match primary {
+                Ok(result) if !result.candidates.is_empty() || result.partial_errors.is_empty() => {
+                    result
+                }
+                Ok(result) => {
+                    if self.crossref_endpoint.is_none() {
+                        return Ok(result);
+                    }
+                    self.bbgpt_unavailable.set(true);
+                    self.lookup_crossref(&query)?
+                }
+                Err(error) => {
+                    if self.crossref_endpoint.is_none() {
+                        return Err(error);
+                    }
+                    self.bbgpt_unavailable.set(true);
+                    self.lookup_crossref(&query)?
+                }
+            }
+        };
+        if result.partial_errors.is_empty() {
+            if let Some(root) = self.cache_dir.as_deref() {
+                write_cache(root, &key, &result, now);
+            }
+        }
+        Ok(result)
+    }
+
+    fn lookup_crossref(&self, query: &str) -> Result<SourceSearch, String> {
+        let endpoint = self
+            .crossref_endpoint
+            .as_ref()
+            .ok_or_else(|| "Citation search is unavailable.".to_owned())?;
+        // CrossRef's anonymous list endpoint permits one request per second.
+        // This wait belongs to the search worker, never the reader's UI thread.
+        if let Some(previous) = self.last_crossref_start.get() {
+            let remaining = CROSSREF_INTERVAL.saturating_sub(previous.elapsed());
+            if !remaining.is_zero() {
+                std::thread::sleep(remaining);
+            }
+        }
+        self.last_crossref_start.set(Some(Instant::now()));
+        let value = self
+            .fetch_json(
+                endpoint,
+                &[
+                    ("query.bibliographic", query),
+                    ("rows", "5"),
+                    ("select", CROSSREF_SELECT),
+                ],
+            )
+            .map_err(|error| format!("CrossRef fallback: {error}"))?;
+        parse_crossref_response(&value)
+    }
+
+    fn fetch_json(&self, endpoint: &Url, parameters: &[(&str, &str)]) -> Result<Value, String> {
         let client = self.client.as_ref().map_err(Clone::clone)?;
         let response = client
             .get(endpoint.clone())
-            .query(&[
-                ("q", query.as_str()),
-                ("engines", "crossref"),
-                ("use_llm", "false"),
-                ("top_per_engine", "5"),
-                ("timeout", "10"),
-            ])
+            .query(parameters)
             .header(reqwest::header::ACCEPT, "application/json")
             .send()
             .map_err(http_error)?;
@@ -260,15 +351,8 @@ impl LookupService {
         }
         let bytes = read_bounded(response, MAX_RESPONSE_BYTES)
             .map_err(|_| "Citation search returned too much or incomplete data.".to_owned())?;
-        let value: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| "Citation search returned an unreadable result.".to_owned())?;
-        let result = parse_response(&value)?;
-        if result.partial_errors.is_empty() {
-            if let Some(root) = self.cache_dir.as_deref() {
-                write_cache(root, &key, &result, now);
-            }
-        }
-        Ok(result)
+        serde_json::from_slice(&bytes)
+            .map_err(|_| "Citation search returned an unreadable result.".to_owned())
     }
 }
 
@@ -333,6 +417,42 @@ fn doi_source_url(doi: &str) -> Option<String> {
     // in the URL path instead of turning its tail into a query or fragment.
     url.set_path(doi);
     crate::citation_links::source_url(url.as_str())
+}
+
+fn parse_crossref_response(value: &Value) -> Result<SourceSearch, String> {
+    if value.get("status").and_then(Value::as_str) != Some("ok") {
+        return Err("CrossRef could not complete the lookup. Try again later.".to_owned());
+    }
+    let items = value
+        .get("message")
+        .and_then(|message| message.get("items"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "CrossRef returned an unreadable result.".to_owned())?;
+    let normalized = items.iter().take(100).map(|item| {
+        let title = item.get("title").and_then(Value::as_array)
+            .and_then(|titles| titles.iter().find_map(|title| text_field(title, 600)));
+        let authors = item.get("author").and_then(Value::as_array).into_iter().flatten()
+            .take(16).filter_map(|author| {
+                let given = author.get("given").and_then(|value| text_field(value, 160));
+                let family = author.get("family").and_then(|value| text_field(value, 160));
+                let name = given.into_iter().chain(family).collect::<Vec<_>>().join(" ");
+                if name.is_empty() {
+                    author.get("name").and_then(|value| text_field(value, 160))
+                } else { Some(name) }
+            }).collect::<Vec<_>>();
+        let year = item.get("issued").and_then(|issued| issued.get("date-parts"))
+            .and_then(Value::as_array).and_then(|dates| dates.first())
+            .and_then(Value::as_array).and_then(|date| date.first())
+            .and_then(Value::as_u64);
+        let doi = item.get("DOI").and_then(doi_field);
+        let url = doi.as_deref().and_then(doi_source_url).or_else(|| {
+            item.get("URL").and_then(Value::as_str).and_then(crate::citation_links::source_url)
+        });
+        serde_json::json!({ "title": title, "authors": authors, "year": year, "doi": doi, "url": url })
+    }).collect::<Vec<_>>();
+    let mut result = parse_response(&serde_json::json!({"success": true, "results": normalized}))?;
+    result.via_crossref = true;
+    Ok(result)
 }
 
 fn parse_response(value: &Value) -> Result<SourceSearch, String> {
@@ -419,6 +539,7 @@ fn parse_response(value: &Value) -> Result<SourceSearch, String> {
             .get("cached")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        via_crossref: false,
     })
 }
 
@@ -577,6 +698,8 @@ fn prune_cache(root: &Path) {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
 
     fn mock_response(
@@ -641,6 +764,157 @@ mod tests {
         }
     }
 
+    fn failing_primary() -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<AtomicBool>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/api/search", listener.local_addr().unwrap());
+        let count = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_count = Arc::clone(&count);
+        let worker_stop = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !worker_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let _ = stream.read(&mut [0_u8; 16_384]);
+                        worker_count.fetch_add(1, Ordering::Relaxed);
+                        let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("mock accept: {error}"),
+                }
+            }
+        });
+        (endpoint, count, stop, handle)
+    }
+
+    fn crossref_fixture() -> Vec<u8> {
+        serde_json::json!({"status":"ok", "message":{"items":[
+            {"title":["A later reprint"],"author":[{"name":"A Collection"}],"issued":{"date-parts":[[2007]]},"DOI":"10.1234/reprint"},
+            {"title":["The Path of the Law"],"author":[{"given":"Oliver Wendell","family":"Holmes"}],"issued":{"date-parts":[[1897,3,25]]},"DOI":"10.2307/1322028","URL":"https://doi.org/10.2307/1322028"},
+            {"title":["No date"],"issued":{"date-parts":[[null]]},"DOI":"10.1234/part?version#section"},
+            {"title":["Unsafe record"],"URL":"http://127.0.0.1/private"}
+        ]}}).to_string().into_bytes()
+    }
+
+    #[test]
+    fn fallback_preserves_evidence_order_caches_and_avoids_retrying_failed_bbgpt() {
+        let (primary, primary_count, stop, primary_server) = failing_primary();
+        let fixture = crossref_fixture();
+        let (fallback, requests, fallback_server) = mock_responses(vec![
+            ("200 OK".to_owned(), fixture.clone(), None),
+            ("200 OK".to_owned(), fixture, None),
+        ]);
+        let cache = tempfile::tempdir().unwrap();
+        let mut service = LookupService::new(&primary, Some(cache.path().to_owned()));
+        service.crossref_endpoint = Some(Url::parse(&fallback).unwrap());
+        let first = service.lookup("Holmes path of law", false).unwrap();
+        assert!(first.via_crossref && !first.cached);
+        assert_eq!(first.candidates.len(), 3);
+        assert_eq!(first.candidates[0].title, "A later reprint");
+        assert_eq!(first.candidates[1].authors, ["Oliver Wendell Holmes"]);
+        assert_eq!(first.candidates[1].year, Some(1897));
+        assert_eq!(first.candidates[1].doi.as_deref(), Some("10.2307/1322028"));
+        assert_eq!(first.candidates[2].year, None);
+        assert_eq!(
+            first.candidates[2].url,
+            "https://doi.org/10.1234/part%3Fversion%23section"
+        );
+        let first_start = service.last_crossref_start.get().unwrap();
+        let cached = service.lookup("Holmes path of law", false).unwrap();
+        assert!(cached.cached && cached.via_crossref);
+        assert!(
+            service
+                .lookup("A second article", false)
+                .unwrap()
+                .via_crossref
+        );
+        assert!(
+            service
+                .last_crossref_start
+                .get()
+                .unwrap()
+                .duration_since(first_start)
+                >= CROSSREF_INTERVAL
+        );
+        stop.store(true, Ordering::Relaxed);
+        primary_server.join().unwrap();
+        fallback_server.join().unwrap();
+        assert_eq!(primary_count.load(Ordering::Relaxed), 1);
+        let requests = requests.try_iter().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        let request_target = requests[0]
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap();
+        let url = Url::parse(&format!("http://localhost{request_target}")).unwrap();
+        let parameters = url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            parameters.get("query.bibliographic").unwrap(),
+            "Holmes path of law"
+        );
+        assert_eq!(parameters.get("rows").unwrap(), "5");
+        assert_eq!(parameters.get("select").unwrap(), CROSSREF_SELECT);
+        assert!(!parameters.contains_key("q"));
+    }
+
+    #[test]
+    fn empty_incomplete_bbgpt_result_uses_fallback_but_complete_empty_does_not() {
+        let body = serde_json::json!({"success":true,"results":[],"engine_errors":{"crossref":"unavailable"}}).to_string().into_bytes();
+        let (primary, _, primary_server) = mock_response("200 OK", body, None);
+        let (fallback, _, fallback_server) = mock_response("200 OK", crossref_fixture(), None);
+        let mut service = LookupService::new(&primary, None);
+        service.crossref_endpoint = Some(Url::parse(&fallback).unwrap());
+        assert!(service.lookup("article", false).unwrap().via_crossref);
+        primary_server.join().unwrap();
+        fallback_server.join().unwrap();
+
+        let (primary, _, primary_server) =
+            mock_response("200 OK", br#"{"success":true,"results":[]}"#.to_vec(), None);
+        let mut service = LookupService::new(&primary, None);
+        service.crossref_endpoint = Some(Url::parse("http://127.0.0.1:0/works").unwrap());
+        let result = service.lookup("article", false).unwrap();
+        assert!(result.candidates.is_empty() && !result.via_crossref);
+        assert!(!service.bbgpt_unavailable.get());
+        primary_server.join().unwrap();
+    }
+
+    #[test]
+    fn fallback_rate_limit_is_an_error_not_a_cached_empty_or_an_automatic_retry() {
+        let (primary, _, primary_server) = mock_response("503 Unavailable", b"{}".to_vec(), None);
+        let (fallback, requests, fallback_server) = mock_response(
+            "429 Too Many Requests",
+            b"private internal error".to_vec(),
+            None,
+        );
+        let cache = tempfile::tempdir().unwrap();
+        let mut service = LookupService::new(&primary, Some(cache.path().to_owned()));
+        service.crossref_endpoint = Some(Url::parse(&fallback).unwrap());
+        let error = service.lookup("article", false).unwrap_err();
+        assert!(error.contains("CrossRef") && error.contains("429"));
+        assert!(!error.contains("private internal error"));
+        primary_server.join().unwrap();
+        fallback_server.join().unwrap();
+        assert_eq!(requests.try_iter().count(), 1);
+        assert_eq!(fs::read_dir(cache.path()).unwrap().count(), 0);
+    }
+
     #[test]
     fn queries_are_bounded_and_cache_keys_include_deployment_and_configuration() {
         assert_eq!(normalize_query("  One\n two\tthree\0 "), "One two three");
@@ -681,7 +955,7 @@ mod tests {
         let body = serde_json::json!({"success":true,"results":[{"title":"A title","authors":["A. Scholar"],"year":"2024","doi":"10.1234/article","url":"https://doi.org/10.1234/article"}]}).to_string().into_bytes();
         let (endpoint, requests, server) = mock_response("200 OK", body, None);
         let cache = tempfile::tempdir().unwrap();
-        let service = LookupService::new(&endpoint, Some(cache.path().to_owned()));
+        let service = LookupService::without_fallback(&endpoint, Some(cache.path().to_owned()));
         let first = service.lookup("A title & another", false).unwrap();
         assert!(!first.cached);
         assert_eq!(first.candidates[0].year, Some(2024));
@@ -719,7 +993,7 @@ mod tests {
         ] {
             let (endpoint, _, server) = mock_response("200 OK", body, length);
             let cache = tempfile::tempdir().unwrap();
-            let error = LookupService::new(&endpoint, Some(cache.path().to_owned()))
+            let error = LookupService::without_fallback(&endpoint, Some(cache.path().to_owned()))
                 .lookup("title", false)
                 .unwrap_err();
             assert!(!error.contains(&endpoint));
@@ -740,7 +1014,7 @@ mod tests {
             ("200 OK".to_owned(), found, None),
         ]);
         let cache = tempfile::tempdir().unwrap();
-        let service = LookupService::new(&endpoint, Some(cache.path().to_owned()));
+        let service = LookupService::without_fallback(&endpoint, Some(cache.path().to_owned()));
         assert!(
             service
                 .lookup("article", false)
@@ -766,7 +1040,7 @@ mod tests {
         let secret = "token=never-display-this-query";
         let (endpoint, _, server) =
             mock_response("429 Too Many Requests", secret.as_bytes().to_vec(), None);
-        let error = LookupService::new(&endpoint, None)
+        let error = LookupService::without_fallback(&endpoint, None)
             .lookup(secret, false)
             .unwrap_err();
         assert!(error.contains("429"));
@@ -827,6 +1101,7 @@ mod tests {
             candidates: vec![candidate()],
             partial_errors: Vec::new(),
             cached: false,
+            via_crossref: false,
         };
         let empty = SourceSearch {
             candidates: Vec::new(),

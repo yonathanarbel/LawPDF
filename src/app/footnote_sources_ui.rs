@@ -334,11 +334,14 @@ impl PdfEditorApp {
             }
             None => {
                 search = ui.small_button(if links.is_empty() { "Find article sources" } else { "Search for other articles" })
-                    .on_hover_text("Sends this footnote text to the BBGPT search engine. The PDF stays on this computer.").clicked();
+                    .on_hover_text("Searches BBGPT, or Crossref if BBGPT is unavailable, using this footnote text. The PDF stays on this computer.").clicked();
                 None
             }
         };
         if let Some(result) = result {
+            if result.via_crossref {
+                ui.label(RichText::new("Crossref results · BBGPT unavailable").small());
+            }
             if result.candidates.is_empty() {
                 ui.label(if result.partial_errors.is_empty() {
                     "No article sources found."
@@ -382,7 +385,7 @@ impl PdfEditorApp {
             _ => None,
         };
         if ui.add_enabled(document.is_some(), egui::Button::new("Find article links"))
-            .on_hover_text("Search up to 32 unresolved footnotes in the prepared Review using BBGPT. Only footnote text is sent; existing URLs and DOIs are reused locally.")
+            .on_hover_text("Search up to 32 unresolved footnotes in the prepared Review using BBGPT, or Crossref if BBGPT is unavailable. Only footnote text is sent; existing URLs and DOIs are reused locally.")
             .clicked() && let Some(document) = document {
             let mut queued = 0;
             'blocks: for (block_index, block) in document.blocks.iter().enumerate() {
