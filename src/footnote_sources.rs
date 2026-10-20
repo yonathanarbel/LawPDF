@@ -327,6 +327,14 @@ fn doi_field(value: &Value) -> Option<String> {
     Some(doi.to_owned())
 }
 
+fn doi_source_url(doi: &str) -> Option<String> {
+    let mut url = Url::parse("https://doi.org/").ok()?;
+    // '?' and '#' can belong to the DOI itself. Keep the complete identifier
+    // in the URL path instead of turning its tail into a query or fragment.
+    url.set_path(doi);
+    crate::citation_links::source_url(url.as_str())
+}
+
 fn parse_response(value: &Value) -> Result<SourceSearch, String> {
     if value.get("success").and_then(Value::as_bool) != Some(true) {
         return Err("Citation search could not complete the lookup. Try again later.".to_owned());
@@ -346,11 +354,7 @@ fn parse_response(value: &Value) -> Result<SourceSearch, String> {
             .get("url")
             .and_then(Value::as_str)
             .and_then(crate::citation_links::source_url)
-            .or_else(|| {
-                doi.as_ref().and_then(|doi| {
-                    crate::citation_links::source_url(&format!("https://doi.org/{doi}"))
-                })
-            });
+            .or_else(|| doi.as_deref().and_then(doi_source_url));
         let Some(url) = url else { continue };
         let identity = doi
             .as_ref()
@@ -796,6 +800,22 @@ mod tests {
         .unwrap();
         assert_eq!(result.candidates.len(), 2);
         assert_eq!(result.candidates[1].url, "https://doi.org/10.5555/other");
+    }
+
+    #[test]
+    fn doi_only_results_preserve_query_and_fragment_characters_in_the_identifier() {
+        let result = parse_response(&serde_json::json!({"success":true,"results":[
+            {"title":"An article","doi":"10.1234/article?version#part"}
+        ]}))
+        .unwrap();
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(
+            result.candidates[0].url,
+            "https://doi.org/10.1234/article%3Fversion%23part"
+        );
+        let url = Url::parse(&result.candidates[0].url).unwrap();
+        assert!(url.query().is_none());
+        assert!(url.fragment().is_none());
     }
 
     #[test]

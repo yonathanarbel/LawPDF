@@ -224,7 +224,17 @@ impl PdfEditorApp {
                     self.footnote_sources_ui.active = None;
                 }
                 let state = match event.result {
-                    Ok(results) => LookupState::Ready(Arc::new(results)),
+                    Ok(results) => {
+                        if results.candidates.is_empty() && !results.partial_errors.is_empty() {
+                            for pending in self.footnote_sources_ui.pending.drain(..) {
+                                self.footnote_sources_ui
+                                    .results
+                                    .remove(&pending.request.key);
+                            }
+                            self.status = "Source search paused because the search engine did not finish. Retry one footnote to resume.".to_owned();
+                        }
+                        LookupState::Ready(Arc::new(results))
+                    }
                     Err(error) => {
                         for pending in self.footnote_sources_ui.pending.drain(..) {
                             self.footnote_sources_ui
