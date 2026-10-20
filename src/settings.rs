@@ -11,12 +11,32 @@ pub const MAX_PDF_ZOOM: f32 = 5.0;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AppSettings {
+    #[serde(default)]
+    pub comment_author_name: String,
+    #[serde(default)]
+    pub comment_author_id: String,
+    #[serde(default)]
+    pub review_margin_mode: crate::comments::ReviewMarginMode,
     #[serde(default = "default_openrouter_api_key", skip_serializing)]
     pub openrouter_api_key: String,
     #[serde(default, skip_serializing)]
     pub openai_api_key: String,
     #[serde(default, skip_serializing)]
     pub groq_api_key: String,
+    #[serde(default, skip_serializing)]
+    pub elevenlabs_api_key: String,
+    #[serde(default)]
+    pub speech_provider: crate::tts::SpeechProvider,
+    #[serde(default = "default_openrouter_speech_model")]
+    pub openrouter_speech_model: String,
+    #[serde(default = "default_openrouter_speech_voice")]
+    pub openrouter_speech_voice: String,
+    #[serde(default = "default_elevenlabs_speech_model")]
+    pub elevenlabs_speech_model: String,
+    #[serde(default = "default_elevenlabs_speech_voice")]
+    pub elevenlabs_speech_voice: String,
+    #[serde(default)]
+    pub speech_include_notes: bool,
     #[serde(skip)]
     pub credential_error: Option<String>,
     #[serde(default = "default_retention_days")]
@@ -61,9 +81,19 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            comment_author_name: String::new(),
+            comment_author_id: String::new(),
+            review_margin_mode: crate::comments::ReviewMarginMode::default(),
             openrouter_api_key: default_openrouter_api_key(),
             openai_api_key: String::new(),
             groq_api_key: String::new(),
+            elevenlabs_api_key: String::new(),
+            speech_provider: crate::tts::SpeechProvider::System,
+            openrouter_speech_model: default_openrouter_speech_model(),
+            openrouter_speech_voice: default_openrouter_speech_voice(),
+            elevenlabs_speech_model: default_elevenlabs_speech_model(),
+            elevenlabs_speech_voice: default_elevenlabs_speech_voice(),
+            speech_include_notes: false,
             credential_error: None,
             cache_retention_days: default_retention_days(),
             last_pdf_zoom: DEFAULT_PDF_ZOOM,
@@ -114,6 +144,7 @@ pub fn effective_openrouter_api_key(settings: &AppSettings) -> Option<String> {
     let configured = settings.openrouter_api_key.trim();
     if configured.is_empty() {
         std::env::var("LAWPDF_OPENROUTER_API_KEY")
+            .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
             .ok()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
@@ -131,6 +162,34 @@ pub fn effective_groq_api_key(settings: &AppSettings) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+pub fn effective_elevenlabs_api_key(settings: &AppSettings) -> Option<String> {
+    let configured = settings.elevenlabs_api_key.trim();
+    if !configured.is_empty() {
+        return Some(configured.to_owned());
+    }
+    std::env::var("LAWPDF_ELEVENLABS_API_KEY")
+        .or_else(|_| std::env::var("ELEVENLABS_API_KEY"))
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn default_openrouter_speech_model() -> String {
+    "openai/gpt-4o-mini-tts-2025-12-15".to_owned()
+}
+
+fn default_openrouter_speech_voice() -> String {
+    "nova".to_owned()
+}
+
+fn default_elevenlabs_speech_model() -> String {
+    "eleven_flash_v2_5".to_owned()
+}
+
+fn default_elevenlabs_speech_voice() -> String {
+    "JBFqnCBsd6RMkjVDRZzb".to_owned()
 }
 
 fn default_openrouter_api_key() -> String {
@@ -232,14 +291,33 @@ pub(crate) fn load_settings_from(path: &Path) -> AppSettings {
 }
 
 pub fn save_settings(settings: &AppSettings) -> Result<(), String> {
-    if let Some(error) = &settings.credential_error {
-        return Err(error.clone());
-    }
+    ensure_settings_save_allowed(settings)?;
     let path = settings_path().ok_or_else(|| "Could not find settings directory.".to_owned())?;
     save_settings_to(settings, &path)
 }
 
+fn ensure_settings_save_allowed(settings: &AppSettings) -> Result<(), String> {
+    // A locked/unavailable keyring must not prevent saving local preferences.
+    // Preserve the legacy JSON, however, until every in-memory legacy secret
+    // has successfully migrated; serialized settings intentionally omit keys.
+    if let Some(error) = &settings.credential_error {
+        if [
+            &settings.openrouter_api_key,
+            &settings.openai_api_key,
+            &settings.groq_api_key,
+            &settings.elevenlabs_api_key,
+        ]
+        .iter()
+        .any(|key| !key.is_empty())
+        {
+            return Err(error.clone());
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn save_settings_to(settings: &AppSettings, path: &Path) -> Result<(), String> {
+    ensure_settings_save_allowed(settings)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Could not create settings folder: {error}"))?;
@@ -262,7 +340,9 @@ pub fn app_data_dir() -> Option<PathBuf> {
         if let Some(path) = std::env::var_os("LAWPDF_SHUTDOWN_SMOKE_DATA_DIR") {
             return Some(PathBuf::from(path));
         }
-        return Some(std::env::temp_dir().join(format!("lawpdf-shutdown-data-{}", std::process::id())));
+        return Some(
+            std::env::temp_dir().join(format!("lawpdf-shutdown-data-{}", std::process::id())),
+        );
     }
     // Unit tests must never read, overwrite, or prune a user's application data.
     if cfg!(test) {
@@ -342,12 +422,59 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_keyring_still_allows_local_preferences_without_secrets() {
+        let path = temp_settings_path("unavailable-keyring-preferences");
+        let settings = AppSettings {
+            credential_error: Some("keyring unavailable".to_owned()),
+            speech_provider: crate::tts::SpeechProvider::ElevenLabs,
+            ..AppSettings::default()
+        };
+        save_settings_to(&settings, &path).unwrap();
+        let restored = load_settings_from(&path);
+        assert_eq!(
+            restored.speech_provider,
+            crate::tts::SpeechProvider::ElevenLabs
+        );
+        assert!(restored.elevenlabs_api_key.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn unavailable_keyring_preserves_every_unmigrated_provider_secret() {
+        let path = temp_settings_path("unavailable-keyring-legacy");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let legacy = b"existing legacy credential settings";
+        std::fs::write(&path, legacy).unwrap();
+        for provider in 0..4 {
+            let mut settings = AppSettings {
+                credential_error: Some("keyring unavailable".to_owned()),
+                ..AppSettings::default()
+            };
+            let field = match provider {
+                0 => &mut settings.openrouter_api_key,
+                1 => &mut settings.openai_api_key,
+                2 => &mut settings.groq_api_key,
+                _ => &mut settings.elevenlabs_api_key,
+            };
+            *field = "non-secret-legacy-test-key".to_owned();
+            assert_eq!(
+                save_settings_to(&settings, &path).unwrap_err(),
+                "keyring unavailable"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), legacy);
+        }
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn settings_round_trip_through_injected_path() {
         let path = temp_settings_path("roundtrip");
         let expected = AppSettings {
             openrouter_api_key: "router".to_owned(),
             openai_api_key: "openai".to_owned(),
             groq_api_key: "groq".to_owned(),
+            elevenlabs_api_key: "elevenlabs-secret".to_owned(),
+            speech_provider: crate::tts::SpeechProvider::ElevenLabs,
             last_pdf_zoom: 2.25,
             pdf_zoom_by_document: BTreeMap::from([
                 ("c:/docs/first.pdf".to_owned(), 1.5),
@@ -370,8 +497,14 @@ mod tests {
         assert!(actual.openrouter_api_key.is_empty());
         assert!(actual.openai_api_key.is_empty());
         assert!(actual.groq_api_key.is_empty());
+        assert!(actual.elevenlabs_api_key.is_empty());
+        assert_eq!(
+            actual.speech_provider,
+            crate::tts::SpeechProvider::ElevenLabs
+        );
         let serialized = std::fs::read_to_string(&path).unwrap();
         assert!(!serialized.contains("api_key"));
+        assert!(!serialized.contains("elevenlabs-secret"));
         assert!(!format!("{expected:?}").contains("router"));
         assert_eq!(actual.last_pdf_zoom, expected.last_pdf_zoom);
         assert_eq!(actual.pdf_zoom_by_document, expected.pdf_zoom_by_document);

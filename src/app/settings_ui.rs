@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) struct SettingsUi {
     pub(super) api_key_edit: String,
-    pub(super) openai_api_key_edit: String,
+    pub(super) elevenlabs_api_key_edit: String,
     pub(super) groq_api_key_edit: String,
     pub(super) open: bool,
     saving_credentials: bool,
@@ -20,7 +20,7 @@ impl SettingsUi {
         let (maintenance_tx, maintenance_rx) = unbounded();
         Self {
             api_key_edit: settings.openrouter_api_key.clone(),
-            openai_api_key_edit: settings.openai_api_key.clone(),
+            elevenlabs_api_key_edit: settings.elevenlabs_api_key.clone(),
             groq_api_key_edit: settings.groq_api_key.clone(),
             open: false,
             saving_credentials: false,
@@ -110,6 +110,7 @@ impl PdfEditorApp {
                     self.settings.openrouter_api_key = saved.openrouter_api_key;
                     self.settings.openai_api_key = saved.openai_api_key;
                     self.settings.groq_api_key = saved.groq_api_key;
+                    self.settings.elevenlabs_api_key = saved.elevenlabs_api_key;
                     self.settings.credential_error = None;
                     match save_settings(&self.settings) {
                         Ok(()) => {
@@ -206,13 +207,15 @@ impl PdfEditorApp {
                         .desired_width(360.0),
                 );
                 ui.add_space(8.0);
-                ui.label(RichText::new("OpenAI (optional TTS)").strong().color(INK));
+                ui.label(RichText::new("ElevenLabs (speech)").strong().color(INK));
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.settings_ui.openai_api_key_edit)
+                    egui::TextEdit::singleline(&mut self.settings_ui.elevenlabs_api_key_edit)
                         .password(true)
                         .hint_text("API key")
                         .desired_width(360.0),
                 );
+                ui.add_space(12.0);
+                self.draw_speech_settings(ui);
                 ui.label(
                     RichText::new("Keys are stored in your system credential store. Blank a field to remove its key.")
                         .size(10.0)
@@ -224,7 +227,7 @@ impl PdfEditorApp {
                     }
                     if ui.button("Cancel").clicked() {
                         self.settings_ui.api_key_edit = self.settings.openrouter_api_key.clone();
-                        self.settings_ui.openai_api_key_edit = self.settings.openai_api_key.clone();
+                        self.settings_ui.elevenlabs_api_key_edit = self.settings.elevenlabs_api_key.clone();
                         self.settings_ui.groq_api_key_edit = self.settings.groq_api_key.clone();
                         self.settings_ui.open = false;
                     }
@@ -235,8 +238,19 @@ impl PdfEditorApp {
         if save_clicked {
             let mut candidate = self.settings.clone();
             candidate.openrouter_api_key = self.settings_ui.api_key_edit.trim().to_owned();
-            candidate.openai_api_key = self.settings_ui.openai_api_key_edit.trim().to_owned();
+            candidate.elevenlabs_api_key =
+                self.settings_ui.elevenlabs_api_key_edit.trim().to_owned();
             candidate.groq_api_key = self.settings_ui.groq_api_key_edit.trim().to_owned();
+            let credentials_changed = candidate.openrouter_api_key
+                != self.settings.openrouter_api_key
+                || candidate.elevenlabs_api_key != self.settings.elevenlabs_api_key
+                || candidate.groq_api_key != self.settings.groq_api_key;
+            if !credentials_changed {
+                self.queue_settings_save();
+                self.settings_ui.open = false;
+                self.status = "Settings saved.".to_owned();
+                return;
+            }
             self.settings_ui.saving_credentials = true;
             self.status = "Saving API keys securely…".to_owned();
             let tx = self.settings_ui.credential_tx.clone();

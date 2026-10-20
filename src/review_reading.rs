@@ -5,13 +5,142 @@
 //! path. Keep them free of Pdfium and native-model I/O so tests can drive them
 //! directly.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use crate::liquid::{
-    ArticleSpan, LiquidBlock, LiquidBlockRole, LiquidDocument, hidden_contents_mask_for_display,
-    should_hide_contents_block_for_display,
+    ArticleSpan, DeepLiquidSourceLine, LiquidBlock, LiquidBlockRole, LiquidBlockSourceLines,
+    LiquidDocument, hidden_contents_mask_for_display, should_hide_contents_block_for_display,
 };
+use crate::model::{DocumentComment, PdfRect};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommentThread {
+    pub root: DocumentComment,
+    pub replies: Vec<DocumentComment>,
+}
+
+/// Follow PDF `/IRT` reply chains, retaining orphan replies and damaged cycles.
+/// This is called when the document's comment cache changes, never per frame.
+pub fn group_comment_threads(comments: &[DocumentComment]) -> Vec<CommentThread> {
+    let indices = comments
+        .iter()
+        .enumerate()
+        .map(|(index, comment)| (comment.key.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let root_of = |start: usize| {
+        let mut path = Vec::new();
+        let mut index = start;
+        loop {
+            if let Some(cycle_start) = path.iter().position(|&seen| seen == index) {
+                return *path[cycle_start..].iter().min().unwrap_or(&index);
+            }
+            path.push(index);
+            let Some(&parent) = comments[index]
+                .reply_to
+                .as_deref()
+                .and_then(|key| indices.get(key))
+            else {
+                return index;
+            };
+            index = parent;
+        }
+    };
+    let mut grouped = BTreeMap::<usize, Vec<usize>>::new();
+    for index in 0..comments.len() {
+        grouped.entry(root_of(index)).or_default().push(index);
+    }
+    grouped
+        .into_iter()
+        .map(|(root, members)| CommentThread {
+            root: comments[root].clone(),
+            replies: members
+                .into_iter()
+                .filter(|&index| index != root)
+                .map(|index| comments[index].clone())
+                .collect(),
+        })
+        .collect()
+}
+
+/// Match a comment's real source geometry to the source lines retained by the
+/// model. This handles columns and uneven page spacing without guessing a line
+/// number from the proportion of the page occupied by the annotation.
+pub fn anchor_comments_to_blocks(
+    comments: &[DocumentComment],
+    block_source_lines: &[LiquidBlockSourceLines],
+    source_geometry: &[DeepLiquidSourceLine],
+    page_heights: &[f32],
+) -> HashMap<usize, Vec<usize>> {
+    let rects = source_geometry
+        .iter()
+        .filter(|line| {
+            [line.left, line.bottom, line.right, line.top]
+                .iter()
+                .all(|value| value.is_finite())
+                && line.right > line.left
+                && line.top > line.bottom
+        })
+        .map(|line| {
+            (
+                (line.page_index, line.line_index),
+                PdfRect::new(line.left, line.bottom, line.right, line.top),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut by_page = BTreeMap::<usize, Vec<(usize, usize, Option<PdfRect>)>>::new();
+    for block in block_source_lines {
+        for line in &block.lines {
+            by_page.entry(line.page_index).or_default().push((
+                line.line_index,
+                block.block_index,
+                rects.get(&(line.page_index, line.line_index)).copied(),
+            ));
+        }
+    }
+    let mut result = HashMap::<usize, Vec<usize>>::new();
+    for (index, comment) in comments.iter().enumerate() {
+        let Some((&page, lines)) = by_page.iter().min_by_key(|(page, _)| {
+            (
+                page.abs_diff(comment.page_index),
+                **page > comment.page_index,
+            )
+        }) else {
+            continue;
+        };
+        let distance = |rect: PdfRect| {
+            let x = comment.anchor.0;
+            let y = comment.anchor.1;
+            let dx = (rect.left - x).max(0.0).max(x - rect.right);
+            let dy = (rect.bottom - y).max(0.0).max(y - rect.top);
+            dx * dx + dy * dy
+        };
+        let geometric = lines
+            .iter()
+            .filter_map(|(_, block, rect)| rect.map(|rect| (*block, distance(rect))))
+            .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        let block = geometric.map(|(block, _)| block).or_else(|| {
+            // Old Review caches omit geometry. Keep those usable until the
+            // existing source preparation supplies real line rectangles.
+            let max_line = lines.iter().map(|(line, _, _)| *line).max().unwrap_or(0);
+            let height = page_heights
+                .get(page)
+                .copied()
+                .filter(|height| *height > 0.0)
+                .unwrap_or(1.0);
+            let fraction = (1.0 - comment.anchor.1 / height).clamp(0.0, 1.0);
+            let target = (fraction * max_line as f32).round() as usize;
+            lines
+                .iter()
+                .min_by_key(|(line, _, _)| line.abs_diff(target))
+                .map(|(_, block, _)| *block)
+        });
+        if let Some(block) = block {
+            result.entry(block).or_default().push(index);
+        }
+    }
+    result
+}
 
 pub const REVIEW_OPENING_PAGE_LIMIT: usize = 4;
 /// Opening a PDF never starts a full Review job. Cache hits are free; anything
@@ -1295,6 +1424,97 @@ mod tests {
     use crate::liquid::LiquidBlockSourceLines;
     use crate::liquid::LiquidSourceLineRef;
 
+    fn comment(key: &str, reply_to: Option<&str>, anchor: (f32, f32)) -> DocumentComment {
+        DocumentComment {
+            page_index: 0,
+            anchor,
+            rect: PdfRect::new(anchor.0, anchor.1, anchor.0, anchor.1),
+            text: key.to_owned(),
+            author: Some("Reviewer".to_owned()),
+            author_id: None,
+            color_rgb: [0.4, 0.5, 0.7],
+            source: crate::model::DocumentCommentSource::Embedded,
+            is_reply: reply_to.is_some(),
+            reply_to: reply_to.map(str::to_owned),
+            key: key.to_owned(),
+        }
+    }
+
+    fn comment_source_line(index: usize, left: f32, bottom: f32) -> DeepLiquidSourceLine {
+        serde_json::from_value(serde_json::json!({
+            "id": format!("p0-l{index}"), "page_index":0, "page_width":612.0, "page_height":792.0,
+            "line_index":index, "text":"Source text", "left":left, "bottom":bottom,
+            "right":left+180.0, "top":bottom+14.0, "font_height":12.0,
+            "font_ratio_page":1.0, "font_ratio_page_ref":1.0, "font_ratio_doc":1.0,
+            "bold":false, "italic":false, "centered":false,
+            "below_footnote_divider":false, "page_has_footnote_divider":false
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn comment_anchor_uses_actual_source_geometry_in_two_columns() {
+        let geometry = vec![
+            comment_source_line(0, 50.0, 700.0),
+            comment_source_line(1, 330.0, 700.0),
+        ];
+        let blocks = geometry
+            .iter()
+            .enumerate()
+            .map(|(index, source)| LiquidBlockSourceLines {
+                block_index: index + 10,
+                lines: vec![LiquidSourceLineRef {
+                    id: Some(source.id.clone()),
+                    page_index: 0,
+                    line_index: source.line_index,
+                    text: source.text.clone(),
+                    role: LiquidBlockRole::Paragraph,
+                    note_markers: Vec::new(),
+                }],
+            })
+            .collect::<Vec<_>>();
+        let comments = vec![
+            comment("right", None, (420.0, 707.0)),
+            comment("left", None, (120.0, 707.0)),
+        ];
+        let anchors = anchor_comments_to_blocks(&comments, &blocks, &geometry, &[792.0]);
+        assert_eq!(anchors[&11], vec![0]);
+        assert_eq!(anchors[&10], vec![1]);
+    }
+
+    #[test]
+    fn reply_chains_orphans_and_cycles_keep_every_comment_once() {
+        let comments = vec![
+            comment("reply2", Some("reply1"), (0.0, 0.0)),
+            comment("root", None, (0.0, 0.0)),
+            comment("reply1", Some("root"), (0.0, 0.0)),
+            comment("orphan", Some("missing"), (0.0, 0.0)),
+            comment("cycle-a", Some("cycle-b"), (0.0, 0.0)),
+            comment("cycle-b", Some("cycle-a"), (0.0, 0.0)),
+        ];
+        let threads = group_comment_threads(&comments);
+        assert_eq!(threads.len(), 3);
+        let mut keys = threads
+            .iter()
+            .flat_map(|thread| std::iter::once(&thread.root).chain(&thread.replies))
+            .map(|comment| comment.key.as_str())
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["cycle-a", "cycle-b", "orphan", "reply1", "reply2", "root"]
+        );
+        assert_eq!(
+            threads
+                .iter()
+                .find(|thread| thread.root.key == "root")
+                .unwrap()
+                .replies
+                .len(),
+            2
+        );
+    }
+
     fn span(article_index: usize, confidence: f32) -> ArticleSpan {
         ArticleSpan {
             article_index,
@@ -1864,7 +2084,14 @@ mod tests {
         let reset = review_prepare_flags_after_restart();
         assert_eq!(reset, ReviewPrepareFlags::default());
         assert_eq!(
-            review_prepare_next_action(3, true, true, false, reset.preview_spawned, reset.full_spawned),
+            review_prepare_next_action(
+                3,
+                true,
+                true,
+                false,
+                reset.preview_spawned,
+                reset.full_spawned
+            ),
             ReviewPrepareAction::SpawnFull { page_count: 3 }
         );
         assert_eq!(

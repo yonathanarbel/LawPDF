@@ -6,11 +6,21 @@ That's the ambition behind LawPDF: a reader built around how legal scholars actu
 Created by **Professor Yonathan Arbel**, LawPDF is a free, open-source desktop PDF
 reader and annotation editor for Windows and Apple-silicon Macs.
 
+The development build adds Linux x86_64 support; see [Linux setup](docs/LINUX.md).
+Linux packages will be available with the next release.
+
 Read the article, follow the footnotes, and keep your place. **Review Mode**
 reconstructs reading flow and footnotes in law review articles, while the original
 PDF remains available for checking quotations, citations, tables, and layout.
 Highlight a passage for class, leave a comment on a colleague's draft, or work
 through a case with search, annotation, and recovery tools in one application.
+
+The development build also provides separate **Show footnotes** and **Show
+comments** controls in Review Mode. Imported PDF comments retain their authors
+and reply threads. Set your own comment name under **⋯ → Comment name…**, or
+click your name on a comment to edit it globally. Author colors distinguish
+readers. Narration uses **System**, **ElevenLabs**, or **OpenRouter** throughout
+the app; select the source and configure provider keys in Settings.
 
 The “world's best” line expresses the creator's vision, not an independently
 tested ranking. **Version 0.2.43 is a public beta.**

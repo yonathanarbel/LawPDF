@@ -228,7 +228,9 @@ impl DocumentStore {
                 // grace period before the UI has received its live revision.
                 // Windows requires write-attributes access for timestamp
                 // updates. Open the private snapshot without truncating it.
-                File::options().write(true).open(&path)
+                File::options()
+                    .write(true)
+                    .open(&path)
                     .and_then(|file| file.set_modified(std::time::SystemTime::now()))
                     .map_err(|error| error.to_string())?;
                 return Ok(path);
@@ -548,11 +550,15 @@ pub fn validate_annotations(annotations: &[EditorAnnotation]) -> Result<(), Stri
                 updated_at,
                 color_rgb,
                 anchor,
+                author,
+                author_id,
             } => {
                 text.len() <= 1_000_000
                     && id.len() <= 1024
                     && created_at.len() <= 1024
                     && updated_at.len() <= 1024
+                    && author.len() <= 4096
+                    && author_id.len() <= 1024
                     && finite_color(color_rgb)
                     && anchor.0.is_finite()
                     && anchor.1.is_finite()
@@ -683,17 +689,24 @@ mod tests {
         let (_directory, store, source, revision) = fixture();
         let snapshot = store.snapshot_path(&revision).unwrap();
         let before = fs::read(&snapshot).unwrap();
-        File::options().write(true).open(&snapshot)
+        File::options()
+            .write(true)
+            .open(&snapshot)
             .unwrap()
             .set_modified(std::time::SystemTime::UNIX_EPOCH)
             .unwrap();
         assert_eq!(store.capture(&source).unwrap(), revision);
         assert_eq!(fs::read(&snapshot).unwrap(), before);
         assert_eq!(FileRevision::read(&source).unwrap(), revision);
-        assert!(fs::metadata(&snapshot).unwrap().modified().unwrap()
-            > std::time::SystemTime::UNIX_EPOCH);
+        assert!(
+            fs::metadata(&snapshot).unwrap().modified().unwrap()
+                > std::time::SystemTime::UNIX_EPOCH
+        );
         store.prune_sources(std::time::Duration::ZERO, &[]).unwrap();
-        assert!(snapshot.exists(), "reopening renews the retention grace period");
+        assert!(
+            snapshot.exists(),
+            "reopening renews the retention grace period"
+        );
     }
 
     #[test]
@@ -703,7 +716,9 @@ mod tests {
             .journal(&source, &revision, 1, &[annotation("keep")])
             .unwrap();
         let snapshot = store.snapshot_path(&revision).unwrap();
-        File::options().write(true).open(&snapshot)
+        File::options()
+            .write(true)
+            .open(&snapshot)
             .unwrap()
             .set_modified(std::time::SystemTime::UNIX_EPOCH)
             .unwrap();

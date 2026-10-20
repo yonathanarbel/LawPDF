@@ -227,6 +227,78 @@ jobs:
           name: LawPDF-SHA256SUMS-macos
           path: dist/SHA256SUMS-macos.txt
 
+  linux:
+    name: Linux x86_64
+    timeout-minutes: 90
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TARGET_DIR: /tmp/lawpdf-target
+      LAWPDF_DIST_DIR: ${{ runner.temp }}/lawpdf-dist
+      LAWPDF_OCR_ENGINE: tesseract
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Linux build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            libgl1-mesa-dev libwayland-dev libxkbcommon-dev libx11-dev \
+            libxcursor-dev libxi-dev libxrandr-dev libfontconfig1-dev \
+            libdbus-1-dev libssl-dev tesseract-ocr tesseract-ocr-eng \
+            desktop-file-utils cups-client
+      - name: Fetch pinned native libraries
+        run: |
+          ./scripts/fetch-pdfium-linux.sh
+          ./scripts/fetch-catboost-linux.sh
+      - name: Verify release manifest and assets
+        run: |
+          args=(--platform linux --require-platform-library)
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            args+=(--expected-version "${GITHUB_REF_NAME#v}")
+          fi
+          python3 tools/verify_release_manifest.py "${args[@]}"
+      - name: Run regression tests
+        run: cargo test --release --locked
+      - name: Build and verify portable package
+        run: ./scripts/package-linux.sh
+      - name: Smoke-test the extracted package outside the checkout
+        run: |
+          smoke="$RUNNER_TEMP/lawpdf-extracted"
+          mkdir -p "$smoke"
+          tar -xzf "$LAWPDF_DIST_DIR/LawPDF-linux-x86_64.tar.gz" -C "$smoke"
+          fixture="$GITHUB_WORKSPACE/tests/fixtures/ocr/scanned-law-review-sample.pdf"
+          cd "$RUNNER_TEMP"
+          env -u LAWPDF_MODEL_DIR "$smoke/LawPDF-linux-x86_64/lawpdf" \
+            --lm2-runtime-status --require-native --require-context --require-arbiter \
+            --require-note-head --require-link-ranker > linux-runtime.json
+          "$smoke/LawPDF-linux-x86_64/lawpdf" --ocr-self-test \
+            --pdf "$fixture" --page 1 --output "$RUNNER_TEMP/linux-ocr.json"
+          XDG_DATA_HOME="$smoke/data" "$smoke/LawPDF-linux-x86_64/install.sh"
+          desktop-file-validate "$smoke/data/applications/lawpdf.desktop"
+          XDG_DATA_HOME="$smoke/data" "$smoke/LawPDF-linux-x86_64/uninstall.sh"
+          test ! -f "$smoke/data/applications/lawpdf.desktop"
+      - name: Upload Linux package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: LawPDF-linux-x86_64
+          path: ${{ runner.temp }}/lawpdf-dist/LawPDF-linux-x86_64.tar.gz
+          if-no-files-found: error
+      - name: Upload Linux checksum fragment
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: LawPDF-SHA256SUMS-linux
+          path: ${{ runner.temp }}/lawpdf-dist/SHA256SUMS-linux.txt
+          if-no-files-found: error
+      - name: Upload Linux smoke evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: LawPDF-Linux-smoke-evidence
+          path: |
+            ${{ runner.temp }}/linux-runtime.json
+            ${{ runner.temp }}/linux-ocr.json
+          if-no-files-found: error
+
+
   publish:
     name: Prepare tagged release for maintainer signing
     permissions:
@@ -235,7 +307,7 @@ jobs:
       attestations: write
     timeout-minutes: 20
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [windows, macos]
+    needs: [windows, macos, linux]
     runs-on: ubuntu-latest
 
     steps:
@@ -259,6 +331,18 @@ jobs:
           name: LawPDF-macos
           path: dist
 
+      - name: Download Linux package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: LawPDF-linux-x86_64
+          path: dist
+
+      - name: Download Linux checksum fragment
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: LawPDF-SHA256SUMS-linux
+          path: checksums
+
       - name: Download Windows checksum fragment
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -273,7 +357,7 @@ jobs:
 
       - name: Assemble and verify SHA-256 manifest
         run: |
-          cat checksums/SHA256SUMS-windows.txt checksums/SHA256SUMS-macos.txt > dist/SHA256SUMS.txt
+          cat checksums/SHA256SUMS-windows.txt checksums/SHA256SUMS-macos.txt checksums/SHA256SUMS-linux.txt > dist/SHA256SUMS.txt
           (cd dist && sha256sum --check SHA256SUMS.txt)
 
       - name: Create release authentication payload
@@ -293,6 +377,7 @@ jobs:
             dist/LawPDF-windows-portable-x64.zip
             dist/LawPDFSetup-x64.exe
             dist/LawPDF-macos.zip
+            dist/LawPDF-linux-x86_64.tar.gz
             dist/SHA256SUMS.txt
             dist/UPDATE-MANIFEST.json
           )

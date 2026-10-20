@@ -9,6 +9,8 @@ import json
 import re
 from pathlib import Path
 
+# Keep the v1 manifest compatible with already installed Windows/Mac clients.
+# Linux is manually downloaded and authenticated by checksums and provenance.
 ASSETS = ("LawPDFSetup-x64.exe", "LawPDF-windows-portable-x64.zip", "LawPDF-macos.zip")
 
 def main():

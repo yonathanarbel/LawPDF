@@ -132,3 +132,6 @@ __pycache__/
 /src/profile_dataset.rs
 /docs/checkpoints/
 /docs/notes/
+
+# Linux PDFium is fetched and verified for packaging.
+/vendor/libpdfium.so

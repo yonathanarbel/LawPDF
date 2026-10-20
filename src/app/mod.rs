@@ -4,8 +4,11 @@ mod annotation_session;
 mod chat_ui;
 mod chrome;
 mod close_ui;
+mod comments_ui;
 mod document_opening;
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "linux")]
+mod platform_ui;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod print_ui;
 mod recovery_ui;
 mod review_margin_ui;
@@ -14,6 +17,7 @@ mod save_as;
 mod search_state;
 mod selection_state;
 mod settings_ui;
+mod speech_ui;
 mod support_ui;
 mod tts_controller;
 mod update_ui;
@@ -71,21 +75,20 @@ use crate::render_worker::{
     PageRenderKey, RenderEvent, RenderRequest, ThumbnailRenderKey, spawn_render_worker,
 };
 use crate::review_reading::{
-    REVIEW_MARGIN_GAP, REVIEW_MARGIN_MIN_WIDTH, REVIEW_PARAGRAPH_GAP, ReviewPrepareAction, ReviewPrepareFlags,
-    apply_live_review_correction, find_hits_in_review_blocks, is_review_note_display_block,
-    opening_pages_ready_for_review, review_all_pages_ready, review_allows_automatic_full_prepare,
-    review_column_layout, review_contents_navigation_entries, review_footnote_superscript,
-    review_gate_automatic_full, review_hidden_display_mask, review_opening_page_count,
-    review_paragraph_display_parts, review_prepare_flags_after_restart, review_prepare_next_action,
-    review_skips_block_as_furniture, review_table_figure_crop, should_apply_review_event,
-    should_precompute_review_on_open, split_fused_review_notes,
+    REVIEW_MARGIN_GAP, REVIEW_MARGIN_MIN_WIDTH, REVIEW_PARAGRAPH_GAP, ReviewPrepareAction,
+    ReviewPrepareFlags, apply_live_review_correction, find_hits_in_review_blocks,
+    is_review_note_display_block, opening_pages_ready_for_review, review_all_pages_ready,
+    review_allows_automatic_full_prepare, review_column_layout, review_contents_navigation_entries,
+    review_footnote_superscript, review_gate_automatic_full, review_hidden_display_mask,
+    review_opening_page_count, review_paragraph_display_parts, review_prepare_flags_after_restart,
+    review_prepare_next_action, review_skips_block_as_furniture, review_table_figure_crop,
+    should_apply_review_event, should_precompute_review_on_open, split_fused_review_notes,
 };
 use crate::settings::{
-    AppSettings, app_data_dir, effective_groq_api_key, effective_openai_api_key,
-    effective_openrouter_api_key, load_settings, normalized_pdf_zoom, save_settings,
+    AppSettings, app_data_dir, effective_groq_api_key, effective_openrouter_api_key, load_settings,
+    normalized_pdf_zoom, save_settings,
 };
 use crate::text_conversion;
-use crate::tts::{PaidTtsEvent, PaidTtsProvider, PaidTtsRequest, spawn_paid_tts_job};
 use crate::updater::{self, UpdateEvent};
 
 const CANVAS_FILL: Color32 = Color32::from_rgb(234, 227, 212);
@@ -452,12 +455,15 @@ pub struct PdfEditorApp {
     pending_annotation_saves: HashMap<PathBuf, PendingAnnotationSave>,
     active_annotation_saves: HashMap<PathBuf, PendingAnnotationSave>,
     annotation_save_generation: u64,
+    comments_ui: comments_ui::CommentsUi,
+    #[cfg(target_os = "linux")]
+    platform_ui: platform_ui::PlatformUi,
     annotation_sessions: HashMap<u64, annotation_session::AnnotationSession>,
     pending_document_opens: HashMap<PathBuf, document_opening::OpenOptions>,
     open_into_sbs: bool,
     recovery_ui: recovery_ui::RecoveryUi,
     save_as: Option<save_as::SaveAsTask>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     print_ui: print_ui::PrintUi,
     page_rotation_in_flight: bool,
     text_box_text: String,
@@ -1260,12 +1266,15 @@ impl PdfEditorApp {
             pending_annotation_saves: HashMap::new(),
             active_annotation_saves: HashMap::new(),
             annotation_save_generation: 0,
+            comments_ui: comments_ui::CommentsUi::default(),
+            #[cfg(target_os = "linux")]
+            platform_ui: platform_ui::PlatformUi::default(),
             annotation_sessions: HashMap::new(),
             pending_document_opens: HashMap::new(),
             open_into_sbs: false,
             recovery_ui: recovery_ui::RecoveryUi::new(ctx, isolated),
             save_as: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             print_ui: print_ui::PrintUi::default(),
             page_rotation_in_flight: false,
             text_box_text: String::new(),
@@ -1715,7 +1724,8 @@ impl PdfEditorApp {
         }
 
         self.tabs.remove(tab_index);
-        self.render_tx.set_live_documents(self.tabs.iter().map(|tab| tab.document_epoch));
+        self.render_tx
+            .set_live_documents(self.tabs.iter().map(|tab| tab.document_epoch));
         self.sbs_pane_states.remove(&closing_epoch);
         self.pending_accessible_text
             .retain(|(epoch, _)| *epoch != closing_epoch);
@@ -1947,7 +1957,9 @@ impl PdfEditorApp {
     }
 
     fn poll_update_events(&mut self, ctx: &Context) {
-        if updater::managed_by_store() { return; }
+        if updater::managed_by_store() {
+            return;
+        }
         while let Ok(event) = self.update_ui.rx.try_recv() {
             match event {
                 UpdateEvent::Checking => {
@@ -2875,7 +2887,8 @@ impl PdfEditorApp {
                     // A panicked Rust task must not permanently disable the
                     // reader. Recovery journals retain any ambiguous save.
                     (self.render_tx, self.render_rx) = spawn_render_worker(Some(ctx.clone()));
-                    self.render_tx.set_live_documents(self.tabs.iter().map(|tab| tab.document_epoch));
+                    self.render_tx
+                        .set_live_documents(self.tabs.iter().map(|tab| tab.document_epoch));
                     self.push_error_notice("The document worker restarted. If a save or rotation was interrupted, reopen that PDF before editing; recovery copies were kept.");
                     ctx.request_repaint_after(RENDER_POLL_INTERVAL);
                     break;
@@ -3159,13 +3172,22 @@ impl PdfEditorApp {
                         self.ensure_liquid_mode2_started(ctx);
                     }
                 }
+                RenderEvent::DocumentComments {
+                    document_epoch,
+                    path,
+                    revision,
+                    result,
+                } => {
+                    self.accept_document_comments(document_epoch, path, revision, result);
+                }
                 RenderEvent::TextPage {
                     document_epoch,
                     path,
                     page_index,
                     result,
                 } => {
-                    self.pending_accessible_text.remove(&(document_epoch, page_index));
+                    self.pending_accessible_text
+                        .remove(&(document_epoch, page_index));
                     if !self.is_current_document(document_epoch, &path) {
                         // A visible side-by-side pane, or a tab switched while
                         // text was loading, still owns its text result.
@@ -3177,7 +3199,8 @@ impl PdfEditorApp {
                                     slot.clone_from(text);
                                 }
                             }
-                            if let Some(slot) = tab.document.native_text_loaded.get_mut(page_index) {
+                            if let Some(slot) = tab.document.native_text_loaded.get_mut(page_index)
+                            {
                                 *slot = true;
                             }
                             ctx.request_repaint();
@@ -4875,10 +4898,23 @@ impl PdfEditorApp {
         page_width: f32,
         page_height: f32,
     ) {
-        let color = COMMENT_COLOR_PRESETS
-            .get(self.comment_color_index)
-            .unwrap_or(&COMMENT_COLOR_PRESETS[0])
-            .color_rgb;
+        if self.settings.comment_author_name.trim().is_empty() {
+            self.comments_ui.pending_comment = Some((
+                self.document_epoch,
+                page_index,
+                anchor_pdf,
+                page_width,
+                page_height,
+            ));
+            self.open_comment_profile();
+            return;
+        }
+        if let Err(error) = self.ensure_comment_author_id() {
+            self.push_error_notice(error);
+            return;
+        }
+        let color =
+            crate::comments::author_color(&format!("id:{}", self.settings.comment_author_id));
         let now = comment_timestamp();
         let annotation_index = self.annotations.len();
         // Alternate margins so stacked comments don't pile onto one side.
@@ -4901,6 +4937,8 @@ impl PdfEditorApp {
             kind: AnnotationKind::Comment {
                 id: new_comment_id(),
                 text: String::new(),
+                author: self.settings.comment_author_name.clone(),
+                author_id: self.settings.comment_author_id.clone(),
                 color_rgb: color,
                 created_at: now.clone(),
                 updated_at: now,
@@ -6254,6 +6292,7 @@ impl PdfEditorApp {
                                     0.0,
                                     width,
                                     None,
+                                    &comments_ui::ReviewComments::default(),
                                 );
                                 if !self.liquid_mode2_complete {
                                     self.draw_liquid_deciphering(ui, ctx);
@@ -6358,7 +6397,7 @@ impl PdfEditorApp {
                 let available = (ui.available_width() - 2.0 * REVIEW_SHEET_GUTTER).max(360.0);
                 // Margin notes are worth a narrower column: give up body width,
                 // down to a floor, before giving up the margins.
-                let body_width = if self.liquid_hide_footnotes {
+                let body_width = if self.liquid_hide_footnotes && !self.review_shows_comments() {
                     self.liquid_max_width
                 } else {
                     self.liquid_max_width.min(
@@ -6366,8 +6405,11 @@ impl PdfEditorApp {
                             .max(REVIEW_NARROW_BODY_MIN_WIDTH),
                     )
                 };
-                let column =
-                    review_column_layout(available, body_width, !self.liquid_hide_footnotes);
+                let column = review_column_layout(
+                    available,
+                    body_width,
+                    !self.liquid_hide_footnotes || self.review_shows_comments(),
+                );
                 let width = column.body_width;
                 let margin_width = column.margin_width;
                 ui.horizontal(|ui| {
@@ -6431,6 +6473,13 @@ impl PdfEditorApp {
                                     });
                                 });
                                 self.refresh_review_derived(&document);
+                                let comments = self.review_comments(&document, ctx);
+                                if self.review_shows_comments() {
+                                    self.draw_comment_load_status(ui);
+                                    if margin_width <= 0.0 {
+                                        self.draw_narrow_comments(ui, &comments);
+                                    }
+                                }
                                 if liquid_document_needs_ocr(&document) {
                                     self.draw_liquid_ocr_actions(ui, ctx, true);
                                 } else if let Some(hint) = liquid_reflow_low_confidence(&document) {
@@ -6450,6 +6499,7 @@ impl PdfEditorApp {
                                     column.body_indent,
                                     width,
                                     margins_live.then_some(&mut margin),
+                                    &comments,
                                 );
                                 self.update_review_active_heading(ui.clip_rect());
                                 if margins_live {
@@ -6472,7 +6522,7 @@ impl PdfEditorApp {
                                         });
                                     });
                                 }
-                                if !self.liquid_hide_footnotes {
+                                if !self.liquid_hide_footnotes && !self.review_shows_comments() {
                                     ui.horizontal(|ui| {
                                         ui.add_space(column.body_indent);
                                         ui.vertical(|ui| {
@@ -6540,10 +6590,27 @@ impl PdfEditorApp {
         indent: f32,
         width: f32,
         mut margin: Option<&mut ReviewMarginCollector>,
+        comments: &comments_ui::ReviewComments,
     ) {
         let mut block_index = 0usize;
         while block_index < document.blocks.len() {
             let block = &document.blocks[block_index];
+            if self.review_shows_comments()
+                && let Some(margin) = margin.as_deref_mut()
+                && let Some(indices) = comments.anchors.get(&block_index)
+            {
+                for &index in indices {
+                    if let Some(thread) = comments.threads.get(index) {
+                        margin.add_comment_thread(
+                            Arc::clone(thread),
+                            ui.cursor().top(),
+                            &self.settings.comment_author_id,
+                            &self.settings.comment_author_name,
+                            &comments.colors,
+                        );
+                    }
+                }
+            }
             if review_skips_block_as_furniture(
                 block,
                 hidden_contents.get(block_index).copied().unwrap_or(false),
@@ -6562,6 +6629,7 @@ impl PdfEditorApp {
                 // their callouts; without one they open from the callout and
                 // appear in the notes list at the end.
                 if !self.liquid_hide_footnotes
+                    && !self.review_shows_comments()
                     && let Some(margin) = margin.as_deref_mut()
                 {
                     margin.add_note_block(block_index, &block.text, ui.cursor().top());
@@ -6598,7 +6666,9 @@ impl PdfEditorApp {
             let hits = in_review_column(ui, indent, width, |ui| {
                 self.draw_liquid_feedback_block(ui, document, block_index, block)
             });
-            if let Some(margin) = margin.as_deref_mut() {
+            if !self.review_shows_comments()
+                && let Some(margin) = margin.as_deref_mut()
+            {
                 margin.add_callouts(&hits, &self.liquid_footnote_index);
             }
             block_index += 1;
@@ -7335,293 +7405,6 @@ impl PdfEditorApp {
                 egui::StrokeKind::Inside,
             );
         }
-    }
-
-    /// Read the reflowed text with an operating-system speech process. The
-    /// process starts only after the user clicks, so Review Mode rendering and
-    /// application startup do not pay for speech initialization.
-    fn start_liquid_tts(&mut self, document: &LiquidDocument) {
-        self.stop_liquid_tts();
-        let text = liquid_tts_text(document, self.tts_controller.include_notes);
-        if text.is_empty() {
-            self.status = "Nothing to read aloud.".to_owned();
-            return;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let tmp = match crate::tts::write_private_speech_text(&text) {
-                Ok(path) => path,
-                Err(error) => {
-                    self.push_error_notice(format!("Could not prepare speech: {error}"));
-                    return;
-                }
-            };
-            match std::process::Command::new("say")
-                .arg("-f")
-                .arg(&tmp)
-                .spawn()
-            {
-                Ok(child) => {
-                    self.tts_controller.child = Some(child);
-                    self.tts_controller.native_text_path = Some(tmp);
-                    self.status = "Reading aloud…".to_owned();
-                }
-                Err(error) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    self.push_error_notice(format!("Text-to-speech unavailable: {error}"));
-                }
-            }
-        }
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            let tmp = match crate::tts::write_private_speech_text(&text) {
-                Ok(path) => path,
-                Err(error) => {
-                    self.push_error_notice(format!("Could not prepare speech: {error}"));
-                    return;
-                }
-            };
-            let error_path = tmp.with_extension("error.txt");
-            let _ = std::fs::remove_file(&error_path);
-            let executable = match std::env::current_exe() {
-                Ok(path) => path,
-                Err(error) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    self.push_error_notice(format!("Could not start speech: {error}"));
-                    return;
-                }
-            };
-            let mut command = std::process::Command::new(executable);
-            command
-                .arg("--speech-worker")
-                .env("LAWPDF_TTS_TEXT_PATH", &tmp)
-                .env("LAWPDF_TTS_ERROR_PATH", &error_path)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .creation_flags(CREATE_NO_WINDOW);
-            match command.spawn() {
-                Ok(child) => {
-                    self.tts_controller.child = Some(child);
-                    self.tts_controller.native_text_path = Some(tmp);
-                    self.tts_controller.native_error_path = Some(error_path);
-                    self.status = "Reading aloud…".to_owned();
-                }
-                Err(error) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    self.push_error_notice(format!("Windows text-to-speech unavailable: {error}"));
-                }
-            }
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            let _ = text;
-            self.status = "Read aloud is unavailable on this platform.".to_owned();
-        }
-    }
-
-    /// #33: stop any in-progress speech playback.
-    fn stop_liquid_tts(&mut self) {
-        if let Some(mut child) = self.tts_controller.child.take() {
-            // Best-effort process cleanup: playback is already detached from app state.
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        self.cleanup_native_tts_files();
-    }
-
-    fn cleanup_native_tts_files(&mut self) {
-        if let Some(path) = self.tts_controller.native_text_path.take() {
-            let _ = std::fs::remove_file(path);
-        }
-        if let Some(path) = self.tts_controller.native_error_path.take() {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-
-    fn start_paid_liquid_tts(&mut self, document: &LiquidDocument) {
-        if self.tts_controller.progress.is_some() {
-            return;
-        }
-        let api_key = match self.tts_controller.provider {
-            PaidTtsProvider::OpenRouter => effective_openrouter_api_key(&self.settings),
-            PaidTtsProvider::OpenAi => effective_openai_api_key(&self.settings),
-        };
-        let Some(api_key) = api_key else {
-            self.settings_ui.open = true;
-            self.status = format!(
-                "Add your {} API key to create an MP3.",
-                self.tts_controller.provider.label()
-            );
-            return;
-        };
-        let text = liquid_tts_text(document, self.tts_controller.include_notes);
-        if text.is_empty() {
-            self.status = "Nothing to narrate.".to_owned();
-            return;
-        }
-        let file_name = self
-            .document
-            .as_ref()
-            .map(|source| default_output_name(&source.path, "review-mode", "mp3"))
-            .unwrap_or_else(|| "review-mode.mp3".to_owned());
-        let Some(destination) =
-            self.pick_save_path("Save narration", &file_name, "MP3 audio", &["mp3"])
-        else {
-            return;
-        };
-        spawn_paid_tts_job(
-            PaidTtsRequest {
-                provider: self.tts_controller.provider,
-                api_key,
-                voice: "nova".to_owned(),
-                text,
-                destination,
-            },
-            self.tts_controller.tx.clone(),
-        );
-        self.tts_controller.progress = Some((0, 0));
-        self.status = format!(
-            "Creating MP3 with {}…",
-            self.tts_controller.provider.label()
-        );
-    }
-
-    fn poll_paid_tts(&mut self, ctx: &Context) {
-        while let Ok(event) = self.tts_controller.rx.try_recv() {
-            match event {
-                PaidTtsEvent::Progress { completed, total } => {
-                    self.tts_controller.progress = Some((completed, total));
-                    self.status = format!("Creating MP3… {completed}/{total}");
-                }
-                PaidTtsEvent::Complete(path) => {
-                    self.tts_controller.progress = None;
-                    self.status = format!("Created {}", path.display());
-                    self.push_info_notice(format!("Created {}", path.display()));
-                }
-                PaidTtsEvent::Failed(error) => {
-                    self.tts_controller.progress = None;
-                    self.push_error_notice(error);
-                }
-            }
-            ctx.request_repaint();
-        }
-    }
-
-    /// Clear the speech handle when playback ends on its own, whatever view is open.
-    fn poll_liquid_tts_finished(&mut self) {
-        let finished = self
-            .tts_controller
-            .child
-            .as_mut()
-            .and_then(|child| child.try_wait().ok().flatten());
-        if let Some(status) = finished {
-            self.tts_controller.child = None;
-            let error = (!status.success()).then(|| {
-                self.tts_controller
-                    .native_error_path
-                    .as_ref()
-                    .and_then(|path| std::fs::read_to_string(path).ok())
-                    .filter(|message| !message.trim().is_empty())
-                    .unwrap_or_else(|| format!("Native text-to-speech exited with {status}."))
-            });
-            self.cleanup_native_tts_files();
-            if let Some(error) = error {
-                self.push_error_notice(format!("Text-to-speech unavailable: {error}"));
-            } else {
-                self.status = "Finished reading aloud.".to_owned();
-            }
-        }
-    }
-
-    /// Reader actions for the legacy Liquid view: text download and narration.
-    fn draw_liquid_tts_controls(&mut self, ui: &mut egui::Ui, document: &LiquidDocument) {
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .button(RichText::new("Download text").size(11.0).strong())
-                .on_hover_text("Save the clean, page-free Review Mode text as a .txt file")
-                .clicked()
-            {
-                self.export_review_text_dialog(document);
-            }
-            if self.tts_controller.child.is_some() {
-                if ui
-                    .button(RichText::new("⏹ Stop reading").size(11.0))
-                    .clicked()
-                {
-                    self.stop_liquid_tts();
-                }
-            } else if ui
-                .button(RichText::new("▶ Read aloud").size(11.0))
-                .on_hover_text(if cfg!(target_os = "windows") {
-                    "Read the reflowed text aloud with Windows speech"
-                } else if cfg!(target_os = "macos") {
-                    "Read the reflowed text aloud with macOS speech"
-                } else {
-                    "Read the reflowed text aloud"
-                })
-                .clicked()
-            {
-                self.start_liquid_tts(document);
-            }
-            ui.separator();
-            egui::ComboBox::from_id_salt("paid_tts_provider")
-                .selected_text(self.tts_controller.provider.label())
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.tts_controller.provider,
-                        PaidTtsProvider::OpenRouter,
-                        "OpenRouter",
-                    );
-                    ui.selectable_value(
-                        &mut self.tts_controller.provider,
-                        PaidTtsProvider::OpenAi,
-                        "OpenAI",
-                    );
-                });
-            let paid_label = self
-                .tts_controller
-                .progress
-                .map(|(completed, total)| {
-                    if total == 0 {
-                        "Creating MP3…".to_owned()
-                    } else {
-                        format!("Creating MP3… {completed}/{total}")
-                    }
-                })
-                .unwrap_or_else(|| "Create AI MP3".to_owned());
-            if ui
-                .add_enabled(
-                    self.tts_controller.progress.is_none(),
-                    egui::Button::new(RichText::new(paid_label).size(11.0)),
-                )
-                .on_hover_text(
-                    "Creates AI-generated narration. Sends the article text to the selected provider using your key; provider charges may apply.",
-                )
-                .clicked()
-            {
-                self.start_paid_liquid_tts(document);
-            }
-            if ui
-                .small_button("TTS keys")
-                .on_hover_text("Add or change OpenAI and OpenRouter API keys")
-                .clicked()
-            {
-                self.settings_ui.open = true;
-            }
-            let mut include = self.tts_controller.include_notes;
-            if ui
-                .checkbox(&mut include, RichText::new("footnotes").size(11.0))
-                .on_hover_text("Read footnotes as a separate pass after the body")
-                .changed()
-            {
-                self.tts_controller.include_notes = include;
-            }
-        });
-        ui.add_space(6.0);
     }
 
     fn current_review_feedback_submission(&self) -> Option<ReviewFeedbackSubmission> {
@@ -8518,45 +8301,45 @@ impl PdfEditorApp {
         egui::CollapsingHeader::new(
             RichText::new(format!("Notes ({})", notes.len())).color(self.liquid_ink_color()),
         )
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.add_space(4.0);
-                for (index, note) in notes.iter().enumerate() {
-                    let parts = split_fused_review_notes(&note.text);
-                    let entries = if parts.is_empty() {
-                        vec![((index + 1).to_string(), note.text.trim().to_owned())]
-                    } else {
-                        parts
-                    };
-                    for (marker, body) in entries {
-                        ui.horizontal_top(|ui| {
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(52.0, 18.0),
-                                egui::Layout::top_down(Align::RIGHT),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new(marker)
-                                            .size(11.0)
-                                            .strong()
-                                            .color(self.liquid_muted_color()),
-                                    );
-                                },
-                            );
-                            ui.add_space(8.0);
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(body)
-                                        .size(14.0)
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.add_space(4.0);
+            for (index, note) in notes.iter().enumerate() {
+                let parts = split_fused_review_notes(&note.text);
+                let entries = if parts.is_empty() {
+                    vec![((index + 1).to_string(), note.text.trim().to_owned())]
+                } else {
+                    parts
+                };
+                for (marker, body) in entries {
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(52.0, 18.0),
+                            egui::Layout::top_down(Align::RIGHT),
+                            |ui| {
+                                ui.label(
+                                    RichText::new(marker)
+                                        .size(11.0)
+                                        .strong()
                                         .color(self.liquid_muted_color()),
-                                )
-                                .wrap()
-                                .selectable(true),
-                            );
-                        });
-                        ui.add_space(7.0);
-                    }
+                                );
+                            },
+                        );
+                        ui.add_space(8.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(body)
+                                    .size(14.0)
+                                    .color(self.liquid_muted_color()),
+                            )
+                            .wrap()
+                            .selectable(true),
+                        );
+                    });
+                    ui.add_space(7.0);
                 }
-            });
+            }
+        });
     }
 
     /// Theme-aware main text color for Liquid view reading controls and body text.
@@ -9171,10 +8954,16 @@ impl PdfEditorApp {
                             self.pdf_page_placements.push((page_index, placement));
                             let response = ui.interact(
                                 rect,
-                                ui.id().with(("document-page", self.document_epoch, page_index)),
+                                ui.id()
+                                    .with(("document-page", self.document_epoch, page_index)),
                                 Sense::click_and_drag(),
                             );
-                            self.expose_page_text(&response, self.document_epoch, &path, page_index);
+                            self.expose_page_text(
+                                &response,
+                                self.document_epoch,
+                                &path,
+                                page_index,
+                            );
                             let response = if let Some(url) =
                                 self.hovered_web_link_url(&response, &placement, page_index)
                             {
@@ -9689,7 +9478,10 @@ impl PdfEditorApp {
                         Sense::click(),
                     );
                     self.expose_page_text(
-                        &response, document.document_epoch, &document.path, page_index,
+                        &response,
+                        document.document_epoch,
+                        &document.path,
+                        page_index,
                     );
                     page_clicked |= response.clicked();
                     let painter = ui.painter();
@@ -10475,12 +10267,19 @@ impl PdfEditorApp {
         card_rect: PdfRect,
     ) -> bool {
         let mut text_changed = false;
-        let mut selected_color = None;
         let mut done_clicked = false;
         let mut delete_clicked = false;
         let mut editor_active = false;
         let mut card_moved = false;
-        let comment_number = self.comment_ordinal(annotation_index);
+        let (comment_author, comment_owned) = match &self.annotations[annotation_index].kind {
+            AnnotationKind::Comment {
+                author, author_id, ..
+            } => (
+                self.comment_display_author(author, author_id),
+                !author_id.is_empty() && *author_id == self.settings.comment_author_id,
+            ),
+            _ => ("Unknown author".to_owned(), false),
+        };
 
         // The card lives in the page margin on its stored side; the editor
         // opens away from the page body so it doesn't cover the text.
@@ -10544,11 +10343,17 @@ impl PdfEditorApp {
                                 self.comment_drag = None;
                                 card_moved = true;
                             }
-                            ui.label(
-                                RichText::new(format!("Comment {comment_number}"))
-                                    .strong()
-                                    .color(INK),
-                            );
+                            if comment_owned {
+                                if ui
+                                    .link(RichText::new(&comment_author).strong())
+                                    .on_hover_text("Edit your name for all comments")
+                                    .clicked()
+                                {
+                                    self.open_comment_profile();
+                                }
+                            } else {
+                                ui.label(RichText::new(&comment_author).strong().color(INK));
+                            }
                             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                                 if ui.button("Delete").clicked() {
                                     delete_clicked = true;
@@ -10561,10 +10366,7 @@ impl PdfEditorApp {
                         ui.add_space(5.0);
 
                         if let Some(EditorAnnotation {
-                            kind:
-                                AnnotationKind::Comment {
-                                    text, color_rgb, ..
-                                },
+                            kind: AnnotationKind::Comment { text, .. },
                             ..
                         }) = self.annotations.get_mut(annotation_index)
                         {
@@ -10581,31 +10383,6 @@ impl PdfEditorApp {
                             }
                             text_changed |= response.changed();
                             editor_active |= response.has_focus() || response.hovered();
-
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                for (index, preset) in COMMENT_COLOR_PRESETS.iter().enumerate() {
-                                    let color = color_from_rgb(preset.color_rgb, 235);
-                                    let selected = close_rgb(*color_rgb, preset.color_rgb);
-                                    let stroke = if selected {
-                                        Stroke::new(2.0_f32, Color32::from_rgb(72, 48, 26))
-                                    } else {
-                                        Stroke::new(1.0_f32, Color32::from_rgb(210, 200, 184))
-                                    };
-                                    let response = ui
-                                        .add(
-                                            egui::Button::new("")
-                                                .fill(color)
-                                                .stroke(stroke)
-                                                .min_size(Vec2::splat(20.0)),
-                                        )
-                                        .on_hover_text(preset.label);
-                                    accessibility::name_color_choice(&response, preset.label, selected);
-                                    if response.clicked() {
-                                        selected_color = Some((index, preset.color_rgb));
-                                    }
-                                }
-                            });
                         }
                     });
             });
@@ -10649,29 +10426,15 @@ impl PdfEditorApp {
             ctx.request_repaint();
         }
 
-        let color_changed = selected_color.is_some();
-        if text_changed || color_changed {
+        if text_changed {
             if let Some(EditorAnnotation {
-                kind:
-                    AnnotationKind::Comment {
-                        color_rgb,
-                        updated_at,
-                        ..
-                    },
+                kind: AnnotationKind::Comment { updated_at, .. },
                 ..
             }) = self.annotations.get_mut(annotation_index)
             {
-                if let Some((index, color)) = selected_color {
-                    *color_rgb = color;
-                    self.comment_color_index = index;
-                }
                 *updated_at = comment_timestamp();
             }
-            if color_changed {
-                self.schedule_annotation_autosave_now(ctx);
-            } else {
-                self.schedule_annotation_autosave(ctx);
-            }
+            self.schedule_annotation_autosave(ctx);
         }
 
         if done_clicked
@@ -11603,8 +11366,11 @@ impl eframe::App for PdfEditorApp {
         self.poll_queued_open_paths(ctx);
         self.poll_render_results(ctx);
         self.poll_recovery(ctx);
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         self.poll_print(ctx);
+        self.poll_comment_cache(ctx);
+        #[cfg(target_os = "linux")]
+        self.poll_platform_actions();
         self.poll_settings_credentials(ctx);
         self.poll_document_links(ctx);
         self.start_due_annotation_saves(ctx);
@@ -11643,7 +11409,9 @@ impl eframe::App for PdfEditorApp {
         }
         #[cfg(target_os = "macos")]
         {
-            let native_print = self._macos_open_files.as_ref()
+            let native_print = self
+                ._macos_open_files
+                .as_ref()
                 .is_some_and(|registration| registration.take_print_requested());
             let shortcut_print = consume_command_shortcut(ctx, egui::Key::P);
             if native_print || shortcut_print {
@@ -11653,8 +11421,14 @@ impl eframe::App for PdfEditorApp {
                 registration.set_print_enabled(self.document.is_some() && !self.print_ui.busy);
             }
         }
+        #[cfg(target_os = "linux")]
+        if consume_command_shortcut(ctx, egui::Key::P) {
+            self.request_print(ctx);
+        }
         #[cfg(target_os = "macos")]
-        let (native_save, native_save_as, native_reveal) = self._macos_open_files.as_ref()
+        let (native_save, native_save_as, native_reveal) = self
+            ._macos_open_files
+            .as_ref()
             .map(|registration| {
                 registration.set_save_enabled(
                     self.document.is_some(),
@@ -11665,7 +11439,8 @@ impl eframe::App for PdfEditorApp {
                     registration.take_save_as_requested(),
                     registration.take_reveal_requested(),
                 )
-            }).unwrap_or_default();
+            })
+            .unwrap_or_default();
         #[cfg(not(target_os = "macos"))]
         let (native_save, native_save_as) = (false, false);
         #[cfg(target_os = "macos")]
@@ -11800,7 +11575,6 @@ impl eframe::App for PdfEditorApp {
 
         self.advance_zoom_animation(ctx);
 
-        self.poll_liquid_tts_finished();
         self.draw_masthead(ctx);
         if self.sidebar_visible() {
             self.draw_side_panel(ctx);
@@ -11809,6 +11583,9 @@ impl eframe::App for PdfEditorApp {
         self.draw_markup_bar(ctx);
         self.draw_review_feedback_ui(ctx);
         self.draw_settings_window(ctx);
+        self.draw_comment_profile(ctx);
+        #[cfg(target_os = "linux")]
+        self.draw_print_dialog(ctx);
         self.draw_unsaved_close_prompt(ctx);
         self.draw_recovery(ctx);
         self.draw_default_reader_prompt(ctx);
@@ -15079,7 +14856,11 @@ mod app_tests {
     fn windows_default_apps_uri_targets_lawpdf_registration() {
         assert_eq!(
             WINDOWS_DEFAULT_APPS_URI,
-            if updater::managed_by_store() { "ms-settings:defaultapps" } else { "ms-settings:defaultapps?registeredAppMachine=LawPDF" }
+            if updater::managed_by_store() {
+                "ms-settings:defaultapps"
+            } else {
+                "ms-settings:defaultapps?registeredAppMachine=LawPDF"
+            }
         );
     }
 

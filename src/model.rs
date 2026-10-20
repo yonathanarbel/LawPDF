@@ -81,6 +81,13 @@ pub enum AnnotationKind {
     Comment {
         id: String,
         text: String,
+        /// Display name stored in the PDF's standard `/T` author field.
+        #[serde(default)]
+        author: String,
+        /// Stable local profile identity. A display-name edit must never
+        /// rename another reader's comments, including anonymous old files.
+        #[serde(default)]
+        author_id: String,
         color_rgb: [f32; 3],
         created_at: String,
         updated_at: String,
@@ -107,6 +114,72 @@ pub struct EditorAnnotation {
     pub page_index: usize,
     pub rect: PdfRect,
     pub kind: AnnotationKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DocumentCommentSource {
+    Embedded,
+    /// An editable LawPDF annotation; human ownership is determined by
+    /// `author_id`, not by the application that wrote it.
+    Mine,
+}
+
+/// A PDF note and its source geometry, loaded only on demand for Review.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocumentComment {
+    pub page_index: usize,
+    pub anchor: (f32, f32),
+    /// Text-markup bounds when present, otherwise the annotation rectangle.
+    /// Coordinates use the same rotation-corrected space as editor annotations.
+    pub rect: PdfRect,
+    pub text: String,
+    pub author: Option<String>,
+    pub author_id: Option<String>,
+    /// The original PDF color. Review may display a per-author color without
+    /// modifying another reader's annotation in the source file.
+    pub color_rgb: [f32; 3],
+    pub source: DocumentCommentSource,
+    pub is_reply: bool,
+    pub reply_to: Option<String>,
+    pub key: String,
+}
+
+impl DocumentComment {
+    pub fn from_editor_annotation(annotation: &EditorAnnotation) -> Option<Self> {
+        let AnnotationKind::Comment {
+            id,
+            text,
+            author,
+            author_id,
+            anchor,
+            color_rgb,
+            ..
+        } = &annotation.kind
+        else {
+            return None;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        Some(Self {
+            page_index: annotation.page_index,
+            anchor: *anchor,
+            rect: PdfRect::new(anchor.0, anchor.1, anchor.0, anchor.1),
+            text: text.to_owned(),
+            author: (!author.trim().is_empty()).then(|| author.clone()),
+            author_id: (!author_id.is_empty()).then(|| author_id.clone()),
+            color_rgb: *color_rgb,
+            source: DocumentCommentSource::Mine,
+            is_reply: false,
+            reply_to: None,
+            key: format!("mine-{id}"),
+        })
+    }
+
+    pub fn is_owned_by(&self, author_id: &str) -> bool {
+        !author_id.is_empty() && self.author_id.as_deref() == Some(author_id)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
