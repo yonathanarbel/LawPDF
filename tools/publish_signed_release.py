@@ -130,7 +130,7 @@ def main():
     evidence_path = work / "RELEASE-VERIFICATION.json"
     evidence_path.write_text(json.dumps({"schema": "lawpdf-release-verification-v1",
         "version": version, "commit": commit, "required_runs": record["required_runs"],
-        "verified_packages": manifest["assets"], "windows_installation": installation}, indent=2) + "\n")
+        "verified_packages": [{"name": name, "sha256": sha(work / name), "bytes": (work / name).stat().st_size} for name in sorted(NAMES)], "windows_installation": installation}, indent=2) + "\n")
     # Verify the existing checksum file too; never replace the built packages.
     verify_checksum_file(work)
     if not args.publish:
@@ -160,7 +160,7 @@ def main():
         else:
             command("gh", "release", "upload", tag, str(extra_asset), "--repo", REPO)
     command("gh", "release", "edit", tag, "--repo", REPO, "--verify-tag",
-            "--title", f"LawPDF {version} — Public beta for Windows and Mac",
+            "--title", f"LawPDF {version} — Public beta for Windows, Mac, and Linux",
             "--notes-file", str(ROOT / f"docs/releases/{tag}.md"),
             "--draft=false", "--prerelease=false", "--latest")
     published = api(f"releases/{release_id}")
