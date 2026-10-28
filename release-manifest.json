@@ -2,7 +2,7 @@
   "schema_version": "lawpdf-public-release-manifest-v1",
   "product": {
     "name": "LawPDF",
-    "version": "0.2.43"
+    "version": "0.2.44"
   },
   "runtime_assets": {
     "fasttab_model": {
@@ -39,6 +39,11 @@
         "path": "profile-models/lm2-native-catboost-runtime/catboostmodel.dll",
         "sha256": "668d8867940a0832accaad6004e249f11ecc48eb63eb1d65551cfdd37c1939ad",
         "fetched_during_release": true
+      },
+      "linux": {
+        "path": "profile-models/lm2-native-catboost-runtime/libcatboostmodel-linux-x86_64-1.2.10.so",
+        "sha256": "de32f8e147ee8f969599a00b7145e8561b943e916b0132b811037f8f71952a0e",
+        "fetched_during_release": true
       }
     },
     "pdfium_libraries": {
@@ -53,6 +58,15 @@
         "sha256": "55e7ebef29a1ec9523d1adb8b260a73e7dfb0f64d3f0285121d20ecd6148ef18",
         "release": "chromium/8057",
         "source": "https://github.com/bblanchon/pdfium-binaries/releases/tag/chromium/8057"
+      },
+      "linux": {
+        "path": "vendor/libpdfium.so",
+        "sha256": "08f6ea53a64f6fbb9f5ba8d9c02e0051987c6a9175f3fb5ba25f219174731aaa",
+        "release": "chromium/8057",
+        "source": "https://github.com/bblanchon/pdfium-binaries/releases/tag/chromium/8057",
+        "archive": "pdfium-linux-x64.tgz",
+        "archive_sha256": "7788fa57a2996ebd21afc4090eb0a42b9f95ef3a72e7ef4c0756f1ea703c0415",
+        "fetched_during_release": true
       }
     }
   },
@@ -64,6 +78,10 @@
     "macos-arm64": {
       "builder": "scripts/package-macos.sh",
       "runtime_verification": "LawPDF --lm2-runtime-status --require-native --require-context --require-arbiter --require-note-head --require-link-ranker"
+    },
+    "linux-x86_64": {
+      "builder": "scripts/package-linux.sh",
+      "runtime_verification": "lawpdf --lm2-runtime-status --require-native --require-context --require-arbiter --require-note-head --require-link-ranker"
     }
   }
 }

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 const CACHE_FOLDERS: &[&str] = &[
+    "citation-sources",
     "performance-cache",
     "ocr-cache",
     "liquid2-cache",

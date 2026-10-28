@@ -17,7 +17,9 @@ import zipfile
 
 REPO = "yonathanarbel/LawPDF"
 PUBLIC_KEY = "dbf757b2f5ada6da73691bb4134b914d372f6526365d58ce4c36ec4b75363caf"
-NAMES = {"LawPDFSetup-x64.exe", "LawPDF-windows-portable-x64.zip", "LawPDF-macos.zip"}
+NAMES = {"LawPDFSetup-x64.exe", "LawPDF-windows-portable-x64.zip", "LawPDF-macos.zip", "LawPDF-linux-x86_64.tar.gz"}
+# Existing v1 clients accept exactly these three automatic-update artifacts.
+SIGNED_NAMES = NAMES - {"LawPDF-linux-x86_64.tar.gz"}
 ROOT = Path(__file__).resolve().parent.parent
 
 def command(*args, capture=False):
@@ -97,12 +99,16 @@ def main():
     require(manifest["repository"] == REPO and manifest["version"] == version
             and manifest["commit"] == commit and manifest["schema"] == 1
             and manifest["purpose"] == "lawpdf-update-v1", "Wrong manifest identity")
-    require(len(manifest["assets"]) == 3
-            and {a["name"] for a in manifest["assets"]} == NAMES, "Wrong packages")
+    require(len(manifest["assets"]) == len(SIGNED_NAMES)
+            and {a["name"] for a in manifest["assets"]} == SIGNED_NAMES, "Wrong packages")
     for item in manifest["assets"]:
         package = work / item["name"]
         require(package.stat().st_size == item["bytes"]
                 and sha(package) == item["sha256"], f"Package mismatch: {item['name']}")
+    # Linux has a manual installer, so it remains outside the legacy update
+    # payload but requires the same source provenance and checksum checks.
+    for name in sorted(NAMES):
+        package = work / name
         command("gh", "attestation", "verify", str(package), "--repo", REPO,
                 "--signer-workflow", f"{REPO}/.github/workflows/release.yml",
                 "--source-ref", f"refs/tags/{tag}", "--source-digest", commit)
@@ -124,7 +130,7 @@ def main():
     evidence_path = work / "RELEASE-VERIFICATION.json"
     evidence_path.write_text(json.dumps({"schema": "lawpdf-release-verification-v1",
         "version": version, "commit": commit, "required_runs": record["required_runs"],
-        "verified_packages": manifest["assets"], "windows_installation": installation}, indent=2) + "\n")
+        "verified_packages": [{"name": name, "sha256": sha(work / name), "bytes": (work / name).stat().st_size} for name in sorted(NAMES)], "windows_installation": installation}, indent=2) + "\n")
     # Verify the existing checksum file too; never replace the built packages.
     verify_checksum_file(work)
     if not args.publish:
@@ -154,7 +160,7 @@ def main():
         else:
             command("gh", "release", "upload", tag, str(extra_asset), "--repo", REPO)
     command("gh", "release", "edit", tag, "--repo", REPO, "--verify-tag",
-            "--title", f"LawPDF {version} — Public beta for Windows and Mac",
+            "--title", f"LawPDF {version} — Public beta for Windows, Mac, and Linux",
             "--notes-file", str(ROOT / f"docs/releases/{tag}.md"),
             "--draft=false", "--prerelease=false", "--latest")
     published = api(f"releases/{release_id}")

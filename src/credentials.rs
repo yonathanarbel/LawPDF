@@ -10,6 +10,8 @@ struct ProviderKeys {
     openrouter: String,
     openai: String,
     groq: String,
+    #[serde(default)]
+    elevenlabs: String,
 }
 
 impl ProviderKeys {
@@ -18,18 +20,23 @@ impl ProviderKeys {
             openrouter: settings.openrouter_api_key.clone(),
             openai: settings.openai_api_key.clone(),
             groq: settings.groq_api_key.clone(),
+            elevenlabs: settings.elevenlabs_api_key.clone(),
         }
     }
     fn apply(self, settings: &mut AppSettings) {
         settings.openrouter_api_key = self.openrouter;
         settings.openai_api_key = self.openai;
         settings.groq_api_key = self.groq;
+        settings.elevenlabs_api_key = self.elevenlabs;
     }
     fn is_empty(&self) -> bool {
-        self.openrouter.is_empty() && self.openai.is_empty() && self.groq.is_empty()
+        self.openrouter.is_empty()
+            && self.openai.is_empty()
+            && self.groq.is_empty()
+            && self.elevenlabs.is_empty()
     }
     fn validate(&self) -> Result<(), String> {
-        if [&self.openrouter, &self.openai, &self.groq]
+        if [&self.openrouter, &self.openai, &self.groq, &self.elevenlabs]
             .iter()
             .any(|key| key.len() > 1024 || key.contains(['\n', '\r', '\0']))
         {
@@ -45,7 +52,7 @@ fn entry() -> Result<keyring::v1::Entry, String> {
 }
 
 fn unavailable() -> String {
-    "Could not access the system credential store. Unlock Keychain or Windows Credential Manager, then save your settings again. Existing credentials were kept.".to_owned()
+    "Could not access the system credential store. Unlock Keychain, Windows Credential Manager, or your Linux keyring, then save your settings again. Existing credentials were kept.".to_owned()
 }
 
 fn read(entry: &keyring::v1::Entry) -> Result<Option<ProviderKeys>, String> {
@@ -111,23 +118,71 @@ pub fn save(settings: &AppSettings) -> Result<(), String> {
     write(&entry()?, &ProviderKeys::from_settings(settings))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn previous_credential_record_loads_without_discarding_existing_keys() {
+        let keys: ProviderKeys =
+            serde_json::from_str(r#"{"openrouter":"router","openai":"legacy","groq":"groq"}"#)
+                .unwrap();
+        let mut settings = AppSettings::default();
+        keys.apply(&mut settings);
+        assert_eq!(settings.openrouter_api_key, "router");
+        assert_eq!(settings.openai_api_key, "legacy");
+        assert_eq!(settings.groq_api_key, "groq");
+        assert!(settings.elevenlabs_api_key.is_empty());
+    }
+
+    #[test]
+    fn elevenlabs_is_validated_and_round_trips_with_other_provider_keys() {
+        let mut settings = AppSettings::default();
+        settings.elevenlabs_api_key = "non-secret-test-key".to_owned();
+        let keys = ProviderKeys::from_settings(&settings);
+        assert!(!keys.is_empty());
+        assert!(keys.validate().is_ok());
+        let decoded: ProviderKeys =
+            serde_json::from_str(&serde_json::to_string(&keys).unwrap()).unwrap();
+        let mut restored = AppSettings::default();
+        decoded.apply(&mut restored);
+        assert_eq!(restored.elevenlabs_api_key, settings.elevenlabs_api_key);
+        settings.elevenlabs_api_key.push('\n');
+        assert!(ProviderKeys::from_settings(&settings).validate().is_err());
+    }
+}
+
 #[cfg(feature = "devtools")]
 pub fn verify_native_store() -> Result<(), String> {
-    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| "Could not create QA identity")?.as_nanos();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "Could not create QA identity")?
+        .as_nanos();
     let account = format!("qa-{}-{nonce}", std::process::id());
     struct QaEntry(keyring::v1::Entry);
     impl Drop for QaEntry {
-        fn drop(&mut self) { let _ = self.0.delete_credential(); }
+        fn drop(&mut self) {
+            let _ = self.0.delete_credential();
+        }
     }
     // This separate service never reads or overwrites the provider-key entry.
-    let entry = QaEntry(keyring::v1::Entry::new("org.lawpdf.LawPDF.release-qa", &account)
-        .map_err(|_| unavailable())?);
-    let keys = ProviderKeys { openrouter: "non-secret-release-qa".to_owned(), ..Default::default() };
+    let entry = QaEntry(
+        keyring::v1::Entry::new("org.lawpdf.LawPDF.release-qa", &account)
+            .map_err(|_| unavailable())?,
+    );
+    let keys = ProviderKeys {
+        openrouter: "non-secret-release-qa".to_owned(),
+        ..Default::default()
+    };
     write(&entry.0, &keys)?;
     write(&entry.0, &ProviderKeys::default())?;
-    entry.0.delete_credential().map_err(|_| "Could not delete the disposable credential-store QA entry")?;
-    if read(&entry.0)?.is_some() { return Err("The disposable QA credential was not deleted".to_owned()); }
+    entry
+        .0
+        .delete_credential()
+        .map_err(|_| "Could not delete the disposable credential-store QA entry")?;
+    if read(&entry.0)?.is_some() {
+        return Err("The disposable QA credential was not deleted".to_owned());
+    }
     println!("Native credential write, read, clear and deletion passed using a disposable service");
     Ok(())
 }
