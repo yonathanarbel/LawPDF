@@ -6,7 +6,7 @@ That's the ambition behind LawPDF: a reader built around how legal scholars actu
 Created by **Professor Yonathan Arbel**, LawPDF is a free, open-source desktop PDF
 reader and annotation editor for Windows, Apple-silicon Macs, and Linux x86_64.
 
-Version 0.2.44 adds the first Linux release; see [Linux setup](docs/LINUX.md).
+Version 0.2.45 adds the first Linux release; see [Linux setup](docs/LINUX.md).
 
 Read the article, follow the footnotes, and keep your place. **Review Mode**
 reconstructs reading flow and footnotes in law review articles, while the original
@@ -31,19 +31,19 @@ Choose the matching result to make that note's button open the source during
 the reading session. Search results are suggestions, not verified matches.
 
 The “world's best” line expresses the creator's vision, not an independently
-tested ranking. **Version 0.2.44 is a public beta.**
+tested ranking. **Version 0.2.45 is a public beta.**
 
 ## Download
 
-[**Download LawPDF for Windows, Mac, or Linux**](https://github.com/yonathanarbel/LawPDF/releases/tag/v0.2.44)
+[**Download LawPDF for Windows, Mac, or Linux**](https://github.com/yonathanarbel/LawPDF/releases/tag/v0.2.45)
 
 | Platform | Download | Requirements |
 | --- | --- | --- |
 | Windows Store | [Microsoft Store](https://apps.microsoft.com/detail/9MZXSP0C423F) | Microsoft-signed package and Store-managed updates; check the version offered while updates await certification |
-| Windows installer | [LawPDFSetup-x64.exe](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.44/LawPDFSetup-x64.exe) | 64-bit Windows; installation may request administrator approval |
-| Windows portable | [LawPDF-windows-portable-x64.zip](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.44/LawPDF-windows-portable-x64.zip) | Extract the entire ZIP, then run `lawpdf.exe` |
-| Mac | [LawPDF-macos.zip](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.44/LawPDF-macos.zip) | Apple silicon (M-series), macOS 13 or later; Intel Macs are not supported by this build |
-| Linux | [LawPDF-linux-x86_64.tar.gz](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.44/LawPDF-linux-x86_64.tar.gz) | x86_64 Ubuntu 24.04 or a compatible modern glibc desktop; see [Linux setup](docs/LINUX.md) |
+| Windows installer | [LawPDFSetup-x64.exe](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.45/LawPDFSetup-x64.exe) | 64-bit Windows; installation may request administrator approval |
+| Windows portable | [LawPDF-windows-portable-x64.zip](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.45/LawPDF-windows-portable-x64.zip) | Extract the entire ZIP, then run `lawpdf.exe` |
+| Mac | [LawPDF-macos.zip](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.45/LawPDF-macos.zip) | Apple silicon (M-series), macOS 13 or later; Intel Macs are not supported by this build |
+| Linux | [LawPDF-linux-x86_64.tar.gz](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.45/LawPDF-linux-x86_64.tar.gz) | x86_64 Ubuntu 24.04 or a compatible modern glibc desktop; see [Linux setup](docs/LINUX.md) |
 
 Close older LawPDF versions before installing or opening the new version.
 Keep a backup of important PDFs while trying the beta.
@@ -141,7 +141,7 @@ keyring. See [Linux setup](docs/LINUX.md) for details.
 
 ## What to expect from this beta
 
-Version 0.2.44 adds Linux, author-labeled margin comments, consistent speech
+Version 0.2.45 adds Linux, author-labeled margin comments, consistent speech
 choices, and footnote source discovery. Comment import, printer discovery, and
 speech start when requested. Citation searches run in the background only after
 **Find source** or **Find article links**; opening a PDF does not trigger them.
@@ -151,8 +151,8 @@ Before release preparation, the [PR #31](https://github.com/yonathanarbel/LawPDF
 candidate recorded **1,185 passing tests and successful CI checks**. These are
 pre-release results. Tagged package builds, checksums, provenance, and exact
 Windows installation evidence are checked separately. See the
-[release verification](docs/releases/v0.2.44.md) and the downloadable
-[artifact record](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.44/RELEASE-VERIFICATION.json)
+[release verification](docs/releases/v0.2.45.md) and the downloadable
+[artifact record](https://github.com/yonathanarbel/LawPDF/releases/download/v0.2.45/RELEASE-VERIFICATION.json)
 for the released source commit and workflow runs. Hosted Windows installation
 checks do not establish testing on the maintainer's own Windows hardware.
 
@@ -195,5 +195,5 @@ The Linux and imported-comment foundations adapt Sarah Lawsky's MIT-licensed
 LawPDF fork; see [Contributors](CONTRIBUTORS.md). Bundled third-party components
 and models are credited in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 Technical evidence and remaining qualification work are documented in
-[the current release evidence](docs/releases/v0.2.44.md)
+[the current release evidence](docs/releases/v0.2.45.md)
 and [release procedure](docs/RELEASING.md).
