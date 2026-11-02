@@ -8,10 +8,20 @@ pub(super) enum CloseTarget {
 
 impl PdfEditorApp {
     pub(super) fn request_window_close(&mut self, ctx: &Context) {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         if self.print_ui.busy {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.status = "Finish or cancel the print dialog before quitting.".to_owned();
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        if self.print_ui.open {
+            // Alt+F4/window close dismisses the active modal first. Otherwise
+            // the unsaved-close prompt can sit behind printing and later quit
+            // the application after a print job has already started.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.print_ui.close();
+            ctx.request_repaint();
             return;
         }
         self.save_active_tab_state();
@@ -181,6 +191,51 @@ mod tests {
         app.active_tab = Some(0);
         app.tabs.push(app.active_tab_snapshot(document));
         (app, ctx)
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn window_close_dismisses_idle_print_modal_before_unsaved_document_prompt() {
+        let (mut app, ctx) = app_with_dirty_tab();
+        app.print_ui.open = true;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            app.request_window_close(ctx);
+        });
+        assert!(!app.print_ui.open);
+        assert!(app.pending_close.is_none());
+        assert!(!app.allow_window_close);
+        assert!(app.annotations_dirty);
+        assert_eq!(app.tabs.len(), 1);
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.request_window_close(ctx)
+        });
+        assert_eq!(app.pending_close, Some(CloseTarget::Window));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn window_close_keeps_an_active_print_job_and_document_open() {
+        let (mut app, ctx) = app_with_dirty_tab();
+        app.print_ui.open = true;
+        app.print_ui.busy = true;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            app.request_window_close(ctx);
+        });
+        assert!(app.print_ui.open);
+        assert!(app.print_ui.busy);
+        assert!(app.pending_close.is_none());
+        assert!(!app.allow_window_close);
+        assert!(app.annotations_dirty);
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
     }
 
     #[test]

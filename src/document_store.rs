@@ -104,12 +104,12 @@ pub struct DocumentStore {
 }
 
 impl DocumentStore {
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(test)]
     pub(crate) fn for_print_test(root: PathBuf) -> Self {
         Self { root }
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     pub(crate) fn print_source(&self, revision: &FileRevision) -> Result<PathBuf, String> {
         let path = self.snapshot_path(revision)?;
         revision.require_current(&path)?;

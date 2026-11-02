@@ -240,6 +240,12 @@ fn cache_root() -> Option<PathBuf> {
 }
 
 fn document_key(source: &Path) -> Option<String> {
+    // A print session owns these snapshots; do not retain unsaved edits in the reader cache.
+    if source.ancestors().any(|path| path.file_name().is_some_and(|name| {
+        name.to_string_lossy().starts_with("lawpdf-print-")
+    })) {
+        return None;
+    }
     let metadata = fs::metadata(source).ok()?;
     let modified = metadata
         .modified()

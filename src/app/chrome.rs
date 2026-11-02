@@ -887,6 +887,13 @@ impl PdfEditorApp {
 
     fn draw_file_actions(&mut self, ui: &mut egui::Ui, ctx: &Context, has_document: bool) {
         // Right-to-left: the last added sits leftmost.
+        #[cfg(target_os = "windows")]
+        if ui.add_enabled(has_document && !self.print_ui.busy,
+            egui::Button::new("Print…").min_size(Vec2::new(64.0, 30.0)))
+            .on_hover_text("Print this PDF · Ctrl+P").clicked()
+        {
+            self.request_print(ctx);
+        }
         let markdown_busy = self.pending_markdown_request.is_some();
         let mut markdown_settings_changed = false;
         toolbar_icon_menu_button(
@@ -963,7 +970,7 @@ impl PdfEditorApp {
             has_document,
             "Export this PDF as another document or image format",
             |ui| {
-                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
                 if ui
                     .add_enabled(
                         !self.print_ui.busy,
@@ -1647,6 +1654,10 @@ impl PdfEditorApp {
         if self.status != self.chrome.last_status {
             self.chrome.last_status = self.status.clone();
             self.chrome.status_changed_at = Some(now);
+        }
+        #[cfg(target_os = "windows")]
+        if self.print_ui.open {
+            return;
         }
         let ocr = self.ocr_is_active().then(|| self.ocr_summary());
         let fresh = self

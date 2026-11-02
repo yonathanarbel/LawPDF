@@ -29,11 +29,18 @@ mod ocr;
 mod page_geometry;
 mod pdf_backend;
 mod performance_cache;
+#[cfg(all(target_os = "windows", feature = "devtools"))]
+mod print_smoke;
 #[cfg(target_os = "macos")]
 mod printing;
 #[cfg(target_os = "linux")]
 #[path = "printing_linux.rs"]
 mod printing;
+#[cfg(target_os = "windows")]
+#[path = "printing_layout.rs"]
+mod printing;
+#[cfg(target_os = "windows")]
+mod printing_windows;
 mod render_worker;
 mod review_margin;
 mod review_masthead;
@@ -134,6 +141,10 @@ fn main() -> eframe::Result<()> {
     #[cfg(target_os = "macos")]
     macos_open_files::install_appkit_crash_workarounds();
 
+    #[cfg(all(target_os = "windows", feature = "devtools"))]
+    if args.iter().any(|arg| arg == "--smoke-print") {
+        return print_smoke::run();
+    }
     #[cfg(feature = "devtools")]
     if args.iter().any(|arg| arg == "--smoke-shutdown") {
         return shutdown_smoke::run();

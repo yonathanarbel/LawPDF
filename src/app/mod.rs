@@ -11,6 +11,9 @@ mod footnote_sources_ui;
 mod platform_ui;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod print_ui;
+#[cfg(target_os = "windows")]
+#[path = "print_windows_ui.rs"]
+mod print_ui;
 mod recovery_ui;
 mod review_margin_ui;
 mod review_reveal;
@@ -465,7 +468,7 @@ pub struct PdfEditorApp {
     open_into_sbs: bool,
     recovery_ui: recovery_ui::RecoveryUi,
     save_as: Option<save_as::SaveAsTask>,
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     print_ui: print_ui::PrintUi,
     page_rotation_in_flight: bool,
     text_box_text: String,
@@ -1277,7 +1280,7 @@ impl PdfEditorApp {
             open_into_sbs: false,
             recovery_ui: recovery_ui::RecoveryUi::new(ctx, isolated),
             save_as: None,
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
             print_ui: print_ui::PrintUi::default(),
             page_rotation_in_flight: false,
             text_box_text: String::new(),
@@ -11383,7 +11386,11 @@ impl eframe::App for PdfEditorApp {
         {
             self.request_window_close(ctx);
         }
-        if consume_command_shortcut(ctx, egui::Key::W) {
+        #[cfg(target_os = "windows")]
+        let print_modal_open = self.print_ui.open;
+        #[cfg(not(target_os = "windows"))]
+        let print_modal_open = false;
+        if !print_modal_open && consume_command_shortcut(ctx, egui::Key::W) {
             self.close_active_tab_or_window(ctx);
         }
 
@@ -11397,7 +11404,7 @@ impl eframe::App for PdfEditorApp {
         self.poll_queued_open_paths(ctx);
         self.poll_render_results(ctx);
         self.poll_recovery(ctx);
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         self.poll_print(ctx);
         self.poll_comment_cache(ctx);
         self.poll_footnote_sources(ctx);
@@ -11426,6 +11433,13 @@ impl eframe::App for PdfEditorApp {
         self.handle_dropped_files(ctx);
         self.flush_settings_if_due(ctx);
 
+        #[cfg(target_os = "windows")]
+        if consume_command_shortcut(ctx, egui::Key::P) {
+            self.request_print(ctx);
+        }
+        #[cfg(target_os = "windows")]
+        let print_modal_open = self.print_ui.open;
+        if !print_modal_open {
         let zoom_delta = ctx.input(|input| input.zoom_delta());
         let pdf_ctrl_wheel_zoom = self.view_mode == DocumentViewMode::Pdf
             && ctx.input(|input| input.modifiers.ctrl)
@@ -11605,6 +11619,7 @@ impl eframe::App for PdfEditorApp {
             }
         }
 
+        }
         self.advance_zoom_animation(ctx);
 
         self.draw_masthead(ctx);
@@ -11622,7 +11637,12 @@ impl eframe::App for PdfEditorApp {
         self.draw_recovery(ctx);
         self.draw_default_reader_prompt(ctx);
         self.draw_update_notice(ctx);
-        self.draw_notices(ctx);
+        // Transient document toasts must not cover the print dialog's action bar.
+        if !print_modal_open {
+            self.draw_notices(ctx);
+        }
+        #[cfg(target_os = "windows")]
+        self.draw_print_dialog(ctx);
 
         if self.zoom_is_animating()
             || !self.pending_page_renders.is_empty()

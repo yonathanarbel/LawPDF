@@ -8,6 +8,10 @@ reader and annotation editor for Windows, Apple-silicon Macs, and Linux x86_64.
 
 Version 0.2.45 adds the first Linux release; see [Linux setup](docs/LINUX.md).
 
+The **0.2.46 release candidate** adds a Windows print-preview window with
+**Ctrl+P** and detailed layout controls; see [Windows printing](docs/PRINTING.md).
+This change is not included in the public 0.2.45 downloads linked below.
+
 Read the article, follow the footnotes, and keep your place. **Review Mode**
 reconstructs reading flow and footnotes in law review articles, while the original
 PDF remains available for checking quotations, citations, tables, and layout.
@@ -111,7 +115,10 @@ keyring. See [Linux setup](docs/LINUX.md) for details.
 - **Choose your narration:** System speech keeps the text local. ElevenLabs and
   OpenRouter support API narration and MP3 export with your own keys; provider
   charges apply. You can include footnotes after the body.
-- **Print on Mac or Linux:** Mac uses the standard **Command-P / File → Print…**
+- **Print on Windows, Mac, or Linux:** Windows **Ctrl+P** or the visible
+  **Print…** button opens a live preview with page ranges, copies, duplex,
+  paper size, scaling, margins, 1/2/4 pages per sheet, grayscale, and annotation
+  controls. See [Windows printing](docs/PRINTING.md). Mac uses **Command-P / File → Print…**
   dialog, including Save as PDF. Linux uses **Ctrl+P** with CUPS printer, copy,
   and page-range controls. Both print a separate copy containing current,
   including unsaved, annotations. A Linux queue receipt confirms acceptance by

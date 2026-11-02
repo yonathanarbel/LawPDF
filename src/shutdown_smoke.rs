@@ -8,8 +8,13 @@ pub fn running() -> bool {
     RUNNING.load(Ordering::Relaxed)
 }
 
-pub fn run() -> eframe::Result<()> {
+/// Isolate native UI QA from the user's settings, updater, and recovery data.
+pub(crate) fn begin_qa() {
     RUNNING.store(true, Ordering::Relaxed);
+}
+
+pub fn run() -> eframe::Result<()> {
+    begin_qa();
     crate::diagnostics::start_session();
     let paths: Vec<_> = std::env::args_os().skip_while(|arg| arg != "--smoke-shutdown")
         .skip(1).map(std::path::PathBuf::from).collect();

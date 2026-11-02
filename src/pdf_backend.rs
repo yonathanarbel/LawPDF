@@ -62,6 +62,7 @@ impl Drop for AnnotationVisibilityGuard<'_> {
 pub enum RenderQuality {
     Crisp,
     Fast,
+    Print,
 }
 
 /// RGB page raster for LiquidVision (LmV tier), plus page size in points.
@@ -353,7 +354,8 @@ impl NativePdfEngine {
         } else {
             &self.performance_cache
         };
-        if let Some(rendered) = cache.load_rendered_page(path, page_index, zoom, fast) {
+        if quality != RenderQuality::Print
+            && let Some(rendered) = cache.load_rendered_page(path, page_index, zoom, fast) {
             return Ok(rendered);
         }
         let rendered = self.with_open_document_data(path, |open| {
@@ -385,10 +387,11 @@ impl NativePdfEngine {
                 .min(limit_by_height)
                 .max(1.0) as i32;
             let config = match quality {
-                RenderQuality::Crisp => PdfRenderConfig::new()
+                RenderQuality::Crisp | RenderQuality::Print => PdfRenderConfig::new()
                     .set_target_width(target_width)
                     .render_form_data(true)
-                    .use_lcd_text_rendering(true)
+                    .use_lcd_text_rendering(quality != RenderQuality::Print)
+                    .use_print_quality(quality == RenderQuality::Print)
                     .set_text_smoothing(true)
                     .set_path_smoothing(true)
                     .set_image_smoothing(true),
@@ -444,7 +447,9 @@ impl NativePdfEngine {
                 rgba,
             })
         })?;
-        cache.save_rendered_page(path, &rendered, zoom, fast);
+        if quality != RenderQuality::Print {
+            cache.save_rendered_page(path, &rendered, zoom, fast);
+        }
         Ok(rendered)
     }
 
@@ -1529,7 +1534,7 @@ pub fn rewrite_hazard(document: &Document) -> Option<RewriteHazard> {
 
 /// Check the original PDF before annotation export can remove an owner-password
 /// wrapper. This matches the macOS PDFKit print path's allowsPrinting check.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 fn allows_printing(document: &Document) -> bool {
     // lopdf removes /Encrypt after automatically decrypting an empty user
     // password. The original permissions survive in its encryption state.
@@ -1548,7 +1553,7 @@ fn allows_printing(document: &Document) -> bool {
         .is_none_or(|permissions| permissions & PRINT_PERMISSION != 0)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 pub(crate) fn allows_printing_at(source: &Path) -> Result<bool> {
     Ok(allows_printing(&Document::load(source)?))
 }
