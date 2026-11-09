@@ -17,6 +17,7 @@ pub(super) struct SearchState {
     pub(super) activated: Option<Instant>,
     pub(super) wrapped: bool,
     pub(super) split_original: bool,
+    pub(super) split_results_open: bool,
     pub(super) close_sidebar: bool,
     pub(super) geometry: HashMap<usize, HashMap<usize, Vec<PdfRect>>>,
     pub(super) density: std::collections::BTreeMap<usize, usize>,

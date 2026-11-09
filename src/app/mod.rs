@@ -1564,6 +1564,7 @@ impl PdfEditorApp {
             self.invalidate_search_results();
             self.search_state.query = query;
             self.search_state.show_highlights = true;
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("lawpdf-find")));
         }
     }
 
@@ -4184,6 +4185,7 @@ impl PdfEditorApp {
             self.sidebar_tab = SidebarTab::Pages;
         }
         self.search_state.close_sidebar = false;
+        self.search_state.split_results_open = false;
         self.search_state.open = false;
         self.search_state.show_highlights = false;
         self.search_state.focus_request = false;
@@ -5122,6 +5124,10 @@ impl PdfEditorApp {
                     .stroke(Stroke::new(1.0_f32, Color32::from_rgb(220, 216, 207))),
             )
             .show(ctx, |ui| {
+                if self.sbs_mode.is_some() {
+                    self.draw_search_tab(ui);
+                    return;
+                }
                 ui.horizontal(|ui| {
                     for tab in SidebarTab::ALL {
                         if ui
@@ -8855,11 +8861,20 @@ impl PdfEditorApp {
                         if let Some(pos) = ctx
                             .input(|i| i.pointer.press_origin().filter(|_| i.pointer.any_pressed()))
                         {
-                            if columns[0].max_rect().contains(pos) {
-                                self.search_state.split_original = false;
-                            }
-                            if columns[1].max_rect().contains(pos) {
-                                self.search_state.split_original = true;
+                            let original = if columns[0].max_rect().contains(pos) {
+                                Some(false)
+                            } else if columns[1].max_rect().contains(pos) {
+                                Some(true)
+                            } else {
+                                None
+                            };
+                            if let Some(original) = original
+                                && self.search_state.split_original != original
+                            {
+                                self.search_state.split_original = original;
+                                if self.search_state.open {
+                                    ctx.memory_mut(|m| m.request_focus(egui::Id::new("lawpdf-find")));
+                                }
                             }
                         }
                         self.draw_liquid_mode2_document(&mut columns[0], ctx);

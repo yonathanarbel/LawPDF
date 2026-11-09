@@ -192,7 +192,7 @@ impl PdfEditorApp {
 
     pub(super) fn sidebar_visible(&self) -> bool {
         if self.sbs_mode.is_some() {
-            return false;
+            return self.search_state.open && self.search_state.split_results_open;
         }
         if self.view_mode == DocumentViewMode::LiquidMode2 && !self.review_pdf_split {
             self.settings.sidebar_in_review
@@ -202,6 +202,10 @@ impl PdfEditorApp {
     }
 
     pub(super) fn set_sidebar_visible(&mut self, visible: bool) {
+        if self.sbs_mode.is_some() {
+            self.search_state.split_results_open = visible;
+            return;
+        }
         if self.view_mode == DocumentViewMode::LiquidMode2 && !self.review_pdf_split {
             self.settings.sidebar_in_review = visible;
         } else {

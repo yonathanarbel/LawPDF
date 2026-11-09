@@ -290,3 +290,20 @@ fn find_anchor_skips_above_viewport_and_visible_matches_do_not_scroll() {
     let far = line.translate(Vec2::new(0., 1400.));
     assert_eq!(far.top() + passage_delta(view, far).y, 200.);
 }
+
+#[test]
+fn paired_find_results_are_local_to_the_open_search() {
+    let ctx = Context::default();
+    let mut app = reader(&ctx);
+    let old_sidebar = app.settings.sidebar_in_pdf;
+    app.sbs_mode = Some(SbsModeState { left_epoch: 1, right_epoch: 2 });
+    app.focus_search(&ctx);
+    assert!(!app.sidebar_visible());
+    app.set_sidebar_visible(true);
+    assert!(app.sidebar_visible());
+    assert_eq!(app.settings.sidebar_in_pdf, old_sidebar);
+    app.dismiss_search(&ctx);
+    assert!(!app.sidebar_visible());
+    app.sbs_mode = None;
+    assert_eq!(app.sidebar_visible(), old_sidebar);
+}
