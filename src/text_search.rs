@@ -33,7 +33,11 @@ pub fn match_ranges(text: &str, query: &str) -> Vec<Range<usize>> {
 }
 
 /// Bound context by characters without rescanning or copying the whole page per hit.
-pub fn snippet(text: &str, range: Range<usize>, context_chars: usize) -> String {
+pub fn snippet_with_match(
+    text: &str,
+    range: Range<usize>,
+    context_chars: usize,
+) -> (String, Range<usize>) {
     let left = text[..range.start]
         .char_indices()
         .rev()
@@ -48,21 +52,45 @@ pub fn snippet(text: &str, range: Range<usize>, context_chars: usize) -> String 
     if left > 0 {
         result.push('…');
     }
-    result.push_str(
-        &text[left..right]
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" "),
-    );
+    let before = &text[left..range.start];
+    let after = &text[range.end..right];
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prefix = words(before);
+    result.push_str(&prefix);
+    if !prefix.is_empty() && before.ends_with(char::is_whitespace) {
+        result.push(' ');
+    }
+    let start = result.len();
+    result.push_str(&words(&text[range]));
+    let matched = start..result.len();
+    let suffix = words(after);
+    if !suffix.is_empty() && after.starts_with(char::is_whitespace) {
+        result.push(' ');
+    }
+    result.push_str(&suffix);
     if right < text.len() {
         result.push('…');
     }
-    result
+    (result, matched)
+}
+
+#[cfg(test)]
+fn snippet(text: &str, range: Range<usize>, context_chars: usize) -> String {
+    snippet_with_match(text, range, context_chars).0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snippet_emphasis_identifies_the_actual_repeat_after_whitespace_folding() {
+        let text = "漢法   LAW\nlaw\tÅ";
+        let range = match_ranges(text, "law").pop().unwrap();
+        let (snippet, found) = snippet_with_match(text, range, 40);
+        assert_eq!(snippet, "漢法 LAW law Å");
+        assert_eq!(&snippet[found], "law");
+    }
 
     #[test]
     fn unicode_matches_keep_original_offsets_and_case() {

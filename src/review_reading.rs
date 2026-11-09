@@ -483,6 +483,7 @@ pub struct ReviewSearchHit {
     pub match_start: usize,
     pub match_end: usize,
     pub snippet: String,
+    pub snippet_match: std::ops::Range<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1144,11 +1145,14 @@ pub fn find_hits_in_review_blocks(blocks: &[LiquidBlock], query: &str) -> Vec<Re
             continue;
         }
         for range in crate::text_search::match_ranges(&block.text, needle) {
+            let (snippet, snippet_match) =
+                crate::text_search::snippet_with_match(&block.text, range.clone(), 24);
             hits.push(ReviewSearchHit {
                 block_index,
                 match_start: range.start,
                 match_end: range.end,
-                snippet: crate::text_search::snippet(&block.text, range, 24),
+                snippet,
+                snippet_match,
             });
         }
     }

@@ -335,6 +335,7 @@ pub struct SearchHit {
     pub match_start: usize,
     pub match_end: usize,
     pub snippet: String,
+    pub snippet_match: std::ops::Range<usize>,
     pub block_index: Option<usize>,
 }
 

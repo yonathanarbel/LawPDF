@@ -65,7 +65,7 @@ pub(super) fn install_masthead_font(fonts: &mut FontDefinitions) {
     );
 }
 
-fn masthead_font(size: f32) -> FontId {
+pub(super) fn masthead_font(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(MASTHEAD_FONT.into()))
 }
 
@@ -542,6 +542,91 @@ impl PdfEditorApp {
         let inner = row.shrink2(Vec2::new(26.0, 0.0));
         let has_document = self.document.is_some();
 
+        if self.search_state.open && has_document {
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(inner)
+                    .layout(egui::Layout::left_to_right(Align::Center)),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 5.;
+                    let scope = if self.sbs_mode.is_some() {
+                        if self
+                            .sbs_mode
+                            .is_some_and(|m| m.left_epoch == self.document_epoch)
+                        {
+                            "Left PDF"
+                        } else {
+                            "Right PDF"
+                        }
+                    } else if self.find_scope() == search_state::FindScope::Review {
+                        "Article"
+                    } else {
+                        "PDF"
+                    };
+                    ui.label(
+                        RichText::new(format!("Find in {scope}"))
+                            .size(13.)
+                            .color(MUTED_INK),
+                    );
+                    let width = (inner.width() * 0.24).clamp(54., 300.);
+                    self.draw_find_field(ui, ctx, true, width);
+                    let count = self.find_progress();
+                    ui.add_sized(
+                        [if inner.width() > 700. { 125. } else { 78. }, 26.],
+                        egui::Label::new(RichText::new(&count).size(13.).color(MUTED_INK))
+                            .truncate(),
+                    )
+                    .on_hover_text(&count);
+                    for (back, icon, tip) in [
+                        (true, "↑", "Previous match (Shift+Enter)"),
+                        (false, "↓", "Next match (Enter)"),
+                    ] {
+                        let button = ui
+                            .add_enabled(
+                                !self.search_state.query.trim().is_empty(),
+                                egui::Button::new(RichText::new(icon).size(17.))
+                                    .min_size(Vec2::new(28., 26.)),
+                            )
+                            .on_hover_text(tip);
+                        ui.ctx()
+                            .accesskit_node_builder(button.id, |node| node.set_label(tip));
+                        if button.clicked() {
+                            self.find_step(ctx, back);
+                            ui.memory_mut(|m| m.request_focus(egui::Id::new("lawpdf-find")));
+                        }
+                    }
+                    if ui
+                        .small_button(if inner.width() < 590. {
+                            "List"
+                        } else {
+                            "All results"
+                        })
+                        .clicked()
+                    {
+                        let already =
+                            self.sidebar_visible() && self.sidebar_tab == SidebarTab::Search;
+                        if !already {
+                            self.search_state.follow_result = true;
+                            self.search_state.close_sidebar = !self.sidebar_visible();
+                            self.sidebar_tab = SidebarTab::Search;
+                        }
+                        self.set_sidebar_visible(!already);
+                    }
+                    let close = ui
+                        .add(
+                            egui::Button::new(RichText::new("×").size(17.))
+                                .min_size(Vec2::new(28., 26.)),
+                        )
+                        .on_hover_text("Close Find (Esc)");
+                    ui.ctx()
+                        .accesskit_node_builder(close.id, |n| n.set_label("Close Find"));
+                    if close.clicked() {
+                        self.dismiss_search(ctx);
+                    }
+                },
+            );
+            return;
+        }
         // Centre: the view switch.
         let switch_width = 300.0_f32.min(inner.width() * 0.34);
         let switch_rect = Rect::from_center_size(
@@ -847,41 +932,57 @@ impl PdfEditorApp {
         has_document: bool,
         width: f32,
     ) {
-        let search_enabled = has_document && self.sbs_mode.is_none();
-        let hint = if self.view_mode == DocumentViewMode::LiquidMode2 {
-            "Find in this article"
+        let id = egui::Id::new("lawpdf-find");
+        let focus_request = self.search_state.focus_request;
+        if focus_request {
+            ui.memory_mut(|m| m.request_focus(id));
+        }
+        let enter = if ui.memory(|m| m.has_focus(id)) {
+            ui.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter) {
+                    Some(true)
+                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
         } else {
-            "Find in this PDF"
+            None
         };
-        let search_response = ui
-            .add_enabled(
-                search_enabled,
-                egui::TextEdit::singleline(&mut self.search_state.query)
-                    .hint_text(hint)
-                    .desired_width(width)
-                    .margin(Margin::symmetric(8, 5)),
-            )
-            .on_disabled_hover_text("Open the active pane solo to search within it");
-        ui.ctx().accesskit_node_builder(search_response.id, |node| {
-            node.set_label("Find");
-        });
-        if self.search_state.focus_request {
-            if search_enabled {
-                search_response.request_focus();
-            } else if has_document {
-                self.status = "Open either SbS pane solo to search within it.".to_owned();
-            }
+        let mut output = egui::TextEdit::singleline(&mut self.search_state.query)
+            .id(id)
+            .hint_text("Find…")
+            .desired_width(width)
+            .interactive(has_document)
+            .margin(Margin::symmetric(8, 5))
+            .show(ui);
+        ui.ctx()
+            .accesskit_node_builder(id, |n| n.set_label("Find in the current view"));
+        if focus_request {
+            let end = egui::text::CCursor::new(self.search_state.query.chars().count());
+            output
+                .state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    end,
+                )));
+            output.state.store(ctx, id);
             self.search_state.focus_request = false;
         }
-        if search_response.changed() {
-            self.invalidate_search_results();
+        if has_document && (output.response.has_focus() || output.response.clicked()) {
+            self.search_state.open = true;
         }
-        let pressed_enter =
-            search_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-        if pressed_enter && search_enabled {
-            self.start_search(ctx);
-            self.sidebar_tab = SidebarTab::Search;
-            self.set_sidebar_visible(true);
+        if output.response.changed() {
+            self.invalidate_search_results();
+            self.search_state.open = true;
+            self.search_state.show_highlights = true;
+            self.search_state.due = Some(Instant::now() + Duration::from_millis(65));
+            ctx.request_repaint_after(Duration::from_millis(65));
+        }
+        if let Some(back) = enter {
+            self.find_step(ctx, back);
         }
     }
 
