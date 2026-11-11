@@ -13,7 +13,6 @@ use crate::review_masthead::{MASTHEAD_PAGES_TO_READ, MastheadIdentity, masthead_
 pub(super) const NAVY: Color32 = Color32::from_rgb(28, 38, 56);
 pub(super) const NAVY_TEXT: Color32 = Color32::from_rgb(233, 226, 210);
 pub(super) const NAVY_MUTED: Color32 = Color32::from_rgb(207, 199, 182);
-pub(super) const IVORY: Color32 = Color32::from_rgb(251, 248, 241);
 pub(super) const BRASS: Color32 = Color32::from_rgb(199, 165, 116);
 pub(super) const OXBLOOD: Color32 = Color32::from_rgb(122, 31, 43);
 pub(super) const RULE: Color32 = Color32::from_rgb(217, 207, 189);
@@ -37,12 +36,45 @@ pub(super) struct ChromeState {
     markup_bar_drag: Option<Vec2>,
     last_status: String,
     status_changed_at: Option<Instant>,
+    /// The check is animated only after this document's confirmed save.
+    save_confirmation: Option<(u64, Instant)>,
     /// Review note shown in full, keyed as in `ReviewMarginEntry::key`.
     pub(super) expanded_note: Option<String>,
     /// Note under the pointer last frame, so callout and note light up together.
     pub(super) hovered_note: Option<String>,
     /// True while the current frame lays notes out in the margin.
     pub(super) margin_notes_live: bool,
+}
+
+impl ChromeState {
+    pub(super) fn confirm_save(&mut self, epoch: u64) {
+        self.save_confirmation = Some((epoch, Instant::now()));
+    }
+}
+
+fn draw_save_check(painter: &egui::Painter, center: Pos2, progress: f32) {
+    let start = center + Vec2::new(-4.5, 0.0);
+    let corner = center + Vec2::new(-1.5, 3.5);
+    let end = center + Vec2::new(5.0, -4.0);
+    let first = start.distance(corner);
+    let second = corner.distance(end);
+    let length = progress.clamp(0.0, 1.0) * (first + second);
+    let stroke = Stroke::new(1.8_f32, BRASS);
+    if length > 0.0 {
+        painter.line_segment(
+            [start, start.lerp(corner, (length / first).min(1.0))],
+            stroke,
+        );
+    }
+    if length > first {
+        painter.line_segment(
+            [
+                corner,
+                corner.lerp(end, ((length - first) / second).min(1.0)),
+            ],
+            stroke,
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,7 +135,11 @@ fn small_caps_button(
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     if response.hovered() && !active {
         ui.painter()
-            .rect_filled(rect, 4.0, Color32::from_rgba_unmultiplied(42, 38, 32, 12));
+            .rect_filled(rect, 4.0, if ui.visuals().dark_mode {
+                Color32::from_white_alpha(20)
+            } else {
+                Color32::from_rgba_unmultiplied(42, 38, 32, 12)
+            });
     }
     let text_pos = rect.center() - galley.size() * 0.5;
     ui.painter().galley(text_pos, galley, color);
@@ -119,7 +155,7 @@ fn small_caps_button(
 }
 
 impl PdfEditorApp {
-    fn masthead_identity_for_view(&mut self) -> MastheadIdentity {
+    pub(super) fn masthead_identity_for_view(&mut self) -> MastheadIdentity {
         let Some(document) = self.document.as_ref() else {
             return MastheadIdentity {
                 title: "LawPDF".to_owned(),
@@ -218,7 +254,7 @@ impl PdfEditorApp {
         self.request_masthead_text();
         let identity = self.masthead_identity_for_view();
         egui::TopBottomPanel::top("masthead")
-            .frame(egui::Frame::NONE.fill(IVORY))
+            .frame(egui::Frame::NONE.fill(self.app_palette().bar))
             .show_separator_line(false)
             .show(ctx, |ui| {
                 quiet_buttons(ui);
@@ -260,7 +296,13 @@ impl PdfEditorApp {
 
         let mut switch_to = None;
         let mut close_tab = None;
+        let mut close_others = None;
+        let mut copy_path = None;
+        let mut reveal_path = None;
+        let mut drop_tab = None;
+        let mut tab_rects = Vec::new();
         let mut open_new = false;
+        let tab_width = ((row.width() - 220.0) / self.tabs.len().max(1) as f32).clamp(84.0, 250.0);
         ui.scope_builder(
             egui::UiBuilder::new()
                 .max_rect(row.shrink2(Vec2::new(14.0, 0.0)))
@@ -284,10 +326,20 @@ impl PdfEditorApp {
                     NAVY_TEXT,
                 );
                 for index in 0..self.tabs.len() {
-                    let action = self.draw_tab(ui, index);
+                    let epoch = self.tabs[index].document_epoch;
+                    let (action, rect) = ui
+                        .push_id(("document-tab", epoch), |ui| {
+                            self.draw_tab(ui, index, tab_width)
+                        })
+                        .inner;
+                    tab_rects.push(rect);
                     match action {
                         TabAction::Switch => switch_to = Some(index),
                         TabAction::Close => close_tab = Some(index),
+                        TabAction::CloseOthers => close_others = Some(epoch),
+                        TabAction::CopyPath => copy_path = Some(index),
+                        TabAction::RevealPath => reveal_path = Some(index),
+                        TabAction::Drop => drop_tab = Some(index),
                         TabAction::None => {}
                     }
                 }
@@ -323,12 +375,42 @@ impl PdfEditorApp {
         }
         if let Some(index) = close_tab {
             self.close_tab(index, ctx);
+        } else if let Some(epoch) = close_others {
+            self.close_other_tabs(epoch, ctx);
+        } else if let Some(index) = copy_path {
+            ctx.copy_text(self.tabs[index].document.path.display().to_string());
+            self.status = "Copied document path.".to_owned();
+        } else if let Some(index) = reveal_path {
+            if let Err(error) = reveal_document_in_file_manager(&self.tabs[index].document.path) {
+                self.push_error_notice(error);
+            }
+        } else if let Some(index) = drop_tab {
+            if let Some(target) = ctx
+                .input(|input| input.pointer.latest_pos())
+                .and_then(|pos| tab_rects.iter().position(|rect| rect.contains(pos)))
+            {
+                self.reorder_tab(index, target);
+            }
         } else if let Some(index) = switch_to {
             self.switch_to_tab(index, ctx);
         }
     }
 
-    fn draw_tab(&mut self, ui: &mut egui::Ui, index: usize) -> TabAction {
+    fn reorder_tab(&mut self, source: usize, target: usize) {
+        if source >= self.tabs.len() || target >= self.tabs.len() || source == target {
+            return;
+        }
+        let active = self
+            .active_tab
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| tab.document_epoch);
+        let tab = self.tabs.remove(source);
+        self.tabs.insert(target, tab);
+        self.active_tab =
+            active.and_then(|epoch| self.tabs.iter().position(|tab| tab.document_epoch == epoch));
+    }
+
+    fn draw_tab(&mut self, ui: &mut egui::Ui, index: usize, max_width: f32) -> (TabAction, Rect) {
         let tab = &self.tabs[index];
         let is_active = self.active_tab == Some(index);
         let dirty = if is_active {
@@ -347,25 +429,31 @@ impl PdfEditorApp {
         });
         let full_title = tab.title();
         let path = tab.document.path.display().to_string();
-        const MAX_TAB_CHARS: usize = 30;
-        let mut title = full_title.clone();
-        if title.chars().count() > MAX_TAB_CHARS {
-            title = format!(
-                "{}…",
-                title.chars().take(MAX_TAB_CHARS - 1).collect::<String>()
-            );
-        }
-        if let Some(side) = sbs_side {
-            title = format!("{title}  ·  {side}");
-        }
-        let text_color = if is_active { INK } else { NAVY_MUTED };
-        let galley = ui
-            .fonts_mut(|fonts| fonts.layout_no_wrap(title, FontId::proportional(14.5), text_color));
+        let text_color = if is_active { self.app_palette().ink } else { NAVY_MUTED };
         let dot = if dirty || is_active { 13.0 } else { 0.0 };
-        let size = Vec2::new(galley.size().x + dot + 16.0 + 26.0, 32.0);
-        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+        let side_galley = sbs_side.map(|side| {
+            ui.fonts_mut(|fonts| {
+                fonts.layout_no_wrap(
+                    format!("  ·  {side}"),
+                    FontId::proportional(14.5),
+                    text_color,
+                )
+            })
+        });
+        let side_width = side_galley.as_ref().map_or(0.0, |galley| galley.size().x);
+        let mut job = LayoutJob::simple_singleline(
+            full_title.clone(),
+            FontId::proportional(14.5),
+            text_color,
+        );
+        job.wrap.max_width = (max_width - dot - side_width - 42.0).max(30.0);
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+        let size = Vec2::new(galley.size().x + side_width + dot + 16.0 + 26.0, 32.0);
+        let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
         let fill = if is_active {
-            IVORY
+            self.app_palette().bar
         } else if response.hovered() {
             Color32::from_rgba_unmultiplied(255, 255, 255, 16)
         } else {
@@ -383,16 +471,24 @@ impl PdfEditorApp {
         );
         let mut x = rect.left() + 12.0;
         if dot > 0.0 {
-            let dot_color = if dirty { OXBLOOD } else { BRASS };
+            let dot_color = if dirty { self.app_palette().accent } else { BRASS };
             ui.painter()
                 .circle_filled(Pos2::new(x + 3.5, rect.center().y), 3.5, dot_color);
             x += dot;
         }
+        let title_width = galley.size().x;
         ui.painter().galley(
             Pos2::new(x, rect.center().y - galley.size().y * 0.5),
             galley,
             text_color,
         );
+        if let Some(side) = side_galley {
+            ui.painter().galley(
+                Pos2::new(x + title_width, rect.center().y - side.size().y * 0.5),
+                side,
+                text_color,
+            );
+        }
         let close_rect = Rect::from_center_size(
             Pos2::new(rect.right() - 15.0, rect.center().y),
             Vec2::splat(18.0),
@@ -402,14 +498,14 @@ impl PdfEditorApp {
             ui.painter().circle_filled(
                 close_rect.center(),
                 9.0,
-                if is_active {
+                if is_active && !ui.visuals().dark_mode {
                     Color32::from_rgba_unmultiplied(42, 38, 32, 22)
                 } else {
                     Color32::from_rgba_unmultiplied(255, 255, 255, 30)
                 },
             );
         }
-        let cross = if is_active { MUTED_INK } else { NAVY_MUTED };
+        let cross = if is_active { self.app_palette().muted } else { NAVY_MUTED };
         let c = close_rect.center();
         for (a, b) in [(-3.5, 3.5), (3.5, -3.5)] {
             ui.painter().line_segment(
@@ -428,6 +524,21 @@ impl PdfEditorApp {
         response.widget_info(|| {
             egui::WidgetInfo::selected(egui::WidgetType::Button, true, is_active, &full_title)
         });
+        let mut menu_action = TabAction::None;
+        response.context_menu(|ui| {
+            if ui.button("Close other tabs").clicked() {
+                menu_action = TabAction::CloseOthers;
+                ui.close();
+            }
+            if ui.button("Show in folder").clicked() {
+                menu_action = TabAction::RevealPath;
+                ui.close();
+            }
+            if ui.button("Copy path").clicked() {
+                menu_action = TabAction::CopyPath;
+                ui.close();
+            }
+        });
         let response = response
             .on_hover_text(if dirty {
                 format!("{path}\nUnsaved annotations")
@@ -435,13 +546,21 @@ impl PdfEditorApp {
                 path
             })
             .on_hover_cursor(CursorIcon::PointingHand);
-        if close.clicked() {
+        let action = if menu_action != TabAction::None {
+            menu_action
+        } else if close.clicked()
+            || close.clicked_by(egui::PointerButton::Middle)
+            || response.clicked_by(egui::PointerButton::Middle)
+        {
             TabAction::Close
+        } else if response.drag_stopped_by(egui::PointerButton::Primary) {
+            TabAction::Drop
         } else if response.clicked() {
             TabAction::Switch
         } else {
             TabAction::None
-        }
+        };
+        (action, rect)
     }
 
     fn draw_identity_row(&mut self, ui: &mut egui::Ui, identity: &MastheadIdentity) {
@@ -458,7 +577,7 @@ impl PdfEditorApp {
             0.0,
             TextFormat {
                 font_id: masthead_font(title_size),
-                color: INK,
+                color: self.app_palette().ink,
                 extra_letter_spacing: title_size * 0.2,
                 ..Default::default()
             },
@@ -478,14 +597,14 @@ impl PdfEditorApp {
         );
         let title_rect = Rect::from_min_size(title_pos, title.size());
         let title_truncated = title.elided;
-        ui.painter().galley(title_pos, title, INK);
+        ui.painter().galley(title_pos, title, self.app_palette().ink);
 
         let flank_width = ((inner.width() - title_rect.width()) * 0.5 - 28.0).max(60.0);
         let authors = ui.fonts_mut(|fonts| {
             fonts.layout_job(small_caps_job(
                 &identity.authors,
                 13.0,
-                MUTED_INK,
+                self.app_palette().muted,
                 flank_width,
             ))
         });
@@ -493,7 +612,7 @@ impl PdfEditorApp {
             fonts.layout_job(small_caps_job(
                 &identity.citation,
                 13.0,
-                MUTED_INK,
+                self.app_palette().muted,
                 flank_width,
             ))
         });
@@ -503,8 +622,8 @@ impl PdfEditorApp {
             Pos2::new(inner.right() - citation.size().x, flank_y),
             citation.size(),
         );
-        ui.painter().galley(authors_rect.min, authors, MUTED_INK);
-        ui.painter().galley(citation_rect.min, citation, MUTED_INK);
+        ui.painter().galley(authors_rect.min, authors, self.app_palette().muted);
+        ui.painter().galley(citation_rect.min, citation, self.app_palette().muted);
         if !identity.authors.is_empty() {
             ui.interact(
                 authors_rect,
@@ -533,9 +652,9 @@ impl PdfEditorApp {
         // The double rule under the title line.
         let y = inner.bottom() - 3.0;
         ui.painter()
-            .hline(inner.x_range(), y, Stroke::new(1.3_f32, INK));
+            .hline(inner.x_range(), y, Stroke::new(1.3_f32, self.app_palette().ink));
         ui.painter()
-            .hline(inner.x_range(), y + 3.0, Stroke::new(0.8_f32, INK));
+            .hline(inner.x_range(), y + 3.0, Stroke::new(0.8_f32, self.app_palette().ink));
     }
 
     fn draw_action_row(&mut self, ui: &mut egui::Ui, ctx: &Context) {
@@ -570,14 +689,14 @@ impl PdfEditorApp {
                     ui.label(
                         RichText::new(format!("Find in {scope}"))
                             .size(13.)
-                            .color(MUTED_INK),
+                            .color(self.app_palette().muted),
                     );
                     let width = (inner.width() * 0.24).clamp(54., 300.);
                     self.draw_find_field(ui, ctx, true, width);
                     let count = self.find_progress();
                     ui.add_sized(
                         [if inner.width() > 700. { 125. } else { 78. }, 26.],
-                        egui::Label::new(RichText::new(&count).size(13.).color(MUTED_INK))
+                        egui::Label::new(RichText::new(&count).size(13.).color(self.app_palette().muted))
                             .truncate(),
                     )
                     .on_hover_text(&count);
@@ -713,7 +832,7 @@ impl PdfEditorApp {
         .map(|(label, _)| {
             ui.fonts_mut(|fonts| {
                 fonts
-                    .layout_job(small_caps_job(label, 12.5, INK, f32::INFINITY))
+                    .layout_job(small_caps_job(label, 12.5, self.app_palette().ink, f32::INFINITY))
                     .size()
                     .x
                     + 10.0
@@ -722,7 +841,8 @@ impl PdfEditorApp {
         .sum::<f32>()
             + 2.0 * ui.spacing().item_spacing.x;
         ui.add_space(((width - item_width) * 0.5).max(0.0));
-        let color = |active: bool| if active { OXBLOOD } else { MUTED_INK };
+        let palette = self.app_palette();
+        let color = |active: bool| if active { palette.accent } else { palette.muted };
         if small_caps_button(ui, "Original", color(pdf_active), pdf_active)
             .on_hover_text("The PDF as printed")
             .clicked()
@@ -772,7 +892,7 @@ impl PdfEditorApp {
             self.liquid_mode2_state,
             LiquidState::PreparingText | LiquidState::Preparing
         ) {
-            ui.spinner().on_hover_text("Preparing Review Mode");
+            motion::busy(ui, self.settings.reduce_motion).on_hover_text("Preparing Review Mode");
         }
     }
 
@@ -788,6 +908,10 @@ impl PdfEditorApp {
             .as_ref()
             .map(|_| Arc::clone(&self.review_derived.outline));
         let in_review = self.view_mode == DocumentViewMode::LiquidMode2;
+        let pdf_outline = (!in_review)
+            .then(|| self.pdf_outlines.get(&self.document_epoch).cloned())
+            .flatten()
+            .filter(|outline| !outline.is_empty());
         let current = if in_review {
             outline.as_ref().and_then(|outline| {
                 let active = self.review_active_heading?;
@@ -810,13 +934,13 @@ impl PdfEditorApp {
             (None, false, 0) => "No document".to_owned(),
             (None, false, count) => format!("Page {} of {count}", self.page_index + 1),
         };
-        let mut job = small_caps_job("Contents", 12.5, OXBLOOD, f32::INFINITY);
+        let mut job = small_caps_job("Contents", 12.5, self.app_palette().accent, f32::INFINITY);
         job.append(
             "   ",
             0.0,
             TextFormat {
                 font_id: FontId::proportional(15.0),
-                color: INK,
+                color: self.app_palette().ink,
                 ..Default::default()
             },
         );
@@ -836,68 +960,101 @@ impl PdfEditorApp {
             0.0,
             TextFormat {
                 font_id: FontId::proportional(16.0),
-                color: INK,
+                color: self.app_palette().ink,
                 italics: true,
                 ..Default::default()
             },
         );
         job.wrap.max_rows = 1;
         let mut clicked_target = None;
+        let mut clicked_pdf_target = None;
         let mut open_review = false;
         let (response, _) =
             egui::containers::menu::MenuButton::from_button(egui::Button::new(job).frame(false))
                 .ui(ui, |ui| {
                     ui.set_max_width(420.0);
                     ui.set_max_height(460.0);
-                    match &outline {
-                        Some(outline) if !outline.is_empty() => {
-                            egui::ScrollArea::vertical()
-                                .id_salt("masthead_contents")
-                                .max_height(440.0)
-                                .show(ui, |ui| {
-                                    for item in outline.iter() {
-                                        let active = in_review
-                                            && self.review_active_heading == Some(item.block_index);
-                                        ui.horizontal(|ui| {
-                                            ui.add_space(
-                                                14.0 * item.level.saturating_sub(1) as f32,
-                                            );
-                                            let text = RichText::new(&item.text)
-                                                .size(if item.level == 1 { 15.5 } else { 14.5 })
-                                                .color(if active {
-                                                    OXBLOOD
-                                                } else if item.level == 1 {
-                                                    INK
-                                                } else {
-                                                    MUTED_INK
-                                                });
-                                            if ui
-                                                .add(egui::Button::new(text).frame(false).wrap())
-                                                .on_hover_cursor(CursorIcon::PointingHand)
-                                                .clicked()
-                                            {
-                                                clicked_target = Some(item.block_index);
-                                                ui.close();
-                                            }
-                                        });
-                                    }
-                                });
-                        }
-                        Some(_) => {
-                            ui.label(
-                                RichText::new("No section headings detected.").color(MUTED_INK),
-                            );
-                        }
-                        None => {
-                            ui.label(
+                    if let Some(outline) = &pdf_outline {
+                        egui::ScrollArea::vertical()
+                            .id_salt("masthead_pdf_contents")
+                            .max_height(440.0)
+                            .show(ui, |ui| {
+                                for item in outline.iter() {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(14.0 * item.level.min(8) as f32);
+                                        let button = egui::Button::new(
+                                            RichText::new(&item.title).size(14.5),
+                                        )
+                                        .frame(false)
+                                        .wrap();
+                                        if ui
+                                            .add_enabled(item.page_index.is_some(), button)
+                                            .clicked()
+                                        {
+                                            clicked_pdf_target = item
+                                                .page_index
+                                                .map(|page| (page, item.page_fraction));
+                                            ui.close();
+                                        }
+                                    });
+                                }
+                            });
+                    } else {
+                        match &outline {
+                            Some(outline) if !outline.is_empty() => {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("masthead_contents")
+                                    .max_height(440.0)
+                                    .show(ui, |ui| {
+                                        for item in outline.iter() {
+                                            let active = in_review
+                                                && self.review_active_heading
+                                                    == Some(item.block_index);
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(
+                                                    14.0 * item.level.saturating_sub(1) as f32,
+                                                );
+                                                let text = RichText::new(&item.text)
+                                                    .size(if item.level == 1 { 15.5 } else { 14.5 })
+                                                    .color(if active {
+                                                        self.app_palette().accent
+                                                    } else if item.level == 1 {
+                                                        self.app_palette().ink
+                                                    } else {
+                                                        self.app_palette().muted
+                                                    });
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(text).frame(false).wrap(),
+                                                    )
+                                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                                    .clicked()
+                                                {
+                                                    clicked_target = Some(item.block_index);
+                                                    ui.close();
+                                                }
+                                            });
+                                        }
+                                    });
+                            }
+                            Some(_) => {
+                                ui.label(
+                                    RichText::new("No section headings detected.").color(self.app_palette().muted),
+                                );
+                            }
+                            None => {
+                                ui.label(
                                 RichText::new(
                                     "Review Mode builds the contents from the article's headings.",
                                 )
-                                .color(MUTED_INK),
+                                .color(self.app_palette().muted),
                             );
-                            if self.document.is_some() && ui.button("Open Review Mode").clicked() {
-                                open_review = true;
-                                ui.close();
+                                if self.document.is_some()
+                                    && ui.button("Open Review Mode").clicked()
+                                {
+                                    open_review = true;
+                                    ui.close();
+                                }
                             }
                         }
                     }
@@ -910,7 +1067,7 @@ impl PdfEditorApp {
         ] {
             ui.painter().line_segment(
                 [chevron + from, chevron + to],
-                Stroke::new(1.3_f32, MUTED_INK),
+                Stroke::new(1.3_f32, self.app_palette().muted),
             );
         }
         response.widget_info(|| {
@@ -920,11 +1077,16 @@ impl PdfEditorApp {
             self.set_view_mode(DocumentViewMode::LiquidMode2, ctx);
         }
         if let Some(block_index) = clicked_target {
+            self.record_jump_origin();
             if self.view_mode != DocumentViewMode::LiquidMode2 {
                 self.set_view_mode(DocumentViewMode::LiquidMode2, ctx);
             }
             self.liquid_scroll_to_block = Some(block_index);
             self.review_active_heading = Some(block_index);
+            ctx.request_repaint();
+        }
+        if let Some((page_index, fraction)) = clicked_pdf_target {
+            self.jump_to_pdf_destination(page_index, fraction);
             ctx.request_repaint();
         }
     }
@@ -993,9 +1155,13 @@ impl PdfEditorApp {
     fn draw_file_actions(&mut self, ui: &mut egui::Ui, ctx: &Context, has_document: bool) {
         // Right-to-left: the last added sits leftmost.
         #[cfg(target_os = "windows")]
-        if ui.add_enabled(has_document && !self.print_ui.busy,
-            egui::Button::new("Print…").min_size(Vec2::new(64.0, 30.0)))
-            .on_hover_text("Print this PDF · Ctrl+P").clicked()
+        if ui
+            .add_enabled(
+                has_document && !self.print_ui.busy,
+                egui::Button::new("Print…").min_size(Vec2::new(64.0, 30.0)),
+            )
+            .on_hover_text("Print this PDF · Ctrl+P")
+            .clicked()
         {
             self.request_print(ctx);
         }
@@ -1061,7 +1227,7 @@ impl PdfEditorApp {
             self.request_markdown_copy(ctx);
         }
         if markdown_busy {
-            ui.spinner();
+            motion::busy(ui, self.settings.reduce_motion);
         }
         let review_document = match &self.liquid_mode2_state {
             LiquidState::Ready(document) if self.view_mode == DocumentViewMode::LiquidMode2 => {
@@ -1188,9 +1354,10 @@ impl PdfEditorApp {
                 }
                 ui.horizontal(|ui| {
                     ui.label("Theme");
-                    ui.selectable_value(&mut self.liquid_theme, LiquidTheme::Paper, "Paper");
-                    ui.selectable_value(&mut self.liquid_theme, LiquidTheme::Sepia, "Sepia");
-                    ui.selectable_value(&mut self.liquid_theme, LiquidTheme::Dark, "Dark");
+                    let paper = ui.selectable_value(&mut self.liquid_theme, LiquidTheme::Paper, "Paper").clicked();
+                    let sepia = ui.selectable_value(&mut self.liquid_theme, LiquidTheme::Sepia, "Sepia").clicked();
+                    let dark = ui.selectable_value(&mut self.liquid_theme, LiquidTheme::Dark, "Dark").clicked();
+                    if paper || sepia || dark { self.liquid_theme_follows_appearance = false; }
                 });
                 ui.separator();
                 ui.checkbox(
@@ -1203,7 +1370,8 @@ impl PdfEditorApp {
                 if ui.button("Reset reading settings").clicked() {
                     self.liquid_text_scale = 1.0;
                     self.liquid_max_width = REVIEW_DEFAULT_MAX_WIDTH;
-                    self.liquid_theme = LiquidTheme::Paper;
+                    self.liquid_theme_follows_appearance = true;
+                    self.liquid_theme = if ui.ctx().theme() == egui::Theme::Dark { LiquidTheme::Dark } else { LiquidTheme::Paper };
                 }
                 let Some(document) = review_document.as_deref() else {
                     return;
@@ -1332,7 +1500,11 @@ impl PdfEditorApp {
                 self.settings_ui.open = true;
                 ui.close();
             }
-            ui.label(RichText::new(APP_VERSION_LABEL).size(12.0).color(MUTED_INK));
+            if ui.button("Keyboard shortcuts…    ?").clicked() {
+                self.shortcuts_open = true;
+                ui.close();
+            }
+            ui.label(RichText::new(APP_VERSION_LABEL).size(12.0).color(self.app_palette().muted));
         });
     }
 
@@ -1366,7 +1538,7 @@ impl PdfEditorApp {
             .interactable(true)
             .show(ctx, |ui| {
                 egui::Frame::NONE
-                    .fill(IVORY)
+                    .fill(self.app_palette().bar)
                     .stroke(Stroke::new(1.0_f32, BRASS))
                     .corner_radius(26)
                     .shadow(egui::epaint::Shadow {
@@ -1407,9 +1579,9 @@ impl PdfEditorApp {
                     ),
                     1.4,
                     if grip.hovered() || grip.dragged() {
-                        INK
+                        self.app_palette().ink
                     } else {
-                        MUTED_INK
+                        self.app_palette().muted
                     },
                 );
             }
@@ -1490,10 +1662,10 @@ impl PdfEditorApp {
             }
             if selected && self.active_tool == Tool::Marker {
                 ui.painter()
-                    .circle_stroke(center, 11.0, Stroke::new(1.5_f32, INK));
+                    .circle_stroke(center, 11.0, Stroke::new(1.5_f32, self.app_palette().ink));
             } else if response.hovered() {
                 ui.painter()
-                    .circle_stroke(center, 11.0, Stroke::new(1.0_f32, RULE));
+                    .circle_stroke(center, 11.0, Stroke::new(1.0_f32, self.app_palette().rule));
             }
             accessibility::name_color_choice(&response, preset.label, selected);
             if response.on_hover_text(preset.label).clicked() && annotation_enabled {
@@ -1538,7 +1710,8 @@ impl PdfEditorApp {
                 },
             );
             if self.page_rotation_in_flight {
-                ui.spinner().on_hover_text("Saving page rotation…");
+                motion::busy(ui, self.settings.reduce_motion)
+                    .on_hover_text("Saving page rotation…");
             }
         }
         if self.view_mode == DocumentViewMode::LiquidMode2 {
@@ -1596,7 +1769,7 @@ impl PdfEditorApp {
         }
         ui.add_sized(
             Vec2::new(44.0, 30.0),
-            egui::Label::new(RichText::new(label).size(14.5).color(INK)),
+            egui::Label::new(RichText::new(label).size(14.5).color(self.app_palette().ink)),
         );
         if toolbar_icon_button(ui, ToolbarIcon::ZoomIn, false, has_document, zoom_in_tip).clicked()
         {
@@ -1631,7 +1804,7 @@ impl PdfEditorApp {
         )
         .clicked()
         {
-            self.go_to_page(self.page_index.saturating_sub(1));
+            self.jump_to_page(self.page_index.saturating_sub(1));
         }
         let page_input_id = ui
             .id()
@@ -1654,6 +1827,12 @@ impl PdfEditorApp {
                     .horizontal_align(Align::Center),
             )
             .on_hover_text("Type a page number and press Enter");
+        if ui.ctx().data_mut(|data| {
+            data.remove_temp::<bool>(egui::Id::new("focus-page-number"))
+                .unwrap_or(false)
+        }) {
+            page_input_response.request_focus();
+        }
         ui.ctx()
             .accesskit_node_builder(page_input_response.id, |node| {
                 node.set_label("Page number");
@@ -1670,7 +1849,7 @@ impl PdfEditorApp {
         if submit_page_number {
             match page_index_from_input(&page_number_text, page_count) {
                 Ok(page_index) => {
-                    self.go_to_page(page_index);
+                    self.jump_to_page(page_index);
                     page_number_text = (page_index + 1).to_string();
                 }
                 Err(message) => {
@@ -1685,7 +1864,7 @@ impl PdfEditorApp {
         ui.label(
             RichText::new(format!("of {page_count}"))
                 .size(14.5)
-                .color(MUTED_INK),
+                .color(self.app_palette().muted),
         )
         .on_hover_text("Total pages in this PDF");
         if toolbar_icon_button(
@@ -1697,7 +1876,7 @@ impl PdfEditorApp {
         )
         .clicked()
         {
-            self.go_to_page(self.page_index + 1);
+            self.jump_to_page(self.page_index + 1);
         }
     }
 
@@ -1707,35 +1886,28 @@ impl PdfEditorApp {
                 || self.active_annotation_saves.contains_key(&document.path)
         });
         let (label, color) = if saving {
-            ("Saving…", MUTED_INK)
+            ("Saving…", self.app_palette().muted)
         } else if self.annotations_dirty {
-            ("Not saved", OXBLOOD)
+            ("Not saved", self.app_palette().accent)
         } else {
-            ("Saved", INK)
+            ("Saved", self.app_palette().ink)
         };
         let (rect, response) = ui.allocate_exact_size(Vec2::new(78.0, 30.0), Sense::hover());
         let mark_center = Pos2::new(rect.left() + 8.0, rect.center().y);
         if saving {
             ui.painter()
-                .circle_stroke(mark_center, 5.0, Stroke::new(1.4_f32, MUTED_INK));
-            ui.ctx().request_repaint_after(RENDER_POLL_INTERVAL);
+                .circle_stroke(mark_center, 5.0, Stroke::new(1.4_f32, self.app_palette().muted));
         } else if self.annotations_dirty {
-            ui.painter().circle_filled(mark_center, 4.0, OXBLOOD);
+            ui.painter().circle_filled(mark_center, 4.0, self.app_palette().accent);
         } else {
-            ui.painter().line_segment(
-                [
-                    mark_center + Vec2::new(-4.5, 0.0),
-                    mark_center + Vec2::new(-1.5, 3.5),
-                ],
-                Stroke::new(1.8_f32, BRASS),
-            );
-            ui.painter().line_segment(
-                [
-                    mark_center + Vec2::new(-1.5, 3.5),
-                    mark_center + Vec2::new(5.0, -4.0),
-                ],
-                Stroke::new(1.8_f32, BRASS),
-            );
+            let progress = self
+                .chrome
+                .save_confirmation
+                .filter(|(epoch, _)| *epoch == self.document_epoch)
+                .map_or(1.0, |(_, started)| {
+                    motion::save_progress(ui.ctx(), started, self.settings.reduce_motion)
+                });
+            draw_save_check(ui.painter(), mark_center, progress);
         }
         ui.painter().text(
             Pos2::new(rect.left() + 19.0, rect.center().y),
@@ -1787,7 +1959,7 @@ impl PdfEditorApp {
             let mut job = LayoutJob::simple(
                 text,
                 FontId::proportional(14.0),
-                MUTED_INK.gamma_multiply(alpha),
+                self.app_palette().muted.gamma_multiply(alpha),
                 (bar.width() + 120.0).max(320.0),
             );
             job.wrap.max_rows = 2;
@@ -1803,14 +1975,14 @@ impl PdfEditorApp {
             egui::Order::Foreground,
             egui::Id::new("markup_bar_caption"),
         ));
-        painter.rect_filled(rect, 12.0, IVORY.gamma_multiply(0.94 * alpha));
+        painter.rect_filled(rect, 12.0, self.app_palette().bar.gamma_multiply(0.94 * alpha));
         painter.rect_stroke(
             rect,
             12.0,
-            Stroke::new(1.0_f32, RULE.gamma_multiply(alpha)),
+            Stroke::new(1.0_f32, self.app_palette().rule.gamma_multiply(alpha)),
             egui::StrokeKind::Inside,
         );
-        painter.galley(rect.min + Vec2::new(12.0, 5.0), galley, MUTED_INK);
+        painter.galley(rect.min + Vec2::new(12.0, 5.0), galley, self.app_palette().muted);
     }
 }
 
@@ -1819,24 +1991,55 @@ enum TabAction {
     None,
     Switch,
     Close,
+    CloseOthers,
+    CopyPath,
+    RevealPath,
+    Drop,
+}
+
+fn reveal_document_in_file_manager(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("explorer.exe");
+        command.arg("/select,").arg(path);
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("open");
+        command.arg("-R").arg(path);
+        command
+    };
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let mut command = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(path.parent().unwrap_or(path));
+        command
+    };
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Could not show the document in its folder: {error}"))
 }
 
 /// Icon buttons without a resting fill or border: they show themselves on hover.
 fn quiet_buttons(ui: &mut egui::Ui) {
+    let dark = ui.visuals().dark_mode;
+    let accent = theme::for_ui(ui).accent;
     let visuals = ui.visuals_mut();
     visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
     visuals.widgets.inactive.bg_stroke = Stroke::NONE;
-    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgba_unmultiplied(42, 38, 32, 16);
+    visuals.widgets.hovered.weak_bg_fill = if dark { Color32::from_white_alpha(24) } else { Color32::from_rgba_unmultiplied(42, 38, 32, 16) };
     visuals.widgets.hovered.bg_stroke = Stroke::NONE;
-    visuals.widgets.active.weak_bg_fill = Color32::from_rgba_unmultiplied(42, 38, 32, 28);
-    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(122, 31, 43, 30);
-    visuals.selection.stroke = Stroke::new(1.0_f32, OXBLOOD);
+    visuals.widgets.active.weak_bg_fill = if dark { Color32::from_white_alpha(40) } else { Color32::from_rgba_unmultiplied(42, 38, 32, 28) };
+    visuals.selection.bg_fill = if dark { Color32::from_rgba_unmultiplied(241, 163, 155, 48) } else { Color32::from_rgba_unmultiplied(122, 31, 43, 30) };
+    visuals.selection.stroke = Stroke::new(1.0_f32, accent);
 }
 
 fn bar_separator(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(9.0, 26.0), Sense::hover());
     ui.painter()
-        .vline(rect.center().x, rect.y_range(), Stroke::new(1.0_f32, RULE));
+        .vline(rect.center().x, rect.y_range(), Stroke::new(1.0_f32, theme::for_ui(ui).rule));
 }
 
 /// Keep the bar fully inside the document area, whatever the window does.
@@ -1879,6 +2082,354 @@ fn paint_bell_mark(ui: &mut egui::Ui, stroke_color: Color32, letter_color: Color
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_check_only_animates_after_the_active_documents_latest_success() {
+        let (mut app, ctx, _worker) = annotation_saving::tests::fixture();
+        let path = app.document.as_ref().unwrap().path.clone();
+        let mut save = PendingAnnotationSave {
+            document_epoch: app.document_epoch,
+            path: path.clone(),
+            generation: 1,
+            annotations: app.annotations.clone(),
+            due_at: Instant::now(),
+        };
+        app.annotations_dirty = true;
+        app.active_annotation_saves
+            .insert(path.clone(), save.clone());
+        let mut newer = save.clone();
+        newer.generation = 2;
+        app.pending_annotation_saves
+            .insert(path.clone(), newer.clone());
+        app.finish_annotation_autosave(
+            save.document_epoch,
+            path.clone(),
+            1,
+            Ok(crate::pdf_backend::SaveReport::default()),
+            &ctx,
+        );
+        assert!(app.annotations_dirty);
+        assert!(app.chrome.save_confirmation.is_none());
+        app.pending_annotation_saves.remove(&path);
+        app.active_annotation_saves.insert(path.clone(), newer);
+        app.finish_annotation_autosave(
+            save.document_epoch,
+            path.clone(),
+            2,
+            Err("test failure".to_owned()),
+            &ctx,
+        );
+        assert!(app.annotations_dirty);
+        assert!(app.chrome.save_confirmation.is_none());
+        save.generation = 3;
+        app.active_annotation_saves
+            .insert(path.clone(), save.clone());
+        app.finish_annotation_autosave(
+            save.document_epoch,
+            path.clone(),
+            3,
+            Ok(crate::pdf_backend::SaveReport::default()),
+            &ctx,
+        );
+        assert!(!app.annotations_dirty);
+        assert_eq!(
+            app.chrome.save_confirmation.map(|(epoch, _)| epoch),
+            Some(app.document_epoch)
+        );
+
+        // A completion for another tab, or a stale completion, cannot replay
+        // the active tab's check mark.
+        app.chrome.save_confirmation = None;
+        let other_path = PathBuf::from("other.pdf");
+        save.document_epoch += 1;
+        save.path = other_path.clone();
+        app.active_annotation_saves
+            .insert(other_path.clone(), save.clone());
+        app.finish_annotation_autosave(
+            save.document_epoch,
+            other_path,
+            3,
+            Ok(crate::pdf_backend::SaveReport::default()),
+            &ctx,
+        );
+        assert!(app.chrome.save_confirmation.is_none());
+    }
+
+    #[test]
+    fn save_check_draws_in_and_reduced_motion_shows_the_complete_mark() {
+        let (mut app, ctx, _worker) = annotation_saving::tests::fixture();
+        let frame = |app: &mut PdfEditorApp| {
+            ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.draw_bar_save_state(ui));
+            })
+        };
+        let segments = |output: &egui::FullOutput| {
+            output
+                .shapes
+                .iter()
+                .filter(|shape| matches!(shape.shape, egui::Shape::LineSegment { .. }))
+                .count()
+        };
+        app.chrome.save_confirmation =
+            Some((app.document_epoch, Instant::now() + Duration::from_secs(1)));
+        app.settings.reduce_motion = false;
+        assert_eq!(segments(&frame(&mut app)), 0);
+        app.chrome.save_confirmation = Some((
+            app.document_epoch,
+            Instant::now() - Duration::from_millis(150),
+        ));
+        assert_eq!(segments(&frame(&mut app)), 2);
+        app.settings.reduce_motion = true;
+        app.chrome.save_confirmation =
+            Some((app.document_epoch, Instant::now() + Duration::from_secs(1)));
+        assert_eq!(segments(&frame(&mut app)), 2);
+        for index in 0..8 {
+            let output = frame(&mut app);
+            if index >= 4 {
+                assert_eq!(
+                    output.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+                    Duration::MAX
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn static_saving_indicator_does_not_schedule_repaints() {
+        let (mut app, ctx, _worker) = annotation_saving::tests::fixture();
+        let path = app.document.as_ref().unwrap().path.clone();
+        app.active_annotation_saves.insert(
+            path.clone(),
+            PendingAnnotationSave {
+                document_epoch: 7,
+                path,
+                generation: 1,
+                annotations: Vec::new(),
+                due_at: Instant::now(),
+            },
+        );
+        for frame in 0..8 {
+            let output = ctx.run(
+                egui::RawInput {
+                    time: Some(frame as f64 * 0.2),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.draw_bar_save_state(ui));
+                },
+            );
+            if frame >= 4 {
+                assert_eq!(
+                    output.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+                    Duration::MAX
+                );
+            }
+        }
+    }
+
+    fn tab_label_center(shape: &egui::Shape, title: &str) -> Option<Pos2> {
+        match shape {
+            egui::Shape::Text(shape) if shape.galley.text() == title => {
+                Some(shape.pos + shape.galley.size() * 0.5)
+            }
+            egui::Shape::Vec(shapes) => shapes
+                .iter()
+                .find_map(|shape| tab_label_center(shape, title)),
+            _ => None,
+        }
+    }
+
+    fn tab_frame(
+        app: &mut PdfEditorApp,
+        ctx: &Context,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 500.0))),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.draw_tab_row(ui, ctx));
+        })
+    }
+
+    fn pointer_button(pos: Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn middle_click_a_dirty_tab_keeps_it_open_for_a_save_decision() {
+        let (mut app, ctx, _worker) = annotation_saving::tests::fixture();
+        app.annotations_dirty = true;
+        let output = tab_frame(&mut app, &ctx, 0.0, vec![]);
+        let point = output
+            .shapes
+            .iter()
+            .find_map(|shape| tab_label_center(&shape.shape, "Fixture"))
+            .unwrap();
+        tab_frame(&mut app, &ctx, 0.1, vec![egui::Event::PointerMoved(point)]);
+        tab_frame(
+            &mut app,
+            &ctx,
+            0.2,
+            vec![pointer_button(point, egui::PointerButton::Middle, true)],
+        );
+        tab_frame(
+            &mut app,
+            &ctx,
+            0.3,
+            vec![pointer_button(point, egui::PointerButton::Middle, false)],
+        );
+        assert_eq!(app.pending_close, Some(CloseTarget::Tab(7)));
+        assert_eq!(app.tabs.len(), 1);
+        assert!(app.annotations_dirty);
+    }
+
+    #[test]
+    fn tab_context_menu_copies_the_selected_documents_path() {
+        let (mut app, ctx, _worker) = annotation_saving::tests::fixture();
+        let expected = app.tabs[0].document.path.display().to_string();
+        let output = tab_frame(&mut app, &ctx, 0.0, vec![]);
+        let point = output
+            .shapes
+            .iter()
+            .find_map(|shape| tab_label_center(&shape.shape, "Fixture"))
+            .unwrap();
+        tab_frame(&mut app, &ctx, 0.1, vec![egui::Event::PointerMoved(point)]);
+        tab_frame(
+            &mut app,
+            &ctx,
+            0.2,
+            vec![pointer_button(point, egui::PointerButton::Secondary, true)],
+        );
+        tab_frame(
+            &mut app,
+            &ctx,
+            0.3,
+            vec![pointer_button(point, egui::PointerButton::Secondary, false)],
+        );
+        let output = tab_frame(&mut app, &ctx, 0.35, vec![]);
+        let menu_point = output
+            .shapes
+            .iter()
+            .find_map(|shape| tab_label_center(&shape.shape, "Copy path"))
+            .expect("context menu opens");
+        tab_frame(
+            &mut app,
+            &ctx,
+            0.4,
+            vec![egui::Event::PointerMoved(menu_point)],
+        );
+        tab_frame(
+            &mut app,
+            &ctx,
+            0.5,
+            vec![pointer_button(
+                menu_point,
+                egui::PointerButton::Primary,
+                true,
+            )],
+        );
+        let output = tab_frame(
+            &mut app,
+            &ctx,
+            0.6,
+            vec![pointer_button(
+                menu_point,
+                egui::PointerButton::Primary,
+                false,
+            )],
+        );
+        assert!(output.platform_output.commands.iter().any(
+            |command| matches!(command, egui::OutputCommand::CopyText(text) if *text == expected)
+        ));
+    }
+
+    #[test]
+    fn tab_titles_are_elided_by_rendered_width() {
+        fn elision(shape: &egui::Shape, text: &str) -> Option<bool> {
+            match shape {
+                egui::Shape::Text(shape) if shape.galley.text() == text => {
+                    Some(shape.galley.elided)
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| elision(shape, text)),
+                _ => None,
+            }
+        }
+        let (mut app, ctx, _worker) = annotation_saving::tests::fixture();
+        for (title, expected) in [
+            ("iiiiiiiiiiiiiiiiiiiiiiiii", false),
+            ("WWWWWWWWWWWWWWWWWWWWWWWWW", true),
+        ] {
+            app.tabs[0].document.title = title.into();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.draw_tab(ui, 0, 190.0);
+                });
+            });
+            assert_eq!(
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| elision(&shape.shape, title)),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn dragging_a_tab_reorders_it_without_changing_the_active_document() {
+        let (mut app, ctx, _worker) = annotation_saving::tests::fixture();
+        app.document.as_mut().unwrap().title = "Alpha".into();
+        app.tabs[0].document.title = "Alpha".into();
+        for (epoch, title) in [(8, "Bravo"), (9, "Charlie")] {
+            let mut tab = app.tabs[0].clone();
+            tab.document_epoch = epoch;
+            tab.document.title = title.into();
+            app.tabs.push(tab);
+        }
+        let output = tab_frame(&mut app, &ctx, 0.0, vec![]);
+        let center = |title| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| tab_label_center(&shape.shape, title))
+                .unwrap()
+        };
+        let from = center("Alpha");
+        let to = center("Charlie");
+        tab_frame(&mut app, &ctx, 0.1, vec![egui::Event::PointerMoved(from)]);
+        tab_frame(
+            &mut app,
+            &ctx,
+            0.2,
+            vec![pointer_button(from, egui::PointerButton::Primary, true)],
+        );
+        tab_frame(&mut app, &ctx, 0.3, vec![egui::Event::PointerMoved(to)]);
+        tab_frame(
+            &mut app,
+            &ctx,
+            0.4,
+            vec![pointer_button(to, egui::PointerButton::Primary, false)],
+        );
+        assert_eq!(
+            app.tabs
+                .iter()
+                .map(|tab| tab.document_epoch)
+                .collect::<Vec<_>>(),
+            vec![8, 9, 7]
+        );
+        assert_eq!(app.active_tab, Some(2));
+        assert_eq!(app.document_epoch, 7);
+    }
 
     #[test]
     fn the_bar_stays_inside_the_document_area() {

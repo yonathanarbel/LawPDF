@@ -236,7 +236,7 @@ impl PdfEditorApp {
                         .char_limit(120),
                 );
                 if let Some(error) = &self.comments_ui.error {
-                    ui.colored_label(Color32::DARK_RED, error);
+                    ui.colored_label(ui.visuals().error_fg_color, error);
                 }
                 ui.horizontal(|ui| {
                     save = ui.button("Save name").clicked()
@@ -561,7 +561,7 @@ impl PdfEditorApp {
         };
         if cache.loading || cache.pending_generation.is_some() {
             ui.horizontal(|ui| {
-                ui.spinner();
+                motion::busy(ui, self.settings.reduce_motion);
                 ui.label("Loading comments…");
             });
         } else if let Some(error) = cache.error.clone() {
@@ -654,12 +654,13 @@ impl PdfEditorApp {
                 .map(|(&block, _)| block);
             if let Some(block) = anchor {
                 if ui.small_button("Go to passage").clicked() {
-                    self.liquid_scroll_to_block = Some(block);
+                    self.jump_to_review_block(block);
                 }
             } else if ui
                 .small_button(format!("Open PDF page {}", thread.root.page_index + 1))
                 .clicked()
             {
+                self.record_jump_origin();
                 self.page_index = thread.root.page_index;
                 self.scroll_target_page = Some(thread.root.page_index);
                 self.set_view_mode(DocumentViewMode::Pdf, ui.ctx());

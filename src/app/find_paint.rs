@@ -90,10 +90,15 @@ impl PdfEditorApp {
                         self.settings.reduce_motion,
                     );
                 } else if !ui.clip_rect().intersects(placement.rect) {
+                    let clip = ui.clip_rect();
                     ui.scroll_to_rect_animation(
                         placement.rect,
                         Some(Align::TOP),
-                        egui::style::ScrollAnimation::none(),
+                        motion::jump_animation(
+                            placement.rect.top() - clip.top(),
+                            clip.height(),
+                            self.settings.reduce_motion,
+                        ),
                     );
                 }
                 self.search_state.landing = false;
@@ -159,11 +164,7 @@ fn scroll_to_passage(ui: &egui::Ui, rect: Rect, reduce: bool) {
     if delta == Vec2::ZERO {
         return;
     }
-    let animation = if reduce || delta.y.abs() > viewport.height() {
-        egui::style::ScrollAnimation::none()
-    } else {
-        ui.style().scroll_animation
-    };
+    let animation = motion::jump_animation(delta.y, viewport.height(), reduce);
     ui.scroll_with_delta_animation(delta, animation);
 }
 pub(super) fn passage_delta(view: Rect, rect: Rect) -> Vec2 {
@@ -286,20 +287,26 @@ impl PdfEditorApp {
             if rendered.is_empty() {
                 continue;
             }
-            let Some(offset) = block.text[source_offset..].find(rendered) else {
+            let Some(source_ranges) = review_paragraph::source_ranges(
+                &block.text,
+                source_offset,
+                rendered,
+                self.liquid_hide_footnotes,
+            ) else {
                 continue;
             };
-            let base = source_offset + offset;
-            source_offset = base + rendered.len();
+            let Some(base) = source_ranges.first().map(|range| range.start) else {
+                continue;
+            };
+            source_offset = source_ranges.last().map_or(base, |range| range.end);
             if self.search_state.review_anchor == Some(block_index) && visible_byte.is_none() {
-                let mut byte = base;
+                let mut character = 0;
                 for row in &galley.rows {
                     if pos.y + row.rect().bottom() >= ui.clip_rect().top() {
-                        visible_byte = Some(byte);
+                        visible_byte = source_ranges.get(character).map(|range| range.start);
                         break;
                     }
-                    byte += row.glyphs.iter().map(|g| g.chr.len_utf8()).sum::<usize>()
-                        + usize::from(row.ends_with_newline);
+                    character += row.glyphs.len() + usize::from(row.ends_with_newline);
                 }
                 self.search_state.review_anchor_byte = visible_byte.unwrap_or(source_offset);
             }
@@ -309,22 +316,23 @@ impl PdfEditorApp {
                     continue;
                 }
                 let active = self.search_state.selected_hit == Some(i);
-                let mut byte = base;
+                let mut character = 0;
                 for row in &galley.rows {
                     let mut bounds = Rect::NOTHING;
                     for glyph in &row.glyphs {
-                        let next = byte + glyph.chr.len_utf8();
-                        if next > hit.match_start && byte < hit.match_end {
+                        if source_ranges.get(character).is_some_and(|range| {
+                            range.end > hit.match_start && range.start < hit.match_end
+                        }) {
                             bounds = bounds.union(
                                 glyph
                                     .logical_rect()
                                     .translate(pos.to_vec2() + row.pos.to_vec2()),
                             );
                         }
-                        byte = next;
+                        character += 1;
                     }
                     if row.ends_with_newline {
-                        byte += 1;
+                        character += 1;
                     }
                     if bounds.is_positive() {
                         if active && active_rect.is_none() {

@@ -139,7 +139,7 @@ impl PdfEditorApp {
                 visible_messages: self.chat_ui.state.messages.clone(),
                 document_context: self.chat_ui.state.document_context.clone(),
             },
-            self.chat_ui.tx.clone(),
+            worker_waking_sender(self.chat_ui.tx.clone(), ctx.clone()),
         );
         self.status = "Chat request sent.".to_owned();
     }
@@ -241,12 +241,12 @@ impl PdfEditorApp {
     pub(super) fn draw_chat_tab(&mut self, ui: &mut egui::Ui) {
         let has_document = self.document.is_some();
         if !has_document {
-            ui.label(RichText::new("No PDF loaded").color(MUTED_INK));
+            ui.label(RichText::new("No PDF loaded").color(self.app_palette().muted));
             return;
         }
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Model").color(INK));
+            ui.label(RichText::new("Model").color(self.app_palette().ink));
             let selected = CHAT_MODELS
                 .get(self.chat_ui.state.model_index)
                 .unwrap_or(&CHAT_MODELS[0]);
@@ -275,9 +275,9 @@ impl PdfEditorApp {
         } else {
             format!("PDF text available: {context_pages} page(s), ~{context_estimate} tokens")
         };
-        ui.label(RichText::new(context_status).color(MUTED_INK));
+        ui.label(RichText::new(context_status).color(self.app_palette().muted));
         if let Some(warning) = self.chat_ui.state.context_warning.as_ref() {
-            ui.label(RichText::new(warning).color(Color32::from_rgb(134, 92, 34)));
+            ui.label(RichText::new(warning).color(ui.visuals().warn_fg_color));
         }
 
         ui.horizontal(|ui| {
@@ -294,7 +294,7 @@ impl PdfEditorApp {
                 };
             }
             if self.chat_ui.state.in_flight {
-                ui.spinner();
+                motion::busy(ui, self.settings.reduce_motion);
             }
         });
 
@@ -305,16 +305,20 @@ impl PdfEditorApp {
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 if self.chat_ui.state.messages.is_empty() {
-                    ui.label(RichText::new("Ask a question about this PDF.").color(MUTED_INK));
+                    ui.label(RichText::new("Ask a question about this PDF.").color(self.app_palette().muted));
                 }
                 for message in &self.chat_ui.state.messages {
                     let (label, color) = match message.role {
-                        ChatRole::User => ("You", Color32::from_rgb(93, 68, 37)),
-                        ChatRole::Assistant => ("LawPDF", INK),
+                        ChatRole::User => ("You", self.app_palette().accent),
+                        ChatRole::Assistant => ("LawPDF", self.app_palette().ink),
                     };
                     ui.label(RichText::new(label).strong().color(color));
                     egui::Frame::NONE
-                        .fill(if message.role == ChatRole::User {
+                        .fill(if ui.visuals().dark_mode && message.role == ChatRole::User {
+                            self.app_palette().hover
+                        } else if ui.visuals().dark_mode {
+                            self.app_palette().bar
+                        } else if message.role == ChatRole::User {
                             Color32::from_rgb(247, 243, 235)
                         } else {
                             Color32::from_rgb(255, 254, 250)
@@ -325,7 +329,7 @@ impl PdfEditorApp {
                         .show(ui, |ui| {
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(&message.content).size(14.0).color(INK),
+                                    RichText::new(&message.content).size(14.0).color(self.app_palette().ink),
                                 )
                                 .wrap(),
                             );

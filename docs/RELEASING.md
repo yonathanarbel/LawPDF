@@ -17,6 +17,14 @@ A release is made from a curated source commit, with private research and traini
    The initial key was created in macOS Keychain with the utility's `init` operation. Do not export it into a source file or shell argument. Keep an approved secure recovery plan for the signing identity; losing it interrupts automatic-update continuity.
 6. Upload the detached signature, verify it against the committed public key, and exercise staging/restart/rollback with disposable app installations. The actual packages remain unchanged after their hashes are signed. Publish only after the gate evidence and accurate signing-status/install notes are attached.
 
+The reusable workflows are manually dispatched from `main`. To prepare a version, run
+`gh workflow run prepare-release.yml --ref main -f version=<version> -f expected_commit=<reviewed-full-commit-sha>`.
+Preparation refuses a changed commit, mismatched package, lockfile, or manifest version, or an existing tag pointing elsewhere; it requests both desktop release and Store verification builds. It does not publish.
+After the maintainer record and release notes are present, run
+`gh workflow run publish-release.yml --ref main -f version=<version> -f publish=false` to verify the draft.
+After the detached signature is committed and the release is authorized, use the same command with `publish=true`.
+The publish job repeats the existing package, attestation, installation-evidence, checksum, and signature checks. Merely committing a signature no longer publishes automatically.
+
 The source signing policy is separate from platform credentials. Until SignPath approves Windows signing, report its absence. The Mac ZIP remains ad hoc signed and unnotarized under the free-distribution plan. Use Apple's documented user approval flow for installation; do not tell users to disable Gatekeeper globally. The Mac updater checks the declared minimum OS and bundled model runtime before replacement. It keeps `LawPDF.app.update-old` beside the installation until the next update; if a newly launched process subsequently fails, quit it and restore this retained bundle or the previous known-good GitHub package while keeping recovery data. LaunchServices accepting a launch is not proof of a healthy reader session. In-app updates reject downgrades.
 
 Android has a separate release gate: lifecycle/process-death/provider-permission instrumentation, local annotation restoration, flattened-export semantics, and an Android signing identity. A desktop release does not certify Android. Do not publish an Android production build based solely on desktop checks.

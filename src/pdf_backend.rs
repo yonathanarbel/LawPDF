@@ -15,9 +15,13 @@ use pdfium_render::prelude::*;
 
 use crate::model::{
     AnnotationKind, DocumentComment, DocumentCommentSource, EditorAnnotation, LoadedDocument,
-    MarkerStyle, PageInfo, PageLink, PageTextChar, PdfRect, RenderedPage,
+    MarkerStyle, PageInfo, PageLink, PageTextChar, PdfNavigation, PdfRect, RenderedPage,
 };
 use crate::performance_cache::{CachedDocumentMetadata, PerformanceCache};
+
+mod foreign_annotations;
+mod navigation;
+pub use foreign_annotations::load_foreign_annotations_checked;
 
 #[cfg(not(test))]
 pub use crate::native_process::PdfEngine;
@@ -142,16 +146,31 @@ impl NativePdfEngine {
             let page_count = document.pages().len() as usize;
             let mut pages = Vec::with_capacity(page_count);
             for page_index in 0..page_count {
-                let page = document
+                // Optimized metadata contains only the displayed page dimensions:
+                // vectors and footnote dividers are loaded later. PDFium can read
+                // these dimensions by index without loading each page's contents.
+                let dimensions = document
                     .pages()
-                    .get(page_index as u16)
-                    .with_context(|| format!("failed to read page {}", page_index + 1))?;
-                let geometry = native_page_geometry(&page);
-                let width = page.width().value;
-                let height = page.height().value;
-                let mut page_info = PageInfo::with_footnote_divider_y_from_top(width, height, None);
-                map_page_geometry(&mut page_info, geometry);
-                pages.push(page_info);
+                    .page_size(page_index as u16)
+                    .ok()
+                    .map(|size| (size.width().value, size.height().value))
+                    .filter(|(width, height)| {
+                        width.is_finite() && height.is_finite() && *width > 0.0 && *height > 0.0
+                    });
+                let (width, height) = if let Some(dimensions) = dimensions {
+                    dimensions
+                } else {
+                    // Preserve the previous loading path for unusual PDFs where
+                    // PDFium cannot provide a valid indexed size.
+                    let page = document
+                        .pages()
+                        .get(page_index as u16)
+                        .with_context(|| format!("failed to read page {}", page_index + 1))?;
+                    (page.width().value, page.height().value)
+                };
+                pages.push(PageInfo::with_footnote_divider_y_from_top(
+                    width, height, None,
+                ));
             }
             Ok(CachedDocumentMetadata {
                 links: vec![Vec::new(); page_count],
@@ -187,12 +206,23 @@ impl NativePdfEngine {
         path: &Path,
         page_count: usize,
     ) -> Result<Vec<Vec<PageLink>>> {
-        if let Some(links) = self.performance_cache.load_document_links(path) {
-            return Ok(links);
+        Ok(self.load_document_navigation(path, page_count)?.links)
+    }
+
+    pub fn load_document_navigation(
+        &self,
+        path: &Path,
+        page_count: usize,
+    ) -> Result<PdfNavigation> {
+        if let Some(navigation) = self.performance_cache.load_document_navigation(path)
+            && navigation.links.len() == page_count
+        {
+            return Ok(navigation);
         }
-        let links = load_pdf_web_links(path, page_count)?;
-        self.performance_cache.save_document_links(path, &links);
-        Ok(links)
+        let navigation = navigation::load_pdf_navigation(path, page_count)?;
+        self.performance_cache
+            .save_document_navigation(path, &navigation);
+        Ok(navigation)
     }
 
     pub fn load_document(&self, path: &Path) -> Result<LoadedDocument> {
@@ -340,6 +370,24 @@ impl NativePdfEngine {
         self.render_page_internal(path, page_index, zoom, quality, true)
     }
 
+    #[cfg(test)]
+    pub(crate) fn render_page_interactive(
+        &self,
+        path: &Path,
+        page_index: usize,
+        zoom: f32,
+        quality: RenderQuality,
+        editor: bool,
+        _retry: bool,
+    ) -> Result<RenderedPage> {
+        self.render_page_internal(path, page_index, zoom, quality, editor)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn render_opening_preview(&self, path: &Path, page: usize) -> Result<RenderedPage> {
+        self.render_page_internal(path, page, 1.0, RenderQuality::Fast, false)
+    }
+
     pub(crate) fn render_page_internal(
         &self,
         path: &Path,
@@ -354,11 +402,15 @@ impl NativePdfEngine {
         } else {
             &self.performance_cache
         };
-        if quality != RenderQuality::Print
-            && let Some(rendered) = cache.load_rendered_page(path, page_index, zoom, fast) {
+        let cache_path = (quality != RenderQuality::Print)
+            .then(|| cache.render_path(path, page_index, zoom, fast))
+            .flatten();
+        if let Some(cache_path) = &cache_path
+            && let Some(rendered) = PerformanceCache::load_rendered_page_at(cache_path, page_index)
+        {
             return Ok(rendered);
         }
-        let rendered = self.with_open_document_data(path, |open| {
+        let (rendered, render_time) = self.with_open_document_data(path, |open| {
             let page = open
                 .document
                 .pages()
@@ -421,6 +473,7 @@ impl NativePdfEngine {
                     hidden.0.push((annotation, was_hidden));
                 }
             }
+            let render_started = std::time::Instant::now();
             let bitmap = page.render_with_config(&config);
             hidden.restore()?;
             let bitmap =
@@ -440,15 +493,22 @@ impl NativePdfEngine {
                 bitmap.as_rgba_bytes(),
             );
 
-            Ok(RenderedPage {
-                page_index,
-                width: width as usize,
-                height: height as usize,
-                rgba,
-            })
+            Ok((
+                RenderedPage {
+                    page_index,
+                    width: width as usize,
+                    height: height as usize,
+                    rgba,
+                },
+                render_started.elapsed(),
+            ))
         })?;
-        if quality != RenderQuality::Print {
-            cache.save_rendered_page(path, &rendered, zoom, fast);
+        // A scanned sample rendered in roughly 24 ms before channel
+        // normalization and benefited from cache hits on this machine.
+        if render_time >= std::time::Duration::from_millis(25)
+            && let Some(cache_path) = cache_path
+        {
+            cache.queue_rendered_page_at(cache_path, &rendered);
         }
         Ok(rendered)
     }
@@ -1910,32 +1970,7 @@ fn pdf_page_geometry(
 }
 
 pub fn load_pdf_web_links(source: &Path, page_count: usize) -> Result<Vec<Vec<PageLink>>> {
-    let document = Document::load(source)
-        .with_context(|| format!("failed to load source PDF {}", source.display()))?;
-    let pages = document.get_pages();
-    let mut links = vec![Vec::new(); page_count];
-
-    for (page_number, page_id) in pages {
-        let page_index = page_number.saturating_sub(1) as usize;
-        if page_index >= links.len() {
-            continue;
-        }
-        let annots = {
-            let page = document.get_object(page_id)?.as_dict()?;
-            page.get(b"Annots").ok().cloned()
-        };
-        let Some(annots) = annots else {
-            continue;
-        };
-
-        append_pdf_web_links_from_annots(&document, &annots, &mut links[page_index]);
-        let geometry = pdf_page_geometry(&document, page_id)?;
-        for link in &mut links[page_index] {
-            link.rect = geometry.rect(link.rect, false);
-        }
-    }
-
-    Ok(links)
+    Ok(navigation::load_pdf_navigation(source, page_count)?.links)
 }
 
 pub fn load_lawpdf_annotations(source: &Path) -> Result<Vec<EditorAnnotation>> {
@@ -2775,57 +2810,6 @@ fn lawpdf_owned_annotation_from_pdf(
     })
 }
 
-fn append_pdf_web_links_from_annots(
-    document: &Document,
-    annots: &Object,
-    page_links: &mut Vec<PageLink>,
-) {
-    match annots {
-        Object::Array(annots) => {
-            for annot in annots {
-                if let Some(link) = pdf_web_link_from_annotation(document, annot) {
-                    page_links.push(link);
-                }
-            }
-        }
-        Object::Reference(annots_id) => {
-            if let Ok(annots) = document.get_object(*annots_id).and_then(Object::as_array) {
-                for annot in annots {
-                    if let Some(link) = pdf_web_link_from_annotation(document, annot) {
-                        page_links.push(link);
-                    }
-                }
-            }
-        }
-        annot => {
-            if let Some(link) = pdf_web_link_from_annotation(document, annot) {
-                page_links.push(link);
-            }
-        }
-    }
-}
-
-fn pdf_web_link_from_annotation(document: &Document, annotation: &Object) -> Option<PageLink> {
-    let dict = annotation_dict(document, annotation)?;
-    let subtype = dict.get(b"Subtype").ok().and_then(pdf_object_text)?;
-    if !subtype.eq_ignore_ascii_case("Link") {
-        return None;
-    }
-
-    let rect = dict.get(b"Rect").ok().and_then(pdf_rect_from_object)?;
-    if rect.width() <= 0.0 || rect.height() <= 0.0 {
-        return None;
-    }
-
-    let uri = dict
-        .get(b"A")
-        .ok()
-        .and_then(|action| pdf_uri_from_action(document, action))?;
-    let url = normalize_web_url(&uri)?;
-
-    Some(PageLink { rect, url })
-}
-
 fn pdf_uri_from_action(document: &Document, action: &Object) -> Option<String> {
     let dict = annotation_dict(document, action)?;
     let action_type = dict.get(b"S").ok().and_then(pdf_object_text)?;
@@ -3164,6 +3148,78 @@ mod tests {
         }
         assert_eq!(win_ansi_byte('\u{3b1}'), b'?');
         assert_eq!(win_ansi_byte('A'), b'A');
+    }
+
+    #[test]
+    fn indexed_optimized_page_sizes_match_loaded_pdfium_geometry() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine =
+            NativePdfEngine::new().expect("PDFium must be available for the desktop tests");
+        let crops = [
+            [0, 0, 612, 792],
+            [20, 40, 600, 760],
+            [-30, -20, 650, 840],
+            [100, 150, 400, 600],
+        ];
+        for (crop_number, crop) in crops.into_iter().enumerate() {
+            for rotation in [0, 90, 180, 270] {
+                for inherited in [false, true] {
+                    let path = directory
+                        .path()
+                        .join(format!("size-{crop_number}-{rotation}-{inherited}.pdf"));
+                    write_blank_pdf(&path);
+                    let mut pdf = Document::load(&path).unwrap();
+                    let page_id = pdf.get_pages()[&1];
+                    let parent_id = pdf
+                        .get_object(page_id)
+                        .unwrap()
+                        .as_dict()
+                        .unwrap()
+                        .get(b"Parent")
+                        .unwrap()
+                        .as_reference()
+                        .unwrap();
+                    let target = if inherited { parent_id } else { page_id };
+                    let dictionary = pdf.get_object_mut(target).unwrap().as_dict_mut().unwrap();
+                    dictionary.set("Rotate", Object::Integer(rotation));
+                    dictionary.set(
+                        "CropBox",
+                        Object::Array(crop.into_iter().map(Object::Integer).collect()),
+                    );
+                    if rotation == 180 {
+                        pdf.get_object_mut(page_id)
+                            .unwrap()
+                            .as_dict_mut()
+                            .unwrap()
+                            .set("UserUnit", Object::Integer(2));
+                    }
+                    save_document_in_place(&mut pdf, &path).unwrap();
+                    let mut expected = engine
+                        .with_open_document(&path, |document| {
+                            let page = document.pages().get(0)?;
+                            let indexed = document.pages().page_size(0)?;
+                            let (width, height) = (page.width().value, page.height().value);
+                            assert!((indexed.width().value - width).abs() < 0.001);
+                            assert!((indexed.height().value - height).abs() < 0.001);
+                            let mut legacy =
+                                PageInfo::with_footnote_divider_y_from_top(width, height, None);
+                            map_page_geometry(&mut legacy, native_page_geometry(&page));
+                            Ok(legacy)
+                        })
+                        .unwrap();
+                    let opened = engine.load_document_optimized(&path).unwrap();
+                    assert_eq!(opened.page_count, 1);
+                    assert!((opened.pages[0].width - expected.width).abs() < 0.001);
+                    assert!((opened.pages[0].height - expected.height).abs() < 0.001);
+                    expected.width = opened.pages[0].width;
+                    expected.height = opened.pages[0].height;
+                    assert_eq!(
+                        serde_json::to_value(&opened.pages[0]).unwrap(),
+                        serde_json::to_value(expected).unwrap()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

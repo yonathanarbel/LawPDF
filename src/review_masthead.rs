@@ -20,6 +20,83 @@ pub struct MastheadIdentity {
     pub citation: String,
 }
 
+/// Provisional citation fields read from the PDF. Readers should verify them,
+/// especially journal abbreviations and the printed (rather than PDF) page.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CitationDetails {
+    pub authors: String,
+    pub title: String,
+    pub journal: String,
+    pub volume: String,
+    pub first_page: String,
+    pub year: String,
+}
+
+pub fn citation_details(
+    page_texts: &[&str],
+    review_title: Option<&str>,
+    review_blocks: &[LiquidBlock],
+) -> CitationDetails {
+    let identity = masthead_identity(page_texts, review_title, review_blocks, "");
+    let heads = RunningHeads::read(page_texts);
+    let opening = page_texts.first().map(|text| opening_page(text));
+    let journal = heads
+        .journal
+        .or_else(|| opening.as_ref().and_then(|page| page.journal.clone()));
+    let volume = heads
+        .volume
+        .or_else(|| opening.as_ref().and_then(|page| page.volume));
+    let first_page = heads
+        .first_page
+        .or_else(|| opening.as_ref().and_then(|page| page.folio));
+    let year = heads
+        .year
+        .or_else(|| opening.as_ref().and_then(|page| page.year));
+    CitationDetails {
+        authors: identity.authors,
+        title: identity.title,
+        journal: journal
+            .as_deref()
+            .map(title_case_journal)
+            .unwrap_or_default(),
+        volume: volume.map(|value| value.to_string()).unwrap_or_default(),
+        first_page: first_page
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        year: year.map(|value| value.to_string()).unwrap_or_default(),
+    }
+}
+
+/// Find a printed page number at a page edge; never substitute the PDF index.
+/// Conflicting candidates are left blank for the reader to check.
+pub fn printed_folio(text: &str, year: Option<u32>) -> Option<u32> {
+    let lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let mut candidates = Vec::new();
+    for line in lines.iter().take(3).chain(lines.iter().rev().take(3)) {
+        let candidate = if journal_volume_head(line).is_some() {
+            leading_number(line).map(|(value, _)| value)
+        } else if dated_title_head(line).is_some() {
+            line.split_whitespace()
+                .last()
+                .and_then(|word| word.parse::<u32>().ok())
+        } else {
+            line.parse::<u32>()
+                .ok()
+                .filter(|value| year.is_some() || !(1800..=2100).contains(value))
+        };
+        if let Some(value) = candidate.filter(|value| *value > 0 && Some(*value) != year) {
+            if !candidates.contains(&value) {
+                candidates.push(value);
+            }
+        }
+    }
+    (candidates.len() == 1).then(|| candidates[0])
+}
+
 /// How many opening pages to read. Running heads start on the second page.
 pub const MASTHEAD_PAGES_TO_READ: usize = 5;
 
@@ -545,6 +622,42 @@ mod tests {
     const HLR_EVEN: &str =
         "1060 HARVARD LAW REVIEW [Vol. 137:1058\r\nno apps or subscriptions required.";
     const HLR_ODD: &str = "2024] CONTRACT-WRAPPED PROPERTY 1061\r\ntext";
+
+    #[test]
+    fn citation_fields_are_provisional_and_do_not_fall_back_to_a_filename() {
+        let details = citation_details(&[NYU_OPENING, NYU_EVEN, NYU_ODD], None, &[]);
+        assert_eq!(details.authors, "Yonathan Arbel & David A. Hoffman");
+        assert_eq!(details.title, "GENERATIVE INTERPRETATION");
+        assert_eq!(details.journal, "New York University Law Review");
+        assert_eq!(
+            (&*details.volume, &*details.first_page, &*details.year),
+            ("99", "451", "2024")
+        );
+        assert_eq!(
+            citation_details(&["An ordinary document"], None, &[]),
+            CitationDetails::default()
+        );
+    }
+
+    #[test]
+    fn printed_folio_requires_an_unambiguous_page_edge() {
+        assert_eq!(printed_folio(NYU_OPENING, Some(2024)), Some(451));
+        assert_eq!(printed_folio(NYU_EVEN, Some(2024)), Some(452));
+        assert_eq!(printed_folio(NYU_ODD, Some(2024)), Some(453));
+        assert_eq!(
+            printed_folio("2024\nA date, not a known folio.", Some(2024)),
+            None
+        );
+        assert_eq!(
+            printed_folio("2024\nA date, not a known folio.", None),
+            None
+        );
+        assert_eq!(printed_folio("451\nText\n452", Some(2024)), None);
+        assert_eq!(
+            printed_folio("Nothing resembling a page number", None),
+            None
+        );
+    }
 
     #[test]
     fn reads_an_nyu_opening_and_running_heads() {

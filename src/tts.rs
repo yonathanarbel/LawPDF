@@ -40,8 +40,16 @@ pub struct ApiSpeechConfig {
     pub model: String,
     pub voice: String,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeechSegment {
+    pub block_index: Option<usize>,
+    pub text: String,
+}
 pub enum SpeechRequest {
-    System(String),
+    System {
+        segments: Vec<SpeechSegment>,
+        rate: i32,
+    },
     Api {
         config: ApiSpeechConfig,
         text: String,
@@ -55,6 +63,7 @@ pub struct SpeechEvent {
 pub enum SpeechEventKind {
     Progress { completed: usize, total: usize },
     Playing,
+    BlockStarted(Option<usize>),
     Complete(Option<PathBuf>),
     Failed(String),
 }
@@ -84,6 +93,7 @@ pub fn spawn_speech_job(
     job_id: u64,
     request: SpeechRequest,
     tx: Sender<SpeechEvent>,
+    repaint: egui::Context,
 ) -> SpeechCancellation {
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
@@ -92,10 +102,11 @@ pub fn spawn_speech_job(
     thread::spawn(move || {
         let send = |kind| {
             let _ = tx.send(SpeechEvent { job_id, kind });
+            repaint.request_repaint();
         };
         let result = match request {
-            SpeechRequest::System(text) => {
-                run_system_speech(&text, &worker_cancel, &worker_process, &send)
+            SpeechRequest::System { segments, rate } => {
+                run_system_speech(&segments, rate, &worker_cancel, &worker_process, &send)
             }
             SpeechRequest::Api {
                 config,
@@ -181,10 +192,14 @@ fn quiet_command(command: &mut Command) {
         command.creation_flags(0x0800_0000);
     }
 }
-fn run_child(
+fn run_child(command: Command, cancel: &AtomicBool, process: &ActiveProcess) -> Result<(), String> {
+    run_child_started(command, cancel, process, || {})
+}
+fn run_child_started(
     mut command: Command,
     cancel: &AtomicBool,
     process: &ActiveProcess,
+    started: impl FnOnce(),
 ) -> Result<(), String> {
     {
         // Cancellation cannot land between spawn and registration. Only this
@@ -198,6 +213,8 @@ fn run_child(
         )?);
     }
     let _registered = RegisteredChild(process);
+    check_cancel(cancel)?;
+    started();
     loop {
         check_cancel(cancel)?;
         let status = {
@@ -220,51 +237,83 @@ fn run_child(
     }
 }
 fn run_system_speech(
-    text: &str,
+    segments: &[SpeechSegment],
+    rate: i32,
     cancel: &AtomicBool,
     process: &ActiveProcess,
     send: &impl Fn(SpeechEventKind),
 ) -> Result<(), String> {
     check_cancel(cancel)?;
-    if text.trim().is_empty() {
+    if segments
+        .iter()
+        .all(|segment| segment.text.trim().is_empty())
+    {
         return Err("Nothing to read aloud.".to_owned());
     }
-    let file = private_text(text)?;
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut c = Command::new("/usr/bin/say");
-        c.arg("-f").arg(file.path());
-        c
-    };
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let executable =
-            std::env::current_exe().map_err(|_| "Could not locate the speech worker.")?;
-        let mut c = Command::new(executable);
-        c.arg("--speech-worker")
-            .env("LAWPDF_TTS_TEXT_PATH", file.path());
-        c
-    };
-    #[cfg(target_os = "linux")]
-    let mut command = {
-        // A private synthesizer can be stopped without affecting other apps.
-        // spd-say --cancel would cancel all Speech Dispatcher clients.
-        let program = find_program(&["espeak-ng", "espeak"]).ok_or("System speech needs espeak-ng or espeak. Install one, or choose ElevenLabs or OpenRouter in Settings.")?;
-        let mut c = Command::new(program);
-        c.arg("-f").arg(file.path());
-        c
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    return Err("System speech is unavailable. Choose ElevenLabs or OpenRouter.".to_owned());
-    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    if segments
+        .iter()
+        .try_fold(0usize, |sum, segment| sum.checked_add(segment.text.len()))
+        .is_none_or(|total| total > 16 * 1024 * 1024)
     {
-        quiet_command(&mut command);
-        check_cancel(cancel)?;
-        send(SpeechEventKind::Playing);
-        run_child(command, cancel, process)?;
-        send(SpeechEventKind::Complete(None));
-        Ok(())
+        return Err("Select less text to read aloud.".to_owned());
     }
+    let rate = rate.clamp(-5, 5);
+    for segment in segments
+        .iter()
+        .filter(|segment| !segment.text.trim().is_empty())
+    {
+        check_cancel(cancel)?;
+        let file = private_text(&segment.text)?;
+        #[cfg(target_os = "macos")]
+        let mut command = {
+            let mut c = Command::new("/usr/bin/say");
+            if rate != 0 {
+                c.arg("-r").arg(system_words_per_minute(rate).to_string());
+            }
+            c.arg("-f").arg(file.path());
+            c
+        };
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            let executable =
+                std::env::current_exe().map_err(|_| "Could not locate the speech worker.")?;
+            let mut c = Command::new(executable);
+            c.arg("--speech-worker")
+                .env("LAWPDF_TTS_TEXT_PATH", file.path())
+                .env("LAWPDF_TTS_RATE", rate.to_string());
+            c
+        };
+        #[cfg(target_os = "linux")]
+        let mut command = {
+            // A private synthesizer can be stopped without affecting other apps.
+            // spd-say --cancel would cancel all Speech Dispatcher clients.
+            let program = find_program(&["espeak-ng", "espeak"]).ok_or("System speech needs espeak-ng or espeak. Install one, or choose ElevenLabs or OpenRouter in Settings.")?;
+            let mut c = Command::new(program);
+            if rate != 0 {
+                c.arg("-s").arg(system_words_per_minute(rate).to_string());
+            }
+            c.arg("-f").arg(file.path());
+            c
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        return Err("System speech is unavailable. Choose ElevenLabs or OpenRouter.".to_owned());
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        {
+            quiet_command(&mut command);
+            check_cancel(cancel)?;
+            run_child_started(command, cancel, process, || {
+                send(SpeechEventKind::Playing);
+                send(SpeechEventKind::BlockStarted(segment.block_index));
+            })?;
+        }
+    }
+    send(SpeechEventKind::Complete(None));
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn system_words_per_minute(rate: i32) -> u32 {
+    (180.0_f32 * 2.0_f32.powf(rate.clamp(-5, 5) as f32 / 5.0)).round() as u32
 }
 #[cfg(target_os = "linux")]
 fn find_program(names: &[&str]) -> Option<PathBuf> {
@@ -643,6 +692,11 @@ pub fn run_windows_speech_worker() -> Result<(), String> {
     use windows::core::PCWSTR;
 
     let path = std::env::var_os("LAWPDF_TTS_TEXT_PATH").ok_or("No speech text was provided.")?;
+    let rate = std::env::var("LAWPDF_TTS_RATE")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(0)
+        .clamp(-5, 5);
     let bytes = crate::document_store::read_limited(&PathBuf::from(path), 16 * 1024 * 1024)
         .map_err(|error| format!("Could not read speech text: {error}"))?;
     let text = String::from_utf8(bytes).map_err(|_| "Speech text is not valid UTF-8.")?;
@@ -658,6 +712,9 @@ pub fn run_windows_speech_worker() -> Result<(), String> {
         .map_err(|error| format!("Could not initialize Windows speech: {error}"))?;
     let result = (|| -> windows::core::Result<()> {
         let voice: ISpVoice = unsafe { CoCreateInstance(&SpVoice, None, CLSCTX_INPROC_SERVER)? };
+        unsafe {
+            voice.SetRate(rate)?;
+        }
         // Speak synchronously; the parent can stop speech by terminating this
         // child. Force plain text so PDF content cannot act as SAPI markup.
         unsafe { voice.Speak(PCWSTR(wide.as_ptr()), SPF_IS_NOT_XML.0 as u32, None) }
@@ -711,6 +768,75 @@ pub fn run_windows_audio_worker() -> Result<(), String> {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn system_speed_stays_bounded_and_increases_monotonically() {
+        assert_eq!(system_words_per_minute(-100), 90);
+        assert_eq!(system_words_per_minute(0), 180);
+        assert_eq!(system_words_per_minute(100), 360);
+        assert!(system_words_per_minute(-1) < system_words_per_minute(0));
+        assert!(system_words_per_minute(1) > system_words_per_minute(0));
+    }
+
+    #[test]
+    fn speech_worker_wakes_ui_when_it_reports_failure() {
+        use std::sync::atomic::AtomicUsize;
+        let ctx = egui::Context::default();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&wakes);
+        ctx.set_request_repaint_callback(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let _job = spawn_speech_job(
+            42,
+            SpeechRequest::System {
+                segments: Vec::new(),
+                rate: 0,
+            },
+            tx,
+            ctx,
+        );
+        let event = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(event.job_id, 42);
+        assert!(matches!(event.kind, SpeechEventKind::Failed(_)));
+        // The channel send precedes the wake callback in the worker.
+        for _ in 0..100 {
+            if wakes.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(wakes.load(Ordering::SeqCst) > 0);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn spoken_passage_event_starts_only_after_a_child_is_launched() {
+        let process = Arc::new(Mutex::new(None));
+        let canceled = AtomicBool::new(false);
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("cmd.exe");
+            command.args(["/C", "exit", "0"]);
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "exit 0"]);
+            command
+        };
+        quiet_command(&mut command);
+        let started = std::cell::Cell::new(false);
+        run_child_started(command, &canceled, &process, || started.set(true)).unwrap();
+        assert!(started.get());
+        assert!(process.lock().unwrap().is_none());
+        let absent = Command::new("lawpdf-test-missing-speech-player-8173");
+        started.set(false);
+        assert!(run_child_started(absent, &canceled, &process, || started.set(true)).is_err());
+        assert!(!started.get());
+    }
 
     fn config(provider: SpeechProvider) -> ApiSpeechConfig {
         ApiSpeechConfig {

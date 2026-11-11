@@ -21,6 +21,19 @@ const NOTE_MAX_ROWS: usize = 9;
 const NOTE_MIN_ROWS: usize = 3;
 const NOTE_OPEN_MAX_WIDTH: f32 = 440.0;
 
+#[derive(Clone)]
+pub(super) struct ReviewMarginRows {
+    layout_id: u64,
+    width: u32,
+    entries: Arc<Vec<ReviewMarginEntry>>,
+    placements: Arc<Vec<MarginNotePlacement>>,
+    sides: Arc<Vec<MarginSide>>,
+    by_top: Arc<Vec<usize>>,
+    prefix_bottom: Arc<Vec<f32>>,
+    bottom: Option<f32>,
+    origin: Vec2,
+}
+
 /// One note waiting for a place, in document order.
 #[derive(Debug, Clone)]
 pub(super) struct ReviewMarginEntry {
@@ -48,13 +61,36 @@ struct ReviewCommentPresentation {
     authors: Vec<ReviewCommentAuthor>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub(super) struct ReviewMarginCollector {
-    entries: Vec<ReviewMarginEntry>,
-    placed: HashSet<String>,
+    entries: Arc<Vec<ReviewMarginEntry>>,
+    placed: Arc<HashSet<String>>,
+    offset: Vec2,
+    scale_y: f32,
+    scale_origin_y: f32,
+}
+
+impl Default for ReviewMarginCollector {
+    fn default() -> Self {
+        Self {
+            entries: Arc::default(),
+            placed: Arc::default(),
+            offset: Vec2::ZERO,
+            scale_y: 1.0,
+            scale_origin_y: 0.0,
+        }
+    }
 }
 
 impl ReviewMarginCollector {
+    pub(super) fn transformed(&self, offset: Vec2, scale_y: f32, scale_origin_y: f32) -> Self {
+        let mut copy = self.clone();
+        copy.offset += offset;
+        copy.scale_y = scale_y;
+        copy.scale_origin_y = scale_origin_y;
+        copy
+    }
+
     /// Callouts found while drawing a body block. Each note appears once, at
     /// its first callout.
     pub(super) fn add_callouts(&mut self, hits: &[(Rect, u16)], index: &HashMap<u16, String>) {
@@ -63,10 +99,10 @@ impl ReviewMarginCollector {
             let Some(body) = index.get(number) else {
                 continue;
             };
-            if !self.placed.insert(key.clone()) {
+            if !Arc::make_mut(&mut self.placed).insert(key.clone()) {
                 continue;
             }
-            self.entries.push(ReviewMarginEntry {
+            Arc::make_mut(&mut self.entries).push(ReviewMarginEntry {
                 marker: key.clone(),
                 key,
                 body: body.clone(),
@@ -102,16 +138,16 @@ impl ReviewMarginCollector {
             // note before it, split by a page break. Rejoin it.
             if marker.parse::<u16>().is_err()
                 && reads_as_continuation(&body)
-                && let Some(previous) = self.entries.last_mut()
+                && let Some(previous) = Arc::make_mut(&mut self.entries).last_mut()
             {
                 previous.body.push(' ');
                 previous.body.push_str(&body);
                 continue;
             }
-            if !self.placed.insert(key.clone()) {
+            if !Arc::make_mut(&mut self.placed).insert(key.clone()) {
                 continue;
             }
-            self.entries.push(ReviewMarginEntry {
+            Arc::make_mut(&mut self.entries).push(ReviewMarginEntry {
                 key,
                 marker,
                 body,
@@ -135,7 +171,7 @@ impl ReviewMarginCollector {
         colors: &HashMap<String, [f32; 3]>,
     ) {
         let key = format!("comment:{}", thread.root.key);
-        if !self.placed.insert(key.clone()) {
+        if !Arc::make_mut(&mut self.placed).insert(key.clone()) {
             return;
         }
         let authors = std::iter::once(&thread.root)
@@ -165,7 +201,7 @@ impl ReviewMarginCollector {
                 }
             })
             .collect();
-        self.entries.push(ReviewMarginEntry {
+        Arc::make_mut(&mut self.entries).push(ReviewMarginEntry {
             key,
             marker: String::new(),
             body: String::new(),
@@ -224,7 +260,8 @@ impl PdfEditorApp {
         colors: &NoteColors,
         width: f32,
         max_rows: usize,
-    ) -> LayoutJob {
+        linkify: bool,
+    ) -> (LayoutJob, Vec<review_paragraph::MarkerRange>) {
         let scale = self.liquid_text_scale;
         let mut job = LayoutJob::default();
         if let Some(comment) = &entry.comment {
@@ -252,20 +289,36 @@ impl PdfEditorApp {
                 },
             );
         }
-        job.append(
-            entry
-                .comment
-                .as_ref()
-                .map(|comment| comment.thread.root.text.as_str())
-                .unwrap_or(&entry.body),
-            if entry.marker.is_empty() { 0.0 } else { 4.0 },
-            TextFormat {
-                font_id: FontId::proportional(13.5 * scale),
-                color: colors.body,
-                line_height: Some(18.0 * scale),
-                ..Default::default()
-            },
-        );
+        let body = entry
+            .comment
+            .as_ref()
+            .map(|comment| comment.thread.root.text.as_str())
+            .unwrap_or(&entry.body);
+        let gap = if entry.marker.is_empty() { 0.0 } else { 4.0 };
+        let body_format = TextFormat {
+            font_id: FontId::proportional(13.5 * scale),
+            color: colors.body,
+            line_height: Some(18.0 * scale),
+            ..Default::default()
+        };
+        let markers = if linkify && entry.comment.is_none() {
+            if let Ok(number) = entry.marker.parse::<u16>() {
+                self.review_references.append_to_job(
+                    &mut job,
+                    number,
+                    body,
+                    body_format,
+                    colors.number,
+                    gap,
+                )
+            } else {
+                job.append(body, gap, body_format);
+                Vec::new()
+            }
+        } else {
+            job.append(body, gap, body_format);
+            Vec::new()
+        };
         if let Some(comment) = &entry.comment
             && !comment.thread.replies.is_empty()
         {
@@ -287,7 +340,7 @@ impl PdfEditorApp {
             break_anywhere: false,
             overflow_character: Some('…'),
         };
-        job
+        (job, markers)
     }
 
     /// Place and paint the collected notes: right margin first, left when crowded.
@@ -305,22 +358,23 @@ impl PdfEditorApp {
         let scale = self.liquid_text_scale;
         let colors = self.review_note_colors();
         let text_width = (width - NOTE_TEXT_INSET).max(40.0);
-        let mut entries = collector.entries;
-        entries.sort_by(|a, b| a.anchor_top.total_cmp(&b.anchor_top));
-
-        let full_rows = entries
-            .iter()
-            .map(|entry| {
-                let job = self.review_note_job(entry, &colors, text_width, usize::MAX);
-                ui.fonts_mut(|fonts| fonts.layout_job(job))
-                    .rows
-                    .len()
-                    .max(1)
-                    // Footnotes reserve one row for the explicit source lookup.
-                    // Comments keep their existing size and never search citations.
-                    + usize::from(entry.comment.is_none())
+        let layout_id = self
+            .review_layout
+            .as_ref()
+            .filter(|layout| layout.active_this_frame)
+            .map(|layout| layout.id);
+        let resizing = self.review_layout.as_ref().is_some_and(|layout| {
+            layout.active_this_frame && (layout.resize_factor - 1.0).abs() > f32::EPSILON
+        });
+        let cached = self
+            .review_margin_rows
+            .as_ref()
+            .filter(|cached| {
+                Some(cached.layout_id) == layout_id
+                    && (cached.width == text_width.to_bits() || resizing)
+                    && cached.entries.len() == collector.entries.len()
             })
-            .collect::<Vec<_>>();
+            .cloned();
         let row_height = 18.0 * scale;
         let metrics = MarginNoteMetrics {
             row_height,
@@ -331,39 +385,89 @@ impl PdfEditorApp {
             min_rows: NOTE_MIN_ROWS,
             drift_limit: row_height * 14.0,
         };
-        let requests = entries
-            .iter()
-            .zip(&full_rows)
-            .map(|(entry, rows)| MarginNoteRequest {
-                anchor_top: entry.anchor_top,
-                total_rows: *rows,
-            })
-            .collect::<Vec<_>>();
-        let sides = assign_margin_sides(&requests, &metrics, row_height * 3.0);
-        let mut placements = vec![
-            MarginNotePlacement {
-                top: 0.0,
-                height: 0.0,
-                rows: 1,
-                shortened: false,
-            };
-            requests.len()
-        ];
-        for side in [MarginSide::Right, MarginSide::Left] {
-            let indices = (0..requests.len())
-                .filter(|index| sides[*index] == side)
-                .collect::<Vec<_>>();
-            let side_requests = indices
+        let layout = cached.unwrap_or_else(|| {
+            let mut entries = collector.entries.as_ref().clone();
+            entries.sort_by(|a, b| a.anchor_top.total_cmp(&b.anchor_top));
+            let full_rows = entries
                 .iter()
-                .map(|index| requests[*index])
+                .map(|entry| {
+                    let (job, _) =
+                        self.review_note_job(entry, &colors, text_width, usize::MAX, false);
+                    ui.fonts_mut(|fonts| fonts.layout_job(job)).rows.len().max(1)
+                        // Footnotes reserve one row for the explicit source lookup.
+                        + usize::from(entry.comment.is_none())
+                })
                 .collect::<Vec<_>>();
-            for (index, placement) in indices
+            let requests = entries
                 .iter()
-                .zip(place_margin_notes(&side_requests, &metrics))
-            {
-                placements[*index] = placement;
+                .zip(&full_rows)
+                .map(|(entry, rows)| MarginNoteRequest {
+                    anchor_top: entry.anchor_top,
+                    total_rows: *rows,
+                })
+                .collect::<Vec<_>>();
+            let sides = assign_margin_sides(&requests, &metrics, row_height * 3.0);
+            let mut placements = vec![
+                MarginNotePlacement {
+                    top: 0.0,
+                    height: 0.0,
+                    rows: 1,
+                    shortened: false,
+                };
+                requests.len()
+            ];
+            for side in [MarginSide::Right, MarginSide::Left] {
+                let indices = (0..requests.len())
+                    .filter(|index| sides[*index] == side)
+                    .collect::<Vec<_>>();
+                let side_requests = indices
+                    .iter()
+                    .map(|index| requests[*index])
+                    .collect::<Vec<_>>();
+                for (index, placement) in indices
+                    .iter()
+                    .zip(place_margin_notes(&side_requests, &metrics))
+                {
+                    placements[*index] = placement;
+                }
             }
-        }
+            let mut by_top = (0..placements.len()).collect::<Vec<_>>();
+            by_top.sort_by(|a, b| placements[*a].top.total_cmp(&placements[*b].top));
+            let mut max_bottom = f32::NEG_INFINITY;
+            let prefix_bottom = by_top
+                .iter()
+                .map(|index| {
+                    max_bottom = max_bottom.max(placements[*index].bottom());
+                    max_bottom
+                })
+                .collect::<Vec<_>>();
+            let layout = ReviewMarginRows {
+                layout_id: layout_id.unwrap_or(0),
+                width: text_width.to_bits(),
+                bottom: margin_notes_bottom(&placements),
+                // Entries remain in their original coordinate space; the
+                // collector carries the current scroll/column translation.
+                origin: Vec2::ZERO,
+                entries: Arc::new(entries),
+                placements: Arc::new(placements),
+                sides: Arc::new(sides),
+                by_top: Arc::new(by_top),
+                prefix_bottom: Arc::new(prefix_bottom),
+            };
+            if layout_id.is_some() {
+                self.review_margin_rows = Some(layout.clone());
+            }
+            layout
+        });
+        let delta = collector.offset - layout.origin;
+        let transform_y = |y: f32| {
+            collector.scale_origin_y + (y - collector.scale_origin_y) * collector.scale_y + delta.y
+        };
+        let transform_rect =
+            |rect: Rect| rect.translate(Vec2::new(delta.x, transform_y(rect.top()) - rect.top()));
+        let entries = &layout.entries;
+        let placements = &layout.placements;
+        let sides = &layout.sides;
 
         let pointer = ui.input(|input| input.pointer.hover_pos());
         let clip = ui.clip_rect();
@@ -372,28 +476,34 @@ impl PdfEditorApp {
         let mut source_opened = None;
         let previous_hover = self.chrome.hovered_note.clone();
         let expanded = self.chrome.expanded_note.clone();
-        let mut note_rects = Vec::with_capacity(entries.len());
-
-        for ((entry, placement), side) in entries.iter().zip(&placements).zip(&sides) {
+        let height_slack =
+            metrics.note_height(NOTE_MAX_ROWS, true) * (1.0 - collector.scale_y).abs();
+        let first = layout
+            .prefix_bottom
+            .partition_point(|bottom| transform_y(*bottom) + height_slack < clip.top() - 200.0);
+        let last = layout
+            .by_top
+            .partition_point(|index| transform_y(placements[*index].top) <= clip.bottom() + 200.0);
+        for &index in &layout.by_top[first..last] {
+            let entry = &entries[index];
+            let placement = placements[index];
+            let side = sides[index];
             let accent = entry
                 .comment
                 .as_ref()
                 .map(|comment| comment.authors[0].color)
                 .unwrap_or(colors.number);
-            let left_side = *side == MarginSide::Left;
+            let left_side = side == MarginSide::Left;
             let left = if left_side { left_left } else { right_left };
             let rect = Rect::from_min_size(
-                Pos2::new(left, placement.top),
+                Pos2::new(left, transform_y(placement.top)),
                 Vec2::new(width, placement.height),
             );
-            note_rects.push(rect);
-            if !rect.intersects(clip.expand(200.0)) {
-                continue;
-            }
             let id = ui.id().with(("review-margin-note", &entry.key));
             let response = ui.interact(rect, id, Sense::click());
             let over_callout = entry
                 .callout
+                .map(transform_rect)
                 .zip(pointer)
                 .is_some_and(|(callout, pointer)| callout.expand(3.0).contains(pointer));
             let lit = response.hovered()
@@ -403,7 +513,7 @@ impl PdfEditorApp {
             if response.hovered() || over_callout {
                 hovered = Some(entry.key.clone());
             }
-            let painter = ui.painter();
+            let painter = ui.painter().clone();
             if response.hovered() {
                 painter.rect_filled(rect.expand2(Vec2::new(4.0, 3.0)), 4.0, colors.hover_fill);
             }
@@ -427,7 +537,13 @@ impl PdfEditorApp {
                 .rows
                 .saturating_sub(usize::from(entry.comment.is_none()))
                 .max(1);
-            let job = self.review_note_job(entry, &colors, text_width, content_rows);
+            let (job, references) = self.review_note_job(
+                entry,
+                &colors,
+                text_width,
+                content_rows,
+                !placement.shortened,
+            );
             let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
             let text_left = if left_side {
                 rect.left()
@@ -454,7 +570,10 @@ impl PdfEditorApp {
                     ),
                 });
             }
-            painter.galley(text_origin, galley, colors.body);
+            painter.galley(text_origin, Arc::clone(&galley), colors.body);
+            let reference_clicked = entry.marker.parse::<u16>().ok().is_some_and(|source| {
+                self.interact_note_references(ui, source, &galley, text_origin, &references)
+            });
             let mut author_clicked = false;
             if let Some(comment) = &entry.comment
                 && comment.authors[0].own
@@ -492,7 +611,7 @@ impl PdfEditorApp {
                     accent,
                 );
             }
-            if lit && let Some(callout) = entry.callout {
+            if lit && let Some(callout) = entry.callout.map(transform_rect) {
                 painter.rect_stroke(
                     callout.expand2(Vec2::new(2.5, 1.0)),
                     3.0,
@@ -515,7 +634,7 @@ impl PdfEditorApp {
                 );
                 let label = self.footnote_sources_button_label(&entry.key, &entry.body);
                 let source = ui
-                    .push_id(("review-note-source", &entry.key), |ui| {
+                    .scope_builder(egui::UiBuilder::new().id(("review-note-source", self.document_epoch, &entry.key)), |ui| {
                         ui.put(
                             source_rect,
                             egui::Button::new(
@@ -553,13 +672,13 @@ impl PdfEditorApp {
             } else {
                 response
             };
-            if response.clicked() && !author_clicked && !source_clicked {
+            if response.clicked() && !author_clicked && !source_clicked && !reference_clicked {
                 toggled = Some(entry.key.clone());
             }
         }
 
-        if let Some(bottom) = margin_notes_bottom(&placements) {
-            let below = bottom - ui.cursor().top();
+        if let Some(bottom) = layout.bottom {
+            let below = transform_y(bottom) + height_slack - ui.cursor().top();
             if below > 0.0 {
                 ui.add_space(below + 16.0);
             }
@@ -579,12 +698,22 @@ impl PdfEditorApp {
             };
         }
         let open = self.chrome.expanded_note.clone().and_then(|key| {
-            entries
-                .iter()
-                .zip(&note_rects)
-                .zip(&sides)
-                .find(|((entry, _), _)| entry.key == key)
-                .map(|((entry, rect), side)| (entry.clone(), *rect, *side))
+            let index = entries.iter().position(|entry| entry.key == key)?;
+            let side = sides[index];
+            let left = if side == MarginSide::Left {
+                left_left
+            } else {
+                right_left
+            };
+            let placement = placements[index];
+            let rect = Rect::from_min_size(
+                Pos2::new(left, transform_y(placement.top)),
+                Vec2::new(width, placement.height),
+            );
+            let mut entry = entries[index].clone();
+            entry.anchor_top = transform_y(entry.anchor_top);
+            entry.callout = entry.callout.map(transform_rect);
+            Some((entry, rect, side))
         });
         if let Some((entry, rect, side)) = open {
             let just_opened = toggled_now || expanded.as_deref() != Some(entry.key.as_str());
@@ -723,15 +852,26 @@ impl PdfEditorApp {
                                         );
                                     }
                                 } else {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&entry.body)
-                                                .size(15.0 * scale)
-                                                .color(colors.body),
-                                        )
-                                        .wrap()
-                                        .selectable(true),
-                                    );
+                                    if let Ok(number) = entry.key.parse::<u16>() {
+                                        self.draw_note_reference_text(
+                                            ui,
+                                            number,
+                                            &entry.body,
+                                            15.0 * scale,
+                                            colors.body,
+                                            colors.number,
+                                        );
+                                    } else {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&entry.body)
+                                                    .size(15.0 * scale)
+                                                    .color(colors.body),
+                                            )
+                                            .wrap()
+                                            .selectable(true),
+                                        );
+                                    }
                                     ui.add_space(8.0);
                                     ui.separator();
                                     self.draw_footnote_sources(ui, &entry.key, &entry.body);

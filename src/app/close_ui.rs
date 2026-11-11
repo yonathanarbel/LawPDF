@@ -25,6 +25,7 @@ impl PdfEditorApp {
             return;
         }
         self.save_active_tab_state();
+        self.pending_close_others.clear();
         if self.has_unsaved_annotations() || self.close_target_is_saving(CloseTarget::Window) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.pending_close = Some(CloseTarget::Window);
@@ -42,6 +43,47 @@ impl PdfEditorApp {
             // must close that window instead of silently swallowing the shortcut.
             self.request_window_close(ctx);
         }
+    }
+
+    pub(super) fn close_other_tabs(&mut self, keep_epoch: u64, ctx: &Context) {
+        if self.pending_close.is_some()
+            || !self.tabs.iter().any(|tab| tab.document_epoch == keep_epoch)
+        {
+            return;
+        }
+        self.save_active_tab_state();
+        let mut targets = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.document_epoch != keep_epoch)
+            .map(|tab| {
+                (
+                    tab.document_epoch,
+                    tab.annotations_dirty
+                        || self.close_target_is_saving(CloseTarget::Tab(tab.document_epoch)),
+                )
+            })
+            .collect::<Vec<_>>();
+        // Ask about unsaved work before closing clean tabs, so Cancel preserves them.
+        targets.sort_by_key(|(_, requires_decision)| !requires_decision);
+        self.pending_close_others = targets.into_iter().map(|(epoch, _)| epoch).collect();
+        self.continue_closing_other_tabs(ctx);
+    }
+
+    fn continue_closing_other_tabs(&mut self, ctx: &Context) {
+        while self.pending_close.is_none() {
+            let Some(epoch) = self.pending_close_others.pop_front() else {
+                break;
+            };
+            if let Some(index) = self.tabs.iter().position(|tab| tab.document_epoch == epoch) {
+                self.close_tab(index, ctx);
+            }
+        }
+    }
+
+    fn cancel_pending_close(&mut self) {
+        self.pending_close = None;
+        self.pending_close_others.clear();
     }
 
     fn discard_close_target(&mut self, target: CloseTarget) -> Result<(), String> {
@@ -80,6 +122,7 @@ impl PdfEditorApp {
             });
         match target {
             CloseTarget::Window => {
+                self.remember_open_session();
                 self.allow_window_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -87,6 +130,7 @@ impl PdfEditorApp {
                 if let Some(index) = self.tabs.iter().position(|tab| tab.document_epoch == epoch) {
                     self.close_tab_without_saving(index, ctx);
                 }
+                self.continue_closing_other_tabs(ctx);
             }
         }
     }
@@ -110,19 +154,20 @@ impl PdfEditorApp {
             self.start_due_annotation_saves(ctx);
             egui::Modal::new(egui::Id::new("unsaved_changes")).show(ctx, |ui| {
                 ui.heading("Saving annotations before closing…");
-                ui.spinner();
+                if !self.settings.reduce_motion {
+                    ui.spinner();
+                }
                 if ui.button("Cancel close").clicked() {
-                    self.pending_close = None;
+                    self.cancel_pending_close();
                 }
             });
-            ctx.request_repaint_after(RENDER_POLL_INTERVAL);
             return;
         }
         let title = match target {
             CloseTarget::Window => "Save changes before quitting?".to_owned(),
             CloseTarget::Tab(epoch) => {
                 let Some(tab) = self.tabs.iter().find(|tab| tab.document_epoch == epoch) else {
-                    self.pending_close = None;
+                    self.cancel_pending_close();
                     return;
                 };
                 format!("Save changes to {}?", tab.title())
@@ -148,12 +193,12 @@ impl PdfEditorApp {
                     }
                 }
                 if ui.button("Cancel").clicked() {
-                    self.pending_close = None;
+                    self.cancel_pending_close();
                 }
             });
         });
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-            self.pending_close = None;
+            self.cancel_pending_close();
         }
     }
 }
@@ -162,6 +207,43 @@ impl PdfEditorApp {
 mod tests {
     use super::*;
     use crate::model::PageInfo;
+
+    #[test]
+    fn reduced_motion_save_before_close_does_not_poll_the_worker() {
+        let (mut app, ctx, _worker) = annotation_saving::tests::fixture();
+        app.settings.reduce_motion = true;
+        ctx.style_mut(|style| style.animation_time = 0.0);
+        app.annotations_dirty = true;
+        app.pending_close = Some(CloseTarget::Window);
+        let path = app.document.as_ref().unwrap().path.clone();
+        app.active_annotation_saves.insert(
+            path.clone(),
+            PendingAnnotationSave {
+                document_epoch: 7,
+                path,
+                generation: 1,
+                annotations: Vec::new(),
+                due_at: Instant::now(),
+            },
+        );
+        for frame in 0..10 {
+            let output = ctx.run(
+                egui::RawInput {
+                    time: Some(frame as f64 * 0.2),
+                    ..Default::default()
+                },
+                |ctx| app.draw_unsaved_close_prompt(ctx),
+            );
+            if frame >= 6 {
+                assert_eq!(
+                    output.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+                    Duration::MAX
+                );
+            }
+        }
+        assert!(app.pending_close.is_some());
+        assert!(app.annotations_dirty);
+    }
 
     fn app_with_dirty_tab() -> (PdfEditorApp, Context) {
         let ctx = Context::default();
@@ -348,5 +430,41 @@ mod tests {
         assert_eq!(app.tabs.len(), 1);
         assert_eq!(app.tabs[0].document_epoch, 9);
         assert!(app.pending_close.is_none());
+    }
+
+    #[test]
+    fn close_others_asks_about_dirty_tabs_first_and_cancel_preserves_the_rest() {
+        let (mut app, ctx) = app_with_dirty_tab();
+        let mut clean = app.tabs[0].clone();
+        clean.document_epoch = 8;
+        clean.annotations_dirty = false;
+        app.tabs.push(clean.clone());
+        clean.document_epoch = 9;
+        app.tabs.push(clean);
+        app.close_other_tabs(9, &ctx);
+        assert_eq!(app.pending_close, Some(CloseTarget::Tab(7)));
+        assert_eq!(app.tabs.len(), 3);
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| app.draw_unsaved_close_prompt(ctx));
+        assert!(app.pending_close.is_none());
+        assert!(app.pending_close_others.is_empty());
+        assert_eq!(app.tabs.len(), 3);
+
+        app.close_other_tabs(9, &ctx);
+        // Simulate the user choosing to close the dirty tab after being prompted.
+        app.finish_close_target(CloseTarget::Tab(7), &ctx);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].document_epoch, 9);
+        assert!(app.pending_close.is_none());
+        assert!(app.pending_close_others.is_empty());
     }
 }

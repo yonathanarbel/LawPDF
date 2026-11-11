@@ -8,6 +8,11 @@ pub(super) struct TtsController {
     pub(super) tx: Sender<SpeechEvent>,
     pub(super) rx: Receiver<SpeechEvent>,
     pub(super) progress: Option<(usize, usize)>,
+    pub(super) follow_epoch: Option<u64>,
+    pub(super) follow_view: Option<DocumentViewMode>,
+    pub(super) follow_document: Option<std::sync::Weak<LiquidDocument>>,
+    pub(super) speaking_block: Option<usize>,
+    pub(super) follow_target: Option<usize>,
 }
 
 impl TtsController {
@@ -20,6 +25,11 @@ impl TtsController {
             tx,
             rx,
             progress: None,
+            follow_epoch: None,
+            follow_view: None,
+            follow_document: None,
+            speaking_block: None,
+            follow_target: None,
         }
     }
 

@@ -83,16 +83,18 @@ pub use cleaning::{
     split_note_marker,
 };
 
-pub fn spawn_liquid_job(request: LiquidRequest, tx: Sender<LiquidEvent>) {
+pub fn spawn_liquid_job(request: LiquidRequest, tx: Sender<LiquidEvent>, repaint: egui::Context) {
     thread::spawn(move || {
         let document_epoch = request.document_epoch;
         let path = request.path.clone();
         let result = prepare_liquid_document(request);
-        let _ = tx.send(LiquidEvent {
+        if tx.send(LiquidEvent {
             document_epoch,
             path,
             result,
-        });
+        }).is_ok() {
+            repaint.request_repaint();
+        }
     });
 }
 

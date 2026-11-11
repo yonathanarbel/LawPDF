@@ -44,10 +44,44 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: .\scripts\fetch-catboost-windows.ps1
+      - name: Check formatting (advisory)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+      - name: Run Clippy (advisory)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: cargo clippy --locked --all-targets
       - name: Test production feature set
         run: cargo test --locked
       - name: Test development feature set
         run: cargo test --locked --features devtools
+      - name: Exercise isolated PDF workers
+        if: runner.os == 'Linux'
+        env:
+          LAWPDF_SMOKE_PDF: ${{ github.workspace }}/tests/fixtures/ocr/scanned-law-review-sample.pdf
+          XDG_DATA_HOME: ${{ runner.temp }}/lawpdf-worker-smoke
+          LAWPDF_DISABLE_PERFORMANCE_CACHE: "1"
+        run: |
+          cargo build --locked --features devtools
+          "$CARGO_TARGET_DIR/debug/lawpdf" --smoke-pdf-isolation
+      - name: Measure opening pipeline on a fixture
+        if: runner.os == 'Linux'
+        env:
+          LAWPDF_BENCH_DATA_DIR: ${{ runner.temp }}/lawpdf-open-benchmark-data
+        run: |
+          "$CARGO_TARGET_DIR/debug/lawpdf" --bench-open-pipeline \
+            "$GITHUB_WORKSPACE/tests/fixtures/ocr/scanned-law-review-sample.pdf" \
+            > "$RUNNER_TEMP/lawpdf-open-benchmark.json"
+          cat "$RUNNER_TEMP/lawpdf-open-benchmark.json"
+      - name: Enforce synthetic Review frame median budgets
+        if: runner.os == 'Linux'
+        env:
+          LAWPDF_ENFORCE_REVIEW_BUDGETS: "1"
+        run: cargo test --release --locked review_frame_cost -- --ignored --nocapture
+      - name: Test release preparation without network
+        if: runner.os == 'Linux'
+        run: python3 -B -m unittest discover -s tools -p test_prepare_release.py
       - name: Verify public runtime assets
         run: python tools/verify_release_manifest.py --require-platform-library
       - name: Verify Markdown exports

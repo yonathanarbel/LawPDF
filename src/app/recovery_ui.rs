@@ -259,8 +259,8 @@ impl PdfEditorApp {
             ui.heading("Recover unsaved annotations");
             ui.label("LawPDF kept your edits and the PDF they belong to. Save a recovered copy to preserve both versions.");
             ui.label("Recovered copies may remove password protection or invalidate a digital signature. Your original stays unchanged.");
-            if let Some(error) = &self.recovery_ui.error { ui.colored_label(Color32::DARK_RED, error); }
-            if self.recovery_ui.busy { ui.spinner(); }
+            if let Some(error) = &self.recovery_ui.error { ui.colored_label(ui.visuals().error_fg_color, error); }
+            if self.recovery_ui.busy { motion::busy(ui, self.settings.reduce_motion); }
             egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                 for (index, item) in self.recovery_ui.items.iter().enumerate() {
                     ui.group(|ui| {

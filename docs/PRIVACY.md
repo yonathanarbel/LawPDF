@@ -18,6 +18,8 @@ Cloud providers have their own accounts, charges, retention settings, and privac
 
 ## What stays on the device
 
+If you enable “Reopen last session on launch,” LawPDF stores the paths of up to 256 open documents locally when you close the window. Those paths expire under the reading-history retention setting, and “Clear reading history” removes them. An explicitly opened document takes precedence over session restoration.
+
 Desktop preferences, per-document zoom, OCR and reading caches, raster caches, local corrections, backups, and recovery records are stored in LawPDF's application-data folder. Windows raster caches use Local AppData. Document paths and content can appear in these local files. A recovery record includes annotations and an immutable copy of the PDF version they belong to. This allows recovery after the original moves or changes. Unsaved recovery data is preserved until recovered or explicitly discarded. The recovery source store has a 4 GB limit; reaching it produces a visible error rather than dropping edits.
 
 API keys are stored in macOS Keychain or Windows Credential Manager. The supported Linux backend uses Secret Service. Legacy settings-file keys are removed only after the native credential store confirms migration. A failed migration leaves the existing file and displays an error. Old settings backups created by earlier versions may still contain keys; remove those backups after confirming that secure migration succeeded. Environment-supplied keys are read from the launching environment and are not written into settings.

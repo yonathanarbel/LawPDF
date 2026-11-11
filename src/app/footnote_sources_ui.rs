@@ -321,7 +321,7 @@ impl PdfEditorApp {
             Some(LookupState::Ready(result)) => Some(Arc::clone(result)),
             Some(LookupState::Queued) => {
                 ui.horizontal(|ui| {
-                    ui.spinner();
+                    motion::busy(ui, self.settings.reduce_motion);
                     ui.label("Finding article sources…");
                 });
                 None

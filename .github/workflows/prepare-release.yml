@@ -1,0 +1,39 @@
+name: Prepare reviewed LawPDF release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version matching Cargo.toml and release-manifest.json (without v)
+        required: true
+        type: string
+      expected_commit:
+        description: Full reviewed main-branch commit SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prepare-lawpdf-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'yonathanarbel/LawPDF' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Tag the reviewed commit and request verification builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: python3 tools/prepare_release.py --version "$RELEASE_VERSION" --expected-commit "$EXPECTED_COMMIT"

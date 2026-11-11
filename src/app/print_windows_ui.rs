@@ -396,6 +396,8 @@ impl PdfEditorApp {
         if !self.print_ui.open {
             return;
         }
+        let reduce_motion = self.settings.reduce_motion;
+        let palette = self.app_palette();
         let print = &mut self.print_ui;
         let Some(source) = print.source.as_ref() else {
             return;
@@ -411,20 +413,21 @@ impl PdfEditorApp {
         let mut submit = None;
         let response = egui::Modal::new(egui::Id::new("lawpdf-print"))
             .backdrop_color(Color32::from_black_alpha(125))
-            .frame(egui::Frame::NONE.fill(BAR_FILL).corner_radius(16)
-                .inner_margin(22).stroke(Stroke::new(1.0_f32, PAPER_STROKE))
+            .frame(egui::Frame::NONE.fill(palette.bar).corner_radius(16)
+                .inner_margin(22).stroke(Stroke::new(1.0_f32, palette.rule))
                 .shadow(Shadow { offset: [0, 12], blur: 40, spread: 1, color: Color32::from_black_alpha(60) }))
             .show(ctx, |ui| {
                 ui.set_width(width);
-                ui.visuals_mut().selection.bg_fill = Color32::from_rgb(216, 235, 229);
-                ui.visuals_mut().selection.stroke = Stroke::new(1.0_f32, ACCENT);
+                let highlight = if ui.visuals().dark_mode { Color32::from_rgb(55, 84, 78) } else { Color32::from_rgb(216, 235, 229) };
+                ui.visuals_mut().selection.bg_fill = highlight;
+                ui.visuals_mut().selection.stroke = Stroke::new(1.0_f32, palette.accent);
                 ui.spacing_mut().item_spacing = Vec2::new(10.0, 9.0);
                 ui.horizontal(|ui| {
                     let (rect, _) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::hover());
-                    paint_printer(ui.painter(), rect, ACCENT);
+                    paint_printer(ui.painter(), rect, palette.accent);
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("Print document").size(25.0).strong().color(INK));
-                        ui.add(egui::Label::new(RichText::new(&title).color(SUBTLE)).truncate());
+                        ui.label(RichText::new("Print document").size(25.0).strong().color(palette.ink));
+                        ui.add(egui::Label::new(RichText::new(&title).color(palette.muted)).truncate());
                     });
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         if ui.add_enabled(!print.busy, egui::Button::new("×").frame(false))
@@ -439,7 +442,7 @@ impl PdfEditorApp {
                         ui.horizontal_top(|ui| {
                             let preview_width = width - 335.0;
                             ui.allocate_ui_with_layout(Vec2::new(preview_width, body_height - 10.0), egui::Layout::top_down(Align::Min), |ui| {
-                                preview_panel(ui, print, preview_width, body_height - 65.0, page_count);
+                                preview_panel(ui, print, preview_width, body_height - 65.0, page_count, reduce_motion);
                             });
                             ui.add_space(8.0);
                             ui.allocate_ui_with_layout(Vec2::new(305.0, body_height - 10.0), egui::Layout::top_down(Align::Min), |ui| {
@@ -447,17 +450,17 @@ impl PdfEditorApp {
                             });
                         });
                     } else {
-                        preview_panel(ui, print, width, 220.0, page_count);
+                        preview_panel(ui, print, width, 220.0, page_count, reduce_motion);
                         ui.add_space(10.0);
                         ui.add_enabled_ui(!print.busy, |ui| controls(ui, print, page_count, ctx));
                     }
                 });
                 ui.separator();
                 if let Some(error) = &print.error {
-                    ui.colored_label(Color32::from_rgb(167, 49, 41), error);
+                    ui.colored_label(ui.visuals().error_fg_color, error);
                 }
                 if let Some(message) = &print.message {
-                    ui.colored_label(ACCENT, message);
+                    ui.colored_label(palette.accent, message);
                 }
                 if print.busy {
                     let (done, total) = print.progress;
@@ -471,7 +474,7 @@ impl PdfEditorApp {
                         let sides = pages.len().div_ceil(print.options.pages_per_sheet);
                         let sheets = if print.duplex == "simplex" { sides } else { sides.div_ceil(2) };
                         ui.label(RichText::new(format!("{} pages · {} sheets × {} copies",
-                            pages.len(), sheets, print.options.copies)).small().color(SUBTLE));
+                            pages.len(), sheets, print.options.copies)).small().color(palette.muted));
                     }
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         let ready = !print.busy && !print.discovering
@@ -511,8 +514,8 @@ impl PdfEditorApp {
 fn section(ui: &mut egui::Ui, number: &str, title: &str) {
     ui.add_space(5.0);
     ui.horizontal(|ui| {
-        ui.label(RichText::new(number).size(10.0).color(ACCENT).strong());
-        ui.label(RichText::new(title).size(16.0).strong().color(INK));
+        ui.label(RichText::new(number).size(10.0).color(theme::for_ui(ui).accent).strong());
+        ui.label(RichText::new(title).size(16.0).strong().color(theme::for_ui(ui).ink));
     });
 }
 
@@ -547,7 +550,7 @@ fn controls(ui: &mut egui::Ui, print: &mut PrintUi, page_count: usize, ctx: &Con
         ui.label(
             RichText::new(error)
                 .small()
-                .color(Color32::from_rgb(150, 71, 40)),
+                .color(ui.visuals().error_fg_color),
         );
     }
     ui.horizontal(|ui| {
@@ -576,7 +579,7 @@ fn controls(ui: &mut egui::Ui, print: &mut PrintUi, page_count: usize, ctx: &Con
         ui.label(
             RichText::new(format!("{page_count} total"))
                 .small()
-                .color(SUBTLE),
+                .color(theme::for_ui(ui).muted),
         );
     });
     ui.add(
@@ -588,7 +591,7 @@ fn controls(ui: &mut egui::Ui, print: &mut PrintUi, page_count: usize, ctx: &Con
         ui.label(
             RichText::new(error)
                 .small()
-                .color(Color32::from_rgb(167, 49, 41)),
+                .color(ui.visuals().error_fg_color),
         );
     }
     ui.horizontal(|ui| {
@@ -707,7 +710,7 @@ fn controls(ui: &mut egui::Ui, print: &mut PrintUi, page_count: usize, ctx: &Con
         ui.label(
             RichText::new("Content beyond the selected margins is cropped.")
                 .small()
-                .color(SUBTLE),
+                .color(theme::for_ui(ui).muted),
         );
     }
     ui.separator();
@@ -717,11 +720,11 @@ fn controls(ui: &mut egui::Ui, print: &mut PrintUi, page_count: usize, ctx: &Con
         &mut print.options.include_annotations,
         "Include annotations",
     );
-    ui.label(RichText::new("Prints the original PDF layout, including filled forms. Preview includes your current edits.").small().color(SUBTLE));
+    ui.label(RichText::new("Prints the original PDF layout, including filled forms. Preview includes your current edits.").small().color(theme::for_ui(ui).muted));
     ui.label(
         RichText::new("300 DPI · Printer margins may trim edge content.")
             .small()
-            .color(SUBTLE),
+            .color(theme::for_ui(ui).muted),
     );
 }
 
@@ -731,10 +734,13 @@ fn preview_panel(
     width: f32,
     height: f32,
     page_count: usize,
+    reduce_motion: bool,
 ) {
     let sheet_count = print.options.sheet_count(page_count).unwrap_or(0);
+    let preview_background = if ui.visuals().dark_mode { theme::for_ui(ui).panel } else { Color32::from_rgb(228, 230, 225) };
+    let preview_label = if ui.visuals().dark_mode { theme::for_ui(ui).muted } else { SUBTLE };
     egui::Frame::NONE
-        .fill(Color32::from_rgb(228, 230, 225))
+        .fill(preview_background)
         .corner_radius(10)
         .inner_margin(16)
         .show(ui, |ui| {
@@ -767,7 +773,7 @@ fn preview_panel(
                     Align2::CENTER_CENTER,
                     label,
                     FontId::proportional(16.0),
-                    SUBTLE,
+                    preview_label,
                 );
             }
         });
@@ -790,7 +796,7 @@ fn preview_panel(
                     },
                     sheet_count
                 ))
-                .color(SUBTLE),
+                .color(theme::for_ui(ui).muted),
             );
             if ui
                 .add_enabled(
@@ -804,7 +810,7 @@ fn preview_panel(
             }
         });
         if print.preview_busy || print.preview_due.is_some() {
-            ui.spinner();
+            motion::busy(ui, reduce_motion);
         }
     });
 }

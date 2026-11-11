@@ -164,14 +164,15 @@ impl PdfEditorApp {
                 Ok(()) => {
                     self.active_annotation_saves.insert(path, save);
                     self.status = "Saving annotations…".to_owned();
-                    ctx.request_repaint_after(RENDER_POLL_INTERVAL);
+                    ctx.request_repaint();
                 }
             }
         }
         if let Some(next) = self
             .pending_annotation_saves
-            .values()
-            .map(|save| save.due_at)
+            .iter()
+            .filter(|(path, _)| !self.active_annotation_saves.contains_key(*path))
+            .map(|(_, save)| save.due_at)
             .min()
         {
             ctx.request_repaint_after(next.saturating_duration_since(now));
@@ -235,6 +236,7 @@ impl PdfEditorApp {
                 {
                     self.annotations_dirty = false;
                     self.status = "All annotations saved to PDF.".to_owned();
+                    self.chrome.confirm_save(epoch);
                 }
                 if let Some(warning) = report.recovery_warning {
                     self.push_error_notice(format!(
@@ -242,11 +244,44 @@ impl PdfEditorApp {
                     ));
                 }
             }
-            Err(error) => self.push_error_notice(format!(
-                "Could not save annotations to {}: {error}. Your changes are still unsaved.",
-                path.display()
-            )),
+            Err(error) => self.push_retry_save_notice(
+                format!(
+                    "Could not save annotations to {}: {error}. Your changes are still unsaved.",
+                    path.display()
+                ),
+                epoch,
+                path,
+            ),
         }
+        ctx.request_repaint();
+    }
+
+    /// Retry only the still-open document and its latest edits, never the
+    /// potentially stale snapshot that failed earlier.
+    pub(super) fn retry_annotation_save(&mut self, epoch: u64, path: PathBuf, ctx: &Context) {
+        self.save_active_tab_state();
+        let Some(tab) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.document_epoch == epoch && tab.document.path == path)
+        else {
+            self.push_warning_notice(
+                "That PDF is no longer open. Check its recovery copy before trying again.",
+            );
+            return;
+        };
+        if !tab.annotations_dirty {
+            self.push_info_notice("The current annotations are already saved.");
+            return;
+        }
+        let annotations = tab.annotations.clone();
+        if let Err(error) = self.queue_annotation_save(epoch, path, annotations) {
+            self.push_error_notice(format!(
+                "Could not retry saving: {error}. Your changes remain unsaved."
+            ));
+            return;
+        }
+        self.start_due_annotation_saves(ctx);
         ctx.request_repaint();
     }
 
@@ -352,6 +387,85 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn pending_save_waits_for_active_save_without_repainting_and_then_runs() {
+        let (mut app, ctx, requests) = fixture();
+        let path = app.document.as_ref().unwrap().path.clone();
+        let first = PendingAnnotationSave {
+            document_epoch: 7,
+            path: path.clone(),
+            generation: 1,
+            annotations: Vec::new(),
+            due_at: Instant::now(),
+        };
+        let mut second = first.clone();
+        second.generation = 2;
+        app.active_annotation_saves
+            .insert(path.clone(), first.clone());
+        app.pending_annotation_saves.insert(path.clone(), second);
+        for frame in 0..8 {
+            let output = ctx.run(
+                egui::RawInput {
+                    time: Some(frame as f64 * 0.2),
+                    ..Default::default()
+                },
+                |ctx| app.start_due_annotation_saves(ctx),
+            );
+            if frame >= 4 {
+                assert_eq!(
+                    output.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+                    Duration::MAX
+                );
+            }
+        }
+        assert!(requests.try_recv().is_err());
+        assert!(app.pending_annotation_saves.contains_key(&path));
+        let _ = ctx.run(Default::default(), |ctx| {
+            app.finish_annotation_autosave(
+                7,
+                path.clone(),
+                first.generation,
+                Ok(SaveReport::default()),
+                ctx,
+            );
+            app.start_due_annotation_saves(ctx);
+        });
+        assert!(matches!(
+            requests.try_recv().unwrap(),
+            RenderRequest::AutosaveAnnotations { generation: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn worker_failure_keeps_unsaved_and_pending_annotations() {
+        let (mut app, ctx, _worker) = fixture();
+        let path = app.document.as_ref().unwrap().path.clone();
+        let active = PendingAnnotationSave {
+            document_epoch: 7,
+            path: path.clone(),
+            generation: 1,
+            annotations: Vec::new(),
+            due_at: Instant::now(),
+        };
+        let mut pending = active.clone();
+        pending.generation = 2;
+        app.annotations_dirty = true;
+        app.active_annotation_saves.insert(path.clone(), active);
+        app.pending_annotation_saves.insert(path.clone(), pending);
+        let (sender, receiver) = unbounded();
+        app.render_rx = receiver;
+        sender.send(RenderEvent::WorkerStopped).unwrap();
+        let _ = ctx.run(Default::default(), |ctx| app.poll_render_results(ctx));
+        assert!(app.annotations_dirty);
+        assert!(app.active_annotation_saves.is_empty());
+        assert_eq!(app.pending_annotation_saves[&path].generation, 2);
+        assert!(app.notices.iter().any(|notice| {
+            notice
+                .message
+                .contains("worker stopped before confirming the save")
+        }));
+    }
+
+    #[test]
     fn text_box_creation_edit_and_deletion_all_queue_complete_snapshots() {
         let (mut app, ctx, rx) = fixture();
         app.add_text_box_annotation(0, PdfRect::new(10.0, 20.0, 200.0, 60.0));
@@ -441,6 +555,96 @@ pub(super) mod tests {
         );
         assert!(!app.annotations_dirty);
         assert!(!app.tabs[0].annotations_dirty);
+    }
+
+    #[test]
+    fn retry_button_saves_latest_edits_after_a_failed_autosave() {
+        let (mut app, ctx, rx) = fixture();
+        app.add_text_box_annotation(0, PdfRect::new(10.0, 20.0, 200.0, 60.0));
+        let failed = start_save(&mut app, &ctx, &rx);
+        app.add_text_box_annotation(0, PdfRect::new(10.0, 80.0, 200.0, 100.0));
+        app.finish_annotation_autosave(
+            7,
+            failed.path.clone(),
+            failed.generation,
+            Err("File temporarily unavailable".into()),
+            &ctx,
+        );
+        assert!(app.annotations_dirty);
+        ctx.enable_accesskit();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0));
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                app.draw_notices(ctx);
+            },
+        );
+        let tree = output.platform_output.accesskit_update.unwrap();
+        let target = tree
+            .nodes
+            .iter()
+            .find_map(|(id, node)| (node.label() == Some("Retry saving")).then_some(*id))
+            .expect("accessible retry action");
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target,
+                    data: None,
+                },
+            )],
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| app.draw_notices(ctx));
+        match rx.try_recv().expect("retried autosave") {
+            RenderRequest::AutosaveAnnotations {
+                document_epoch,
+                path,
+                annotations,
+                ..
+            } => {
+                assert_eq!(document_epoch, 7);
+                assert_eq!(path, failed.path);
+                assert_eq!(annotations.len(), 2);
+            }
+            _ => panic!("retry did not request an annotation save"),
+        }
+        assert!(app.annotations_dirty);
+        assert_eq!(
+            std::fs::read(&failed.path).unwrap(),
+            b"initial test document"
+        );
+    }
+
+    #[test]
+    fn stale_retry_does_not_save_a_closed_or_already_saved_document() {
+        let (mut app, ctx, rx) = fixture();
+        let path = app.document.as_ref().unwrap().path.clone();
+        app.retry_annotation_save(7, path.clone(), &ctx);
+        assert!(rx.try_recv().is_err());
+        assert!(
+            app.notices
+                .back()
+                .unwrap()
+                .message
+                .contains("already saved")
+        );
+        app.tabs.clear();
+        app.document = None;
+        app.active_tab = None;
+        app.retry_annotation_save(7, path, &ctx);
+        assert!(rx.try_recv().is_err());
+        assert!(
+            app.notices
+                .back()
+                .unwrap()
+                .message
+                .contains("no longer open")
+        );
     }
 
     #[test]

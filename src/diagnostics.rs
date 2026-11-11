@@ -44,7 +44,10 @@ pub fn start_session() {
     let Some(root) = crate::settings::app_data_dir() else {
         return;
     };
-    if SESSION.set(initialize_at(&root, now_unix_ms(), std::process::id())).is_ok() {
+    if SESSION
+        .set(initialize_at(&root, now_unix_ms(), std::process::id()))
+        .is_ok()
+    {
         #[cfg(target_os = "macos")]
         install_normal_exit_hook();
     }
@@ -95,6 +98,46 @@ fn finish_native_exit(session: &Session) {
 /// Record a lifecycle milestone without document contents or credentials.
 pub fn event(name: &str) {
     event_details(name, Value::Null);
+}
+
+/// Timings contain only an internal phase name and durations, never PDF data.
+pub fn timing(name: &str, phase: &'static str, elapsed: std::time::Duration) {
+    event_details(
+        name,
+        json!({ "phase": phase, "duration_ms": elapsed.as_millis() }),
+    );
+}
+
+pub fn document_open_phases(
+    snapshot: std::time::Duration,
+    metadata: std::time::Duration,
+    annotations: std::time::Duration,
+    revision_and_recovery: std::time::Duration,
+) {
+    event_details(
+        "document_open_phases",
+        json!({
+            "recovery_snapshot_ms": snapshot.as_millis(),
+            "pdf_metadata_ms": metadata.as_millis(),
+            "annotations_ms": annotations.as_millis(),
+            "revision_and_recovery_ms": revision_and_recovery.as_millis(),
+        }),
+    );
+}
+
+pub fn slow_frame(
+    elapsed: std::time::Duration,
+    phase: &'static str,
+    phase_elapsed: std::time::Duration,
+) {
+    event_details(
+        "slow_frame",
+        json!({
+            "duration_ms": elapsed.as_millis(),
+            "slowest_phase": phase,
+            "phase_ms": phase_elapsed.as_millis(),
+        }),
+    );
 }
 
 /// Record a bounded error description. Callers must not pass PDF text or keys.
