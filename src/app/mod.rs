@@ -7654,7 +7654,7 @@ impl PdfEditorApp {
         // seen taking their places in it); the canvas and the printed page
         // over everything while the words lift; the words in flight above.
         for (_, landing, _, f) in &flights {
-            if !f.settled {
+            if review_reveal::hide_landing(f, page_alpha) {
                 painter.rect_filled(landing.rect.expand2(Vec2::new(1.0, 0.0)), 0.0, sheet_fill);
             }
         }

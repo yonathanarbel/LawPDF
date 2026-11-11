@@ -486,10 +486,16 @@ pub(super) fn page_alpha(p: f32) -> f32 {
     1.0 - motion::smoothstep(START_HOLD + STAGGER, PAGE_FADE_END, p)
 }
 
+/// Keep the destination covered until the moving copy can hand off to it.
+/// This also prevents two copies showing through as the source page fades.
+pub(super) fn hide_landing(flight: &Flight, page_alpha: f32) -> bool {
+    !flight.settled || page_alpha > 0.0
+}
+
 /// A landed word still needs to be drawn over the source page until the
 /// page has faded away and its real Review text is fully visible.
 pub(super) fn show_flight(flight: &Flight, page_alpha: f32) -> bool {
-    flight.alpha > 0.01 && (!flight.settled || page_alpha > 0.0)
+    flight.alpha > 0.01 && hide_landing(flight, page_alpha)
 }
 
 pub(super) fn with_alpha(color: Color32, alpha: f32) -> Color32 {
@@ -939,10 +945,15 @@ mod tests {
         let first_landed = flight(&word, end, START_HOLD + FLIGHT_DURATION).unwrap();
         assert!(first_landed.settled);
         assert!(page_alpha(START_HOLD + FLIGHT_DURATION) > 0.0);
+        assert!(hide_landing(
+            &first_landed,
+            page_alpha(START_HOLD + FLIGHT_DURATION)
+        ));
         assert!(show_flight(
             &first_landed,
             page_alpha(START_HOLD + FLIGHT_DURATION)
         ));
+        assert!(!hide_landing(&first_landed, 0.0));
         assert!(!show_flight(&first_landed, 0.0));
 
         word.order = 1.0;
