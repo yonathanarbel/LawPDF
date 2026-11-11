@@ -1080,7 +1080,7 @@ struct Lm2PymupdfGroupingBlock {
     source_line_ids: Vec<String>,
 }
 
-pub fn spawn_liquid_mode2_job(request: LiquidMode2Request, tx: Sender<LiquidMode2Event>) {
+pub fn spawn_liquid_mode2_job(request: LiquidMode2Request, tx: Sender<LiquidMode2Event>, repaint: egui::Context) {
     thread::Builder::new()
         .name("lawpdf-review-mode".to_owned())
         .spawn(move || {
@@ -1091,7 +1091,7 @@ pub fn spawn_liquid_mode2_job(request: LiquidMode2Request, tx: Sender<LiquidMode
             // as a dropped channel: the UI keeps showing "Preparing Review
             // Mode..." forever when no event ever arrives.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_liquid_mode2_job(request, &tx);
+                run_liquid_mode2_job(request, &tx, &repaint);
             }));
             if let Err(payload) = outcome {
                 let message = format!(
@@ -1107,6 +1107,7 @@ pub fn spawn_liquid_mode2_job(request: LiquidMode2Request, tx: Sender<LiquidMode
                     runtime_choice,
                     result: Err(message),
                 });
+                repaint.request_repaint();
             }
         })
         .expect("spawn Review Mode worker thread");
@@ -1124,7 +1125,7 @@ pub(crate) fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> Str
     }
 }
 
-fn run_liquid_mode2_job(request: LiquidMode2Request, tx: &Sender<LiquidMode2Event>) {
+fn run_liquid_mode2_job(request: LiquidMode2Request, tx: &Sender<LiquidMode2Event>, repaint: &egui::Context) {
     {
         let document_epoch = request.document_epoch;
         let path = request.path.clone();
@@ -1142,6 +1143,7 @@ fn run_liquid_mode2_job(request: LiquidMode2Request, tx: &Sender<LiquidMode2Even
                 runtime_choice,
                 result,
             });
+            repaint.request_repaint();
             return;
         }
         if !request.skip_progressive_preview
@@ -1158,6 +1160,7 @@ fn run_liquid_mode2_job(request: LiquidMode2Request, tx: &Sender<LiquidMode2Even
                 runtime_choice,
                 result: Ok(document),
             });
+            repaint.request_repaint();
         }
         let result = prepare_liquid_mode2_document(request);
         if let Ok(document) = &result {
@@ -1177,6 +1180,7 @@ fn run_liquid_mode2_job(request: LiquidMode2Request, tx: &Sender<LiquidMode2Even
             runtime_choice,
             result,
         });
+        repaint.request_repaint();
     }
 }
 

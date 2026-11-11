@@ -1,6 +1,6 @@
 [package]
 name = "lawpdf"
-version = "0.2.48"
+version = "0.2.89"
 edition = "2024"
 description = "Native PDF reader and annotation editor for legal workflows"
 license = "MIT"
@@ -39,7 +39,7 @@ zip = { version = "9.0.0", default-features = false, features = ["deflate"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
 objc2-pdf-kit = { version = "0.3.2", default-features = false, features = ["std", "PDFDocument", "objc2-app-kit"] }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "std"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSAccessibility", "NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSWorkspace", "std"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSAppleEventDescriptor", "NSAppleEventManager", "NSData", "NSDictionary", "NSError", "NSNotification", "NSObject", "NSString", "NSUserDefaults", "NSURL", "objc2-core-services", "std"] }
 objc2-vision = { version = "0.3.2", default-features = false, features = ["VNObservation", "VNRecognizeTextRequest", "VNRequest", "VNRequestHandler", "objc2-core-foundation", "std"] }
 
@@ -48,3 +48,10 @@ windows = { version = "0.61.3", features = ["Foundation", "Foundation_Collection
 
 [build-dependencies]
 winresource = { version = "0.1.31", default-features = false }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.dev.package."*"]
+opt-level = 3

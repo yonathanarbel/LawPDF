@@ -252,6 +252,42 @@ fn find_review_occurrences_remain_distinct_within_the_same_block() {
 }
 
 #[test]
+fn find_lands_on_text_after_a_review_footnote_marker() {
+    let ctx = Context::default();
+    let mut app = reader(&ctx);
+    let text = format!("Before {}12{} the target passage.", layout_roles::CALLOUT_START, layout_roles::CALLOUT_END);
+    let review: LiquidDocument = serde_json::from_value(serde_json::json!({
+        "title":"Reader","blocks":[{"role":"paragraph","text":text}, {"role":"footnote","text":"12. A note."}],
+        "llm_used":false,"warnings":[],"source_signature":"find-callout"
+    })).unwrap();
+    app.view_mode = DocumentViewMode::LiquidMode2;
+    app.liquid_mode2_complete = true;
+    app.liquid_mode2_state = LiquidState::Ready(Arc::new(review));
+    app.search_state.query = "target".into();
+    app.search_state.open = true;
+    let end = Instant::now() + Duration::from_secs(4);
+    while app.search_state.hits.is_empty() && Instant::now() < end {
+        frame(&ctx, &mut app, vec![], egui::Modifiers::NONE);
+        std::thread::yield_now();
+    }
+    assert_eq!(app.search_state.hits.len(), 1);
+    app.find_step(&ctx, false);
+    let doc = match &app.liquid_mode2_state {
+        LiquidState::Ready(d) => Arc::clone(d),
+        _ => unreachable!(),
+    };
+    app.liquid_footnote_index = build_liquid_footnote_index(&doc.blocks);
+    let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(960.0, 700.0))), ..Default::default() };
+    let _ = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            app.draw_liquid_feedback_block(ui, &doc, 0, &doc.blocks[0]);
+        });
+    });
+    assert!(!app.search_state.landing, "the visible match must land on its actual glyphs");
+    assert!(!app.search_state.block_landed, "a normal match must not need a fallback excerpt");
+}
+
+#[test]
 fn find_scope_follows_the_focused_split_pane() {
     let ctx = Context::default();
     let mut app = reader(&ctx);

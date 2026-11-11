@@ -181,7 +181,7 @@ impl PdfEditorApp {
             .title_bar(false)
             .frame(
                 egui::Frame::window(&ctx.style())
-                    .fill(BAR_FILL)
+                    .fill(self.app_palette().bar)
                     .corner_radius(8)
                     .inner_margin(Margin::symmetric(16, 14)),
             )
@@ -194,7 +194,7 @@ impl PdfEditorApp {
                         pending.copy.title()
                     ))
                     .small()
-                    .color(MUTED_INK),
+                    .color(self.app_palette().muted),
                 );
                 ui.add_space(8.0);
 
@@ -237,12 +237,12 @@ impl PdfEditorApp {
                 ui.label(
                     RichText::new("Leave Pages empty to print everything, or enter 1-4,7.")
                         .small()
-                        .color(MUTED_INK),
+                        .color(self.app_palette().muted),
                 );
 
                 if let Some(error) = &pending.error {
                     ui.add_space(4.0);
-                    ui.label(RichText::new(error).small().color(egui::Color32::LIGHT_RED));
+                    ui.label(RichText::new(error).small().color(ui.visuals().error_fg_color));
                 }
 
                 ui.add_space(8.0);

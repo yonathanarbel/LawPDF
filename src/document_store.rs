@@ -31,6 +31,22 @@ pub struct FileRevision {
     pub bytes: u64,
 }
 
+/// A revision computed from this exact immutable byte slice. Passing the pair
+/// together avoids rehashing the same in-memory snapshot before writing it.
+struct HashedBytes<'a> {
+    bytes: &'a [u8],
+    revision: FileRevision,
+}
+
+impl<'a> HashedBytes<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            revision: FileRevision::from_bytes(bytes),
+        }
+    }
+}
+
 impl FileRevision {
     pub fn from_bytes(bytes: &[u8]) -> Self {
         Self {
@@ -178,11 +194,11 @@ impl DocumentStore {
     /// acts as the compare-before-replace token for all subsequent PDF writes.
     pub fn capture(&self, source: &Path) -> Result<FileRevision, String> {
         let bytes = read_limited(source, MAX_DOCUMENT_BYTES)?;
-        let revision = FileRevision::from_bytes(&bytes);
-        revision.require_current(source)?;
+        let hashed = HashedBytes::new(&bytes);
+        hashed.revision.require_current(source)?;
         let _access = store_access();
-        self.write_snapshot(&revision, &bytes)?;
-        Ok(revision)
+        self.write_snapshot(&hashed)?;
+        Ok(hashed.revision)
     }
 
     /// Reserve and flush the next recovery source before changing the user's
@@ -192,10 +208,10 @@ impl DocumentStore {
         if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
             return Err("This PDF exceeds the document limit.".to_owned());
         }
-        let revision = FileRevision::from_bytes(bytes);
+        let hashed = HashedBytes::new(bytes);
         let _access = store_access();
-        self.write_snapshot(&revision, bytes)?;
-        Ok(revision)
+        self.write_snapshot(&hashed)?;
+        Ok(hashed.revision)
     }
 
     fn snapshot_path(&self, revision: &FileRevision) -> Result<PathBuf, String> {
@@ -217,10 +233,31 @@ impl DocumentStore {
             .join(format!("{:x}.json", Sha256::digest(key.as_bytes())))
     }
 
-    fn write_snapshot(&self, revision: &FileRevision, bytes: &[u8]) -> Result<PathBuf, String> {
-        if FileRevision::from_bytes(bytes) != *revision {
+    fn write_snapshot(&self, hashed: &HashedBytes<'_>) -> Result<PathBuf, String> {
+        self.write_hashed_snapshot_with_limit(hashed, MAX_RECOVERY_BYTES)
+    }
+
+    #[cfg(test)]
+    fn write_snapshot_with_limit(
+        &self,
+        revision: &FileRevision,
+        bytes: &[u8],
+        limit: u64,
+    ) -> Result<PathBuf, String> {
+        let hashed = HashedBytes::new(bytes);
+        if hashed.revision != *revision {
             return Err("Recovery snapshot did not match the document revision.".to_owned());
         }
+        self.write_hashed_snapshot_with_limit(&hashed, limit)
+    }
+
+    fn write_hashed_snapshot_with_limit(
+        &self,
+        hashed: &HashedBytes<'_>,
+        limit: u64,
+    ) -> Result<PathBuf, String> {
+        let revision = &hashed.revision;
+        let bytes = hashed.bytes;
         let path = self.snapshot_path(revision)?;
         if path.is_file() {
             if FileRevision::read(&path)? == *revision {
@@ -250,7 +287,7 @@ impl DocumentStore {
                 .map_err(|error| error.to_string())?;
             used = used.saturating_add(metadata.len());
         }
-        if used.saturating_add(bytes.len() as u64) > MAX_RECOVERY_BYTES {
+        if used.saturating_add(bytes.len() as u64) > limit {
             return Err("Local recovery storage reached its 4 GB limit. Use Settings to clear unused cached data, then try saving again. Pending recovery edits are preserved.".to_owned());
         }
         crate::atomic_file::write(&path, bytes)
@@ -306,20 +343,30 @@ impl DocumentStore {
         generation: u64,
         saved_bytes: &[u8],
     ) -> Result<FileRevision, String> {
-        let revision = FileRevision::from_bytes(saved_bytes);
+        let hashed = HashedBytes::new(saved_bytes);
+        self.acknowledge_hashed(source, generation, &hashed)?;
+        Ok(hashed.revision)
+    }
+
+    fn acknowledge_hashed(
+        &self,
+        source: &Path,
+        generation: u64,
+        hashed: &HashedBytes<'_>,
+    ) -> Result<(), String> {
         let _access = store_access();
-        self.write_snapshot(&revision, saved_bytes)?;
+        self.write_snapshot(hashed)?;
         let path = self.journal_path(source);
         match self.read_record(&path) {
             Ok(mut record) if record.generation > generation => {
-                record.base_revision = revision.clone();
+                record.base_revision = hashed.revision.clone();
                 self.write_record(&record)?;
             }
             Ok(_) => remove_durable(&path)?,
             Err(_) if !path.exists() => {}
             Err(error) => return Err(error),
         }
-        Ok(revision)
+        Ok(())
     }
 
     pub fn acknowledge_saved_file(
@@ -329,11 +376,11 @@ impl DocumentStore {
         expected: &FileRevision,
     ) -> Result<(), String> {
         let bytes = read_limited(source, MAX_DOCUMENT_BYTES)?;
-        if FileRevision::from_bytes(&bytes) != *expected {
+        let hashed = HashedBytes::new(&bytes);
+        if hashed.revision != *expected {
             return Err("The PDF changed again before saving was confirmed. Your recovery record was kept; save a separate copy.".to_owned());
         }
-        self.acknowledge(source, generation, &bytes)?;
-        Ok(())
+        self.acknowledge_hashed(source, generation, &hashed)
     }
 
     pub fn discard(&self, source: &Path) -> Result<(), String> {
@@ -623,6 +670,39 @@ mod tests {
         assert_eq!(recovered.record.base_revision, saved);
         assert_eq!(recovered.record.annotations, vec![annotation("newer")]);
     }
+
+    #[test]
+    fn saved_file_acknowledgment_rebases_newer_work_and_rejects_a_later_change() {
+        let (_directory, store, source, revision) = fixture();
+        store
+            .journal(&source, &revision, 2, &[annotation("keep")])
+            .unwrap();
+        let saved = b"saved first revision";
+        fs::write(&source, saved).unwrap();
+        let expected = FileRevision::from_bytes(saved);
+        store.acknowledge_saved_file(&source, 1, &expected).unwrap();
+        let rebased = store.pending_for(&source).unwrap().unwrap();
+        assert_eq!(rebased.record.generation, 2);
+        assert_eq!(rebased.record.base_revision, expected);
+        assert_eq!(fs::read(&rebased.snapshot_path).unwrap(), saved);
+        fs::write(&source, b"external revision").unwrap();
+        assert!(store.acknowledge_saved_file(&source, 2, &expected).is_err());
+        let preserved = store.pending_for(&source).unwrap().unwrap();
+        assert_eq!(preserved.record, rebased.record);
+        assert_eq!(fs::read(source).unwrap(), b"external revision");
+    }
+
+    #[test]
+    fn a_mismatched_snapshot_revision_is_rejected_before_writing() {
+        let (_directory, store, _source, _revision) = fixture();
+        let revision = FileRevision::from_bytes(b"different content");
+        assert!(
+            store
+                .write_snapshot_with_limit(&revision, b"actual content", 4096)
+                .is_err()
+        );
+        assert!(!store.snapshot_path(&revision).unwrap().exists());
+    }
     #[test]
     fn external_changes_are_rejected_and_original_snapshot_survives() {
         let (_directory, store, source, revision) = fixture();
@@ -680,8 +760,15 @@ mod tests {
         let (directory, store, source, revision) = fixture();
         let allocation =
             File::create(directory.path().join("recovery/sources/quota-placeholder")).unwrap();
-        allocation.set_len(MAX_RECOVERY_BYTES).unwrap();
-        assert!(store.preserve_bytes(b"new revision").is_err());
+        let test_limit = 4096;
+        allocation.set_len(test_limit).unwrap();
+        let new_bytes = b"new revision";
+        let new_revision = FileRevision::from_bytes(new_bytes);
+        assert!(
+            store
+                .write_snapshot_with_limit(&new_revision, new_bytes, test_limit)
+                .is_err()
+        );
         assert_eq!(FileRevision::read(&source).unwrap(), revision);
     }
     #[test]

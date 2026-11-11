@@ -116,6 +116,32 @@ pub struct EditorAnnotation {
     pub kind: AnnotationKind,
 }
 
+/// A read-only mark made by another PDF application. It is deliberately not
+/// an `EditorAnnotation`, so saving LawPDF edits cannot rewrite or claim it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignAnnotationKind {
+    Highlight,
+    Underline,
+    Squiggly,
+    StrikeOut,
+    Comment,
+    TextBox,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeignAnnotation {
+    pub page_index: usize,
+    pub rects: Vec<PdfRect>,
+    /// True only when every markup quadrilateral was usable, not when the
+    /// navigation rectangle was used as a fallback.
+    pub precise_text_geometry: bool,
+    pub kind: ForeignAnnotationKind,
+    pub text: String,
+    pub author: String,
+    pub color_rgb: [f32; 3],
+    pub key: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DocumentCommentSource {
     Embedded,
@@ -284,6 +310,27 @@ pub struct PageTextChar {
 pub struct PageLink {
     pub rect: PdfRect,
     pub url: String,
+    /// Zero-based page for an internal PDF destination, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_page: Option<usize>,
+    /// Distance from the top of the rotated, cropped page, if supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_fraction: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PdfOutlineItem {
+    pub title: String,
+    pub page_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_fraction: Option<f32>,
+    pub level: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PdfNavigation {
+    pub links: Vec<Vec<PageLink>>,
+    pub outline: Vec<PdfOutlineItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

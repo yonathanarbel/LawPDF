@@ -1,7 +1,8 @@
 use super::*;
 use crate::settings::effective_elevenlabs_api_key;
 use crate::tts::{
-    ApiSpeechConfig, SpeechEventKind, SpeechProvider, SpeechRequest, spawn_speech_job,
+    ApiSpeechConfig, SpeechEventKind, SpeechProvider, SpeechRequest, SpeechSegment,
+    spawn_speech_job,
 };
 
 impl PdfEditorApp {
@@ -45,6 +46,7 @@ impl PdfEditorApp {
             self.tts_controller.job_id,
             request,
             self.tts_controller.tx.clone(),
+            self.repaint_context.clone(),
         ));
         self.status = if exporting {
             format!(
@@ -57,13 +59,50 @@ impl PdfEditorApp {
     }
 
     pub(super) fn start_liquid_tts(&mut self, document: &LiquidDocument) {
-        let text = liquid_tts_text(document, self.settings.speech_include_notes);
+        self.start_liquid_tts_from(document, 0);
+    }
+
+    pub(super) fn start_liquid_tts_from(&mut self, document: &LiquidDocument, start: usize) {
+        let follow_document = if self.settings.speech_provider == SpeechProvider::System
+            && self.settings.speech_follow_along
+        {
+            let state = match self.view_mode {
+                DocumentViewMode::Liquid => Some(&self.liquid_state),
+                DocumentViewMode::LiquidMode2 => Some(&self.liquid_mode2_state),
+                DocumentViewMode::Pdf => None,
+            };
+            match state {
+                Some(LiquidState::Ready(current)) if std::ptr::eq(current.as_ref(), document) => {
+                    Some(Arc::downgrade(current))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let segments =
+            liquid_tts_segments_from(document, self.settings.speech_include_notes, start);
+        let text = segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
         if text.trim().is_empty() {
             self.status = "Nothing to read aloud.".to_owned();
             return;
         }
         let request = if self.settings.speech_provider == SpeechProvider::System {
-            SpeechRequest::System(text)
+            SpeechRequest::System {
+                segments: if follow_document.is_some() {
+                    segments
+                } else {
+                    vec![SpeechSegment {
+                        block_index: None,
+                        text,
+                    }]
+                },
+                rate: self.settings.system_speech_rate,
+            }
         } else {
             let Some(config) = self.selected_api_speech() else {
                 return;
@@ -75,6 +114,11 @@ impl PdfEditorApp {
             }
         };
         self.launch_speech(request, false);
+        if let Some(document) = follow_document {
+            self.tts_controller.follow_epoch = Some(self.document_epoch);
+            self.tts_controller.follow_view = Some(self.view_mode);
+            self.tts_controller.follow_document = Some(document);
+        }
     }
 
     pub(super) fn stop_liquid_tts(&mut self) {
@@ -84,7 +128,65 @@ impl PdfEditorApp {
             job.cancel();
         }
         self.tts_controller.progress = None;
+        self.clear_speech_follow();
         self.tts_controller.job_id = self.tts_controller.job_id.wrapping_add(1);
+    }
+
+    pub(super) fn clear_speech_follow_scroll(&mut self) {
+        if self.tts_controller.follow_epoch == Some(self.document_epoch)
+            && self.tts_controller.follow_target.is_some()
+            && self.liquid_scroll_to_block == self.tts_controller.follow_target
+        {
+            self.liquid_scroll_to_block = None;
+        }
+        self.tts_controller.follow_target = None;
+    }
+
+    pub(super) fn clear_speech_follow(&mut self) {
+        self.clear_speech_follow_scroll();
+        self.tts_controller.follow_epoch = None;
+        self.tts_controller.follow_view = None;
+        self.tts_controller.follow_document = None;
+        self.tts_controller.speaking_block = None;
+    }
+
+    pub(super) fn speech_follow_matches_current(&self) -> bool {
+        if self.tts_controller.follow_epoch != Some(self.document_epoch)
+            || self.tts_controller.follow_view != Some(self.view_mode)
+        {
+            return false;
+        }
+        let state = match self.view_mode {
+            DocumentViewMode::Liquid => &self.liquid_state,
+            DocumentViewMode::LiquidMode2 => &self.liquid_mode2_state,
+            DocumentViewMode::Pdf => return false,
+        };
+        match (state, &self.tts_controller.follow_document) {
+            (LiquidState::Ready(current), Some(follow)) => {
+                std::ptr::eq(Arc::as_ptr(current), follow.as_ptr())
+            }
+            _ => false,
+        }
+    }
+
+    fn follow_spoken_block(&mut self, block: Option<usize>) {
+        self.tts_controller.speaking_block = block;
+        if !self.speech_follow_matches_current() {
+            return;
+        }
+        if self.tts_controller.follow_target.is_some()
+            && self.liquid_scroll_to_block == self.tts_controller.follow_target
+        {
+            self.liquid_scroll_to_block = None;
+        }
+        self.tts_controller.follow_target = None;
+        if let Some(block) = block
+            && self.liquid_scroll_to_block.is_none()
+        {
+            self.tts_controller.follow_target = Some(block);
+            self.liquid_scroll_to_block = Some(block);
+            self.liquid_scroll_instant = self.settings.reduce_motion;
+        }
     }
 
     pub(super) fn start_paid_liquid_tts(&mut self, document: &LiquidDocument) {
@@ -136,9 +238,11 @@ impl PdfEditorApp {
                     };
                 }
                 SpeechEventKind::Playing => self.status = "Reading aloud…".to_owned(),
+                SpeechEventKind::BlockStarted(block) => self.follow_spoken_block(block),
                 SpeechEventKind::Complete(path) => {
                     self.tts_controller.active = None;
                     self.tts_controller.progress = None;
+                    self.clear_speech_follow();
                     if let Some(path) = path {
                         self.status = format!("Created {}", path.display());
                         self.push_info_notice(self.status.clone());
@@ -149,13 +253,11 @@ impl PdfEditorApp {
                 SpeechEventKind::Failed(error) => {
                     self.tts_controller.active = None;
                     self.tts_controller.progress = None;
+                    self.clear_speech_follow();
                     self.push_error_notice(error);
                 }
             }
             ctx.request_repaint();
-        }
-        if self.tts_controller.is_active() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 
@@ -184,6 +286,18 @@ impl PdfEditorApp {
         match self.settings.speech_provider {
             SpeechProvider::System => {
                 ui.label("Uses your computer's installed speech engine. Document text stays on this computer.");
+                save |= ui
+                    .add(
+                        egui::Slider::new(&mut self.settings.system_speech_rate, -5..=5)
+                            .text("Voice speed"),
+                    )
+                    .on_hover_text("Changes take effect on the next narration.")
+                    .changed();
+                let follow_changed = ui.checkbox(&mut self.settings.speech_follow_along, "Follow the spoken passage").on_hover_text("Highlight and keep each passage in view. Changes take effect on the next narration.").changed();
+                save |= follow_changed;
+                if follow_changed && !self.settings.speech_follow_along {
+                    self.clear_speech_follow();
+                }
                 #[cfg(target_os = "linux")]
                 ui.label(
                     "Requires espeak-ng or espeak. Only LawPDF's speech stops when you click Stop.",
@@ -263,7 +377,7 @@ impl PdfEditorApp {
                 if total > 0 {
                     ui.label(format!("{completed}/{total}"));
                 } else {
-                    ui.spinner();
+                    motion::busy(ui, self.settings.reduce_motion);
                 }
             }
         } else {
@@ -274,6 +388,15 @@ impl PdfEditorApp {
             };
             if ui.button("Read aloud").on_hover_text(tip).clicked() {
                 self.start_liquid_tts(document);
+                ui.ctx().request_repaint();
+            }
+            if let Some(start) = self.search_state.review_anchor.filter(|start| *start < document.blocks.len())
+                && ui.button("Read from here").on_hover_text(if self.settings.speech_provider == SpeechProvider::System {
+                    "Start at the first visible Review passage. Only linked footnotes are included when reading from here."
+                } else {
+                    "Send text from the first visible Review passage to the selected provider. Charges apply; only linked footnotes are included."
+                }).clicked() {
+                self.start_liquid_tts_from(document, start);
                 ui.ctx().request_repaint();
             }
             if self.settings.speech_provider != SpeechProvider::System && ui.button("Create MP3…")
@@ -304,5 +427,46 @@ impl PdfEditorApp {
             }
         });
         ui.add_space(6.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speech_follow_uses_current_document_and_preserves_user_jumps() {
+        let (mut app, _ctx, _worker) = annotation_saving::tests::fixture();
+        let document: Arc<LiquidDocument> = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "title":"Article", "blocks":[{"role":"paragraph","text":"A passage."}],
+                "llm_used":false,"warnings":[],"source_signature":"speech-follow"
+            }))
+            .unwrap(),
+        );
+        app.view_mode = DocumentViewMode::LiquidMode2;
+        app.liquid_mode2_state = LiquidState::Ready(Arc::clone(&document));
+        app.tts_controller.follow_epoch = Some(7);
+        app.tts_controller.follow_view = Some(DocumentViewMode::LiquidMode2);
+        app.tts_controller.follow_document = Some(Arc::downgrade(&document));
+        app.follow_spoken_block(Some(4));
+        assert_eq!(app.tts_controller.speaking_block, Some(4));
+        assert_eq!(app.liquid_scroll_to_block, Some(4));
+        app.follow_spoken_block(Some(5));
+        assert_eq!(app.liquid_scroll_to_block, Some(5));
+        app.liquid_scroll_to_block = Some(10);
+        app.follow_spoken_block(Some(6));
+        assert_eq!(app.liquid_scroll_to_block, Some(10));
+        app.follow_spoken_block(None);
+        assert_eq!(app.liquid_scroll_to_block, Some(10));
+        assert!(app.tts_controller.speaking_block.is_none());
+        app.document_epoch = 8;
+        app.liquid_scroll_to_block = None;
+        app.follow_spoken_block(Some(3));
+        assert!(app.liquid_scroll_to_block.is_none());
+        app.document_epoch = 7;
+        app.liquid_mode2_state = LiquidState::Ready(Arc::new((*document).clone()));
+        app.follow_spoken_block(Some(3));
+        assert!(app.liquid_scroll_to_block.is_none());
     }
 }

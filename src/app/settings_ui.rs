@@ -142,10 +142,52 @@ impl PdfEditorApp {
             .vscroll(true)
             .show(ctx, |ui| {
                 if let Some(error) = &self.settings.credential_error {
-                    ui.colored_label(Color32::DARK_RED, error);
+                    ui.colored_label(ui.visuals().error_fg_color, error);
                 }
                 if self.settings_ui.saving_credentials { ui.disable(); }
-                ui.label(RichText::new(APP_VERSION_LABEL).size(12.0).color(MUTED_INK));
+                ui.label(RichText::new(APP_VERSION_LABEL).size(12.0).color(self.app_palette().muted));
+                ui.add_space(8.0);
+                let mut appearance = self.settings.appearance;
+                ui.horizontal(|ui| {
+                    ui.label("Appearance");
+                    ui.selectable_value(&mut appearance, crate::settings::Appearance::System, "System");
+                    ui.selectable_value(&mut appearance, crate::settings::Appearance::Light, "Light");
+                    ui.selectable_value(&mut appearance, crate::settings::Appearance::Dark, "Dark");
+                });
+                if appearance != self.settings.appearance {
+                    self.settings.appearance = appearance;
+                    theme::set_preference(ctx, appearance);
+                    self.sync_review_appearance(ctx);
+                    self.queue_settings_save();
+                    ctx.request_repaint();
+                }
+                if ui.checkbox(&mut self.settings.reduce_motion, "Reduce motion")
+                    .on_hover_text("Reduce effects such as highlight animations and keyboard scrolling.").changed()
+                {
+                    let animation = if self.settings.reduce_motion {
+                        egui::style::ScrollAnimation::none()
+                    } else {
+                        egui::style::ScrollAnimation::duration(THUMBNAIL_SCROLL_SECONDS)
+                    };
+                    ctx.all_styles_mut(|style| style.scroll_animation = animation);
+                    self.queue_settings_save();
+                }
+                if ui.checkbox(&mut self.settings.dim_original_pages, "Dim original PDF pages")
+                    .on_hover_text("Warm and dim original pages on screen. The PDF, printed pages, and exports are unchanged; colors on screen will look different.").changed()
+                {
+                    self.queue_settings_save();
+                    ctx.request_repaint();
+                }
+                if ui.checkbox(&mut self.settings.optimize_large_documents, "Optimize PDF opening")
+                    .on_hover_text("Load detailed structure when Review Mode needs it. Applies to newly opened documents.").changed()
+                {
+                    self.queue_settings_save();
+                }
+                ui.collapsing("Advanced", |ui| {
+                    let grouping = ui.checkbox(&mut self.settings.liquid_mode2_use_pymupdf_blocks, "Use PyMuPDF block grouping").changed();
+                    let regions = ui.checkbox(&mut self.settings.liquid_mode2_use_pp_footnote_regions, "Use PP footnote regions").changed();
+                    if grouping || regions { self.queue_settings_save(); }
+                });
                 if updater::managed_by_store() {
                     ui.label("Microsoft Store manages updates for this installation.");
                 } else {
@@ -165,10 +207,10 @@ impl PdfEditorApp {
                             "Checking for updates…",
                             UpdateNoticeKind::Working,
                         ));
-                        updater::spawn_update_check(self.update_ui.tx.clone());
+                        updater::spawn_update_check(worker_waking_sender(self.update_ui.tx.clone(), ctx.clone()));
                     }
                     if self.update_ui.check_in_flight {
-                        ui.spinner();
+                        motion::busy(ui, self.settings.reduce_motion);
                     }
                 });
                 if let Some(error) = &self.update_ui.last_check_error {
@@ -179,10 +221,26 @@ impl PdfEditorApp {
                 }
                 ui.add_space(12.0);
                 ui.label(RichText::new("Local document data").strong());
-                ui.label("Cached text and images and old backup copies expire after the selected period. Unsaved edits and their source PDFs stay until you recover or discard them.");
+                if ui.checkbox(&mut self.settings.reopen_last_session, "Reopen last session on launch")
+                    .on_hover_text("Reopens tabs after a clean close when no document was explicitly opened. Session paths expire with reading history.").changed()
+                {
+                    if !self.settings.reopen_last_session {
+                        self.settings.last_session_paths.clear();
+                        self.settings.last_session_saved_unix = 0;
+                    } else {
+                        self.session_history_suppressed = false;
+                    }
+                    self.queue_settings_save();
+                }
+                ui.label("Reading history, cached text and images, and old backup copies expire after the selected period. Unsaved edits and their source PDFs stay until you recover or discard them.");
                 let retention_changed = ui.add(egui::Slider::new(&mut self.settings.cache_retention_days, 1..=365).text("Days to keep cached data")).changed();
                 if retention_changed {
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                    self.settings.prune_recent_documents(now);
                     if let Err(error) = save_settings(&self.settings) { self.push_error_notice(error); }
+                }
+                if ui.add_enabled(!self.settings.recent_documents.is_empty() || !self.settings.last_session_paths.is_empty(), egui::Button::new("Clear reading history")).clicked() {
+                    self.clear_reading_history();
                 }
                 if ui.add_enabled(!self.settings_ui.maintenance_busy, egui::Button::new("Clear cached text and images")).clicked() {
                     self.start_storage_maintenance(true, ctx);
@@ -191,7 +249,7 @@ impl PdfEditorApp {
                 if ui.button("Save support diagnostics…").clicked() { self.export_support_diagnostics(); }
                 ui.hyperlink_to("Privacy and data storage", "https://github.com/yonathanarbel/LawPDF/blob/main/docs/PRIVACY.md");
                 ui.add_space(12.0);
-                ui.label(RichText::new("Groq").strong().color(INK));
+                ui.label(RichText::new("Groq").strong().color(self.app_palette().ink));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.settings_ui.groq_api_key_edit)
                         .password(true)
@@ -199,7 +257,7 @@ impl PdfEditorApp {
                         .desired_width(360.0),
                 );
                 ui.add_space(8.0);
-                ui.label(RichText::new("OpenRouter").strong().color(INK));
+                ui.label(RichText::new("OpenRouter").strong().color(self.app_palette().ink));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.settings_ui.api_key_edit)
                         .password(true)
@@ -207,7 +265,7 @@ impl PdfEditorApp {
                         .desired_width(360.0),
                 );
                 ui.add_space(8.0);
-                ui.label(RichText::new("ElevenLabs (speech)").strong().color(INK));
+                ui.label(RichText::new("ElevenLabs (speech)").strong().color(self.app_palette().ink));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.settings_ui.elevenlabs_api_key_edit)
                         .password(true)
@@ -219,7 +277,7 @@ impl PdfEditorApp {
                 ui.label(
                     RichText::new("Keys are stored in your system credential store. Blank a field to remove its key.")
                         .size(10.0)
-                        .color(MUTED_INK),
+                        .color(self.app_palette().muted),
                 );
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {

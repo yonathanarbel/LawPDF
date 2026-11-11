@@ -3,8 +3,8 @@
 //! The words of the page the reader was on lift off the printed page and
 //! settle where they now live: body text into the reading column, footnote
 //! text into the margin cards beside the lines that cite them. It is a
-//! one-time explanation of what Review Mode did to the page, so it is kept
-//! short, it plays once per document, it never runs when the reader prefers
+//! one-time explanation of what Review Mode did to the page. It plays once
+//! per document, it never runs when the reader prefers
 //! reduced motion, and any click, scroll or key ends it at once.
 //!
 //! Sources and destinations are measured, never guessed: the printed
@@ -19,14 +19,13 @@ use std::sync::Arc;
 
 use egui::{Color32, Galley, Pos2, Rect, TextureId, Vec2};
 
-use super::PagePlacement;
+use super::{PagePlacement, motion};
 use crate::liquid::{LiquidBlockRole, LiquidDocument};
 use crate::model::{PageTextChar, PdfRect};
 use crate::review_reading::{is_review_note_display_block, split_fused_review_notes};
 
-/// Flight time of the reveal. Short enough to read as a settle, long enough
-/// to follow a word with the eye.
-pub(super) const REVEAL_SECONDS: f64 = 1.05;
+/// Total time for the complete reveal, including its opening and landing.
+pub(super) const REVEAL_SECONDS: f64 = motion::REVEAL_SECONDS;
 /// Source lines of each Review block on the page: (page index, line text).
 pub(super) type BlockLines = HashMap<usize, Vec<(usize, String)>>;
 /// Source lines of each footnote shown as a margin note, by note number.
@@ -38,8 +37,13 @@ const MIN_MATCHED_WORDS: usize = 16;
 const MAX_PAGE_WORDS: usize = 1400;
 /// Frames to wait for Review Mode to scroll to the page before giving up.
 const MAX_SETTLE_FRAMES: u8 = 8;
-/// Reading-order stagger: the last word leaves this far into the flight.
-const STAGGER: f32 = 0.32;
+/// A brief still moment makes the starting page legible before it lifts.
+const START_HOLD: f32 = 0.06;
+/// Successive words leave in reading order over this part of the timeline.
+const STAGGER: f32 = 0.40;
+/// Each word gets the same flight time, including the last word to leave.
+const FLIGHT_DURATION: f32 = 0.48;
+const PAGE_FADE_END: f32 = 0.74;
 /// Alignment work is bounded so a pathological page cannot stall a frame.
 const MAX_ALIGN_TOKENS: usize = 700;
 
@@ -143,21 +147,25 @@ impl ReviewReveal {
         if page_words.len() < MIN_MATCHED_WORDS || page_words.len() > MAX_PAGE_WORDS {
             return None;
         }
-        let total = page_words.len().max(1) as f32;
-        let words = page_words
+        let mut words = page_words
             .into_iter()
-            .enumerate()
-            .map(|(index, (text, rect))| RevealWord {
+            .map(|(text, rect)| RevealWord {
                 key: key(&text),
                 text,
                 from: placement.pdf_rect_to_screen(rect),
                 to: None,
-                order: index as f32 / total,
+                order: 0.0,
             })
             .filter(|word| word.from.intersects(viewport.expand(40.0)))
             .collect::<Vec<_>>();
         if words.len() < MIN_MATCHED_WORDS {
             return None;
+        }
+        // Stagger the words the reader can actually see across the whole
+        // sequence, even when most of a long page is outside the viewport.
+        let last = (words.len() - 1) as f32;
+        for (index, word) in words.iter_mut().enumerate() {
+            word.order = index as f32 / last;
         }
         Some(Self {
             page_index,
@@ -335,12 +343,13 @@ impl ReviewReveal {
         matched
     }
 
-    /// Eased 0..1 progress of the flight, or `None` when not playing.
+    /// Linear 0..1 timeline. Individual words have their own easing and
+    /// departure times; easing the global clock as well makes the middle rush.
     pub(super) fn progress(&self, now: f64) -> Option<f32> {
         match self.phase {
             RevealPhase::Playing { started } => {
                 let linear = ((now - started) / REVEAL_SECONDS).clamp(0.0, 1.0) as f32;
-                Some(ease_in_out(linear))
+                Some(linear)
             }
             RevealPhase::Settling { .. } => Some(0.0),
             RevealPhase::Done => None,
@@ -448,9 +457,9 @@ pub(super) struct Flight {
 /// destination stay on the printed page and fade with it; they get `None`.
 pub(super) fn flight(word: &RevealWord, end: Pos2, p: f32) -> Option<Flight> {
     let to = word.to?;
-    let depart = STAGGER * word.order;
-    let local = ((p - depart) / (1.0 - depart)).clamp(0.0, 1.0);
-    let e = ease_in_out(local);
+    let depart = START_HOLD + STAGGER * word.order.clamp(0.0, 1.0);
+    let local = ((p - depart) / FLIGHT_DURATION).clamp(0.0, 1.0);
+    let e = motion::smoothstep(0.0, 1.0, local);
     let from_size = (word.from.height() * 0.82).clamp(6.0, 40.0);
     let lift = if word.from.center().y > to.rect.center().y {
         18.0
@@ -465,34 +474,26 @@ pub(super) fn flight(word: &RevealWord, end: Pos2, p: f32) -> Option<Flight> {
         scale: size / to.style.size.max(1.0),
         // Invisible until it lifts, so the printed glyph underneath is the
         // only one the eye sees at rest.
-        alpha: smoothstep(0.0, 0.1, local),
+        alpha: motion::smoothstep(0.0, 0.1, local),
         departed: local,
         settled: local >= 0.97,
     })
 }
 
 /// How much of the printed page is still on screen at progress `p`. It
-/// stays until every word has lifted (the last departs at `STAGGER`).
+/// stays until every visible word has started lifting.
 pub(super) fn page_alpha(p: f32) -> f32 {
-    1.0 - smoothstep(STAGGER, 0.62, p)
+    1.0 - motion::smoothstep(START_HOLD + STAGGER, PAGE_FADE_END, p)
+}
+
+/// A landed word still needs to be drawn over the source page until the
+/// page has faded away and its real Review text is fully visible.
+pub(super) fn show_flight(flight: &Flight, page_alpha: f32) -> bool {
+    flight.alpha > 0.01 && (!flight.settled || page_alpha > 0.0)
 }
 
 pub(super) fn with_alpha(color: Color32, alpha: f32) -> Color32 {
     color.gamma_multiply(alpha.clamp(0.0, 1.0))
-}
-
-fn ease_in_out(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    if t < 0.5 {
-        4.0 * t * t * t
-    } else {
-        1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
-    }
-}
-
-fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
-    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
 }
 
 /// Matching key: letters and digits, lowercased. Punctuation and ligature
@@ -799,6 +800,37 @@ mod tests {
     }
 
     #[test]
+    fn stagger_uses_the_full_range_of_visible_words() {
+        let mut chars = Vec::new();
+        for index in 0..40 {
+            chars.push(ch('a', index as f32 * 10.0, 100.0));
+            chars.push(PageTextChar {
+                ch: ' ',
+                rect: None,
+                font_size: None,
+                bold: false,
+                italic: false,
+            });
+        }
+        let placement = PagePlacement {
+            rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0)),
+            page_width: 400.0,
+            page_height: 200.0,
+        };
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(160.0, 200.0));
+        let reveal = ReviewReveal::plan(0, &placement, None, &chars, viewport).unwrap();
+        assert!(reveal.words.len() >= MIN_MATCHED_WORDS && reveal.words.len() < 40);
+        assert_eq!(reveal.words.first().unwrap().order, 0.0);
+        assert_eq!(reveal.words.last().unwrap().order, 1.0);
+        assert!(
+            reveal
+                .words
+                .windows(2)
+                .all(|pair| pair[0].order < pair[1].order)
+        );
+    }
+
+    #[test]
     fn locate_lines_walks_contiguous_runs_with_tolerance() {
         let page = [
             "running", "head", "the", "court", "held", "that", "flood", "12", "means", "water",
@@ -816,10 +848,7 @@ mod tests {
         let page = ["one", "two"].map(key);
         // The first line reaches the end; the next line starts with the last
         // word but has no complete two-word match on this page.
-        assert_eq!(
-            locate_lines(&page, &["one two", "two missing"]),
-            vec![0, 1]
-        );
+        assert_eq!(locate_lines(&page, &["one two", "two missing"]), vec![0, 1]);
         assert!(locate_lines(&[key("two")], &["two missing"]).is_empty());
     }
 
@@ -882,7 +911,74 @@ mod tests {
     #[test]
     fn page_stays_until_every_word_has_lifted() {
         assert_eq!(page_alpha(0.0), 1.0);
-        assert_eq!(page_alpha(STAGGER), 1.0);
-        assert_eq!(page_alpha(0.62), 0.0);
+        assert_eq!(page_alpha(START_HOLD + STAGGER), 1.0);
+        assert!(page_alpha(0.6) > 0.0 && page_alpha(0.6) < 1.0);
+        assert_eq!(page_alpha(PAGE_FADE_END), 0.0);
+    }
+
+    #[test]
+    fn reveal_gives_each_word_time_and_keeps_early_landings_visible() {
+        let mut word = RevealWord {
+            text: "held".into(),
+            key: "held".into(),
+            from: Rect::from_min_size(Pos2::new(100.0, 600.0), Vec2::new(30.0, 12.0)),
+            to: Some(Landing {
+                rect: Rect::from_min_size(Pos2::new(400.0, 200.0), Vec2::new(40.0, 20.0)),
+                baseline: 215.0,
+                style: LandingStyle {
+                    size: 17.0,
+                    line_height: None,
+                },
+            }),
+            order: 0.0,
+        };
+        let end = Pos2::new(400.0, 201.0);
+        assert_eq!(flight(&word, end, START_HOLD).unwrap().departed, 0.0);
+        let first_mid = flight(&word, end, START_HOLD + FLIGHT_DURATION / 2.0).unwrap();
+        assert!((first_mid.departed - 0.5).abs() < 1e-5);
+        let first_landed = flight(&word, end, START_HOLD + FLIGHT_DURATION).unwrap();
+        assert!(first_landed.settled);
+        assert!(page_alpha(START_HOLD + FLIGHT_DURATION) > 0.0);
+        assert!(show_flight(
+            &first_landed,
+            page_alpha(START_HOLD + FLIGHT_DURATION)
+        ));
+        assert!(!show_flight(&first_landed, 0.0));
+
+        word.order = 1.0;
+        assert_eq!(
+            flight(&word, end, START_HOLD + STAGGER).unwrap().departed,
+            0.0
+        );
+        let last_mid = flight(&word, end, START_HOLD + STAGGER + FLIGHT_DURATION / 2.0).unwrap();
+        assert!((last_mid.departed - 0.5).abs() < 1e-5);
+        assert!(
+            flight(&word, end, START_HOLD + STAGGER + FLIGHT_DURATION)
+                .unwrap()
+                .settled
+        );
+        assert!(
+            f64::from(START_HOLD + STAGGER + FLIGHT_DURATION) * REVEAL_SECONDS < REVEAL_SECONDS
+        );
+    }
+
+    #[test]
+    fn reveal_uses_a_linear_clock_and_finishes_after_3_2_seconds() {
+        let reveal = ReviewReveal {
+            page_index: 0,
+            page_rect: Rect::NOTHING,
+            texture: None,
+            words: Vec::new(),
+            phase: RevealPhase::Playing { started: 10.0 },
+            labels: Vec::new(),
+            notes: Vec::new(),
+            last_layout: Vec::new(),
+            galleys: Vec::new(),
+        };
+        assert_eq!(reveal.progress(10.0), Some(0.0));
+        assert!((reveal.progress(10.8).unwrap() - 0.25).abs() < 1e-5);
+        assert!((reveal.progress(11.6).unwrap() - 0.5).abs() < 1e-5);
+        assert!(!reveal.finished(13.19));
+        assert!(reveal.finished(13.21));
     }
 }

@@ -27,6 +27,7 @@ mod model;
 mod native_process;
 mod ocr;
 mod page_geometry;
+mod page_text_codec;
 mod pdf_backend;
 mod performance_cache;
 #[cfg(all(target_os = "windows", feature = "devtools"))]
@@ -69,6 +70,7 @@ const APP_TITLE: &str = concat!(
 );
 
 fn main() -> eframe::Result<()> {
+    let startup_started = std::time::Instant::now();
     install_panic_log_hook();
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     if args.len() == 2 && args[0] == "--citation-source-probe" {
@@ -232,13 +234,22 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(APP_TITLE)
+        .with_icon(std::sync::Arc::new(load_app_icon()))
+        .with_inner_size([1280.0, 860.0])
+        .with_min_inner_size([720.0, 520.0]);
+    if let Some(saved) = settings::load_window_placement() {
+        viewport = viewport
+            .with_inner_size(saved.inner_size)
+            .with_maximized(saved.maximized);
+        if let Some(position) = saved.outer_position {
+            viewport = viewport.with_position(position);
+        }
+    }
     let options = eframe::NativeOptions {
         run_and_return: native_run_and_return(),
-        viewport: egui::ViewportBuilder::default()
-            .with_title(APP_TITLE)
-            .with_icon(std::sync::Arc::new(load_app_icon()))
-            .with_inner_size([1280.0, 860.0])
-            .with_min_inner_size([720.0, 520.0]),
+        viewport,
         ..Default::default()
     };
 
@@ -247,6 +258,11 @@ fn main() -> eframe::Result<()> {
         APP_TITLE,
         options,
         Box::new(move |cc| {
+            diagnostics::timing(
+                "startup_window",
+                "process_to_window",
+                startup_started.elapsed(),
+            );
             #[cfg(target_os = "macos")]
             {
                 macos_open_files.register();
@@ -346,6 +362,12 @@ const DEV_COMMANDS: &[DevCommand] = &[
     DevCommand {
         flags: &["--bench-scroll"],
         handler: dev_bench_scroll,
+    },
+    DevCommand {
+        flags: &["--bench-open-pipeline"],
+        handler: |args| {
+            benchmark::run_open_pipeline_benchmark(args).map_err(|error| format!("{error:#}"))
+        },
     },
     DevCommand {
         flags: &["--smoke-liquid", "--smoke-liquid2"],

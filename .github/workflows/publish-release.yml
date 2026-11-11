@@ -1,0 +1,59 @@
+name: Verify and publish reviewed LawPDF release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to verify (without v)
+        required: true
+        type: string
+      publish:
+        description: Publish after the existing signature and verification gates pass
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-lawpdf-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'yonathanarbel/LawPDF' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Verify package hashes, provenance, and installed Windows evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: python3 tools/publish_signed_release.py --version "$RELEASE_VERSION"
+
+  publish:
+    needs: verify
+    if: inputs.publish && github.repository == 'yonathanarbel/LawPDF' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Reverify and publish only with the maintainer signature
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: python3 tools/publish_signed_release.py --version "$RELEASE_VERSION" --publish

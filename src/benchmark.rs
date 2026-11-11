@@ -13,6 +13,166 @@ const BENCH_ZOOM: f32 = 1.25;
 const BENCH_PIXELS_PER_POINT: f32 = 1.0;
 const BENCH_MAX_TEXTURE_SIDE: u32 = 8192;
 
+/// Time the actual open/recovery pipeline through the first CPU raster.
+/// The caller supplies a fresh, absolute LAWPDF_BENCH_DATA_DIR so a benchmark
+/// never writes to or prunes the reader's normal recovery and performance data.
+pub fn run_open_pipeline_benchmark(args: Vec<OsString>) -> Result<()> {
+    use crate::render_worker::{PageRenderKey, RenderEvent, RenderRequest, spawn_render_worker};
+    use std::time::Duration;
+
+    let (source, scale) = parse_open_pipeline_args(&args)?;
+    let source = source
+        .canonicalize()
+        .context("Could not resolve the PDF path")?;
+    let metadata = std::fs::metadata(&source).context("Could not inspect the PDF")?;
+    anyhow::ensure!(metadata.is_file(), "The benchmark input must be a file");
+    let data_dir = std::env::var_os("LAWPDF_BENCH_DATA_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .context("Set LAWPDF_BENCH_DATA_DIR to a fresh absolute directory path")?;
+    std::fs::create_dir(&data_dir).with_context(|| {
+        format!(
+            "Benchmark data directory must not already exist: {}",
+            data_dir.display()
+        )
+    })?;
+
+    let start = Instant::now();
+    let (worker, events) = spawn_render_worker(None);
+    worker
+        .send(RenderRequest::OpenDocument {
+            path: source.clone(),
+            optimize_large_documents: true,
+            preview_page: Some(0),
+        })
+        .map_err(|error| anyhow::anyhow!("Could not queue document opening: {error}"))?;
+    let mut preview_ready_ms = None;
+    let opened = loop {
+        let remaining = Duration::from_secs(60).saturating_sub(start.elapsed());
+        match events
+            .recv_timeout(remaining)
+            .context("Timed out opening the PDF")?
+        {
+            RenderEvent::OpeningPreview { .. } => {
+                preview_ready_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            RenderEvent::DocumentOpened { result, .. } => {
+                break result.map_err(anyhow::Error::msg)?;
+            }
+            _ => bail!("The worker returned an unexpected opening event"),
+        }
+    };
+    let open_ms = start.elapsed().as_secs_f64() * 1000.0;
+    anyhow::ensure!(opened.document.page_count > 0, "The PDF has no pages");
+    worker.set_live_documents([1]);
+    worker.set_viewport(1, 0, 0, 0);
+    let key = PageRenderKey::new(1, 0, scale);
+    let render_started = Instant::now();
+    worker
+        .send(RenderRequest::Page {
+            key,
+            path: source.clone(),
+            zoom: 1.0,
+            render_scale: scale,
+            fast: false,
+        })
+        .map_err(|error| anyhow::anyhow!("Could not queue the first page: {error}"))?;
+    let page = loop {
+        let remaining = Duration::from_secs(30).saturating_sub(render_started.elapsed());
+        match events
+            .recv_timeout(remaining)
+            .context("Timed out rendering the first page")?
+        {
+            RenderEvent::Page { result, .. } => break result.map_err(anyhow::Error::msg)?,
+            // A preview arriving after the verified document is no longer useful.
+            RenderEvent::OpeningPreview { .. } => {}
+            _ => bail!("The worker returned an unexpected page event"),
+        }
+    };
+    let render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
+    let ready_ms = start.elapsed().as_secs_f64() * 1000.0;
+    opened
+        .revision
+        .require_current(&source)
+        .map_err(anyhow::Error::msg)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": "lawpdf-open-pipeline-benchmark-v1",
+            "app_version": env!("CARGO_PKG_VERSION"),
+            "input": source, "input_bytes": metadata.len(), "page_count": opened.document.page_count,
+            "optimized_open": true, "render_scale": scale,
+            "open_ms": open_ms, "first_page_render_ms": render_ms, "first_page_ready_ms": ready_ms,
+            "read_only_preview_ready_ms": preview_ready_ms,
+            "open_phase_ms": {
+                "recovery_snapshot": opened.timings.snapshot.as_secs_f64() * 1000.0,
+                "pdf_metadata": opened.timings.metadata.as_secs_f64() * 1000.0,
+                "annotations": opened.timings.annotations.as_secs_f64() * 1000.0,
+                "revision_and_recovery": opened.timings.revision_and_recovery.as_secs_f64() * 1000.0
+            },
+            "first_page_pixels": [page.width, page.height], "source_unchanged": true,
+            "data_directory": data_dir,
+            "scope": "Recovery snapshot, metadata, annotation read, first CPU raster and UI pixel preparation; excludes window, GPU upload and presentation."
+        }))?
+    );
+    drop(worker);
+    crate::native_process::shutdown();
+    Ok(())
+}
+
+fn parse_open_pipeline_args(args: &[OsString]) -> Result<(PathBuf, f32)> {
+    anyhow::ensure!(
+        args.len() == 2 || args.len() == 3,
+        "Usage: --bench-open-pipeline PDF [render-scale]"
+    );
+    anyhow::ensure!(
+        args[0] == OsStr::new("--bench-open-pipeline"),
+        "Expected --bench-open-pipeline"
+    );
+    let scale = if args.len() == 3 {
+        args[2]
+            .to_string_lossy()
+            .parse::<f32>()
+            .context("Render scale must be a number")?
+    } else {
+        1.0
+    };
+    anyhow::ensure!(
+        scale.is_finite() && (0.25..=4.0).contains(&scale),
+        "Render scale must be between 0.25 and 4.0"
+    );
+    Ok((PathBuf::from(&args[1]), scale))
+}
+
+#[cfg(test)]
+mod open_pipeline_tests {
+    use super::*;
+
+    #[test]
+    fn open_pipeline_arguments_require_a_path_and_safe_scale() {
+        let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            parse_open_pipeline_args(&args(&["--bench-open-pipeline", "paper.pdf"]))
+                .unwrap()
+                .1,
+            1.0
+        );
+        assert_eq!(
+            parse_open_pipeline_args(&args(&["--bench-open-pipeline", "paper.pdf", "2"]))
+                .unwrap()
+                .1,
+            2.0
+        );
+        for invalid in [
+            &["--bench-open-pipeline"][..],
+            &["--bench-open-pipeline", "paper.pdf", "NaN"][..],
+            &["--bench-open-pipeline", "paper.pdf", "8"][..],
+        ] {
+            assert!(parse_open_pipeline_args(&args(invalid)).is_err());
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum BenchLoadMode {
     Full,

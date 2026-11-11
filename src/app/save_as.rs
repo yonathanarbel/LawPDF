@@ -10,6 +10,14 @@ pub(super) struct SaveAsTask {
     result: Option<Receiver<Result<FileRevision, String>>>,
 }
 
+fn guarded_save_as(
+    work: impl FnOnce() -> Result<FileRevision, String>,
+) -> Result<FileRevision, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|_| {
+        Err("The Save As task stopped. Your original and edits were kept.".to_owned())
+    })
+}
+
 impl PdfEditorApp {
     pub(super) fn save_as_dialog(&mut self, ctx: &Context) {
         if self.save_as.is_some() || self.recovery_is_busy() || self.page_rotation_in_flight {
@@ -86,11 +94,11 @@ impl PdfEditorApp {
             task.result = Some(rx);
             let ctx = ctx.clone();
             std::thread::spawn(move || {
-                let result = (|| {
+                let result = guarded_save_as(|| {
                     let store = DocumentStore::new()?;
                     store.export_annotations(&source, &revision, &annotations, &destination)?;
                     store.capture(&destination)
-                })();
+                });
                 let _ = tx.send(result);
                 ctx.request_repaint();
             });
@@ -112,10 +120,11 @@ impl PdfEditorApp {
                 ui.add_space(48.0);
                 ui.heading("Saving PDF…");
                 ui.label(task.destination.display().to_string());
-                ui.spinner();
+                if !self.settings.reduce_motion {
+                    ui.spinner();
+                }
             });
         });
-        ctx.request_repaint_after(RENDER_POLL_INTERVAL);
         true
     }
 
@@ -199,6 +208,45 @@ impl PdfEditorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reduced_motion_save_as_waits_without_polling_and_reports_failure() {
+        let (mut app, ctx, _worker) = super::super::annotation_saving::tests::fixture();
+        app.settings.reduce_motion = true;
+        ctx.style_mut(|style| style.animation_time = 0.0);
+        app.annotations_dirty = true;
+        let source = app.document.as_ref().unwrap().path.clone();
+        let destination = source.with_file_name("save-as-idle.pdf");
+        app.begin_save_as(destination.clone()).unwrap();
+        let (sender, receiver) = unbounded();
+        app.save_as.as_mut().unwrap().result = Some(receiver);
+        for frame in 0..8 {
+            let output = ctx.run(
+                egui::RawInput {
+                    time: Some(frame as f64 * 0.2),
+                    ..Default::default()
+                },
+                |ctx| {
+                    assert!(app.poll_save_as(ctx));
+                },
+            );
+            if frame >= 4 {
+                assert_eq!(
+                    output.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+                    Duration::MAX
+                );
+            }
+        }
+        sender.send(Err("test failure".to_owned())).unwrap();
+        let _ = ctx.run(Default::default(), |ctx| {
+            assert!(!app.poll_save_as(ctx));
+        });
+        assert!(app.save_as.is_none());
+        assert!(app.annotations_dirty);
+        assert_eq!(app.document.as_ref().unwrap().path, source);
+        assert!(!destination.exists());
+        assert!(guarded_save_as(|| panic!("test panic")).is_err());
+    }
 
     fn edited_fixture() -> (PdfEditorApp, Context, Receiver<RenderRequest>) {
         let (mut app, ctx, rx) = super::super::annotation_saving::tests::fixture();
