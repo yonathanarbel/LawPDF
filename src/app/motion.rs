@@ -100,6 +100,9 @@ mod tests {
         use crate::render_worker::PreparedPage;
         use egui::{Color32, ColorImage, Pos2, Rect, TextureOptions, Vec2};
         let (mut app, ctx, _worker) = annotation_saving::tests::fixture();
+        // The host's accessibility setting may default this to true. This
+        // test exercises both choices explicitly and starts with motion on.
+        app.settings.reduce_motion = false;
         app.settings.dim_original_pages = false;
         let image = || ColorImage::new([2, 2], vec![Color32::WHITE; 4]);
         let thumbnail = ctx.load_texture("motion-thumb", image(), TextureOptions::LINEAR);

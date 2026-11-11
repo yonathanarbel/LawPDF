@@ -427,6 +427,12 @@ mod tests {
 
     #[test]
     fn clicking_link_in_other_side_by_side_pane_focuses_and_navigates_it() {
+        for reduce_motion in [false, true] {
+            exercise_side_by_side_link(reduce_motion);
+        }
+    }
+
+    fn exercise_side_by_side_link(reduce_motion: bool) {
         fn page_rect(shape: &egui::Shape) -> Option<Rect> {
             match shape {
                 egui::Shape::Rect(shape) if shape.fill == PAPER_FILL => Some(shape.rect),
@@ -435,6 +441,14 @@ mod tests {
             }
         }
         let (mut app, ctx, _worker) = annotation_saving::tests::fixture();
+        app.settings.reduce_motion = reduce_motion;
+        ctx.all_styles_mut(|style| {
+            style.scroll_animation = if reduce_motion {
+                egui::style::ScrollAnimation::none()
+            } else {
+                egui::style::ScrollAnimation::duration(THUMBNAIL_SCROLL_SECONDS)
+            };
+        });
         app.scroll_target_page = None;
         let mut second = app.document.as_ref().unwrap().clone();
         second.page_count = 4;
@@ -475,7 +489,12 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| app.draw_sbs_document(ui, ctx));
             })
         };
-        let output = draw(&mut app, 0.0, vec![]);
+        // The initial page can snap or animate depending on the preference.
+        // Measure the link only after that positioning has settled.
+        for step in 0..10 {
+            draw(&mut app, step as f64 * 0.1, vec![]);
+        }
+        let output = draw(&mut app, 1.0, vec![]);
         let rect = output
             .shapes
             .iter()
@@ -490,8 +509,8 @@ mod tests {
         }
         .pdf_rect_to_screen(link_rect)
         .center();
-        draw(&mut app, 0.1, vec![egui::Event::PointerMoved(point)]);
-        for (time, pressed) in [(0.2, true), (0.3, false)] {
+        draw(&mut app, 1.1, vec![egui::Event::PointerMoved(point)]);
+        for (time, pressed) in [(1.2, true), (1.3, false)] {
             draw(
                 &mut app,
                 time,
@@ -509,7 +528,7 @@ mod tests {
             app.sbs_pane_states[&8].destination_fraction,
             Some((2, 0.25))
         );
-        for step in 4..20 {
+        for step in 14..30 {
             draw(&mut app, step as f64 * 0.1, vec![]);
         }
         let landed = app
@@ -522,9 +541,13 @@ mod tests {
             "landed at {}",
             landed.top_fraction
         );
-        let _ = ctx.run(Default::default(), |ctx| {
-            app.navigate_jump_history(ctx, false)
-        });
+        let _ = ctx.run(
+            egui::RawInput {
+                time: Some(3.1),
+                ..Default::default()
+            },
+            |ctx| app.navigate_jump_history(ctx, false),
+        );
         assert_eq!(app.scroll_target_page, Some(0));
     }
 }

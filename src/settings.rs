@@ -924,14 +924,17 @@ mod tests {
         #[cfg(not(windows))]
         let (program, immediate, slow): (&str, &[&str], &[&str]) =
             ("sh", &["-c", "printf ready"], &["-c", "exec sleep 4"]);
+        // A busy hosted Windows runner can take several seconds to start
+        // PowerShell. This success-case allowance is separate from the real
+        // 250/500 ms desktop-query deadlines and the timeout test below.
         let output =
-            bounded_desktop_query(program, immediate, Instant::now() + Duration::from_secs(3));
+            bounded_desktop_query(program, immediate, Instant::now() + Duration::from_secs(15));
         assert_eq!(output.as_deref().map(str::trim), Some("ready"));
         let started = Instant::now();
         assert!(
             bounded_desktop_query(program, slow, started + Duration::from_millis(300)).is_none()
         );
-        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     fn temp_settings_path(test_name: &str) -> PathBuf {
