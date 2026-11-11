@@ -1,0 +1,11 @@
+{
+  "version": "0.2.89",
+  "commit": "14d81dc13eab07e28f592845b08dd143eca11aa9",
+  "release_id": 442146138,
+  "manifest_sha256": "c544e44057715744f19989d62ae98d6928ff7208d310872fddf1b33cb760b656",
+  "required_runs": [
+    43087069766,
+    43087005534,
+    43087072834
+  ]
+}
