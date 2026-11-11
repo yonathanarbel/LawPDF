@@ -26,7 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
-      contents: read
+      # GitHub requires write access to read an unpublished draft release.
+      contents: write
       actions: read
       attestations: read
     steps:
