@@ -31,7 +31,7 @@ impl PdfEditorApp {
         }
         if ctx
             .layer_id_at(pointer)
-            .is_some_and(|layer| layer.order > egui::Order::Middle)
+            .is_some_and(|layer| layer != egui::LayerId::background())
         {
             return;
         }
@@ -386,6 +386,54 @@ mod tests {
         let color = color_from_rgb(MARKER_PRESETS[0].color_rgb, 255);
         assert!(
             output
+                .shapes
+                .iter()
+                .any(|shape| has_color(&shape.shape, color))
+        );
+    }
+
+    #[test]
+    fn marker_cursor_does_not_cover_a_window_over_the_pdf() {
+        let (mut app, ctx, _worker) = annotation_saving::tests::fixture();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let point = Pos2::new(300.0, 300.0);
+        app.active_tool = Tool::Marker;
+        app.chrome.document_rect = Some(screen);
+        app.pdf_page_placements = vec![(
+            0,
+            PagePlacement {
+                rect: screen,
+                page_width: 612.0,
+                page_height: 792.0,
+            },
+        )];
+        let frame = |time, events: Vec<egui::Event>| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |_| {});
+                    egui::Area::new(egui::Id::new("cursor-test-dialog"))
+                        .order(egui::Order::Middle)
+                        .fixed_pos(Pos2::new(250.0, 250.0))
+                        .show(ctx, |ui| ui.set_min_size(Vec2::splat(100.0)));
+                    // A text field in the dialog can use the same I-beam as
+                    // the document; the layer still needs to suppress the badge.
+                    ctx.set_cursor_icon(CursorIcon::Text);
+                    app.draw_tool_cursor(ctx);
+                },
+            )
+        };
+        let _ = frame(0.0, vec![]);
+        let output = frame(0.1, vec![egui::Event::PointerMoved(point)]);
+        assert_eq!(ctx.layer_id_at(point).unwrap().order, egui::Order::Middle);
+        let color = color_from_rgb(MARKER_PRESETS[0].color_rgb, 255);
+        assert!(
+            !output
                 .shapes
                 .iter()
                 .any(|shape| has_color(&shape.shape, color))
