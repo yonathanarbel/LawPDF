@@ -42,6 +42,7 @@ mod speech_ui;
 mod support_ui;
 mod thumbnail_layout;
 mod theme;
+mod tool_cursor;
 mod tts_controller;
 mod update_ui;
 
@@ -1799,7 +1800,7 @@ impl PdfEditorApp {
         self.drag_preview = tab.drag_preview;
         self.active_signature_stroke = tab.active_signature_stroke;
         self.selection_state.pending_select_all = tab.pending_select_all_text;
-        self.selection_state.pending_mark = false;
+        self.selection_state.pending_mark = None;
         self.invalidate_search_results();
         self.search_state.query = tab.search_query;
         self.search_state.hits = tab.search_hits;
@@ -5386,6 +5387,48 @@ impl PdfEditorApp {
 
     fn marker_preset(&self) -> MarkerPreset {
         MARKER_PRESETS[self.marker_preset_index.min(MARKER_PRESETS.len() - 1)]
+    }
+
+    fn choose_marker_preset(&mut self, index: usize) {
+        self.marker_preset_index = index.min(MARKER_PRESETS.len() - 1);
+        self.active_tool = Tool::Marker;
+        let preset = self.marker_preset();
+        if self.view_mode == DocumentViewMode::Pdf
+            && (self.selection_state.text.is_some() || self.selection_state.pending_select_all)
+        {
+            self.mark_selection_when_ready(preset);
+        } else {
+            self.status = format!("Marker set to {}", preset.label);
+        }
+    }
+
+    fn mark_selection_when_ready(&mut self, preset: MarkerPreset) {
+        if self.selection_state.text.is_none() {
+            if self.selection_state.pending_select_all {
+                self.selection_state.pending_mark = Some(preset);
+                self.status = "Preparing selected text for highlighting…".to_owned();
+            }
+            return;
+        }
+        if self.selected_text().is_some() {
+            self.mark_selection(preset);
+        } else {
+            self.selection_state.pending_mark = Some(preset);
+            self.status = "Preparing selected text for highlighting…".to_owned();
+        }
+    }
+
+    fn finish_pending_mark(&mut self) {
+        if !self.selection_state.pending_select_all && self.selection_state.text.is_none() {
+            self.selection_state.pending_mark = None;
+            return;
+        }
+        if let Some(preset) = self.selection_state.pending_mark
+            && self.selected_text().is_some()
+        {
+            self.selection_state.pending_mark = None;
+            self.mark_selection(preset);
+        }
     }
 
     fn marker_opacity_for(&self, preset: MarkerPreset) -> f32 {
@@ -12191,7 +12234,7 @@ impl PdfEditorApp {
                         .map(|(start, end)| TextSelection::new(page_index, start, end))
                 });
                 if let Some(selection) = selection {
-                    self.selection_state.pending_mark = false;
+                    self.selection_state.pending_mark = None;
                     self.selection_state.anchor = None;
                     self.selection_state.extend_anchor =
                         Some((selection.start_page, selection.start));
@@ -12214,7 +12257,7 @@ impl PdfEditorApp {
                 .ensure_text_chars(page_index)
                 .and_then(|chars| selection_state::word_bounds(chars, index))
         {
-            self.selection_state.pending_mark = false;
+            self.selection_state.pending_mark = None;
             self.selection_state.anchor = None;
             self.selection_state.extend_anchor = Some((page_index, start));
             self.selection_state.text = Some(TextSelection::new(page_index, start, end));
@@ -12227,7 +12270,7 @@ impl PdfEditorApp {
             && let Some(pdf) = placement.screen_to_pdf(pos)
             && let Some(index) = self.text_char_index_at(page_index, pdf)
         {
-            self.selection_state.pending_mark = false;
+            self.selection_state.pending_mark = None;
             let (anchor_page, anchor_index) = self
                 .selection_state
                 .extend_anchor
@@ -12257,7 +12300,7 @@ impl PdfEditorApp {
             {
                 if let Some(pdf) = placement.screen_to_pdf(pos) {
                     if let Some(char_index) = self.text_char_index_at(page_index, pdf) {
-                        self.selection_state.pending_mark = false;
+                        self.selection_state.pending_mark = None;
                         self.selection_state.anchor = Some((page_index, char_index));
                         self.selection_state.extend_anchor = Some((page_index, char_index));
                         self.selection_state.text =
@@ -12341,12 +12384,7 @@ impl PdfEditorApp {
         if !down {
             self.selection_state.anchor = None;
             if self.active_tool == Tool::Marker {
-                if self.selected_text().is_some() {
-                    self.mark_selection(self.marker_preset());
-                } else if self.selection_state.text.is_some() {
-                    self.selection_state.pending_mark = true;
-                    self.status = "Preparing selected text for highlighting…".to_owned();
-                }
+                self.mark_selection_when_ready(self.marker_preset());
             } else if let Some(text) = self.selected_text() {
                 self.status = format!("Selected {} character(s)", text.chars().count());
             }
@@ -12616,6 +12654,7 @@ impl PdfEditorApp {
         self.selection_state.anchor = None;
         self.selection_state.extend_anchor = None;
         self.selection_state.toolbar_rect = None;
+        self.selection_state.pending_mark = None;
         self.selection_state.pending_select_all = true;
         self.finish_pending_select_all_text(ctx);
     }
@@ -12735,15 +12774,17 @@ impl PdfEditorApp {
             }
         }
 
+        if count == 0 {
+            self.status = "No highlightable text was found in the selection.".to_owned();
+            return;
+        }
         self.status = match preset.style {
             MarkerStyle::Highlight => {
                 format!("Highlighted selected text ({count} line segment(s))")
             }
             MarkerStyle::Underline => format!("Underlined selected text ({count} line segment(s))"),
         };
-        if count > 0 {
-            self.mark_annotations_changed();
-        }
+        self.mark_annotations_changed();
         self.clear_text_selection();
     }
 
@@ -12937,10 +12978,7 @@ impl eframe::App for PdfEditorApp {
                 self.enqueue_text_chars(&path, page);
             }
         }
-        if self.selection_state.pending_mark && self.selected_text().is_some() {
-            self.selection_state.pending_mark = false;
-            self.mark_selection(self.marker_preset());
-        }
+        self.finish_pending_mark();
         self.poll_ocr(ctx);
         self.poll_chat_results(ctx);
         self.poll_liquid_results(ctx);
@@ -13235,6 +13273,7 @@ impl eframe::App for PdfEditorApp {
         #[cfg(target_os = "windows")]
         self.draw_print_dialog(ctx);
         self.draw_file_drop_overlay(ctx);
+        self.draw_tool_cursor(ctx);
 
         // Workers wake the UI when they publish results. Queued opens and
         // in-flight animations are the only work that needs another frame here.

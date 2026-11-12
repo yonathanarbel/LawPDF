@@ -9,7 +9,8 @@ pub(super) struct SelectionState {
     pub(super) extend_anchor: Option<(usize, usize)>,
     pub(super) toolbar_rect: Option<Rect>,
     pub(super) pending_select_all: bool,
-    pub(super) pending_mark: bool,
+    /// The preset chosen for a selection whose page geometry is still loading.
+    pub(super) pending_mark: Option<MarkerPreset>,
 }
 
 pub(super) fn selected_text(

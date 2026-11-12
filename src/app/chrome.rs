@@ -1629,7 +1629,7 @@ impl PdfEditorApp {
                 self.active_tool = tool;
             }
         }
-        // Swatches: picking one arms the marker in that colour.
+        // A swatch also marks any existing PDF text selection.
         ui.add_space(2.0);
         for (index, preset) in MARKER_PRESETS.iter().copied().enumerate() {
             let selected = self.marker_preset_index == index;
@@ -1669,9 +1669,8 @@ impl PdfEditorApp {
             }
             accessibility::name_color_choice(&response, preset.label, selected);
             if response.on_hover_text(preset.label).clicked() && annotation_enabled {
-                self.marker_preset_index = index;
-                self.active_tool = Tool::Marker;
-                self.status = format!("Marker set to {}", preset.label);
+                self.choose_marker_preset(index);
+                ctx.request_repaint();
             }
         }
         bar_separator(ui);
@@ -2082,6 +2081,166 @@ fn paint_bell_mark(ui: &mut egui::Ui, stroke_color: Color32, letter_color: Color
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::PageInfo;
+
+    fn marker_test_chars(text: &str, bottom: f32) -> Vec<PageTextChar> {
+        text.chars()
+            .enumerate()
+            .map(|(index, ch)| PageTextChar {
+                ch,
+                rect: Some(PdfRect::new(
+                    72.0 + index as f32 * 9.0,
+                    bottom,
+                    80.0 + index as f32 * 9.0,
+                    bottom + 16.0,
+                )),
+                font_size: Some(12.0),
+                bold: false,
+                italic: false,
+            })
+            .collect()
+    }
+
+    fn markup_frame(
+        app: &mut PdfEditorApp,
+        ctx: &Context,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 900.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                app.draw_document(ctx);
+                app.draw_markup_bar(ctx);
+            },
+        )
+    }
+
+    fn swatch_center(shape: &egui::Shape, color: Color32) -> Option<Pos2> {
+        match shape {
+            egui::Shape::Circle(circle) if circle.radius == 8.0 && circle.fill == color => {
+                Some(circle.center)
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| swatch_center(shape, color)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn clicking_a_color_marks_the_existing_selection_and_arms_the_tool() {
+        let (mut app, ctx, _worker) = annotation_saving::tests::fixture();
+        app.settings.sidebar_in_pdf = false;
+        app.document.as_mut().unwrap().text_chars[0] = Some(marker_test_chars("Read", 700.0));
+        app.selection_state.text = Some(TextSelection::range(0, 0, 0, 3));
+        app.active_tool = Tool::Select;
+        let texture = ctx.load_texture(
+            "marker-swatch-test-page",
+            egui::ColorImage::filled([4, 4], Color32::WHITE),
+            TextureOptions::LINEAR,
+        );
+        app.page_textures.insert(
+            0,
+            PageTexture {
+                _zoom: app.zoom,
+                render_scale: app.page_render_scale(&ctx, 612.0, 792.0),
+                last_used: 1,
+                texture,
+                fade_started: None,
+            },
+        );
+        let _ = markup_frame(&mut app, &ctx, 0.0, vec![]);
+        let output = markup_frame(&mut app, &ctx, 0.1, vec![]);
+        let pink = MARKER_PRESETS[1];
+        let point = output
+            .shapes
+            .iter()
+            .find_map(|shape| swatch_center(&shape.shape, color_from_rgb(pink.color_rgb, 230)))
+            .expect("pink swatch is visible");
+        let _ = markup_frame(&mut app, &ctx, 0.2, vec![egui::Event::PointerMoved(point)]);
+        let _ = markup_frame(
+            &mut app,
+            &ctx,
+            0.3,
+            vec![pointer_button(point, egui::PointerButton::Primary, true)],
+        );
+        let _ = markup_frame(
+            &mut app,
+            &ctx,
+            0.4,
+            vec![pointer_button(point, egui::PointerButton::Primary, false)],
+        );
+        assert_eq!(app.active_tool, Tool::Marker);
+        assert_eq!(app.marker_preset_index, 1);
+        assert!(app.selection_state.text.is_none());
+        assert!(app.annotations_dirty);
+        assert_eq!(app.annotations.len(), 1);
+        assert!(matches!(
+            app.annotations[0].kind,
+            AnnotationKind::Marker { color_rgb, style: MarkerStyle::Highlight, .. }
+                if color_rgb == pink.color_rgb
+        ));
+    }
+
+    #[test]
+    fn swatch_waits_for_cross_page_geometry_and_uses_the_latest_choice() {
+        let (mut app, _ctx, _worker) = annotation_saving::tests::fixture();
+        let document = app.document.as_mut().unwrap();
+        document.page_count = 2;
+        document.pages.push(PageInfo::new(612.0, 792.0));
+        document.text_chars = vec![Some(marker_test_chars("AB", 700.0)), None];
+        app.selection_state.text = Some(TextSelection::range(0, 0, 1, 1));
+        app.choose_marker_preset(1);
+        app.choose_marker_preset(3);
+        assert!(app.annotations.is_empty());
+        assert_eq!(app.selection_state.pending_mark.unwrap().label, "Blue");
+        app.document.as_mut().unwrap().text_chars[1] = Some(marker_test_chars("CD", 700.0));
+        app.finish_pending_mark();
+        assert_eq!(app.annotations.len(), 2);
+        assert!(app.annotations.iter().all(|annotation| matches!(
+            annotation.kind,
+            AnnotationKind::Marker { color_rgb, style: MarkerStyle::Highlight, .. }
+                if color_rgb == MARKER_PRESETS[3].color_rgb
+        )));
+        assert!(app.selection_state.text.is_none());
+        assert!(app.annotations_dirty);
+    }
+
+    #[test]
+    fn swatch_applies_after_select_all_finishes_loading() {
+        let (mut app, ctx, _worker) = annotation_saving::tests::fixture();
+        app.select_all_text(&ctx);
+        assert!(app.selection_state.pending_select_all);
+        app.choose_marker_preset(1);
+        assert_eq!(app.selection_state.pending_mark.unwrap().label, "Pink");
+        app.document.as_mut().unwrap().text_chars[0] = Some(marker_test_chars("AB", 700.0));
+        app.finish_pending_select_all_text(&ctx);
+        app.finish_pending_mark();
+        assert_eq!(app.annotations.len(), 1);
+        assert!(matches!(
+            app.annotations[0].kind,
+            AnnotationKind::Marker { color_rgb, .. } if color_rgb == MARKER_PRESETS[1].color_rgb
+        ));
+    }
+
+    #[test]
+    fn choosing_underline_marks_selection_and_empty_selection_only_arms_it() {
+        let (mut app, _ctx, _worker) = annotation_saving::tests::fixture();
+        app.choose_marker_preset(5);
+        assert_eq!(app.active_tool, Tool::Marker);
+        assert!(app.annotations.is_empty());
+        app.document.as_mut().unwrap().text_chars[0] = Some(marker_test_chars("AB", 700.0));
+        app.selection_state.text = Some(TextSelection::range(0, 0, 0, 1));
+        app.choose_marker_preset(5);
+        assert!(matches!(
+            app.annotations[0].kind,
+            AnnotationKind::Marker { style: MarkerStyle::Underline, .. }
+        ));
+    }
 
     #[test]
     fn save_check_only_animates_after_the_active_documents_latest_success() {
