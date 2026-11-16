@@ -1632,7 +1632,7 @@ impl PdfEditorApp {
         // A swatch also marks any existing PDF text selection.
         ui.add_space(2.0);
         for (index, preset) in MARKER_PRESETS.iter().copied().enumerate() {
-            let selected = self.marker_preset_index == index;
+            let selected = self.active_tool == Tool::Marker && self.marker_preset_index == index;
             let (rect, response) = ui.allocate_exact_size(Vec2::new(22.0, 30.0), Sense::click());
             let center = rect.center();
             let color = color_from_rgb(preset.color_rgb, 230);
@@ -1660,7 +1660,7 @@ impl PdfEditorApp {
                     );
                 }
             }
-            if selected && self.active_tool == Tool::Marker {
+            if selected {
                 ui.painter()
                     .circle_stroke(center, 11.0, Stroke::new(1.5_f32, self.app_palette().ink));
             } else if response.hovered() {
@@ -2184,6 +2184,16 @@ mod tests {
             AnnotationKind::Marker { color_rgb, style: MarkerStyle::Highlight, .. }
                 if color_rgb == pink.color_rgb
         ));
+        let _ = markup_frame(
+            &mut app, &ctx, 0.5,
+            vec![pointer_button(point, egui::PointerButton::Primary, true)],
+        );
+        let _ = markup_frame(
+            &mut app, &ctx, 0.6,
+            vec![pointer_button(point, egui::PointerButton::Primary, false)],
+        );
+        assert_eq!(app.active_tool, Tool::Select);
+        assert_eq!(app.annotations.len(), 1);
     }
 
     #[test]
@@ -2233,6 +2243,8 @@ mod tests {
         app.choose_marker_preset(5);
         assert_eq!(app.active_tool, Tool::Marker);
         assert!(app.annotations.is_empty());
+        app.choose_marker_preset(5);
+        assert_eq!(app.active_tool, Tool::Select);
         app.document.as_mut().unwrap().text_chars[0] = Some(marker_test_chars("AB", 700.0));
         app.selection_state.text = Some(TextSelection::range(0, 0, 0, 1));
         app.choose_marker_preset(5);

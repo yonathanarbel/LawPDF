@@ -350,6 +350,56 @@ fn review_quote_page(
 }
 
 impl PdfEditorApp {
+    /// Ask egui's label selection plugin to copy the passage after a completed
+    /// selection gesture in Review. Inject before drawing labels so it collects
+    /// the final range in the same pass, just as it does for Ctrl+C.
+    pub(super) fn auto_copy_review_selection(&self, ui: &egui::Ui, ctx: &Context) {
+        let id = egui::Id::new(("review-auto-copy", self.document_epoch, ui.id()));
+        let (pressed, released, gesture, position) = ctx.input(|input| {
+            let pointer = &input.pointer;
+            (
+                pointer.primary_pressed(),
+                pointer.primary_released(),
+                pointer.is_decidedly_dragging()
+                    || pointer.button_double_clicked(egui::PointerButton::Primary)
+                    || pointer.button_triple_clicked(egui::PointerButton::Primary)
+                    || input.modifiers.shift,
+                pointer.interact_pos(),
+            )
+        });
+        if pressed {
+            let started_on_review = self.active_tool == Tool::Select
+                && self.sbs_mode.is_none()
+                && position.is_some_and(|pos| {
+                    ui.clip_rect().contains(pos)
+                        && ctx.layer_id_at(pos).is_none_or(|layer| layer == egui::LayerId::background())
+                });
+            ctx.data_mut(|data| data.insert_temp(id, started_on_review));
+        }
+        if released {
+            let started_on_review = ctx.data_mut(|data| data.remove_temp::<bool>(id)).unwrap_or(false);
+            if started_on_review && gesture && self.active_tool == Tool::Select {
+                ensure_copy_event(ctx);
+            }
+        }
+        let keyboard_selection = ctx.input(|input| input.events.iter().any(|event| matches!(
+            event,
+            egui::Event::Key {
+                key: egui::Key::ArrowLeft | egui::Key::ArrowRight | egui::Key::ArrowUp
+                    | egui::Key::ArrowDown | egui::Key::Home | egui::Key::End,
+                pressed: true, modifiers, ..
+            } if modifiers.shift
+        )));
+        if keyboard_selection
+            && self.active_tool == Tool::Select
+            && self.sbs_mode.is_none()
+            && !ctx.wants_keyboard_input()
+            && ctx.plugin::<egui::text_selection::LabelSelectionState>().lock().has_selection()
+        {
+            ensure_copy_event(ctx);
+        }
+    }
+
     fn active_review_document(&self) -> Option<&Arc<LiquidDocument>> {
         match self.view_mode {
             DocumentViewMode::Liquid => match &self.liquid_state {
@@ -758,7 +808,7 @@ mod tests {
             &mut app,
         );
         let _ = draw(0.4, vec![egui::Event::PointerMoved(end)], 0, &mut app);
-        let _ = draw(
+        let automatic = draw(
             0.5,
             vec![egui::Event::PointerButton {
                 pos: end,
@@ -784,9 +834,29 @@ mod tests {
                 _ => None,
             })
             .expect("ordinary copy must produce the selected text");
+        let automatically_copied = automatic.platform_output.commands.iter().find_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text.as_str()),
+            _ => None,
+        });
+        assert_eq!(automatically_copied, Some(selected.as_str()));
         assert!(selected.contains("paragraph has selected words"));
         assert!(selected.contains("Second"));
         assert!(!selected.contains("Article"));
+        let keyboard = draw(0.65, vec![egui::Event::Key {
+            key: egui::Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::SHIFT,
+        }], 0, &mut app);
+        let selected = keyboard.platform_output.commands.iter().find_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        }).expect("keyboard selection should also be copied");
+        let ordinary_after_key = draw(0.66, vec![egui::Event::Copy], 1, &mut app);
+        assert!(ordinary_after_key.platform_output.commands.iter().any(|command| matches!(
+            command, egui::OutputCommand::CopyText(text) if text == &selected
+        )));
         let citation = draw(0.7, vec![], 2, &mut app);
         let clipboard_commands = citation
             .platform_output

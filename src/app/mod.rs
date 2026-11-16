@@ -557,6 +557,8 @@ pub struct PdfEditorApp {
     recent_suppressed_epoch: Option<u64>,
     session_history_suppressed: bool,
     active_tool: Tool,
+    #[cfg(target_os = "windows")]
+    native_marker_cursor: Option<tool_cursor::NativeMarkerCursor>,
     sidebar_tab: SidebarTab,
     selection_state: SelectionState,
     selected_text_box: Option<usize>,
@@ -1528,6 +1530,8 @@ impl PdfEditorApp {
             recent_suppressed_epoch: None,
             session_history_suppressed: false,
             active_tool: Tool::Select,
+            #[cfg(target_os = "windows")]
+            native_marker_cursor: None,
             sidebar_tab: SidebarTab::Pages,
             selection_state: SelectionState::default(),
             selected_text_box: None,
@@ -1801,6 +1805,7 @@ impl PdfEditorApp {
         self.active_signature_stroke = tab.active_signature_stroke;
         self.selection_state.pending_select_all = tab.pending_select_all_text;
         self.selection_state.pending_mark = None;
+        self.selection_state.pending_copy = None;
         self.invalidate_search_results();
         self.search_state.query = tab.search_query;
         self.search_state.hits = tab.search_hits;
@@ -5390,7 +5395,14 @@ impl PdfEditorApp {
     }
 
     fn choose_marker_preset(&mut self, index: usize) {
-        self.marker_preset_index = index.min(MARKER_PRESETS.len() - 1);
+        let index = index.min(MARKER_PRESETS.len() - 1);
+        if self.active_tool == Tool::Marker && self.marker_preset_index == index {
+            self.active_tool = Tool::Select;
+            self.status = "Selection tool active.".to_owned();
+            return;
+        }
+        self.selection_state.pending_copy = None;
+        self.marker_preset_index = index;
         self.active_tool = Tool::Marker;
         let preset = self.marker_preset();
         if self.view_mode == DocumentViewMode::Pdf
@@ -6688,6 +6700,7 @@ impl PdfEditorApp {
     }
 
     fn draw_liquid_document(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+        self.auto_copy_review_selection(ui, ctx);
         ui.set_style(ctx.style_of(if self.liquid_theme == LiquidTheme::Dark { egui::Theme::Dark } else { egui::Theme::Light }));
         ui.painter().rect_filled(ui.max_rect(), 0.0, self.review_sheet_colors().0);
         let state = self.liquid_state.clone();
@@ -6899,6 +6912,7 @@ impl PdfEditorApp {
     }
 
     fn draw_liquid_mode2_document(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+        self.auto_copy_review_selection(ui, ctx);
         ui.set_style(ctx.style_of(if self.liquid_theme == LiquidTheme::Dark { egui::Theme::Dark } else { egui::Theme::Light }));
         let state = self.liquid_mode2_state.clone();
         let ready_document = match &state {
@@ -12245,6 +12259,7 @@ impl PdfEditorApp {
                         "Selected an estimated paragraph on this page."
                     }
                     .to_owned();
+                    self.auto_copy_pdf_selection(&response.ctx);
                 }
             }
             return;
@@ -12261,6 +12276,7 @@ impl PdfEditorApp {
             self.selection_state.anchor = None;
             self.selection_state.extend_anchor = Some((page_index, start));
             self.selection_state.text = Some(TextSelection::new(page_index, start, end));
+            self.auto_copy_pdf_selection(&response.ctx);
             return;
         }
         if response.clicked()
@@ -12283,6 +12299,7 @@ impl PdfEditorApp {
                     self.request_text_chars(&response.ctx, &path, page);
                 }
             }
+            self.auto_copy_pdf_selection(&response.ctx);
             return;
         }
         if response.clicked()
@@ -12293,6 +12310,7 @@ impl PdfEditorApp {
         }
 
         if response.drag_started() {
+            self.selection_state.pending_copy = None;
             if let Some(pos) = response
                 .ctx
                 .input(|input| input.pointer.press_origin())
@@ -12385,8 +12403,8 @@ impl PdfEditorApp {
             self.selection_state.anchor = None;
             if self.active_tool == Tool::Marker {
                 self.mark_selection_when_ready(self.marker_preset());
-            } else if let Some(text) = self.selected_text() {
-                self.status = format!("Selected {} character(s)", text.chars().count());
+            } else if self.active_tool == Tool::Select {
+                self.auto_copy_pdf_selection(ctx);
             }
         }
     }
@@ -12553,6 +12571,31 @@ impl PdfEditorApp {
         self.copy_text_to_clipboard(ctx, text);
     }
 
+    fn auto_copy_pdf_selection(&mut self, ctx: &Context) {
+        if self.active_tool != Tool::Select || self.view_mode != DocumentViewMode::Pdf {
+            return;
+        }
+        self.selection_state.pending_copy = self.selection_state.text;
+        self.finish_pending_auto_copy(ctx);
+    }
+
+    fn finish_pending_auto_copy(&mut self, ctx: &Context) {
+        let Some(selection) = self.selection_state.pending_copy else {
+            return;
+        };
+        if self.active_tool != Tool::Select
+            || self.view_mode != DocumentViewMode::Pdf
+            || self.selection_state.text != Some(selection)
+            || self.selection_state.anchor.is_some()
+            || !ctx.input(|input| input.focused)
+        {
+            self.selection_state.pending_copy = None;
+        } else if let Some(text) = self.selected_text() {
+            self.selection_state.pending_copy = None;
+            self.copy_text_to_clipboard(ctx, text);
+        }
+    }
+
     fn copy_review_shortcut(&mut self, ctx: &Context) {
         let has_selection = ctx
             .plugin::<egui::text_selection::LabelSelectionState>()
@@ -12587,6 +12630,8 @@ impl PdfEditorApp {
     }
 
     fn copy_text_to_clipboard(&mut self, ctx: &Context, text: String) {
+        // A later explicit copy should not be replaced by a slow page load.
+        self.selection_state.pending_copy = None;
         let chars = text.chars().count();
         ctx.copy_text(text);
         self.status = copy_status_message(chars);
@@ -12599,7 +12644,10 @@ impl PdfEditorApp {
                 ctx.plugin::<egui::text_selection::LabelSelectionState>()
                     .lock()
                     .clear_selection();
-                self.select_all_liquid_text()
+                self.select_all_liquid_text();
+                if self.active_tool == Tool::Select && self.selection_state.liquid_all {
+                    self.copy_liquid_selection(ctx);
+                }
             }
         }
     }
@@ -12655,6 +12703,7 @@ impl PdfEditorApp {
         self.selection_state.extend_anchor = None;
         self.selection_state.toolbar_rect = None;
         self.selection_state.pending_mark = None;
+        self.selection_state.pending_copy = None;
         self.selection_state.pending_select_all = true;
         self.finish_pending_select_all_text(ctx);
     }
@@ -12738,6 +12787,7 @@ impl PdfEditorApp {
         self.selection_state.toolbar_rect = None;
         self.selection_state.pending_select_all = false;
         self.status = format!("Selected all text ({character_count} character(s))");
+        self.auto_copy_pdf_selection(ctx);
         ctx.request_repaint();
     }
 
@@ -12926,7 +12976,7 @@ impl eframe::App for PdfEditorApp {
         crate::diagnostics::cleanup_completed();
     }
 
-    fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
         self.sync_review_appearance(ctx);
         let mut frame_timing = FrameStallTimer::new();
         if ctx.input(|input| input.viewport().close_requested()) && !self.allow_window_close {
@@ -12979,6 +13029,7 @@ impl eframe::App for PdfEditorApp {
             }
         }
         self.finish_pending_mark();
+        self.finish_pending_auto_copy(ctx);
         self.poll_ocr(ctx);
         self.poll_chat_results(ctx);
         self.poll_liquid_results(ctx);
@@ -13273,7 +13324,7 @@ impl eframe::App for PdfEditorApp {
         #[cfg(target_os = "windows")]
         self.draw_print_dialog(ctx);
         self.draw_file_drop_overlay(ctx);
-        self.draw_tool_cursor(ctx);
+        self.update_tool_cursor(ctx, frame);
 
         // Workers wake the UI when they publish results. Queued opens and
         // in-flight animations are the only work that needs another frame here.
@@ -14610,8 +14661,8 @@ fn draw_comment_marker(
 
 fn tool_cursor(tool: Tool) -> CursorIcon {
     match tool {
-        Tool::Select => CursorIcon::Text,
-        Tool::Marker => CursorIcon::Text,
+        Tool::Select => CursorIcon::Default,
+        Tool::Marker => CursorIcon::Default,
         Tool::TextBox => CursorIcon::Text,
         Tool::Signature => CursorIcon::Cell,
     }

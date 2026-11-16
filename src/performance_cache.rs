@@ -101,11 +101,11 @@ impl PerformanceCache {
     }
 
     pub fn load_page_text(&self, source: &Path, page_index: usize) -> Option<String> {
-        fs::read_to_string(self.page_path(source, "text", page_index, "txt")?).ok()
+        fs::read_to_string(self.page_path(source, "text-v2-watermarks", page_index, "txt")?).ok()
     }
 
     pub fn save_page_text(&self, source: &Path, page_index: usize, text: &str) {
-        if let Some(path) = self.page_path(source, "text", page_index, "txt") {
+        if let Some(path) = self.page_path(source, "text-v2-watermarks", page_index, "txt") {
             let _ = write_atomic(&path, text.as_bytes());
         }
     }
@@ -115,7 +115,7 @@ impl PerformanceCache {
         source: &Path,
         page_index: usize,
     ) -> Option<Vec<PageTextChar>> {
-        let path = self.page_path(source, "chars-v1", page_index, "bin")?;
+        let path = self.page_path(source, "chars-v2-watermarks", page_index, "bin")?;
         let file = fs::File::open(path).ok()?;
         let mut bytes = Vec::new();
         file.take((crate::page_text_codec::MAX_ENCODED_BYTES + 1) as u64)
@@ -124,7 +124,7 @@ impl PerformanceCache {
     }
 
     pub fn save_page_text_chars(&self, source: &Path, page_index: usize, chars: &[PageTextChar]) {
-        let Some(path) = self.page_path(source, "chars-v1", page_index, "bin") else {
+        let Some(path) = self.page_path(source, "chars-v2-watermarks", page_index, "bin") else {
             return;
         };
         if let Ok(bytes) = crate::page_text_codec::encode(chars) {
@@ -514,7 +514,16 @@ mod tests {
         fs::write(&old, b"[]").unwrap();
         assert!(cache.load_page_text_chars(&source, 0).is_none());
 
-        let new = cache.page_path(&source, "chars-v1", 0, "bin").unwrap();
+        // Valid pre-watermark text and binary geometry must both be ignored.
+        let legacy_text = cache.page_path(&source, "text", 0, "txt").unwrap();
+        fs::create_dir_all(legacy_text.parent().unwrap()).unwrap();
+        fs::write(&legacy_text, b"stale watermark").unwrap();
+        assert!(cache.load_page_text(&source, 0).is_none());
+        let legacy_chars = cache.page_path(&source, "chars-v1", 0, "bin").unwrap();
+        fs::create_dir_all(legacy_chars.parent().unwrap()).unwrap();
+        fs::write(&legacy_chars, crate::page_text_codec::encode(&[]).unwrap()).unwrap();
+        assert!(cache.load_page_text_chars(&source, 0).is_none());
+        let new = cache.page_path(&source, "chars-v2-watermarks", 0, "bin").unwrap();
         fs::create_dir_all(new.parent().unwrap()).unwrap();
         fs::write(&new, b"LPC1\x01\0\0\0").unwrap();
         assert!(cache.load_page_text_chars(&source, 0).is_none());

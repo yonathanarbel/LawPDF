@@ -21,6 +21,7 @@ use crate::performance_cache::{CachedDocumentMetadata, PerformanceCache};
 
 mod foreign_annotations;
 mod navigation;
+mod watermarks;
 pub use foreign_annotations::load_foreign_annotations_checked;
 
 #[cfg(not(test))]
@@ -39,6 +40,7 @@ struct OpenPdfDocument {
     path: PathBuf,
     document: PdfDocument<'static>,
     editor_annotation_indices: HashMap<usize, Vec<usize>>,
+    watermarks: watermarks::Watermarks,
 }
 
 struct AnnotationVisibilityGuard<'a>(Vec<(PdfPageAnnotation<'a>, bool)>);
@@ -306,7 +308,8 @@ impl NativePdfEngine {
         if let Some(text) = self.performance_cache.load_page_text(path, page_index) {
             return Ok(text);
         }
-        let text = self.with_open_document(path, |document| {
+        let text = self.with_open_document_data(path, |open| {
+            let document = &open.document;
             let page = document
                 .pages()
                 .get(page_index as u16)
@@ -316,7 +319,15 @@ impl NativePdfEngine {
                 .text()
                 .with_context(|| format!("failed to read text on page {}", page_index + 1))?;
 
-            Ok(text_page.all())
+            let excluded = open.watermarks.excluded(document, page_index, &page, &text_page);
+            if excluded.iter().any(|&skip| skip) {
+                Ok(text_page.chars().iter()
+                    .filter(|ch| !excluded[ch.index() as usize])
+                    .filter_map(|ch| ch.unicode_char().filter(|&c| c != '\0'))
+                    .collect())
+            } else {
+                Ok(text_page.all())
+            }
         })?;
         self.performance_cache
             .save_page_text(path, page_index, &text);
@@ -334,7 +345,8 @@ impl NativePdfEngine {
         {
             return Ok(chars);
         }
-        let chars = self.with_open_document(path, |document| {
+        let chars = self.with_open_document_data(path, |open| {
+            let document = &open.document;
             let page = document
                 .pages()
                 .get(page_index as u16)
@@ -345,7 +357,8 @@ impl NativePdfEngine {
                 .with_context(|| format!("failed to read text on page {}", page_index + 1))?;
 
             let geometry = native_page_geometry(&page);
-            let mut chars = extract_text_chars(&text_page);
+            let excluded = open.watermarks.excluded(document, page_index, &page, &text_page);
+            let mut chars = extract_text_chars(&text_page, &excluded);
             for character in &mut chars {
                 character.rect = character.rect.map(|rect| geometry.rect(rect, false));
             }
@@ -612,6 +625,7 @@ impl NativePdfEngine {
                 path: path.to_path_buf(),
                 document,
                 editor_annotation_indices: editor_annotation_indices(path).unwrap_or_default(),
+                watermarks: watermarks::Watermarks::default(),
             });
             while open_documents.len() > OPEN_DOCUMENT_CACHE_CAP {
                 open_documents.pop_back();
@@ -758,10 +772,11 @@ fn crop_local_visible_rect(rect: PdfRect, crop_box: PdfRect) -> Option<PdfRect> 
     (right > left && top > bottom).then(|| PdfRect::new(left, bottom, right, top))
 }
 
-fn extract_text_chars(text_page: &PdfPageText<'_>) -> Vec<PageTextChar> {
+fn extract_text_chars(text_page: &PdfPageText<'_>, excluded: &[bool]) -> Vec<PageTextChar> {
     text_page
         .chars()
         .iter()
+        .filter(|ch| !excluded.get(ch.index() as usize).copied().unwrap_or(false))
         .filter_map(|char| {
             let ch = char.unicode_char()?;
             if ch == '\0' {

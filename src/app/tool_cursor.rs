@@ -1,23 +1,23 @@
 use super::*;
 
-const BADGE_SIZE: Vec2 = Vec2::new(27.0, 25.0);
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+pub(super) use windows::NativeMarkerCursor;
 
 impl PdfEditorApp {
-    /// Keep the native cursor's precise hot spot and add a non-interactive
-    /// badge beside it only while an editing tool is over the PDF itself.
-    pub(super) fn draw_tool_cursor(&self, ctx: &Context) {
+    /// Identify the PDF surface where the highlighter should replace the cursor.
+    fn marker_cursor_preset(&self, ctx: &Context) -> Option<MarkerPreset> {
         if self.view_mode != DocumentViewMode::Pdf
             || self.sbs_mode.is_some()
             || self.document.is_none()
-            || self.active_tool == Tool::Select
+            || self.active_tool != Tool::Marker
             || self.editing_text_box.is_some()
             || self.editing_comment.is_some()
         {
-            return;
+            return None;
         }
-        let Some(pointer) = ctx.input(|input| input.pointer.hover_pos()) else {
-            return;
-        };
+        let pointer = ctx.input(|input| input.pointer.hover_pos())?;
         if !self
             .chrome
             .document_rect
@@ -26,145 +26,74 @@ impl PdfEditorApp {
                 .pdf_page_placements
                 .iter()
                 .any(|(_, placement)| placement.rect.contains(pointer))
+            || ctx
+                .layer_id_at(pointer)
+                .is_some_and(|layer| layer != egui::LayerId::background())
         {
-            return;
+            return None;
         }
-        if ctx
-            .layer_id_at(pointer)
-            .is_some_and(|layer| layer != egui::LayerId::background())
+        let dragging_page = ctx.input(|input| input.pointer.primary_down())
+            && self.selection_state.anchor.is_some();
+        if ctx.output(|output| output.cursor_icon) != tool_cursor(Tool::Marker) && !dragging_page {
+            return None;
+        }
+        Some(self.marker_preset())
+    }
+
+    pub(super) fn update_tool_cursor(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        let preset = self.marker_cursor_preset(ctx);
+        #[cfg(target_os = "windows")]
         {
-            return;
-        }
-        // Do not cover a link, annotation handle, or other control that has
-        // already selected a different native pointer.
-        let expected_cursor = tool_cursor(self.active_tool);
-        if ctx.output(|output| output.cursor_icon) != expected_cursor {
-            let dragging_page = ctx.input(|input| input.pointer.primary_down())
-                && match self.active_tool {
-                    Tool::Marker => self.selection_state.anchor.is_some(),
-                    Tool::TextBox | Tool::Signature => self.active_drag_page.is_some(),
-                    Tool::Select => false,
-                };
-            if !dragging_page {
+            if preset.is_some() && self.native_marker_cursor.is_none() {
+                self.native_marker_cursor = NativeMarkerCursor::new(_frame);
+            }
+            if let Some(native) = self.native_marker_cursor.as_mut()
+                && native.set(preset.map(|_| self.marker_preset_index))
+            {
                 return;
             }
-            // Egui keeps the drag on its starting page, even after the pointer
-            // crosses onto another page or the starting page scrolls away.
-            ctx.set_cursor_icon(expected_cursor);
         }
+        if let Some(preset) = preset {
+            self.draw_marker_cursor(ctx, preset);
+        }
+    }
 
-        let rect = badge_rect(pointer, ctx.content_rect());
+    /// Cross-platform fallback: replace, rather than accompany, the pointer.
+    fn draw_marker_cursor(&self, ctx: &Context, preset: MarkerPreset) {
+        let Some(point) = ctx.input(|input| input.pointer.hover_pos()) else {
+            return;
+        };
+        ctx.set_cursor_icon(CursorIcon::None);
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Tooltip,
-            egui::Id::new("pdf-tool-cursor"),
+            egui::Id::new("pdf-marker-cursor"),
         ));
-        painter.rect_filled(
-            rect.translate(Vec2::new(0.0, 1.5)),
-            7,
-            Color32::from_black_alpha(40),
-        );
-        painter.rect_filled(rect, 7, Color32::from_rgba_unmultiplied(255, 253, 247, 245));
-        painter.rect_stroke(
-            rect,
-            7,
-            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(49, 42, 37, 150)),
-            egui::StrokeKind::Inside,
-        );
-        match self.active_tool {
-            Tool::Marker => paint_marker(&painter, rect, self.marker_preset()),
-            Tool::TextBox => paint_text_box(&painter, rect),
-            Tool::Signature => paint_signature(&painter, rect),
-            Tool::Select => {}
+        let at = |x, y| point + Vec2::new(x, y);
+        let ink = Color32::from_rgb(48, 44, 42);
+        let color = color_from_rgb(preset.color_rgb, 255);
+        // The tip is exactly at the pointer's selection hot spot.
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                at(0.0, 0.0),
+                at(3.0, -7.0),
+                at(20.0, -24.0),
+                at(26.0, -18.0),
+                at(9.0, -1.0),
+                at(3.0, 2.0),
+            ],
+            color,
+            Stroke::new(1.2_f32, ink),
+        ));
+        painter.line_segment([at(3.0, -7.0), at(9.0, -1.0)], Stroke::new(1.0_f32, ink));
+    }
+
+    #[cfg(test)]
+    fn draw_tool_cursor(&self, ctx: &Context) {
+        if let Some(preset) = self.marker_cursor_preset(ctx) {
+            self.draw_marker_cursor(ctx, preset);
         }
     }
 }
-
-fn badge_rect(pointer: Pos2, bounds: Rect) -> Rect {
-    let offset = Vec2::new(12.0, 14.0);
-    let x = if pointer.x + offset.x + BADGE_SIZE.x <= bounds.right() {
-        pointer.x + offset.x
-    } else {
-        pointer.x - offset.x - BADGE_SIZE.x
-    };
-    let y = if pointer.y + offset.y + BADGE_SIZE.y <= bounds.bottom() {
-        pointer.y + offset.y
-    } else {
-        pointer.y - offset.y - BADGE_SIZE.y
-    };
-    Rect::from_min_size(
-        Pos2::new(
-            x.clamp(
-                bounds.left(),
-                (bounds.right() - BADGE_SIZE.x).max(bounds.left()),
-            ),
-            y.clamp(
-                bounds.top(),
-                (bounds.bottom() - BADGE_SIZE.y).max(bounds.top()),
-            ),
-        ),
-        BADGE_SIZE,
-    )
-}
-
-fn paint_marker(painter: &egui::Painter, rect: Rect, preset: MarkerPreset) {
-    let at = |x, y| rect.min + Vec2::new(x, y);
-    let ink = Color32::from_rgb(54, 48, 43);
-    let color = color_from_rgb(preset.color_rgb, 255);
-    // A little angled marker with its actual selected colour at the nib.
-    painter.add(egui::Shape::convex_polygon(
-        vec![at(8.0, 15.0), at(15.0, 5.0), at(20.0, 8.0), at(13.0, 18.0)],
-        Color32::from_rgb(250, 247, 237),
-        Stroke::new(1.1_f32, ink),
-    ));
-    painter.add(egui::Shape::convex_polygon(
-        vec![at(7.0, 15.0), at(12.0, 18.0), at(8.0, 20.0), at(5.0, 19.0)],
-        color,
-        Stroke::new(0.8_f32, ink),
-    ));
-    let width: f32 = if preset.style == MarkerStyle::Highlight {
-        3.2
-    } else {
-        1.6
-    };
-    painter.line_segment([at(5.0, 21.0), at(18.0, 21.0)], Stroke::new(width, color));
-}
-
-fn paint_text_box(painter: &egui::Painter, rect: Rect) {
-    let ink = Color32::from_rgb(54, 48, 43);
-    let frame = Rect::from_center_size(rect.center(), Vec2::new(17.0, 16.0));
-    painter.rect_stroke(
-        frame,
-        2,
-        Stroke::new(1.0_f32, ink),
-        egui::StrokeKind::Inside,
-    );
-    painter.text(
-        frame.center(),
-        Align2::CENTER_CENTER,
-        "T",
-        FontId::proportional(13.0),
-        ink,
-    );
-}
-
-fn paint_signature(painter: &egui::Painter, rect: Rect) {
-    let at = |x, y| rect.min + Vec2::new(x, y);
-    let ink = Color32::from_rgb(54, 48, 43);
-    painter.add(egui::Shape::convex_polygon(
-        vec![
-            at(6.0, 19.0),
-            at(10.0, 9.0),
-            at(16.0, 4.0),
-            at(21.0, 9.0),
-            at(16.0, 15.0),
-        ],
-        Color32::from_rgb(239, 225, 196),
-        Stroke::new(1.0_f32, ink),
-    ));
-    painter.line_segment([at(6.0, 19.0), at(15.0, 10.0)], Stroke::new(1.0_f32, ink));
-    painter.circle_filled(at(15.0, 10.0), 1.2, ink);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,16 +114,6 @@ mod tests {
             }
             egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| swatch_center(shape, color)),
             _ => None,
-        }
-    }
-
-    #[test]
-    fn badge_stays_on_screen_near_the_edges() {
-        let bounds = Rect::from_min_size(Pos2::ZERO, Vec2::new(500.0, 400.0));
-        for pointer in [Pos2::new(1.0, 1.0), Pos2::new(499.0, 399.0)] {
-            let rect = badge_rect(pointer, bounds);
-            assert!(bounds.contains_rect(rect));
-            assert!(!rect.contains(pointer));
         }
     }
 
@@ -246,7 +165,7 @@ mod tests {
         let color = color_from_rgb(MARKER_PRESETS[2].color_rgb, 255);
         assert_eq!(
             output.platform_output.cursor_icon,
-            CursorIcon::Text,
+            CursorIcon::None,
             "pointer {point:?}, page {:?}, document {:?}",
             app.pdf_page_placements[0].1.rect,
             app.chrome.document_rect
@@ -382,7 +301,7 @@ mod tests {
         );
         let output = frame(0.2, vec![egui::Event::PointerMoved(second)], &mut app);
         assert!(app.selection_state.anchor.is_some());
-        assert_eq!(output.platform_output.cursor_icon, CursorIcon::Text);
+        assert_eq!(output.platform_output.cursor_icon, CursorIcon::None);
         let color = color_from_rgb(MARKER_PRESETS[0].color_rgb, 255);
         assert!(
             output
@@ -423,7 +342,7 @@ mod tests {
                         .show(ctx, |ui| ui.set_min_size(Vec2::splat(100.0)));
                     // A text field in the dialog can use the same I-beam as
                     // the document; the layer still needs to suppress the badge.
-                    ctx.set_cursor_icon(CursorIcon::Text);
+                    ctx.set_cursor_icon(CursorIcon::None);
                     app.draw_tool_cursor(ctx);
                 },
             )
