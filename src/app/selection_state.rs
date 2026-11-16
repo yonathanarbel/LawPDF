@@ -9,7 +9,10 @@ pub(super) struct SelectionState {
     pub(super) extend_anchor: Option<(usize, usize)>,
     pub(super) toolbar_rect: Option<Rect>,
     pub(super) pending_select_all: bool,
-    pub(super) pending_mark: bool,
+    /// The preset chosen for a selection whose page geometry is still loading.
+    pub(super) pending_mark: Option<MarkerPreset>,
+    /// A completed arrow selection awaiting text from one or more pages.
+    pub(super) pending_copy: Option<TextSelection>,
 }
 
 pub(super) fn selected_text(
@@ -296,6 +299,141 @@ mod tests {
         assert!(selected_text(&[pages[0].clone(), None], forward).is_none());
     }
 
+    fn copied(output: &egui::FullOutput) -> Vec<&str> {
+        output
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn arrow_selection_waits_for_missing_pages_then_copies_once() {
+        let (mut app, ctx, _worker) = annotation_saving::tests::fixture();
+        let document = app.document.as_mut().unwrap();
+        document.page_count = 2;
+        document.text_chars = vec![Some(chars("tail")), None];
+        app.selection_state.text = Some(TextSelection::range(0, 0, 1, 3));
+        let output = ctx.run(Default::default(), |ctx| app.auto_copy_pdf_selection(ctx));
+        assert!(copied(&output).is_empty());
+        assert!(app.selection_state.pending_copy.is_some());
+        app.document.as_mut().unwrap().text_chars[1] = Some(chars("head"));
+        let output = ctx.run(Default::default(), |ctx| app.finish_pending_auto_copy(ctx));
+        assert_eq!(copied(&output), vec!["tail\nhead"]);
+        let output = ctx.run(Default::default(), |ctx| app.finish_pending_auto_copy(ctx));
+        assert!(copied(&output).is_empty());
+    }
+
+    #[test]
+    fn stale_selection_and_marker_mode_do_not_copy() {
+        let (mut app, ctx, _worker) = annotation_saving::tests::fixture();
+        app.document.as_mut().unwrap().text_chars = vec![Some(chars("tail")), None];
+        app.selection_state.text = Some(TextSelection::range(0, 0, 1, 3));
+        let _ = ctx.run(Default::default(), |ctx| app.auto_copy_pdf_selection(ctx));
+        app.selection_state.text = Some(TextSelection::range(0, 0, 0, 1));
+        let output = ctx.run(Default::default(), |ctx| app.finish_pending_auto_copy(ctx));
+        assert!(copied(&output).is_empty());
+        assert!(app.selection_state.pending_copy.is_none());
+        app.active_tool = Tool::Marker;
+        let output = ctx.run(Default::default(), |ctx| app.auto_copy_pdf_selection(ctx));
+        assert!(copied(&output).is_empty());
+    }
+
+    #[test]
+    fn slow_selection_never_overwrites_a_later_copy_or_an_unfocused_clipboard() {
+        let (mut app, ctx, _worker) = annotation_saving::tests::fixture();
+        app.document.as_mut().unwrap().text_chars = vec![Some(chars("tail")), None];
+        app.selection_state.text = Some(TextSelection::range(0, 0, 1, 3));
+        let _ = ctx.run(Default::default(), |ctx| app.auto_copy_pdf_selection(ctx));
+        let _ = ctx.run(egui::RawInput { focused: false, ..Default::default() }, |ctx| {
+            app.finish_pending_auto_copy(ctx);
+        });
+        assert!(app.selection_state.pending_copy.is_none());
+
+        let _ = ctx.run(Default::default(), |ctx| app.auto_copy_pdf_selection(ctx));
+        assert!(app.selection_state.pending_copy.is_some());
+        let explicit = ctx.run(Default::default(), |ctx| app.copy_text_to_clipboard(ctx, "newer copy".to_owned()));
+        assert_eq!(copied(&explicit), vec!["newer copy"]);
+        app.document.as_mut().unwrap().text_chars[1] = Some(chars("head"));
+        let output = ctx.run(Default::default(), |ctx| app.finish_pending_auto_copy(ctx));
+        assert!(copied(&output).is_empty());
+    }
+
+    #[test]
+    fn dragging_with_arrow_copies_the_text_only_when_released() {
+        let (mut app, ctx, _worker) = annotation_saving::tests::fixture();
+        let text = "Select this"
+            .chars()
+            .enumerate()
+            .map(|(index, ch)| PageTextChar {
+                ch,
+                rect: Some(PdfRect::new(
+                    72.0 + index as f32 * 9.0,
+                    700.0,
+                    80.0 + index as f32 * 9.0,
+                    716.0,
+                )),
+                font_size: Some(12.0),
+                bold: false,
+                italic: false,
+            })
+            .collect();
+        app.document.as_mut().unwrap().text_chars[0] = Some(text);
+        app.settings.sidebar_in_pdf = false;
+        app.zoom = 0.7;
+        app.target_zoom = 0.7;
+        app.scroll_target_page = None;
+        let texture = ctx.load_texture(
+            "auto-copy-drag",
+            egui::ColorImage::filled([4, 4], Color32::WHITE),
+            TextureOptions::LINEAR,
+        );
+        app.page_textures.insert(
+            0,
+            PageTexture {
+                _zoom: app.zoom,
+                render_scale: app.page_render_scale(&ctx, 612.0, 792.0),
+                last_used: 1,
+                texture,
+                fade_started: None,
+            },
+        );
+        let frame = |app: &mut PdfEditorApp, time, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 900.0))),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.draw_document(ctx),
+            )
+        };
+        let _ = frame(&mut app, 0.0, vec![]);
+        let placement = app.pdf_page_placements[0].1;
+        let first = placement.pdf_to_screen((76.0, 708.0));
+        let last = placement.pdf_to_screen((121.0, 708.0));
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = frame(
+            &mut app,
+            0.1,
+            vec![egui::Event::PointerMoved(first), button(first, true)],
+        );
+        let dragging = frame(&mut app, 0.2, vec![egui::Event::PointerMoved(last)]);
+        assert!(copied(&dragging).is_empty());
+        let released = frame(&mut app, 0.3, vec![button(last, false)]);
+        assert_eq!(copied(&released), vec!["Select"]);
+    }
+
     #[test]
     fn double_click_word_bounds_respect_whitespace_and_unicode() {
         let text = chars("The court’s ruling.");
@@ -537,7 +675,7 @@ mod tests {
         );
         let bounds = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 900.0));
         let draw = |app: &mut PdfEditorApp, time, events| {
-            let _ = ctx.run(
+            ctx.run(
                 egui::RawInput {
                     screen_rect: Some(bounds),
                     time: Some(time),
@@ -545,9 +683,9 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| app.draw_document(ctx),
-            );
+            )
         };
-        draw(&mut app, 0.0, vec![]);
+        let _ = draw(&mut app, 0.0, vec![]);
         let point = app
             .pdf_page_placements
             .iter()
@@ -555,7 +693,8 @@ mod tests {
             .unwrap()
             .1
             .pdf_to_screen((84.0, 705.0));
-        draw(&mut app, 0.02, vec![egui::Event::PointerMoved(point)]);
+        let _ = draw(&mut app, 0.02, vec![egui::Event::PointerMoved(point)]);
+        let mut last_output = None;
         for (time, pressed) in [
             (0.10, true),
             (0.12, false),
@@ -564,7 +703,7 @@ mod tests {
             (0.30, true),
             (0.32, false),
         ] {
-            draw(
+            last_output = Some(draw(
                 &mut app,
                 time,
                 vec![egui::Event::PointerButton {
@@ -573,11 +712,15 @@ mod tests {
                     pressed,
                     modifiers: egui::Modifiers::NONE,
                 }],
-            );
+            ));
         }
         assert_eq!(
             app.selected_text().as_deref(),
             Some("First paragraph is long enough to fill the line\r\nand ends here.")
+        );
+        assert_eq!(
+            copied(&last_output.unwrap()),
+            vec!["First paragraph is long enough to fill the line\r\nand ends here."]
         );
     }
 }
